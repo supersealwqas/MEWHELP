@@ -1,0 +1,96 @@
+<!doctype html>
+<!-- MewHelp 客服聊天页：同源调用聊天 API，提供气泡消息、增量回复与多轮会话。 -->
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#285b49">
+    <meta name="description" content="与喵购商城小喵客服聊一聊，体验流式回复与连续对话。">
+    <title>小喵客服 · MewHelp</title>
+    <link rel="icon" href="/static/mew.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/static/styles.css">
+    <script type="module" src="/static/chat.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#message-input">跳到消息输入框</a>
+    <div class="page-shell">
+      <header class="site-header">
+        <a class="brand" href="/" aria-label="MewHelp 首页，开启新对话">
+          <img src="/static/mew.svg" alt="" width="40" height="40">
+          <span class="brand-name">MewHelp<span class="brand-caption">喵购商城 · 客服体验</span></span>
+        </a>
+        <a class="docs-link" href="/docs" target="_blank" rel="noopener noreferrer">
+          接口文档
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 17 17 7M7 7h10v10"/></svg>
+        </a>
+      </header>
+
+      <main class="chat-card" aria-labelledby="chat-title">
+        <header class="chat-header">
+          <div class="assistant-profile">
+            <img class="assistant-avatar" src="/static/mew.svg" alt="" width="44" height="44">
+            <div>
+              <h1 id="chat-title">小喵客服</h1>
+              <p class="assistant-subtitle"><span class="status-dot" aria-hidden="true"></span>你的喵购商城智能助手</p>
+            </div>
+          </div>
+          <button class="button button-secondary" id="new-chat" type="button" title="使用新的会话编号重新开始，不删除服务端旧历史">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+            新会话
+          </button>
+        </header>
+
+        <div class="conversation" id="conversation" tabindex="0" aria-label="聊天内容">
+          <section class="welcome" id="welcome" aria-labelledby="welcome-title">
+            <div class="welcome-illustration" aria-hidden="true">
+              <span class="orbit orbit-one"></span><span class="orbit orbit-two"></span>
+              <img src="/static/mew.svg" alt="" width="76" height="76">
+              <span class="hello-label">HELLO, FRIEND</span>
+            </div>
+            <p class="eyebrow">每一个小问题，都值得认真回答</p>
+            <h2 id="welcome-title">嗨，有什么可以帮你？</h2>
+            <p class="welcome-description">商品、物流或售后，都可以聊聊。<br>我会接住本次对话，方便你继续追问。</p>
+            <div class="suggestions" aria-label="示例问题，点击填入输入框">
+              <button class="suggestion" type="button" data-prompt="你们家猫粮发什么快递？">猫粮发什么快递？<span aria-hidden="true">↗</span></button>
+              <button class="suggestion" type="button" data-prompt="退换货通常需要提供哪些信息？">想了解退换货<span aria-hidden="true">↗</span></button>
+            </div>
+            <p class="welcome-hint">点选一个问题，或在下方写下你的想法</p>
+          </section>
+          <!-- 动态内容一律通过 textContent 写入，不将用户或模型文本作为 HTML 执行。 -->
+          <div class="messages" id="messages" role="log" aria-label="对话消息" aria-live="polite" aria-relevant="additions text"></div>
+        </div>
+
+        <footer class="composer-area">
+          <div class="conversation-status">
+            <p id="request-status" role="status">准备好了，开始聊聊吧</p>
+            <span class="stream-label"><span aria-hidden="true"></span>SSE 流式回复</span>
+          </div>
+          <p class="feedback" id="feedback" role="alert" hidden></p>
+          <form id="chat-form">
+            <div class="composer">
+              <label class="sr-only" for="message-input">给小喵发送消息</label>
+              <textarea id="message-input" name="message" rows="2" required placeholder="和小喵说说，你想了解什么…" aria-describedby="keyboard-hint" autofocus></textarea>
+              <div class="composer-toolbar">
+                <p id="keyboard-hint"><kbd>Enter</kbd> 发送 <span>·</span> <kbd>Shift + Enter</kbd> 换行</p>
+                <div class="composer-actions">
+                  <button class="button button-secondary" id="stop-button" type="button" hidden>停止回复</button>
+                  <button class="button button-primary" id="send-button" type="submit" disabled>
+                    <span>发送</span>
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 14-7-7 14-1-6-6-1ZM11 13l8-8"/></svg>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </form>
+          <p class="capability-note">AI 回复仅供参考；目前不能查询真实订单、办理退款或转接人工。</p>
+        </footer>
+      </main>
+
+      <footer class="page-footer">
+        <span class="session-label">当前会话 <code id="session-id" title="同一页面内的连续提问使用同一个 session_id"></code></span>
+        <span>刷新或新建会话会重新开始；服务重启后历史清空。</span>
+      </footer>
+    </div>
+    <noscript><p class="noscript">聊天页面需要启用 JavaScript；也可以通过 <a href="/docs">接口文档</a>测试后端。</p></noscript>
+  </body>
+</html>

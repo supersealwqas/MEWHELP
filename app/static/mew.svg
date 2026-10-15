@@ -1,0 +1,6 @@
+<!-- MewHelp 本地矢量头像：简洁猫咪轮廓，同时用作网站图标，不请求外部资源。 -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 80" fill="none">
+  <rect width="80" height="80" rx="23" fill="#E4ECDF"/>
+  <path d="M21 37V20l14 10a27 27 0 0 1 10 0l14-10v17c4 5 5 8 4 13-2 10-11 15-23 15s-21-5-23-15c-1-5 0-8 4-13Z" fill="#FCFDF8" stroke="#285B49" stroke-width="3" stroke-linejoin="round"/>
+  <path d="M29 43v3m22-3v3m-13 6 2 2 2-2m-2 2v3m0 0c-2 2-5 2-7 0m7 0c2 2 5 2 7 0M18 49l-6-1m7 7-6 1m49-7 6-1m-7 7 6 1" stroke="#285B49" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
