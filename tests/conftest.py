@@ -1,10 +1,30 @@
-"""Pytest shared fixtures and test configuration."""
+"""全局 Pytest 测试配置文件与 Fixture 夹具定义。"""
 
+import os
 import pytest
 
 
 @pytest.fixture(autouse=True)
-def clean_env(monkeypatch):
-    """Ensure tests run with predictable environment variables."""
-    # Specific tests can override using monkeypatch as needed
+def clean_env(monkeypatch: pytest.MonkeyPatch):
+    """在每个测试用例运行前，隔离关键环境变量，避免开发环境的 .env 文件影响单测默认值判定。
+
+    参数:
+        monkeypatch: pytest 提供的环境修改夹具。
+    """
+    keys_to_clean = [
+        "CHAT_BASE_URL",
+        "CHAT_MODEL",
+        "CHAT_API_KEY",
+        "CHAT_TOKEN_BUDGET",
+        "EMBED_BASE_URL",
+        "EMBED_MODEL",
+        "EMBED_API_KEY",
+        "RERANK_BASE_URL",
+        "RERANK_MODEL",
+        "RERANK_API_KEY",
+    ]
+    # 仅备份并临时清理可能影响配置单测的变量
+    for key in keys_to_clean:
+        if key in os.environ:
+            monkeypatch.delenv(key, raising=False)
     yield
