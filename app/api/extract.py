@@ -37,10 +37,15 @@ async def extract_after_sales_info(request: ExtractRequest) -> AfterSalesTicket:
         fastapi.HTTPException: 当上游模型调用超时、网络故障或模型解析失败时，抛出 502 Bad Gateway 异常。
     """
     try:
-        # 初始化确定性采样温度 (0.0) 的 LLM 实例
-        llm = get_llm(temperature=0.0)
+        # 初始化确定性采样温度 (0.0) 的 LLM 实例，显式开启 streaming=True 以兼容强制流式响应的网关
+        llm = get_llm(temperature=0.0, streaming=True)
         # 将模型输出强绑定为售后工单结构化数据契约 (采用 function_calling 机制)
-        structured_llm = llm.with_structured_output(AfterSalesTicket, method="function_calling")
+        # 指定 tool_choice="auto"，兼容要求字符串类型 tool_choice 的部分上游代理网关
+        structured_llm = llm.with_structured_output(
+            AfterSalesTicket,
+            method="function_calling",
+            tool_choice="auto",
+        )
         # 编排 Prompt 模板与结构化输出链
         chain = EXTRACTION_PROMPT | structured_llm
         # 异步执行抽取链路并返回结构化数据
