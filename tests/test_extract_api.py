@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 from langchain_core.runnables.base import RunnableSequence
 
 from app.main import app
-from app.schemas.after_sales import AfterSalesTicket
+from app.schemas.extract import AfterSalesTicket
 
 
 @pytest.fixture
@@ -137,13 +137,48 @@ class TestExtractEndpointSuccess:
 class TestExtractEndpointUpstreamFailure:
     """POST /api/extract 上游异常处理测试类。"""
 
+    def test_missing_tool_result_returns_502(self, client: TestClient) -> None:
+        """验证上游未返回结构化工具结果时使用受控错误响应。
+
+        参数:
+            client: FastAPI 测试客户端。
+        返回值:
+            None: 断言空结果被转换为 HTTP 502。
+        异常:
+            AssertionError: 接口未安全处理空结果时抛出。
+        """
+        with patch.object(RunnableSequence, "ainvoke", new_callable=AsyncMock) as invoke:
+            invoke.return_value = None
+            response = client.post("/api/extract", json={"text": "请帮我退款"})
+        assert response.status_code == 502
+        assert response.json()["detail"] == "上游模型暂时不可用，请稍后重试"
+
+    def test_extract_factory_failure_returns_502(self, client: TestClient) -> None:
+        """验证提取链工厂初始化失败时，接口仍按原约定返回 HTTP 502。
+
+        参数:
+            client: FastAPI 测试客户端实例。
+
+        返回值:
+            None: 断言初始化错误被接口统一包装。
+
+        异常:
+            AssertionError: 错误响应不符合原接口约定时抛出。
+        """
+        with patch(
+            "app.api.extract.get_extractor", side_effect=ValueError("模型参数无效")
+        ):
+            response = client.post("/api/extract", json={"text": "商品损坏，申请退款"})
+        assert response.status_code == 502
+        assert response.json()["detail"] == "上游模型暂时不可用，请稍后重试"
+
     def test_extract_upstream_exception_returns_502(self, client: TestClient) -> None:
         """测试上游模型调用抛出通用异常时，接口转换为 HTTP 502 错误。
 
         参数:
             client (TestClient): FastAPI 测试客户端实例
         """
-        error_message = "Connection reset by peer"
+        error_message = "Connection reset by peer; sensitive-upstream-detail"
 
         with patch.object(RunnableSequence, "ainvoke", new_callable=AsyncMock) as mock_ainvoke:
             # 模拟上游 LLM 调用故障抛出异常
@@ -154,7 +189,8 @@ class TestExtractEndpointUpstreamFailure:
             assert response.status_code == 502
             data = response.json()
             assert "detail" in data
-            assert f"上游模型提取失败: {error_message}" in data["detail"]
+            assert data["detail"] == "上游模型暂时不可用，请稍后重试"
+            assert "sensitive-upstream-detail" not in response.text
 
     def test_extract_upstream_timeout_returns_502(self, client: TestClient) -> None:
         """测试上游模型调用超时时，接口转换为 HTTP 502 错误。
@@ -169,7 +205,7 @@ class TestExtractEndpointUpstreamFailure:
 
             assert response.status_code == 502
             data = response.json()
-            assert "上游模型提取失败: Request timed out after 30.0s" in data["detail"]
+            assert data["detail"] == "上游模型暂时不可用，请稍后重试"
 
 
 class TestExtractEndpointValidation:

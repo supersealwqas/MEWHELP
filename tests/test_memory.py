@@ -1,40 +1,43 @@
 """内存会话存储与 Token 裁剪单元测试模块。
 
-覆盖客服会话历史内存存储组件 (InMemoryChatHistory) 与
+覆盖客服会话历史内存存储组件 (SessionStore) 与
 基于 Token 预算控制的历史裁剪函数 (trim_history) 的核心行为与边界场景。
 """
 
 import pytest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
-from app.core import InMemoryChatHistory, memory, trim_history
+from app.api.chat import store
+from app.core import SessionStore, trim_history
 from app.core.memory import (
-    InMemoryChatHistory as DirectInMemoryChatHistory,
-    memory as direct_memory,
+    SessionStore as DirectSessionStore,
     trim_history as direct_trim_history,
 )
 
 
-class TestInMemoryChatHistory:
-    """测试内存会话存储管理器 (InMemoryChatHistory) 的功能。"""
+class TestSessionStore:
+    """测试内存会话存储管理器 (SessionStore) 的功能。"""
 
-    def test_in_memory_chat_history_basic(self) -> None:
+    def test_session_store_basic(self) -> None:
         """测试添加用户消息与客服消息、按顺序读取历史以及不同会话间的隔离性。
 
         返回值:
             None: 无返回值，通过断言验证消息顺序、类型与多会话隔离。
         """
-        chat_memory = InMemoryChatHistory()
+        chat_memory = SessionStore()
         session_a = "session_user_001"
         session_b = "session_user_002"
 
         # 会话 A 添加对话轮次
-        chat_memory.add_user_message(session_a, "你好，我想咨询退货流程")
-        chat_memory.add_ai_message(session_a, "您好！请提供您的订单编号，我为您查询。")
-        chat_memory.add_user_message(session_a, "订单号是 ORD-2026-001")
+        chat_memory.append(
+            session_a,
+            HumanMessage(content="你好，我想咨询退货流程"),
+            AIMessage(content="您好！请提供您的订单编号，我为您查询。"),
+        )
+        chat_memory.append(session_a, HumanMessage(content="订单号是 ORD-2026-001"))
 
         # 验证会话 A 的消息内容与顺序
-        msgs_a = chat_memory.get_messages(session_a)
+        msgs_a = chat_memory.get(session_a)
         assert len(msgs_a) == 3
         assert isinstance(msgs_a[0], HumanMessage)
         assert msgs_a[0].content == "你好，我想咨询退货流程"
@@ -44,70 +47,69 @@ class TestInMemoryChatHistory:
         assert msgs_a[2].content == "订单号是 ORD-2026-001"
 
         # 验证会话 B 隔离：此时会话 B 尚无历史
-        msgs_b_initial = chat_memory.get_messages(session_b)
+        msgs_b_initial = chat_memory.get(session_b)
         assert msgs_b_initial == []
 
         # 会话 B 添加自己的消息，互不干扰
-        chat_memory.add_user_message(session_b, "快递什么时候能发货？")
-        msgs_b = chat_memory.get_messages(session_b)
+        chat_memory.append(session_b, HumanMessage(content="快递什么时候能发货？"))
+        msgs_b = chat_memory.get(session_b)
         assert len(msgs_b) == 1
         assert msgs_b[0].content == "快递什么时候能发货？"
 
         # 会话 A 的历史数量不受会话 B 影响
-        assert len(chat_memory.get_messages(session_a)) == 3
+        assert len(chat_memory.get(session_a)) == 3
 
-    def test_in_memory_chat_history_returns_copy(self) -> None:
-        """测试 get_messages 返回的是内部消息列表的浅拷贝副本，防止外部修改污染内部状态。
+    def test_session_store_returns_copy(self) -> None:
+        """测试 get 返回的是内部消息列表的浅拷贝副本，防止外部修改污染内部状态。
 
         返回值:
             None: 无返回值，断言外部变更不污染内部会话存储。
         """
-        chat_memory = InMemoryChatHistory()
+        chat_memory = SessionStore()
         session_id = "session_copy_test"
-        chat_memory.add_user_message(session_id, "原始消息")
+        chat_memory.append(session_id, HumanMessage(content="原始消息"))
 
         # 获取消息列表并在外部修改
-        copied_list = chat_memory.get_messages(session_id)
+        copied_list = chat_memory.get(session_id)
         assert len(copied_list) == 1
         copied_list.append(HumanMessage(content="外部追加的消息"))
 
         # 再次获取内部存储，长度应仍为 1
-        fresh_list = chat_memory.get_messages(session_id)
+        fresh_list = chat_memory.get(session_id)
         assert len(fresh_list) == 1
         assert fresh_list[0].content == "原始消息"
 
-    def test_in_memory_chat_history_clear(self) -> None:
+    def test_session_store_clear(self) -> None:
         """测试清除指定 session_id 的历史记录，且不影响其他 session_id。
 
         返回值:
             None: 无返回值，断言目标会话被清空而其他会话保留。
         """
-        chat_memory = InMemoryChatHistory()
+        chat_memory = SessionStore()
         session_1 = "session_clear_1"
         session_2 = "session_clear_2"
 
-        chat_memory.add_user_message(session_1, "用户1的消息")
-        chat_memory.add_user_message(session_2, "用户2的消息")
+        chat_memory.append(session_1, HumanMessage(content="用户1的消息"))
+        chat_memory.append(session_2, HumanMessage(content="用户2的消息"))
 
         # 清除 session_1
         chat_memory.clear(session_1)
 
         # 验证 session_1 已被清空，而 session_2 依然保留
-        assert chat_memory.get_messages(session_1) == []
-        assert len(chat_memory.get_messages(session_2)) == 1
+        assert chat_memory.get(session_1) == []
+        assert len(chat_memory.get(session_2)) == 1
 
         # 测试清除不存在的 session_id 不会抛出异常
         chat_memory.clear("non_existent_session")
 
-    def test_memory_singleton_instance(self) -> None:
-        """测试全局单例 memory 实例存在且属于 InMemoryChatHistory 类型。
+    def test_store_singleton_instance(self) -> None:
+        """测试对话入口单例 store 实例存在且属于 SessionStore 类型。
 
         返回值:
             None: 无返回值，验证单例实例。
         """
-        assert isinstance(memory, InMemoryChatHistory)
-        assert isinstance(direct_memory, DirectInMemoryChatHistory)
-        assert memory is direct_memory
+        assert isinstance(store, SessionStore)
+        assert SessionStore is DirectSessionStore
 
 
 class TestTrimHistory:

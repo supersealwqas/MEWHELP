@@ -4,6 +4,14 @@ import os
 import pytest
 
 
+# 离线测试进程使用虚拟凭据，模块导入期间也不会读取真实账号进行模型初始化。
+os.environ.update({
+    "CHAT_BASE_URL": "http://test.invalid/v1",
+    "CHAT_MODEL": "test-model",
+    "CHAT_API_KEY": "test-key",
+})
+
+
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch: pytest.MonkeyPatch):
     """在每个测试用例运行前，隔离关键环境变量，避免开发环境的 .env 文件影响单测默认值判定。
@@ -15,6 +23,7 @@ def clean_env(monkeypatch: pytest.MonkeyPatch):
         "CHAT_BASE_URL",
         "CHAT_MODEL",
         "CHAT_API_KEY",
+        "TOKEN_BUDGET",
         "CHAT_TOKEN_BUDGET",
         "EMBED_BASE_URL",
         "EMBED_MODEL",

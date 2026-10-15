@@ -1,35 +1,36 @@
 """客服会话历史内存存储与 Token 裁剪模块。
 
-提供客服服务端纯内存会话历史管理器 (InMemoryChatHistory) 与
+提供客服服务端纯内存会话历史管理器 (SessionStore) 与
 基于 LangChain trim_messages 封装的上下文预算裁剪函数 (trim_history)。
 """
 
-from langchain_core.messages import (
-    AIMessage,
-    BaseMessage,
-    HumanMessage,
-    trim_messages,
-)
+from langchain_core.messages import BaseMessage, trim_messages
 
 
-class InMemoryChatHistory:
+class SessionStore:
     """客服会话历史纯内存存储管理器。
 
     设计意图：
         提供快速、无外部数据库依赖的多会话历史管理能力，支持不同 session_id
-        间的历史隔离、单条消息追加、历史读取与会话清理。
+        间的历史隔离、多条消息追加、历史读取与会话清理。
     """
 
     def __init__(self) -> None:
         """初始化内存会话存储字典。
 
+        参数:
+            无。
+
         返回值:
             None: 构造函数无返回值。
+
+        异常:
+            无业务异常抛出。
         """
         # 使用字典保存每个 session_id 对应的消息列表
-        self._storage: dict[str, list[BaseMessage]] = {}
+        self._sessions: dict[str, list[BaseMessage]] = {}
 
-    def get_messages(self, session_id: str) -> list[BaseMessage]:
+    def get(self, session_id: str) -> list[BaseMessage]:
         """获取指定会话的历史消息列表副本。
 
         参数:
@@ -42,14 +43,14 @@ class InMemoryChatHistory:
             无业务异常抛出
         """
         # 返回列表浅拷贝，避免外部直接修改污染内部存储
-        return list(self._storage.get(session_id, []))
+        return list(self._sessions.get(session_id, []))
 
-    def add_user_message(self, session_id: str, message: str) -> None:
-        """向指定会话追加一条用户消息 (HumanMessage)。
+    def append(self, session_id: str, *messages: BaseMessage) -> None:
+        """向指定会话按顺序追加一条或多条消息。
 
         参数:
             session_id (str): 会话唯一标识符
-            message (str): 用户输入的文本内容
+            *messages (BaseMessage): 待追加的用户或客服消息，可为空。
 
         返回值:
             None: 无返回值
@@ -57,28 +58,8 @@ class InMemoryChatHistory:
         异常:
             无业务异常抛出
         """
-        # 若会话尚不存在，自动初始化空列表
-        if session_id not in self._storage:
-            self._storage[session_id] = []
-        self._storage[session_id].append(HumanMessage(content=message))
-
-    def add_ai_message(self, session_id: str, message: str) -> None:
-        """向指定会话追加一条客服 AI 消息 (AIMessage)。
-
-        参数:
-            session_id (str): 会话唯一标识符
-            message (str): 客服 AI 生成的文本内容
-
-        返回值:
-            None: 无返回值
-
-        异常:
-            无业务异常抛出
-        """
-        # 若会话尚不存在，自动初始化空列表
-        if session_id not in self._storage:
-            self._storage[session_id] = []
-        self._storage[session_id].append(AIMessage(content=message))
+        # 若会话尚不存在，先初始化空列表，再按传入顺序写入消息。
+        self._sessions.setdefault(session_id, []).extend(messages)
 
     def clear(self, session_id: str) -> None:
         """清理指定会话的全部历史记录。
@@ -93,11 +74,7 @@ class InMemoryChatHistory:
             无业务异常抛出
         """
         # 安全移除目标会话，若不存在则静默忽略
-        self._storage.pop(session_id, None)
-
-
-# 导出全局单例实例供应用各层共享调用
-memory = InMemoryChatHistory()
+        self._sessions.pop(session_id, None)
 
 
 def trim_history(messages: list[BaseMessage], max_tokens: int = 2000) -> list[BaseMessage]:

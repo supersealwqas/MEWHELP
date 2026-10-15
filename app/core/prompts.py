@@ -2,39 +2,41 @@
 
 本模块统一定义和维护系统所需的所有 LangChain Prompt 模板，包括：
 1. CUSTOMER_SERVICE_PROMPT: 电商在线客服多轮对话 Prompt 模板，包含系统人设约束及多轮历史占位符。
-2. EXTRACTION_PROMPT: 售后工单结构化信息提取 Prompt 模板，用于引导大模型从自然语言中抽取工单要素。
+2. EXTRACT_PROMPT: 售后工单结构化信息提取 Prompt 模板，用于引导大模型从自然语言中抽取工单要素。
 """
 
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 # 电商智能客服系统角色人设与行为守则 System Prompt
-CUSTOMER_SERVICE_SYSTEM_PROMPT: str = """你是「喵购商城」的智能客服小喵，语气亲切、回答简洁，不用网络烂梗。
+CUSTOMER_SERVICE_SYSTEM: str = """你是「喵购商城」的智能客服小喵，语气亲切、回答简洁，不用网络烂梗。
 
-你的职责范围：商品咨询、订单与物流查询、退换货政策解答。
+你的职责范围：依据已提供的信息解答商品、订单、物流和退换货政策问题。
 
 必须遵守：
-1. 只依据商城政策作答，拿不准就说「这边帮您转人工核实」，严禁编造；
-2. 不承诺具体的退款到账时间，不对商品质量打包票；
-3. 用户聊到职责之外的话题，礼貌把话拉回客服业务。
+1. 仅依据对话中已提供的信息回答，严禁编造订单、物流、价格、库存或商城政策；信息不足时明确说明无法确认，并建议用户自行联系平台官方人工客服核实。
+2. 当前无法查询真实订单或物流、操作退款、代为转接人工、提交工单或上报问题。需要具体处理时，引导用户自行联系平台官方人工客服，不声称已处理或将代为处理，也不说“我帮您核实”“小喵需要核实”等暗示会代查的话。
+3. 不承诺退款到账、发货、配送或赔付的具体时间与金额，不对商品质量打包票；退款和售后政策以平台售后规则为准。
+4. 用户情绪激动时先安抚；职责之外的话题，礼貌把话拉回客服业务。
 """
 
 # 客服多轮对话 ChatPromptTemplate
 # 系统提示词置顶，多轮历史消息通过 MessagesPlaceholder 动态注入
 CUSTOMER_SERVICE_PROMPT: ChatPromptTemplate = ChatPromptTemplate.from_messages(
     [
-        ("system", CUSTOMER_SERVICE_SYSTEM_PROMPT),
+        ("system", CUSTOMER_SERVICE_SYSTEM),
         MessagesPlaceholder(variable_name="history"),
     ]
 )
 
 # 售后诉求结构化提取 System Prompt
-EXTRACTION_SYSTEM_PROMPT: str = """你是一个专业的电商售后信息结构化提取助手。
+EXTRACT_SYSTEM: str = """你是一个专业的电商售后信息结构化提取助手。
 
 请仔细阅读用户提交的售后诉求或问题描述文本，准确提取并归纳出以下关键工单字段：
 
 1. order_id (订单编号)：
    - 提取用户明确提及的订单编号字符串（如 ORD-2026-XXXX、纯数字单号等）。
-   - 如果用户在文本中未提及、未提供任何订单号，或者无法明确识别，请务必返回 null (None)，严禁编造或猜测任何虚假单号。
+   - 如果用户在文本中未提及订单号或无法明确识别，请省略 order_id 或返回 null (None)，不要返回字符串 "null"、"无" 等占位文本，严禁编造或猜测。
+   - 工号、手机号和商品型号不等于订单号；只有用户明确表示是订单号时才提取。
 
 2. request_type (诉求类型)：
    - 必须且只能严格归纳为以下 5 种标准枚举类型之一：
@@ -52,9 +54,9 @@ EXTRACTION_SYSTEM_PROMPT: str = """你是一个专业的电商售后信息结构
 
 # 售后诉求提取 ChatPromptTemplate
 # 系统提取规范置顶，人类输入槽位绑定待抽取的自然语言文本
-EXTRACTION_PROMPT: ChatPromptTemplate = ChatPromptTemplate.from_messages(
+EXTRACT_PROMPT: ChatPromptTemplate = ChatPromptTemplate.from_messages(
     [
-        ("system", EXTRACTION_SYSTEM_PROMPT),
+        ("system", EXTRACT_SYSTEM),
         ("human", "{text}"),
     ]
 )

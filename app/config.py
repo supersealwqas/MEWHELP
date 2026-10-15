@@ -4,7 +4,7 @@
 集中管理上游大模型连接凭证、Token 裁剪预算以及预留的向量与重排配置。
 """
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -22,19 +22,22 @@ class Settings(BaseSettings):
 
     # 对话模型配置项
     chat_base_url: str = Field(
-        default="http://8.219.192.36:9000",
+        min_length=1,
         description="对话模型上游兼容端点地址（支持 OpenAI 协议）",
     )
     chat_model: str = Field(
-        default="claude-opus-4-8",
+        min_length=1,
         description="上游对话模型的真实模型名称，换模型需与上游提供方完全一致",
     )
     chat_api_key: str = Field(
-        default="test-token",
+        min_length=1,
         description="上游对话模型调用的 API 鉴权密钥",
     )
-    chat_token_budget: int = Field(
+    token_budget: int = Field(
         default=2000,
+        gt=0,
+        # 优先使用参考项目的名称，同时兼容已有 .env 中的旧配置键。
+        validation_alias=AliasChoices("token_budget", "chat_token_budget"),
         description="多轮会话上下文裁剪保留的 Token 上限预算",
     )
 

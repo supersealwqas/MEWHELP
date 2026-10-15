@@ -5,6 +5,7 @@
 """
 
 import pytest
+from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import ValidationError
 
 from app.schemas import (
@@ -12,8 +13,9 @@ from app.schemas import (
     ChatChunk,
     ChatRequest,
     ExtractRequest,
+    RequestType,
 )
-from app.schemas.after_sales import (
+from app.schemas.extract import (
     AfterSalesTicket as DirectAfterSalesTicket,
     ExtractRequest as DirectExtractRequest,
 )
@@ -141,6 +143,55 @@ class TestExtractRequest:
 class TestAfterSalesTicket:
     """测试售后工单模型 (AfterSalesTicket) 的类型与枚举校验。"""
 
+    @pytest.mark.parametrize("placeholder", ["", "   ", "null", " None ", "N/A", "无"])
+    def test_missing_order_placeholders_become_none(self, placeholder: str) -> None:
+        """验证模型用占位文本表示缺失订单号时统一返回空值。
+
+        参数:
+            placeholder: 不表示真实订单号的模型输出。
+        返回值:
+            None: 断言订单号归一化结果。
+        异常:
+            AssertionError: 占位文本被误当作订单号时抛出。
+        """
+        ticket = AfterSalesTicket(
+            order_id=placeholder, request_type="退款", expected_solution="退全款"
+        )
+        assert ticket.order_id is None
+
+    @pytest.mark.parametrize("solution", ["", " \n\t"])
+    def test_blank_solution_is_rejected(self, solution: str) -> None:
+        """验证缺少有效期望方案的模型输出被拒绝。
+
+        参数:
+            solution: 空字符串或纯空白方案。
+        返回值:
+            None: 断言触发模型校验错误。
+        异常:
+            AssertionError: 无效方案被接受时抛出。
+        """
+        with pytest.raises(ValidationError):
+            AfterSalesTicket(request_type="退款", expected_solution=solution)
+
+    def test_ticket_tool_schema_preserves_request_types(self) -> None:
+        """验证改用 RequestType 后，模型调用仍能获得全部中文诉求选项。
+
+        参数:
+            无。
+
+        返回值:
+            None: 断言发往模型的工具定义完整且保留可选订单号。
+
+        异常:
+            AssertionError: 工具字段定义与既有接口约定不符时抛出。
+        """
+        tool = convert_to_openai_tool(AfterSalesTicket)
+        parameters = tool["function"]["parameters"]
+        assert parameters["properties"]["request_type"]["enum"] == [
+            "退款", "换货", "维修", "投诉", "其他"
+        ]
+        assert "order_id" not in parameters["required"]
+
     def test_valid_ticket_with_order_id(self) -> None:
         """测试包含订单号的工单正常解析。
 
@@ -185,6 +236,8 @@ class TestAfterSalesTicket:
             expected_solution="处理诉求",
         )
         assert ticket.request_type == valid_type
+        assert ticket.request_type is RequestType(valid_type)
+        assert ticket.model_dump(mode="json")["request_type"] == valid_type
 
     @pytest.mark.parametrize("invalid_type", ["退货", "咨询", "催发货", "unknown", ""])
     def test_invalid_request_type_rejected(self, invalid_type: str) -> None:
@@ -219,7 +272,7 @@ class TestDirectSubmoduleImports:
     """测试直接从子模块导入模型的可用性与一致性。"""
 
     def test_submodule_classes_match_package_exports(self) -> None:
-        """测试直接从 app.schemas.chat 和 app.schemas.after_sales 导入的模型与顶层包导出一致。
+        """测试直接从 app.schemas.chat 和 app.schemas.extract 导入的模型与顶层包导出一致。
 
         返回值:
             None: 无返回值，断言导出的类标识符完全一致。

@@ -1,8 +1,8 @@
-"""客服多轮对话 SSE 流式输出 API 端点测试模块。
+"""客服多轮对话 API 测试模块，与参考项目统一为 test_chat_api.py。
 
 本模块针对 POST /api/chat 接口进行完备的单元测试，涵盖：
 1. 正常多 Token 流式推送（验证 HTTP 200、text/event-stream 响应头、逐 chunk 增量数据帧与 [DONE] 完成帧）；
-2. 会话历史自动回写（验证请求处理完成后 memory 中记录了完整的用户输入与合并的 AI 回答）；
+2. 会话历史自动回写（验证请求处理完成后 store 中记录了完整的用户输入与合并的 AI 回答）；
 3. 多轮对话上下文继承（验证第二轮请求时，传给 chain.astream 的 history 包含上一轮的用户与 AI 消息）；
 4. 上游模型异常安全处理（验证立即异常与流式中途异常时推送 event: error 帧，且不写回不完整历史）；
 5. 请求体参数边界校验（缺少字段、空字符或纯空白字符返回 HTTP 422）；
@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
 from langchain_core.runnables.base import RunnableSequence
 
-from app.core.memory import memory
+from app.api.chat import store
 from app.main import app
 
 
@@ -48,7 +48,7 @@ def session_id() -> Generator[str, None, None]:
         yield sid
     finally:
         # 测试结束后清理当前测试产生的会话历史，保证单测之间隔离
-        memory.clear(sid)
+        store.clear(sid)
 
 
 class TestChatSSEStreamOutput:
@@ -169,8 +169,8 @@ class TestChatSSEMemoryHistory:
             response = client.post("/api/chat", json=payload)
             assert response.status_code == 200
 
-            # 校验全局 memory 中存储的消息列表
-            history = memory.get_messages(session_id)
+            # 校验全局 store 中存储的消息列表
+            history = store.get(session_id)
             assert len(history) == 2
             # 第一条为用户输入的提问
             assert isinstance(history[0], HumanMessage)
@@ -278,15 +278,13 @@ class TestChatSSEErrorHandling:
             text = response.text
             # 必须包含规范的错误事件帧
             assert "event: error\n" in text
-            expected_data = json.dumps({"error": "上游模型调用失败: 上游连接已断开"}, ensure_ascii=False)
+            expected_data = json.dumps({"error": "上游模型暂时不可用，请稍后重试"}, ensure_ascii=False)
             assert f"data: {expected_data}\n\n" in text
             # 异常情况下不应该输出完成标志帧
             assert "data: [DONE]" not in text
 
-            # 验证 memory 中不记录失败的 AI 消息（仅有用户的提问）
-            history = memory.get_messages(session_id)
-            assert len(history) == 1
-            assert isinstance(history[0], HumanMessage)
+            # 失败轮次的用户消息与不完整回复均不写入历史。
+            assert store.get(session_id) == []
 
     def test_chat_sse_upstream_midstream_exception(
         self, client: TestClient, session_id: str
@@ -318,18 +316,61 @@ class TestChatSSEErrorHandling:
             assert 'data: {"delta": "正在查询中"}\n\n' in text
             # 确认中途崩溃被捕获并推送错误帧
             assert "event: error\n" in text
-            expected_data = json.dumps({"error": "上游模型调用失败: 上游模型响应超时"}, ensure_ascii=False)
+            expected_data = json.dumps({"error": "上游模型暂时不可用，请稍后重试"}, ensure_ascii=False)
             assert f"data: {expected_data}\n\n" in text
             assert "data: [DONE]" not in text
 
-            # 验证异常中断未向 memory 写入不完整的 AI 回答
-            history = memory.get_messages(session_id)
-            assert len(history) == 1
-            assert isinstance(history[0], HumanMessage)
+            assert store.get(session_id) == []
 
 
 class TestChatSSEValidationAndRouting:
     """POST /api/chat 请求体校验与路由注册测试类。"""
+
+    def test_factory_failure_is_an_error_frame(
+        self, client: TestClient, session_id: str
+    ) -> None:
+        """验证模型初始化失败也能关闭流，并保留之前的成功历史。
+
+        参数:
+            client: API 测试客户端。
+            session_id: 隔离的会话标识。
+        返回值:
+            None: 断言错误帧、历史及敏感错误详情的处理。
+        异常:
+            AssertionError: 异常逃出流或历史被污染时抛出。
+        """
+        previous = [HumanMessage(content="上一问"), AIMessage(content="上一答")]
+        store.append(session_id, *previous)
+        with patch("app.api.chat.get_chat_model", side_effect=ValueError("sensitive-detail")):
+            response = client.post("/api/chat", json={"session_id": session_id, "message": "继续"})
+        assert "event: error" in response.text
+        assert "sensitive-detail" not in response.text
+        assert "[DONE]" not in response.text
+        assert store.get(session_id) == previous
+
+    def test_oversized_current_message_is_not_silently_dropped(
+        self, client: TestClient, session_id: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """验证本轮消息无法放入预算时明确提示缩短，并避免空上下文调用。
+
+        参数:
+            client: API 测试客户端。
+            session_id: 隔离会话标识。
+            monkeypatch: 配置替换夹具。
+        返回值:
+            None: 断言拒绝过长消息且不调用模型。
+        异常:
+            AssertionError: 消息被静默丢弃或仍调用模型时抛出。
+        """
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "token_budget", 1)
+        with patch("app.api.chat.get_chat_model") as factory:
+            response = client.post("/api/chat", json={"session_id": session_id, "message": "很长的问题" * 50})
+        assert "消息过长" in response.text
+        assert "[DONE]" not in response.text
+        factory.assert_not_called()
+        assert store.get(session_id) == []
 
     def test_chat_missing_required_fields(self, client: TestClient) -> None:
         """测试缺失必填字段时返回 HTTP 422 校验失败。
@@ -382,13 +423,76 @@ class TestChatSSEValidationAndRouting:
         assert "post" in paths["/api/chat"]
 
 
+@pytest.mark.parametrize("content", ["完整回答", [{"type": "text", "text": "完整回答"}, {"type": "reasoning", "text": "内部推理"}]])
+async def test_history_is_written_before_done(session_id: str, content: Any) -> None:
+    """验证结束帧发出前历史已完整写入，结构化分块只输出文本。
+
+    参数:
+        session_id: 隔离会话标识。
+        content: 字符串或包含文本与推理的模型分块。
+    返回值:
+        None: 断言真实响应生成器在结束帧处的历史状态。
+    异常:
+        AssertionError: 历史延迟写入或内部内容混入回复时抛出。
+    """
+    from app.api.chat import chat
+    from app.schemas.chat import ChatRequest
+
+    async def stream(*args: Any, **kwargs: Any):
+        """产生单条测试分块。
+
+        参数: args、kwargs 为调用链入参，此处不使用。
+        返回值: 异步迭代器，产出 AIMessageChunk。
+        异常: 无业务异常。
+        """
+        yield AIMessageChunk(content=content)
+
+    with patch.object(RunnableSequence, "astream", side_effect=stream):
+        response = await chat(ChatRequest(session_id=session_id, message="提问"))
+        iterator = response.body_iterator
+        try:
+            delta = await anext(iterator)
+            assert json.loads(delta.removeprefix("data: ")) == {"delta": "完整回答"}
+            assert await anext(iterator) == "data: [DONE]\n\n"
+            assert [m.content for m in store.get(session_id)] == ["提问", "完整回答"]
+        finally:
+            # 模拟客户端收到结束帧后立即关闭，历史仍应完整。
+            await iterator.aclose()
+
+
+def test_empty_model_reply_is_error(client: TestClient, session_id: str) -> None:
+    """验证模型只有空分块时不生成伪成功记录。
+
+    参数:
+        client: API 测试客户端。
+        session_id: 隔离会话标识。
+    返回值:
+        None: 断言空回复产生错误且没有历史写入。
+    异常:
+        AssertionError: 空回复被当作成功时抛出。
+    """
+    async def stream(*args: Any, **kwargs: Any):
+        """产生空分块。
+
+        参数: args、kwargs 为调用链入参，此处不使用。
+        返回值: 异步迭代器，产出空 AIMessageChunk。
+        异常: 无业务异常。
+        """
+        yield AIMessageChunk(content="")
+
+    with patch.object(RunnableSequence, "astream", side_effect=stream):
+        response = client.post("/api/chat", json={"session_id": session_id, "message": "你好"})
+    assert "event: error" in response.text
+    assert "[DONE]" not in response.text
+    assert store.get(session_id) == []
+
+
 class TestSubmoduleExports:
     """API 模块导出一致性测试类。"""
 
     def test_api_package_exports_chat_router(self) -> None:
         """测试 app.api 包层导出的 chat_router 与子模块 chat.router 一致。"""
         from app.api import chat_router as package_chat_router
-        from app.api.chat import chat_router as direct_chat_router, router as direct_router
+        from app.api.chat import router as direct_router
 
-        assert package_chat_router is direct_chat_router
         assert package_chat_router is direct_router
