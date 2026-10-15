@@ -1,0 +1,217 @@
+"""售后信息结构化提取 API 端点测试模块。
+
+本模块针对 POST /api/extract 接口进行完备的单元测试，涵盖：
+1. 正常售后文本结构化提取（包含订单号、诉求类型、期望方案）；
+2. 缺失订单号文本提取（order_id 为 None，验证非臆造约束）；
+3. 上游大模型异常/超时情况下的 HTTP 502 错误封装；
+4. 请求体缺失或非法的 HTTP 422 校验机制（空字符串、纯空白字符、缺少必填字段）；
+5. 路由注册与元数据核验。
+所有测试通过 Mock 阻断真实网络请求，确保单测执行的轻量与幂等。
+"""
+
+from typing import Generator
+from unittest.mock import AsyncMock, patch
+import pytest
+from fastapi.testclient import TestClient
+from langchain_core.runnables.base import RunnableSequence
+
+from app.main import app
+from app.schemas.after_sales import AfterSalesTicket
+
+
+@pytest.fixture
+def client() -> Generator[TestClient, None, None]:
+    """创建 FastAPI 测试客户端 Fixture。
+
+    提供与 FastAPI 应用程序交互的轻量级同步客户端实例。
+
+    返回值:
+        Generator[TestClient, None, None]: TestClient 实例生成器
+    """
+    with TestClient(app) as test_client:
+        yield test_client
+
+
+class TestExtractEndpointSuccess:
+    """POST /api/extract 正常提取功能测试类。"""
+
+    def test_extract_success_with_order_id(self, client: TestClient) -> None:
+        """测试正常包含订单号的售后文本提取，返回 HTTP 200 及完整结构化字段。
+
+        参数:
+            client (TestClient): FastAPI 测试客户端实例
+        """
+        # 构造预期的上游提取结果对象
+        mock_ticket = AfterSalesTicket(
+            order_id="MH20260701123",
+            request_type="退款",
+            expected_solution="商品到货损坏，要求退货退款",
+        )
+
+        # Mock RunnableSequence.ainvoke 模拟大模型结构化抽取链异步返回
+        with patch.object(RunnableSequence, "ainvoke", new_callable=AsyncMock) as mock_ainvoke:
+            mock_ainvoke.return_value = mock_ticket
+
+            payload = {
+                "text": "我上周买的猫爬架，订单号 MH20260701123，到货就散架了，我要退款"
+            }
+            response = client.post("/api/extract", json=payload)
+
+            # 验证 HTTP 状态码与响应体
+            assert response.status_code == 200
+            data = response.json()
+            assert data["order_id"] == "MH20260701123"
+            assert data["request_type"] == "退款"
+            assert data["expected_solution"] == "商品到货损坏，要求退货退款"
+
+            # 验证上游 chain.ainvoke 被正确调用且入参匹配
+            mock_ainvoke.assert_awaited_once_with({"text": payload["text"]})
+
+    def test_extract_success_without_order_id(self, client: TestClient) -> None:
+        """测试无订单号的售后文本提取，返回 HTTP 200 且 order_id 为 None。
+
+        参数:
+            client (TestClient): FastAPI 测试客户端实例
+        """
+        # 构造未包含订单号的提取结果，order_id 显式为 None
+        mock_ticket = AfterSalesTicket(
+            order_id=None,
+            request_type="换货",
+            expected_solution="衣服尺码偏小，申请更换大一号",
+        )
+
+        with patch.object(RunnableSequence, "ainvoke", new_callable=AsyncMock) as mock_ainvoke:
+            mock_ainvoke.return_value = mock_ticket
+
+            payload = {
+                "text": "昨天收到的毛衣尺码有点偏小，穿不进去，能帮忙换个L码吗？"
+            }
+            response = client.post("/api/extract", json=payload)
+
+            assert response.status_code == 200
+            data = response.json()
+            assert data["order_id"] is None
+            assert data["request_type"] == "换货"
+            assert data["expected_solution"] == "衣服尺码偏小，申请更换大一号"
+            mock_ainvoke.assert_awaited_once_with({"text": payload["text"]})
+
+    @pytest.mark.parametrize(
+        ("request_type", "expected_solution"),
+        [
+            ("维修", "吸尘器电机异响，在保修期内申请免费检修"),
+            ("投诉", "承诺次日达但延误三天，客服态度恶劣要求道歉并赔付"),
+            ("其他", "咨询发票开具抬头修改流程"),
+        ],
+    )
+    def test_extract_various_request_types(
+        self, client: TestClient, request_type: str, expected_solution: str
+    ) -> None:
+        """测试不同售后枚举类型的正确提取与序列化。
+
+        参数:
+            client (TestClient): FastAPI 测试客户端实例
+            request_type (str): 诉求枚举类型字符串
+            expected_solution (str): 期望方案内容
+        """
+        mock_ticket = AfterSalesTicket(
+            order_id="ORD-998877",
+            request_type=request_type,  # type: ignore[arg-type]
+            expected_solution=expected_solution,
+        )
+
+        with patch.object(RunnableSequence, "ainvoke", new_callable=AsyncMock) as mock_ainvoke:
+            mock_ainvoke.return_value = mock_ticket
+
+            response = client.post(
+                "/api/extract",
+                json={"text": f"订单 ORD-998877 售后诉求：{expected_solution}"},
+            )
+
+            assert response.status_code == 200
+            data = response.json()
+            assert data["order_id"] == "ORD-998877"
+            assert data["request_type"] == request_type
+            assert data["expected_solution"] == expected_solution
+
+
+class TestExtractEndpointUpstreamFailure:
+    """POST /api/extract 上游异常处理测试类。"""
+
+    def test_extract_upstream_exception_returns_502(self, client: TestClient) -> None:
+        """测试上游模型调用抛出通用异常时，接口转换为 HTTP 502 错误。
+
+        参数:
+            client (TestClient): FastAPI 测试客户端实例
+        """
+        error_message = "Connection reset by peer"
+
+        with patch.object(RunnableSequence, "ainvoke", new_callable=AsyncMock) as mock_ainvoke:
+            # 模拟上游 LLM 调用故障抛出异常
+            mock_ainvoke.side_effect = RuntimeError(error_message)
+
+            response = client.post("/api/extract", json={"text": "订单已损坏，申请退货"})
+
+            assert response.status_code == 502
+            data = response.json()
+            assert "detail" in data
+            assert f"上游模型提取失败: {error_message}" in data["detail"]
+
+    def test_extract_upstream_timeout_returns_502(self, client: TestClient) -> None:
+        """测试上游模型调用超时时，接口转换为 HTTP 502 错误。
+
+        参数:
+            client (TestClient): FastAPI 测试客户端实例
+        """
+        with patch.object(RunnableSequence, "ainvoke", new_callable=AsyncMock) as mock_ainvoke:
+            mock_ainvoke.side_effect = TimeoutError("Request timed out after 30.0s")
+
+            response = client.post("/api/extract", json={"text": "申请退款"})
+
+            assert response.status_code == 502
+            data = response.json()
+            assert "上游模型提取失败: Request timed out after 30.0s" in data["detail"]
+
+
+class TestExtractEndpointValidation:
+    """POST /api/extract 请求体参数校验测试类。"""
+
+    def test_extract_missing_text_field(self, client: TestClient) -> None:
+        """测试缺失 text 必填字段时，返回 HTTP 422 校验失败。
+
+        参数:
+            client (TestClient): FastAPI 测试客户端实例
+        """
+        response = client.post("/api/extract", json={})
+        assert response.status_code == 422
+        errors = response.json()["detail"]
+        assert any("text" in error["loc"] for error in errors)
+
+    @pytest.mark.parametrize("empty_value", ["", "   ", "\n\t  "])
+    def test_extract_empty_or_whitespace_text_rejected(
+        self, client: TestClient, empty_value: str
+    ) -> None:
+        """测试 text 为空字符串或纯空白字符时，返回 HTTP 422 校验失败。
+
+        参数:
+            client (TestClient): FastAPI 测试客户端实例
+            empty_value (str): 空值或纯空白字符串
+        """
+        response = client.post("/api/extract", json={"text": empty_value})
+        assert response.status_code == 422
+        errors = response.json()["detail"]
+        assert any("text" in error["loc"] for error in errors)
+
+
+class TestAppMetadataAndRouting:
+    """FastAPI 应用与路由元数据测试类。"""
+
+    def test_app_title_and_version(self) -> None:
+        """测试 FastAPI 应用实例的元数据符合规划规范。"""
+        assert app.title == "MewHelp E-Commerce Customer Service"
+        assert app.version == "0.1.0"
+
+    def test_extract_route_registered(self) -> None:
+        """测试 POST /api/extract 路由已被正确挂载在 FastAPI app 中。"""
+        paths = app.openapi()["paths"]
+        assert "/api/extract" in paths
+        assert "post" in paths["/api/extract"]
