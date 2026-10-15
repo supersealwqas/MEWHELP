@@ -83,10 +83,10 @@ class TestCustomerServicePrompt:
 
         # 验证核心业务人设与约束关键词
         assert "客服" in prompt_text
-        # 严禁臆造/虚构订单或物流单号的红线约束
-        assert any(keyword in prompt_text for keyword in ["臆造", "捏造", "虚构", "杜绝", "真实"])
-        # 偏离主题时的礼貌引导
-        assert any(keyword in prompt_text for keyword in ["引导", "无关", "电商", "购物"])
+        # 严禁编造/臆造虚假信息的红线约束
+        assert any(keyword in prompt_text for keyword in ["臆造", "捏造", "虚构", "杜绝", "真实", "编造"])
+        # 偏离主题时的礼貌拉回/引导
+        assert any(keyword in prompt_text for keyword in ["引导", "无关", "电商", "购物", "拉回", "职责之外"])
 
 
 class TestExtractionPrompt:
