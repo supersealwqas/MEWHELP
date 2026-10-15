@@ -1,1 +1,1 @@
-"""MewHelp application package."""
+"""MewHelp 电商智能客服系统主应用包。"""
