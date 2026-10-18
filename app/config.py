@@ -4,7 +4,7 @@
 集中管理上游大模型连接凭证、Token 裁剪预算以及预留的向量与重排配置。
 """
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -40,6 +40,17 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("token_budget", "chat_token_budget"),
         description="多轮会话上下文裁剪保留的 Token 上限预算",
     )
+
+    # 预留向量嵌入模型配置
+    mysql_host: str = Field(default="127.0.0.1", description="MySQL 主机地址")
+    mysql_port: int = Field(default=3307, ge=1, le=65535, description="MySQL 本机映射端口")
+    mysql_database: str = Field(default="mewhelp", description="应用数据库名称")
+    mysql_test_database: str = Field(default="mewhelp_test", description="隔离测试库名称")
+    mysql_user: str = Field(default="mewhelp", description="非 root 的应用数据库账号")
+    mysql_password: SecretStr = Field(default=SecretStr(""), description="应用数据库密码，日志中隐藏")
+    tool_timeout_seconds: float = Field(default=5, gt=0, le=60, description="单次工具执行超时秒数")
+    tool_max_retries: int = Field(default=1, ge=0, le=1, description="工具最大故障重试次数")
+    tool_retry_delay_seconds: float = Field(default=0.2, ge=0, le=5, description="可取消的重试等待秒数")
 
     # 预留向量嵌入模型配置
     embed_base_url: str | None = Field(

@@ -196,3 +196,13 @@ def test_settings_singleton_instance() -> None:
         None: 断言单例类型。
     """
     assert isinstance(settings, Settings)
+
+
+@pytest.mark.parametrize("values", [
+    {"mysql_port": 0}, {"mysql_port": 65536}, {"tool_timeout_seconds": 0},
+    {"tool_max_retries": 2}, {"tool_max_retries": -1}, {"tool_retry_delay_seconds": -1},
+])
+def test_invalid_database_and_tool_limits(values: dict) -> None:
+    """拒绝无效端口、无限执行或额外重试配置。参数：非法配置组合；返回：None；异常：断言失败。"""
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **values)

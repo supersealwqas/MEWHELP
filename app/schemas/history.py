@@ -1,0 +1,19 @@
+"""数据库历史的纯数据契约，隔离 ORM 对象与模型消息。"""
+
+from typing import Literal
+from pydantic import BaseModel, Field
+
+
+class StoredMessage(BaseModel):
+    """一条已提交的消息及原始工具关联。"""
+    role: Literal["user", "assistant", "tool"] = Field(description="持久化消息角色")
+    content: str = Field(description="消息内容或工具结果 JSON")
+    tool_calls: list[dict] | None = Field(default=None, description="模型申请列表")
+    tool_call_id: str | None = Field(default=None, description="结果对应的工具申请 ID")
+
+
+class StoredTurn(BaseModel):
+    """按轮次分组的历史，用于完整配对与裁剪。"""
+    turn_id: str = Field(description="轮次唯一编号")
+    turn_status: str = Field(description="轮次完成状态")
+    messages: list[StoredMessage] = Field(default_factory=list, description="按消息主键顺序排列的记录")
