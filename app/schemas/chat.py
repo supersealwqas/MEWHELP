@@ -37,7 +37,7 @@ class ChatRequest(BaseModel):
             info (ValidationInfo): 校验元数据，提供正在校验的字段名称信息
 
         返回值:
-            str: 校验通过的原始字符串
+            str: 消息保持原文；会话和用户标识去除首尾空白。
 
         异常:
             ValueError: 当输入值仅包含空白字符或为空时抛出
@@ -45,7 +45,8 @@ class ChatRequest(BaseModel):
         # 拦截首尾去空后长度为0的纯空白字符串，避免无效调用
         if not value or not value.strip():
             raise ValueError(f"{info.field_name} 不能为空或纯空白字符")
-        return value
+        # MySQL 的 utf8mb4_bin 比较忽略末尾空格；统一标识，避免同会话绕过内存互斥。
+        return value if info.field_name == "message" else value.strip()
 
 
 class ChatChunk(BaseModel):

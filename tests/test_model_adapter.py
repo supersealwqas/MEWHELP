@@ -53,3 +53,23 @@ async def test_final_model_unbound_filters_reasoning_and_rejects_tool_calls(monk
     model.chunks = [AIMessageChunk(content="", tool_call_chunks=[{"name": "query_order", "id": "c", "args": "{}", "index": 0}])]
     with pytest.raises(ValueError):
         [v async for v in llm.ChatModelAdapter().stream_answer([])]
+
+
+async def test_closing_answer_immediately_closes_upstream_stream(monkeypatch):
+    """停止回复必须等待模型流关闭，不依赖垃圾回收。参数：替换器；返回：None；异常：断言失败。"""
+    from app.core import llm
+    closed = []
+    class StreamingModel:
+        """可观察关闭的网络边界。"""
+        async def astream(self, messages):
+            """返回首块后等待下一次拉取。参数：消息；返回：分片流；异常：取消。"""
+            try:
+                yield AIMessageChunk(content="第一块")
+                yield AIMessageChunk(content="第二块")
+            finally:
+                closed.append(True)
+    monkeypatch.setattr(llm, "get_chat_model", lambda **kwargs: StreamingModel())
+    stream = llm.ChatModelAdapter().stream_answer([])
+    assert await anext(stream) == "第一块"
+    await stream.aclose()
+    assert closed == [True]

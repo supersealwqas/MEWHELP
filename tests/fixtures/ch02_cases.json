@@ -9,5 +9,8 @@
   {"id":"missing_order","message":"我的物流到哪了","tool":null,"review":"先询问订单号，不编造订单或查询结果。"},
   {"id":"greeting","message":"你好","tool":null,"review":"以小喵身份自然问候。"},
   {"id":"context_order","session":"reference","message":"帮我查订单 1001","tool":"query_order","args":{"order_id":"1001"},"review":"提供订单演示数据，为后续指代保留单号。"},
-  {"id":"context_logistics","session":"reference","message":"它的物流呢","tool":"query_logistics","args":{"order_id":"1001"},"review":"从同会话继承 1001，只选物流工具，结果与返回节点一致。"}
+  {"id":"context_logistics","session":"reference","message":"它的物流呢","tool":"query_logistics","args":{"order_id":"1001"},"review":"从同会话继承 1001，只选物流工具，结果与返回节点一致。"},
+  {"id":"sequence_logistics","session":"acceptance-sequence","message":"订单 1001 的物流到哪了","tool":"query_logistics","args":{"order_id":"1001"},"review":"同一聊天页连续三问的第一条，按返回节点回答并说明演示。"},
+  {"id":"sequence_return","session":"acceptance-sequence","message":"退货政策是什么","tool":"query_faq","args":{"keyword":"退货政策"},"matches":true,"review":"同一会话第二条必须新查退货政策。"},
+  {"id":"sequence_postage","session":"acceptance-sequence","message":"邮费是多少","tool":"query_faq","args":{"keyword":"邮费"},"matches":false,"review":"同一会话第三条仍须查邮费并零命中，禁止沿用历史或编造金额/免运门槛。"}
 ]

@@ -6,6 +6,7 @@
 
 import json
 from typing import Any
+import anyio
 
 from langchain_core.messages import AIMessage, AIMessageChunk
 
@@ -60,8 +61,13 @@ class ChatModelAdapter:
         """汇总完整申请。参数：完整消息与工具列表；返回：AIMessage；异常：网络错误、空响应或坏 JSON。"""
         model = get_chat_model(streaming=True).bind_tools(tools, tool_choice="auto")
         gathered = None
-        async for chunk in model.astream(messages):
-            gathered = chunk if gathered is None else gathered + chunk
+        stream = model.astream(messages)
+        try:
+            async for chunk in stream:
+                gathered = chunk if gathered is None else gathered + chunk
+        finally:
+            with anyio.CancelScope(shield=True):
+                await stream.aclose()
         if gathered is None:
             raise ValueError("模型未返回决策")
         # LangChain 的分片解析允许自动补全 JSON；业务执行前必须严格解析原始全文。
@@ -79,14 +85,20 @@ class ChatModelAdapter:
     async def stream_answer(self, messages):
         """生成最终文本。参数：含工具事实的消息；返回：异步字符串流；异常：网络错误或意外工具申请。"""
         model = get_chat_model(streaming=True, temperature=0.3)
-        async for chunk in model.astream(messages):
-            if chunk.tool_calls or chunk.invalid_tool_calls or getattr(chunk, "tool_call_chunks", None):
-                raise ValueError("回答阶段不允许再次调用工具")
-            if isinstance(chunk.content, str):
-                delta = chunk.content
-            else:
-                delta = "".join(block if isinstance(block, str) else block["text"]
-                    for block in chunk.content if isinstance(block, str) or
-                    (isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str)))
-            if delta:
-                yield delta
+        stream = model.astream(messages)
+        try:
+            async for chunk in stream:
+                if chunk.tool_calls or chunk.invalid_tool_calls or getattr(chunk, "tool_call_chunks", None):
+                    raise ValueError("回答阶段不允许再次调用工具")
+                if isinstance(chunk.content, str):
+                    delta = chunk.content
+                else:
+                    delta = "".join(block if isinstance(block, str) else block["text"]
+                        for block in chunk.content if isinstance(block, str) or
+                        (isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str)))
+                if delta:
+                    yield delta
+        finally:
+            # 直接关闭内部模型流，不能等异步生成器被垃圾回收后才释放网络连接。
+            with anyio.CancelScope(shield=True):
+                await stream.aclose()

@@ -135,3 +135,28 @@ async def test_cancel_during_tool_waits_for_cleanup_and_stops_retry():
     await stream.aclose()
     assert cleaned.is_set() and not repo.results
     assert next(iter(repo.turns.values())).turn_status == "cancelled"
+
+
+async def test_padded_session_id_cannot_bypass_same_conversation_lock():
+    """MySQL 忽略末尾空格，客户端变体不得绕过互斥。参数：无；返回：None；异常：断言失败。"""
+    service, repo, _, _ = make_service()
+    first = service.stream_turn(request("same"))
+    await anext(first)
+    try:
+        events = [e async for e in service.stream_turn(request("same "))]
+        assert events[0].event == "error" and len(repo.turns) == 1
+    finally:
+        await first.aclose()
+
+
+async def test_cleanup_failure_still_releases_execution_right():
+    """失败收尾异常不能永久锁住会话。参数：无；返回：None；异常：断言失败。"""
+    service, repo, _, model = make_service(chunks=[RuntimeError("private")])
+    async def broken_mark(context, status):
+        """模拟收尾写失败。参数：上下文和状态；返回：不返回；异常：ConnectionError。"""
+        raise ConnectionError("private")
+    repo.mark_turn = broken_mark
+    events = [e async for e in service.stream_turn(request())]
+    assert events[-1].event == "error"
+    model.chunks = ["恢复"]
+    assert [e async for e in service.stream_turn(request())][-1].event == "done"

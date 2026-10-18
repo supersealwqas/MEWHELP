@@ -7,7 +7,7 @@ from uuid import uuid4
 import anyio
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from app.core.memory import ContextBudgetExceeded, assemble_turns, trim_turns, valid_tool_calls
-from app.core.prompts import CUSTOMER_SERVICE_SYSTEM
+from app.core.prompts import CUSTOMER_SERVICE_SYSTEM, FINAL_ANSWER_SYSTEM, TOOL_DECISION_SYSTEM
 from app.repositories.chat import PersistenceUncertain
 from app.schemas.chat import ChatEvent, ChatRequest
 from app.schemas.tools import ToolContext
@@ -70,7 +70,7 @@ class ChatService:
             context = await self.chat.start_turn(context, request.message)
             started = True
             history = assemble_turns(await self.chat.load_turns(context.conversation_id, exclude_turn_id=context.turn_id))
-            messages = [SystemMessage(content=CUSTOMER_SERVICE_SYSTEM), *trim_turns(history, current, self.settings.token_budget)]
+            messages = [SystemMessage(content=CUSTOMER_SERVICE_SYSTEM + TOOL_DECISION_SYSTEM), *trim_turns(history, current, self.settings.token_budget)]
             decision = await self.model.decide(messages, self.registry.all())
             if decision.invalid_tool_calls or not valid_tool_calls(decision.tool_calls):
                 raise ValueError("模型工具申请不完整")
@@ -95,7 +95,7 @@ class ChatService:
                                 current.append(ToolMessage(content=item.model_dump_json(), tool_call_id=context.tool_call_id))
                     finally:
                         await execution.aclose()
-            messages = [SystemMessage(content=CUSTOMER_SERVICE_SYSTEM), *trim_turns(history, current, self.settings.token_budget)]
+            messages = [SystemMessage(content=CUSTOMER_SERVICE_SYSTEM + FINAL_ANSWER_SYSTEM), *trim_turns(history, current, self.settings.token_budget)]
             text = []
             answer_stream = self.model.stream_answer(messages)
             try:
