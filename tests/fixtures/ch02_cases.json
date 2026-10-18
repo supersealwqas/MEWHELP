@@ -1,0 +1,13 @@
+[
+  {"id":"logistics","message":"订单 1001 的物流到哪了","tool":"query_logistics","args":{"order_id":"1001"},"review":"说明演示数据，回答包含 latest_node，不能编造预计到达时间。"},
+  {"id":"return_policy","message":"退货政策是什么","tool":"query_faq","args":{"keyword":"退货政策"},"matches":true,"review":"答案与 FAQ 退货政策一致。"},
+  {"id":"postage_miss","message":"邮费是多少","tool":"query_faq","args":{"keyword":"邮费"},"matches":false,"review":"明确没查到，不提供价格、不改词、不建工单。"},
+  {"id":"shipping_hit","message":"运费是多少","tool":"query_faq","args":{"keyword":"运费"},"matches":true,"review":"应按配送规则说明 8 元、满 99 元免运费及偏远地区需核实。"},
+  {"id":"order","message":"帮我查订单 1001","tool":"query_order","args":{"order_id":"1001"},"review":"订单号、金额、状态忠于随机结果，并说明演示数据。"},
+  {"id":"product","message":"猫粮价格和库存如何","tool":"query_product","args":{"keyword":"猫粮"},"review":"商品价格与库存忠于随机结果，说明演示数据。"},
+  {"id":"ticket","message":"请帮我创建人工工单，订单 1001 一直未送达","tool":"create_ticket","review":"包含真实已保存工单号和待处理状态，不宣称人工已接入。"},
+  {"id":"missing_order","message":"我的物流到哪了","tool":null,"review":"先询问订单号，不编造订单或查询结果。"},
+  {"id":"greeting","message":"你好","tool":null,"review":"以小喵身份自然问候。"},
+  {"id":"context_order","session":"reference","message":"帮我查订单 1001","tool":"query_order","args":{"order_id":"1001"},"review":"提供订单演示数据，为后续指代保留单号。"},
+  {"id":"context_logistics","session":"reference","message":"它的物流呢","tool":"query_logistics","args":{"order_id":"1001"},"review":"从同会话继承 1001，只选物流工具，结果与返回节点一致。"}
+]
