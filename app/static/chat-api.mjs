@@ -44,12 +44,13 @@ async function httpErrorMessage(response) {
  * @param {string} options.message 非空用户消息。
  * @param {AbortSignal} options.signal 用于手动停止请求的取消信号。
  * @param {(delta: string) => void} options.onDelta 增量文本回调，不接收 HTML。
+ * @param {(status: object) => void} [options.onToolStatus] 工具状态回调，与回答正文分离。
  * @param {typeof fetch} fetcher 默认使用浏览器 fetch；测试可注入离线替身。
  * @returns {Promise<string>} 收到 [DONE] 后返回本轮完整回复。
  * @throws {Error} HTTP 失败、SSE 错误、非法数据、空回复或缺少完成帧时抛出。
  * @throws {DOMException} 请求被取消时透传 AbortError。
  */
-export async function streamChat({ sessionId, message, signal, onDelta }, fetcher = globalThis.fetch) {
+export async function streamChat({ sessionId, message, signal, onDelta, onToolStatus }, fetcher = globalThis.fetch) {
   // EventSource 不支持此处需要的 POST JSON，因此使用 fetch 的可读响应流。
   const response = await fetcher("/api/chat", {
     method: "POST",
@@ -76,7 +77,7 @@ export async function streamChat({ sessionId, message, signal, onDelta }, fetche
         const frame = buffer.slice(0, boundary.index);
         buffer = buffer.slice(boundary.index + boundary[0].length);
         const event = parseEvent(frame);
-        if (!event.data || !["message", "error"].includes(event.event)) continue;
+        if (!event.data || !["message", "error", "tool_status"].includes(event.event)) continue;
         if (event.event === "message" && event.data === "[DONE]") {
           if (!answer.trim()) throw new Error("模型没有返回有效回复，请重新提问。");
           return answer;
@@ -90,6 +91,15 @@ export async function streamChat({ sessionId, message, signal, onDelta }, fetche
         }
         if (event.event === "error") {
           throw new Error(typeof payload?.error === "string" ? payload.error : "模型暂时不可用，请稍后重试。");
+        }
+        if (event.event === "tool_status") {
+          if (typeof payload?.tool_call_id !== "string" || typeof payload?.name !== "string" ||
+              typeof payload?.label !== "string" || typeof payload?.is_mock !== "boolean" ||
+              !["running", "retrying", "succeeded", "failed"].includes(payload?.status)) {
+            throw new Error("工具状态数据不完整，请稍后重试。");
+          }
+          onToolStatus?.(payload);
+          continue;
         }
         if (typeof payload?.delta !== "string") {
           throw new Error("SSE 增量缺少文本 delta 字段。");

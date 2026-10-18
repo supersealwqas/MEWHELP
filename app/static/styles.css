@@ -157,3 +157,11 @@ kbd { font: inherit; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+/* 工具轨迹与正文同处气泡内，状态使用文字及颜色共同表达。 */
+.message-content { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.tool-trail { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+.tool-trail[hidden] { display: none; }
+.tool-badge { display: inline-flex; align-items: center; padding: 4px 9px; border-radius: 8px;
+  background: #edf4ef; border: 1px solid #d2e3d7; color: #315a43; font-size: 12px; line-height: 1.5; }
+.tool-badge[data-status="running"], .tool-badge[data-status="retrying"] { background: #fff5de; color: #79591c; border-color: #eddcae; }
+.tool-badge[data-status="failed"], .tool-badge[data-status="interrupted"] { background: #fff0ec; color: #974333; border-color: #efcfc5; }

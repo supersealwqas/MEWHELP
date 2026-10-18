@@ -83,9 +83,16 @@ function appendMessage(role, text) {
   const author = document.createElement("p");
   author.className = "message-author";
   author.textContent = role === "user" ? "你" : "小喵";
-  const bubble = document.createElement("p");
+  const bubble = document.createElement("div");
   bubble.className = "message-bubble";
-  bubble.textContent = text;
+  const tools = document.createElement("div");
+  tools.className = "tool-trail";
+  tools.hidden = true;
+  tools.setAttribute("aria-live", "polite");
+  const content = document.createElement("p");
+  content.className = "message-content";
+  content.textContent = text;
+  bubble.append(tools, content);
   const note = document.createElement("p");
   note.className = "message-note";
   note.hidden = true;
@@ -93,7 +100,7 @@ function appendMessage(role, text) {
   article.append(avatar, body);
   ui.messages.append(article);
   scrollToLatest();
-  return { article, bubble, note };
+  return { article, bubble: content, tools, note };
 }
 
 /**
@@ -236,13 +243,45 @@ async function sendMessage(event) {
     renderer.append(delta);
   }
 
+  const badges = new Map();
+  const toolNames = { query_order: "订单查询", query_product: "商品查询", query_logistics: "物流查询",
+    query_faq: "常见问题查询", create_ticket: "人工工单" };
+
+  /** 更新同一个调用的徽章；所有文字均作为纯文本展示。 */
+  function onToolStatus(status) {
+    let badge = badges.get(status.tool_call_id);
+    if (!badge) {
+      badge = document.createElement("span");
+      badge.className = "tool-badge";
+      badges.set(status.tool_call_id, badge);
+      reply.tools.append(badge);
+    }
+    reply.tools.hidden = false;
+    badge.dataset.status = status.status;
+    badge.textContent = `${toolNames[status.name] || status.name} · ${status.label}${status.is_mock ? " · 演示" : ""}`;
+    badge.title = `${status.name} · ${status.tool_call_id}`;
+    badge.setAttribute("aria-label", `${status.name}：${badge.textContent}`);
+    if (!renderer.hasText()) {
+      reply.bubble.textContent = ["running", "retrying"].includes(status.status)
+        ? `${status.label}…` : "小喵正在整理结果…";
+      ui.status.textContent = reply.bubble.textContent;
+    }
+    scrollToLatest();
+  }
+
   try {
-    await streamChat({ sessionId, message, signal: controller.signal, onDelta });
+    await streamChat({ sessionId, message, signal: controller.signal, onDelta, onToolStatus });
     await renderer.finish();
     ui.status.textContent = "回复完成，可以接着追问";
   } catch (error) {
     renderer.flush();
     const stopped = controller.signal.aborted;
+    for (const badge of badges.values()) {
+      if (["running", "retrying"].includes(badge.dataset.status)) {
+        badge.dataset.status = "interrupted";
+        badge.textContent += " · 已中断，结果待核实";
+      }
+    }
     if (!renderer.hasText()) reply.bubble.textContent = stopped ? "本次回复已停止。" : "这次没能收到回复。";
     reply.note.textContent = stopped
       ? "已停止接收；是否保存本轮上下文，以服务端实际完成情况为准。"
