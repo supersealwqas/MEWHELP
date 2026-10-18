@@ -17,6 +17,9 @@ dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "httpx>=0.28.1",
+    # Jupyter notebook 内核支持；同时锁定 debugpy、psutil、pyzmq 等运行依赖，
+    # 避免 uv sync 将 VS Code 写入 .venv 的 notebook 组件视为多余包而尝试删除。
+    "ipykernel>=6.29.0",
 ]
 
 [tool.pytest.ini_options]

@@ -12,6 +12,10 @@ from fastapi.staticfiles import StaticFiles
 
 from app.api.chat import router as chat_router
 from app.api.extract import router as extract_router
+from app.core.logging import setup_logging
+
+# 在应用创建前初始化业务日志，确保所有模块的 logger 都使用统一格式输出。
+setup_logging()
 
 # 实例化主 FastAPI 应用，注入全局服务元数据
 app = FastAPI(

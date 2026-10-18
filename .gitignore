@@ -4,9 +4,10 @@
 __pycache__/
 *.pyc
 
-# Pi subagents / package cache
+# Pi / Agent 第三方技能缓存
 .pi/git/
 .pi/npm/
+.agents/skills/superpowers/
 
 # Testing & build
 .pytest_cache/
@@ -14,3 +15,9 @@ __pycache__/
 htmlcov/
 dist/
 build/
+
+# 本地学习文档、示例与 Notebook；开发文档 docs/、dev-notes/ 仍正常跟踪
+/mydemo/
+/learning-guide/
+*.ipynb
+.ipynb_checkpoints/
