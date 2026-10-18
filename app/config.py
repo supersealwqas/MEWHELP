@@ -41,7 +41,7 @@ class Settings(BaseSettings):
         description="多轮会话上下文裁剪保留的 Token 上限预算",
     )
 
-    # 预留向量嵌入模型配置
+    # 本章 MySQL 持久化及工具的有限执行配置。
     mysql_host: str = Field(default="127.0.0.1", description="MySQL 主机地址")
     mysql_port: int = Field(default=3307, ge=1, le=65535, description="MySQL 本机映射端口")
     mysql_database: str = Field(default="mewhelp", description="应用数据库名称")

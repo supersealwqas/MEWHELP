@@ -1,6 +1,28 @@
 """工具结果和可信服务端上下文；业务参数 Schema 在工具阶段扩展。"""
 
+from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
+
+
+class BusinessArgs(BaseModel):
+    """模型只能填写业务字段，禁止类型强转和额外身份字段。"""
+    model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=True)
+
+
+class OrderArgs(BusinessArgs):
+    """订单与物流查询参数。"""
+    order_id: str = Field(min_length=1, max_length=64, description="用户提供或历史中已明确的订单号，不得猜测")
+
+
+class KeywordArgs(BusinessArgs):
+    """商品或 FAQ 的单个关键词。"""
+    keyword: str = Field(min_length=1, max_length=100, description="用户原话中的关键词；FAQ 不允许同义词改写")
+
+
+class TicketArgs(BusinessArgs):
+    """人工工单业务参数，不包含会话身份。"""
+    description: str = Field(min_length=1, max_length=2000, description="用户明确要求提交处理的问题描述")
+    ticket_type: Literal["售后", "投诉", "咨询"] = Field(description="工单分类，仅售后、投诉、咨询")
 
 
 class ToolContext(BaseModel):
