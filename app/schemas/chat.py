@@ -4,6 +4,7 @@
 以及服务端向客户端逐 token 推送的流式增量文本块 (ChatChunk)。
 """
 
+from typing import Literal
 from pydantic import BaseModel, Field, ValidationInfo, field_validator
 
 
@@ -16,15 +17,17 @@ class ChatRequest(BaseModel):
     session_id: str = Field(
         ...,
         min_length=1,
+        max_length=64,
         description="会话唯一标识符，用于多轮对话历史上下文关联与隔离",
     )
+    user_id: str = Field(default="demo-user", min_length=1, max_length=64, description="演示用户标识，不作为身份认证")
     message: str = Field(
         ...,
         min_length=1,
         description="用户发送的当前轮次提问内容，不可为空或纯空白字符",
     )
 
-    @field_validator("session_id", "message")
+    @field_validator("session_id", "message", "user_id")
     @classmethod
     def validate_not_whitespace(cls, value: str, info: ValidationInfo) -> str:
         """校验字符串字段不能为纯空白字符。
@@ -55,3 +58,9 @@ class ChatChunk(BaseModel):
         ...,
         description="大模型生成的单次增量文本内容，结束时可为空字符串",
     )
+
+
+class ChatEvent(BaseModel):
+    """服务层的语义事件，由 API 层编码为 SSE。"""
+    event: Literal["delta", "tool_status", "error", "done"] = Field(description="事件类型")
+    data: dict = Field(default_factory=dict, description="安全事件载荷；done 为空")

@@ -4,7 +4,9 @@
 基于 LangChain trim_messages 封装的上下文预算裁剪函数 (trim_history)。
 """
 
-from langchain_core.messages import BaseMessage, trim_messages
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage, trim_messages
+from langchain_core.messages.utils import count_tokens_approximately
+from app.schemas.history import StoredTurn
 
 
 class SessionStore:
@@ -114,3 +116,60 @@ def trim_history(messages: list[BaseMessage], max_tokens: int = 2000) -> list[Ba
     )
 
     return trimmed
+
+
+class ContextBudgetExceeded(ValueError):
+    """当前用户问题与工具事实无法完整放入上下文预算。"""
+
+
+def valid_tool_calls(calls: list[dict]) -> bool:
+    """校验可回灌的申请协议。参数：申请列表；返回：是否完整且 ID 唯一；异常：无。"""
+    ids = []
+    for call in calls:
+        identifier = call.get("id")
+        if not isinstance(identifier, str) or not identifier.strip() or len(identifier) > 64:
+            return False
+        if not isinstance(call.get("name"), str) or not call["name"].strip() or not isinstance(call.get("args"), dict):
+            return False
+        ids.append(identifier)
+    return len(ids) == len(set(ids))
+
+
+def assemble_turns(turns: list[StoredTurn]) -> list[list[BaseMessage]]:
+    """恢复完整轮及已提交事实。参数：按时间排列的存储轮；返回：逐轮消息；异常：无业务异常。"""
+    history = []
+    for turn in turns:
+        if turn.turn_status == "running":
+            continue
+        group = []
+        for row in turn.messages:
+            if row.role == "user":
+                group.append(HumanMessage(content=row.content))
+            elif row.role == "assistant" and row.tool_calls:
+                calls = row.tool_calls
+                results = [m for m in turn.messages if m.role == "tool" and m.tool_call_id in {c.get("id") for c in calls}]
+                # 任一结果缺失、重复或申请损坏时整组跳过，原始记录仍留数据库审计。
+                if valid_tool_calls(calls) and len(results) == len(calls) and len({m.tool_call_id for m in results}) == len(calls):
+                    group.append(AIMessage(content="", tool_calls=calls))
+                    by_id = {m.tool_call_id: m for m in results}
+                    group.extend(ToolMessage(content=by_id[c["id"]].content, tool_call_id=c["id"]) for c in calls)
+            elif row.role == "assistant" and row.content and turn.turn_status == "completed":
+                group.append(AIMessage(content=row.content))
+        if group and turn.turn_status in {"cancelled", "failed"}:
+            group.append(AIMessage(content="上一轮回答未完成；以上工具结果是已保存的事实，请勿重复提交已创建的工单。"))
+        if group:
+            history.append(group)
+    return history
+
+
+def trim_turns(history: list[list[BaseMessage]], current: list[BaseMessage], max_tokens: int) -> list[BaseMessage]:
+    """按整轮保留最近历史。参数：历史轮、不可裁剪当前轮和预算；返回：平铺消息；异常：ContextBudgetExceeded。"""
+    if count_tokens_approximately(current) > max_tokens:
+        raise ContextBudgetExceeded("当前消息或工具结果过长，请缩短问题后重试")
+    kept = list(current)
+    for turn in reversed(history):
+        candidate = [*turn, *kept]
+        if count_tokens_approximately(candidate) > max_tokens:
+            break
+        kept = candidate
+    return kept

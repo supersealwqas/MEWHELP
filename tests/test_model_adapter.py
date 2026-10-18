@@ -1,0 +1,55 @@
+"""模型适配层的真实消息分片聚合及单轮终止约束。"""
+
+import pytest
+from langchain_core.messages import AIMessageChunk, HumanMessage
+
+
+class ChunkModel:
+    """替代模型网络连接，保留 LangChain 真实消息类型。"""
+    def __init__(self, chunks):
+        """设置网络分片。参数：列表；返回：None；异常：无。"""
+        self.chunks, self.binds = chunks, []
+
+    def bind_tools(self, tools, **kwargs):
+        """记录模型可见参数。参数：工具、选项；返回：自身；异常：无。"""
+        self.binds.append(kwargs)
+        return self
+
+    async def astream(self, messages):
+        """生成网络分片。参数：消息；返回：异步分片流；异常：无。"""
+        for chunk in self.chunks:
+            yield chunk
+
+
+async def test_decide_aggregates_complete_json_without_leaking_partial_args(monkeypatch):
+    """分片未聚合或遗漏 auto 绑定会失败。参数：替换器；返回：None；异常：断言失败。"""
+    from app.core import llm
+    model = ChunkModel([
+        AIMessageChunk(content="", tool_call_chunks=[{"name": "query_logistics", "id": "c", "args": '{"order_', "index": 0}]),
+        AIMessageChunk(content="", tool_call_chunks=[{"name": None, "id": None, "args": 'id":"1001"}', "index": 0}])])
+    monkeypatch.setattr(llm, "get_chat_model", lambda **kwargs: model)
+    result = await llm.ChatModelAdapter().decide([HumanMessage(content="查物流")], [])
+    assert result.tool_calls[0]["args"] == {"order_id": "1001"} and result.tool_calls[0]["id"] == "c"
+    assert model.binds == [{"tool_choice": "auto"}]
+
+
+async def test_truncated_json_not_accepted_by_partial_json_parser(monkeypatch):
+    """LangChain 宽松补全不能把截断参数当成完整申请。参数：替换器；返回：None；异常：断言失败。"""
+    from app.core import llm
+    model = ChunkModel([AIMessageChunk(content="", tool_call_chunks=[
+        {"name": "query_logistics", "id": "c", "args": '{"order_id":"1001"', "index": 0}])])
+    monkeypatch.setattr(llm, "get_chat_model", lambda **kwargs: model)
+    with pytest.raises(ValueError):
+        await llm.ChatModelAdapter().decide([], [])
+
+
+async def test_final_model_unbound_filters_reasoning_and_rejects_tool_calls(monkeypatch):
+    """回答阶段不能继续选工具，也不能展示推理块。参数：替换器；返回：None；异常：断言失败。"""
+    from app.core import llm
+    model = ChunkModel([AIMessageChunk(content=[{"type": "text", "text": "你好"}, {"type": "reasoning", "text": "SECRET"}])])
+    monkeypatch.setattr(llm, "get_chat_model", lambda **kwargs: model)
+    assert [v async for v in llm.ChatModelAdapter().stream_answer([])] == ["你好"]
+    assert not model.binds
+    model.chunks = [AIMessageChunk(content="", tool_call_chunks=[{"name": "query_order", "id": "c", "args": "{}", "index": 0}])]
+    with pytest.raises(ValueError):
+        [v async for v in llm.ChatModelAdapter().stream_answer([])]

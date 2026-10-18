@@ -4,6 +4,7 @@
 注册业务 API，并在首页提供同源客服聊天页面及其专用静态资源。
 """
 
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -13,28 +14,21 @@ from fastapi.staticfiles import StaticFiles
 from app.api.chat import router as chat_router
 from app.api.extract import router as extract_router
 from app.core.logging import setup_logging
+from app.config import settings
+from app.core.llm import ChatModelAdapter
+from app.db.session import create_database
+from app.repositories.chat import ChatRepository
+from app.repositories.support import SupportRepository
+from app.services.chat import ChatService
+from app.tools.registry import build_registry
 
 # 在应用创建前初始化业务日志，确保所有模块的 logger 都使用统一格式输出。
 setup_logging()
 
-# 实例化主 FastAPI 应用，注入全局服务元数据
-app = FastAPI(
-    title="MewHelp E-Commerce Customer Service",
-    description="MewHelp 电商智能客服系统与售后工单结构化提取服务 API",
-    version="0.1.0",
-)
-
-# 注册售后诉求提取接口路由
-app.include_router(extract_router)
-# 注册客服多轮对话流式接口路由
-app.include_router(chat_router)
-
 # 仅公开前端专用目录，不能挂载项目根目录，避免泄露 .env 等配置。
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
-@app.get("/", response_class=FileResponse, include_in_schema=False)
 async def chat_page() -> FileResponse:
     """返回可直接连接本服务聊天 API 的网页。
 
@@ -59,3 +53,43 @@ async def chat_page() -> FileResponse:
             ),
         },
     )
+
+
+@asynccontextmanager
+async def database_runtime():
+    """建立单 worker 运行时并恢复中断轮。参数：无；返回：聊天服务；异常：恢复/连接失败阻止启动。"""
+    engine, factory = create_database()
+    try:
+        repository = ChatRepository(factory)
+        await repository.recover_interrupted_turns()
+        yield ChatService(repository, SupportRepository(factory), ChatModelAdapter(), build_registry(), settings)
+    finally:
+        await engine.dispose()
+
+
+# 运行时工厂可在测试边界替换，生产默认始终连接 MySQL，不提供内存后备。
+create_runtime = database_runtime
+
+
+def create_app(runtime_factory=None) -> FastAPI:
+    """创建应用。参数：可选异步运行时工厂；返回：FastAPI；异常：资源错误在 lifespan 启动时抛出。"""
+    @asynccontextmanager
+    async def lifespan(application):
+        """先恢复后接收请求。参数：应用；返回：生命周期；异常：运行时初始化失败。"""
+        async with (runtime_factory or create_runtime)() as service:
+            application.state.chat_service = service
+            try:
+                yield
+            finally:
+                del application.state.chat_service
+
+    application = FastAPI(title="MewHelp E-Commerce Customer Service",
+        description="MewHelp 电商智能客服系统与售后工单结构化提取服务 API", version="0.1.0", lifespan=lifespan)
+    application.include_router(extract_router)
+    application.include_router(chat_router)
+    application.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    application.add_api_route("/", chat_page, response_class=FileResponse, include_in_schema=False)
+    return application
+
+
+app = create_app()

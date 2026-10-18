@@ -4,7 +4,10 @@
 隔离上游模型服务提供方的连接凭证与端点细节。
 """
 
+import json
 from typing import Any
+
+from langchain_core.messages import AIMessage, AIMessageChunk
 
 from langchain_openai import ChatOpenAI
 
@@ -48,3 +51,42 @@ def get_chat_model(
         streaming=streaming,
         **kwargs,
     )
+
+
+class ChatModelAdapter:
+    """隔离两段模型请求：流式汇总决策，随后以无工具模型流式作答。"""
+
+    async def decide(self, messages, tools) -> AIMessage:
+        """汇总完整申请。参数：完整消息与工具列表；返回：AIMessage；异常：网络错误、空响应或坏 JSON。"""
+        model = get_chat_model(streaming=True).bind_tools(tools, tool_choice="auto")
+        gathered = None
+        async for chunk in model.astream(messages):
+            gathered = chunk if gathered is None else gathered + chunk
+        if gathered is None:
+            raise ValueError("模型未返回决策")
+        # LangChain 的分片解析允许自动补全 JSON；业务执行前必须严格解析原始全文。
+        if isinstance(gathered, AIMessageChunk) and gathered.tool_call_chunks:
+            calls = []
+            for chunk in gathered.tool_call_chunks:
+                args = json.loads(chunk.get("args") or "")
+                if not isinstance(args, dict):
+                    raise ValueError("工具参数必须是对象")
+                calls.append({"name": chunk.get("name"), "id": chunk.get("id"), "args": args})
+            return AIMessage(content="", tool_calls=calls)
+        return AIMessage(content=gathered.content, tool_calls=gathered.tool_calls,
+                         invalid_tool_calls=gathered.invalid_tool_calls)
+
+    async def stream_answer(self, messages):
+        """生成最终文本。参数：含工具事实的消息；返回：异步字符串流；异常：网络错误或意外工具申请。"""
+        model = get_chat_model(streaming=True, temperature=0.3)
+        async for chunk in model.astream(messages):
+            if chunk.tool_calls or chunk.invalid_tool_calls or getattr(chunk, "tool_call_chunks", None):
+                raise ValueError("回答阶段不允许再次调用工具")
+            if isinstance(chunk.content, str):
+                delta = chunk.content
+            else:
+                delta = "".join(block if isinstance(block, str) else block["text"]
+                    for block in chunk.content if isinstance(block, str) or
+                    (isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str)))
+            if delta:
+                yield delta

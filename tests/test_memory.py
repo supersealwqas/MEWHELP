@@ -7,7 +7,9 @@
 import pytest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
-from app.api.chat import store
+from app.core.memory import SessionStore
+
+store = SessionStore()
 from app.core import SessionStore, trim_history
 from app.core.memory import (
     SessionStore as DirectSessionStore,
