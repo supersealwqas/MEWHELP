@@ -11,8 +11,10 @@ import anyio
 from langchain_core.messages import AIMessage, AIMessageChunk
 
 from langchain_openai import ChatOpenAI
+from pydantic import ValidationError
 
 from app.config import settings
+from app.schemas.chat import InvalidToolDecision
 
 
 def get_chat_model(
@@ -58,7 +60,7 @@ class ChatModelAdapter:
     """隔离两段模型请求：流式汇总决策，随后以无工具模型流式作答。"""
 
     async def decide(self, messages, tools) -> AIMessage:
-        """汇总完整申请。参数：完整消息与工具列表；返回：AIMessage；异常：网络错误、空响应或坏 JSON。"""
+        """汇总完整申请。参数：完整消息与工具列表；返回：AIMessage；异常：网络错误、空响应或携带审计的 InvalidToolDecision。"""
         model = get_chat_model(streaming=True).bind_tools(tools, tool_choice="auto")
         gathered = None
         stream = model.astream(messages)
@@ -72,13 +74,20 @@ class ChatModelAdapter:
             raise ValueError("模型未返回决策")
         # LangChain 的分片解析允许自动补全 JSON；业务执行前必须严格解析原始全文。
         if isinstance(gathered, AIMessageChunk) and gathered.tool_call_chunks:
-            calls = []
-            for chunk in gathered.tool_call_chunks:
-                args = json.loads(chunk.get("args") or "")
-                if not isinstance(args, dict):
-                    raise ValueError("工具参数必须是对象")
-                calls.append({"name": chunk.get("name"), "id": chunk.get("id"), "args": args})
-            return AIMessage(content="", tool_calls=calls)
+            try:
+                calls = []
+                for chunk in gathered.tool_call_chunks:
+                    args = json.loads(chunk.get("args") or "")
+                    if not isinstance(args, dict):
+                        raise ValueError("工具参数必须是对象")
+                    # Python 容许 NaN/Infinity，指数也可能溢出成 inf；MySQL JSON 不接受这些值。
+                    # 在落库前严格校验整棵参数树，失败时保留原始字符串审计而非写入坏 JSON。
+                    json.dumps(args, allow_nan=False)
+                    calls.append({"name": chunk.get("name"), "id": chunk.get("id"), "args": args})
+                return AIMessage(content="", tool_calls=calls)
+            except (ValueError, TypeError, ValidationError) as error:
+                # 空参数与坏 JSON 不能修补成合法申请；保留原文供服务保存，日志只记安全异常类型。
+                raise InvalidToolDecision(tool_call_chunks=gathered.tool_call_chunks) from error
         return AIMessage(content=gathered.content, tool_calls=gathered.tool_calls,
                          invalid_tool_calls=gathered.invalid_tool_calls)
 

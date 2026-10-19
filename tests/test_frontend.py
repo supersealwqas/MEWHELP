@@ -5,10 +5,12 @@
 
 from pathlib import Path
 
+import anyio
 import pytest
 from fastapi.testclient import TestClient
+from fastapi.responses import StreamingResponse
 
-from app.main import app
+from app.main import app, create_app
 
 
 def test_chat_homepage() -> None:
@@ -34,6 +36,89 @@ def test_chat_homepage() -> None:
     assert response.headers["cache-control"] == "no-cache"
     assert "connect-src 'self'" in response.headers["content-security-policy"]
     assert response.headers["x-content-type-options"] == "nosniff"
+
+
+@pytest.mark.parametrize("url", ["/", "/static/index.html"])
+def test_chat_html_entrypoints_have_same_security_headers(url: str) -> None:
+    """验证所有聊天 HTML 入口均限制脚本与请求来源，避免绕过首页响应头。
+
+    参数:
+        url: 首页或静态 HTML 的直接访问路径。
+    返回值:
+        None: 断言两种入口使用一致的内容安全策略和 MIME 保护。
+    异常:
+        AssertionError: 某个入口缺少关键防护指令时抛出。
+    """
+    with TestClient(app) as client:
+        response = client.get(url)
+        homepage = client.get("/")
+    policy = response.headers.get("content-security-policy", "")
+    assert policy == homepage.headers["content-security-policy"]
+    assert "script-src 'self'" in policy
+    assert "connect-src 'self'" in policy
+    assert "frame-ancestors 'none'" in policy
+    assert response.headers.get("x-content-type-options") == "nosniff"
+
+
+@pytest.mark.asyncio
+async def test_security_headers_preserve_incremental_stream_and_cancellation() -> None:
+    """验证统一响应头不会缓存 SSE 正文，且取消仍能到达流生成器。
+
+    参数:
+        无；使用只产生一帧后等待的本地路由，不调用模型或数据库。
+    返回值:
+        None: 断言首帧立即交付、正文不被改写并且取消可执行清理。
+    异常:
+        AssertionError: 头部遗漏、首帧被缓存或取消被吞掉时抛出。
+        TimeoutError: 等待首帧超过本地测试时限时抛出。
+    """
+    application = create_app()
+    first_chunk = anyio.Event()
+    stream_closed = anyio.Event()
+    messages = []
+
+    async def chunks():
+        """提供可取消数据流。参数：无；返回：异步字节迭代器；异常：透传任务取消。"""
+        try:
+            yield b"data: first\n\n"
+            await anyio.sleep_forever()
+        finally:
+            stream_closed.set()
+
+    async def stream_page():
+        """返回测试 SSE。参数：无；返回：StreamingResponse；异常：无。"""
+        return StreamingResponse(chunks(), media_type="text/event-stream")
+
+    async def receive():
+        """等待取消。参数：无；返回：本例不产生接收帧；异常：透传任务取消。"""
+        await anyio.sleep_forever()
+
+    async def send(message):
+        """收集真实输出帧。参数：ASGI 响应帧；返回：None；异常：无。"""
+        messages.append(message)
+        if message["type"] == "http.response.body":
+            first_chunk.set()
+
+    application.add_api_route("/test-stream", stream_page)
+    scope = {
+        "type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"},
+        "http_version": "1.1", "method": "GET", "scheme": "http",
+        "path": "/test-stream", "raw_path": b"/test-stream", "root_path": "",
+        "query_string": b"", "headers": [], "client": ("127.0.0.1", 12345),
+        "server": ("testserver", 80),
+    }
+    with anyio.fail_after(2):
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(application, scope, receive, send)
+            await first_chunk.wait()
+            tasks.cancel_scope.cancel()
+    assert stream_closed.is_set()
+    response_headers = dict(messages[0]["headers"])
+    assert response_headers.get(b"x-content-type-options") == b"nosniff"
+    assert b"content-security-policy" not in response_headers
+    assert messages[1] == {
+        "type": "http.response.body", "body": b"data: first\n\n", "more_body": True,
+    }
 
 
 @pytest.mark.parametrize(

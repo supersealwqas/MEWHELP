@@ -962,6 +962,7 @@ name = "mewhelp"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "anyio" },
     { name = "asyncmy" },
     { name = "fastapi" },
     { name = "langchain-core" },
@@ -982,6 +983,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "anyio", specifier = ">=4.0,<5" },
     { name = "asyncmy", specifier = ">=0.2.16,<0.3" },
     { name = "fastapi", specifier = ">=0.139.0" },
     { name = "langchain-core", specifier = ">=0.3.0" },

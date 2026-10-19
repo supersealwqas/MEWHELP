@@ -18,6 +18,7 @@ from app.config import Settings
 from app.db.seed import FAQ_SEEDS
 from app.db.session import create_database
 from app.models.customer_service import Conversation, FAQ, Message, Ticket
+from app.services.chat import FIXED_REJECTION_REPLIES
 
 
 async def sample(client, base_url, case, session_id):
@@ -87,12 +88,25 @@ async def run(args):
                     "completed": all(m.turn_status == "completed" for m in messages),
                     "nonempty_answer": bool(answer.strip()),
                     "result_pairing": len(results) == len(calls),
-                    "result_success": all(r["ok"] for r in results),
                 }
+                if case.get("reject"):
+                    # 拒绝样例必须存下对应错误码，且最终文本逐字等于服务端固定回复。
+                    expected_reply = FIXED_REJECTION_REPLIES[case["reject"]]
+                    checks["result_rejected"] = bool(results) and not results[0]["ok"] and \
+                        (results[0].get("error") or {}).get("code") == case["reject"]
+                    checks["fixed_reply"] = answer.strip() == expected_reply
+                    # 固定回复不得泄露订单字段或存在性措辞。
+                    checks["no_order_fields"] = not any(
+                        token in answer for token in ("演示猫粮", "tracking_no", "MOCK", "1001", "不存在", "2003"))
+                else:
+                    # 只有非拒绝样例才要求工具执行成功；拒绝本身就是预期失败事实。
+                    checks["result_success"] = all(r["ok"] for r in results)
                 if case["tool"]:
                     checks["status_before_text"] = bool(deltas) and events[0]["event"] == "tool_status" and events[0]["seconds"] <= deltas[0]["seconds"]
                 if "matches" in case:
-                    checks["faq_matches"] = bool(results) and bool(results[0]["data"]) is case["matches"]
+                    # query_faq 现在以 hits 表达命中，空命中是 hits=[] 而非 data=[]。
+                    hits = (results[0]["data"] or {}).get("hits") if results else None
+                    checks["faq_matches"] = bool(hits) is case["matches"]
                 if case["tool"] == "create_ticket":
                     checks["ticket_committed"] = ticket is not None and ticket.conversation_id == conversation.id
                 ok = all(checks.values())

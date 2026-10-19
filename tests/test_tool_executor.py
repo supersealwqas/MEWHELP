@@ -1,10 +1,12 @@
 """验证工具执行器的限时、有限重试、持久化顺序及取消。"""
 
 import asyncio
+from typing import Annotated
 import pytest
-from langchain_core.tools import tool
+from langchain_core.tools import InjectedToolArg, tool
+from pydantic import Field
 from app.repositories.chat import PersistenceUncertain
-from app.schemas.tools import ToolContext, ToolResult
+from app.schemas.tools import BusinessArgs, ToolContext, ToolResult
 from app.tools.registry import ToolRegistry, build_registry
 from app.tools.executor import ToolExecutor
 
@@ -39,6 +41,64 @@ def call(name="slow", args=None):
 
 async def ignore_status(status):
     """测试无需展示状态。参数：状态字典；返回：None；异常：无。"""
+
+
+class IdentityArgs(BusinessArgs):
+    """执行器身份注入探针的完整运行参数，保留真实严格校验。"""
+    order_id: str = Field(min_length=1, max_length=64, description="订单号")
+    user_id: Annotated[str, InjectedToolArg] = Field(min_length=1, description="系统注入用户身份")
+
+
+@tool(args_schema=IdentityArgs)
+async def identity_probe(order_id: str, user_id: Annotated[str, InjectedToolArg]) -> dict:
+    """返回实际接收的参数。参数：订单号和系统身份；返回：业务字典；异常：无。"""
+    return {"order_id": order_id, "user_id": user_id}
+
+
+async def test_executor_injects_context_identity_without_mutating_model_call():
+    """遗漏注入或直接修改模型申请会失败。参数：无；返回：None；异常：断言失败。"""
+    registry, store = ToolRegistry(), ResultStore()
+    registry.register(identity_probe)
+    model_call = call("identity_probe", {"order_id": " 1001 "})
+    result = await ToolExecutor(registry, store, None).execute(model_call, context(), ignore_status)
+    assert result.ok and result.data == {"order_id": "1001", "user_id": "u"}
+    assert model_call["args"] == {"order_id": " 1001 "}
+
+
+@pytest.mark.parametrize("args", [
+    {"order_id": "1001", "user_id": "victim"},
+    {"order_id": "1001", "user_id": "u"},
+    {"order_id": "1001", "extra": "value"},
+    {"order_id": 1001},
+    {"order_id": " "},
+])
+async def test_executor_rejects_injected_or_invalid_model_arguments(args):
+    """模型夹带身份和不合法参数不能进入工具。参数：申请参数；返回：None；异常：断言失败。"""
+    registry, store = ToolRegistry(), ResultStore()
+    registry.register(identity_probe)
+    result = await ToolExecutor(registry, store, None).execute(call("identity_probe", args), context(), ignore_status)
+    assert not result.ok and result.error.code == "INVALID_ARGUMENTS" and result.data is None
+
+
+@pytest.mark.parametrize("payload,ok", [
+    ({"order_id": "1001", "tracking_no": "TRACK-1001"}, True),
+    ({"error": "没有找到您的这笔订单", "code": "order_not_owned"}, False),
+])
+async def test_executor_normalizes_business_dictionary(payload, ok):
+    """业务字典必须转换为统一结果，拒绝不是成功数据。参数：字典和成功标识；返回：None；异常：断言失败。"""
+    @tool
+    async def dictionary_probe() -> dict:
+        """提供真实工具的字典返回。参数：无；返回：业务字典；异常：无。"""
+        return dict(payload)
+    registry, store = ToolRegistry(), ResultStore()
+    registry.register(dictionary_probe)
+    result = await ToolExecutor(registry, store, None).execute(call("dictionary_probe"), context(), ignore_status)
+    assert result.ok is ok and store.result == result and store.writes == 1
+    if ok:
+        assert result.data == payload and result.error is None
+    else:
+        assert result.data is None
+        assert result.error.model_dump() == {"message": payload["error"], "code": payload["code"]}
 
 
 async def test_timeout_retry_once():
@@ -134,3 +194,123 @@ async def test_unavailable_verification_never_executes():
     with pytest.raises(PersistenceUncertain):
         await ToolExecutor(build_registry(), store, None).execute(call("create_ticket"), context(), ignore_status)
     assert store.writes == 0
+
+
+def test_is_mock_tool_reads_tags_only():
+    """演示标记只能由工具自身 tags 决定，不能靠工具名猜测。参数：无；返回：None；异常：断言失败。"""
+    from langchain_core.tools import tool
+    from app.tools.executor import is_mock_tool
+
+    @tool(description="带演示标记")
+    def tagged() -> dict:
+        """带标记工具。"""
+        return {}
+
+    @tool(description="真实工具")
+    def real() -> dict:
+        """真实工具。"""
+        return {}
+
+    tagged.tags = ["mock"]
+    assert is_mock_tool(tagged) is True
+    assert is_mock_tool(real) is False
+    # 未知工具没有对象可查，必须降级为真实语义，避免把未知工具说成演示数据。
+    assert is_mock_tool(None) is False
+
+
+def test_registry_mock_flags_match_tool_tags():
+    """注册表内每个工具的演示语义必须与其 tags 一致。参数：无；返回：None；异常：断言失败。"""
+    from app.tools.executor import is_mock_tool
+    expected = {"query_order": True, "query_product": True, "query_logistics": True,
+                "query_faq": False, "create_ticket": False}
+    actual = {tool.name: is_mock_tool(tool) for tool in build_registry().all()}
+    assert actual == expected
+
+
+async def test_tool_returning_only_data_key_is_not_unpacked():
+    """单键 data 字典必须原样保留，不能把业务字段名当协议拆包。参数：无；返回：None；异常：断言失败。"""
+    @tool
+    async def data_only() -> dict:
+        """模拟业务数据恰好只有 data 键。参数：无；返回：业务字典；异常：无。"""
+        return {"data": "这是订单摘要文本"}
+
+    registry, store = ToolRegistry(), ResultStore()
+    registry.register(data_only)
+    result = await ToolExecutor(registry, store, None).execute(call("data_only"), context(), ignore_status)
+    assert result.ok and result.data == {"data": "这是订单摘要文本"}
+
+
+async def test_create_ticket_failure_keeps_business_error_code():
+    """工单写入失败必须保留业务错误码，不能被 hasattr 兜底吞成 TOOL_FAILED。参数：无；返回：None；异常：断言失败。"""
+    from app.schemas.tools import ToolError, ToolResult
+
+    class FailingSupport:
+        """受控工单服务，返回业务失败结果。"""
+        async def create_ticket(self, context, description, ticket_type):
+            """返回失败结果。参数：上下文、描述、类型；返回：失败 ToolResult；异常：无。"""
+            return ToolResult(ok=False, error=ToolError(code="TICKET_CONFLICT", message="工单号冲突"))
+
+    registry, store = ToolRegistry(), ResultStore()
+    result = await ToolExecutor(build_registry(), store, FailingSupport()).execute(
+        call("create_ticket", {"description": "x", "ticket_type": "咨询"}), context(), ignore_status)
+    assert result.ok is False and result.error.code == "TICKET_CONFLICT"
+    assert result.error.message == "工单号冲突"
+
+
+async def test_write_tool_retries_only_after_confirmed_rollback():
+    """写操作在核实到未提交时才重试；核实到已提交则直接复用。参数：无；返回：None；异常：断言失败。"""
+    attempts = []
+
+    @tool
+    async def create_ticket(description: str) -> dict:
+        """模拟写操作瞬时故障后成功。参数：描述；返回：业务字典；异常：首次 TimeoutError。"""
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise TimeoutError()
+        return {"ticket_no": "T-1", "status": "待处理"}
+
+    create_ticket.tags = ["write"]
+
+    registry, store = ToolRegistry(), ResultStore()
+    registry.register(create_ticket)
+    result = await ToolExecutor(registry, store, None, max_retries=1, retry_delay_seconds=0).execute(
+        call("create_ticket", {"description": "x"}), context(), ignore_status)
+    # ResultStore 在重试前返回 None，说明本次确定未提交，重试是安全的。
+    assert len(attempts) == 2 and result.ok and result.data["ticket_no"] == "T-1"
+
+
+async def test_write_tool_timeout_message_warns_about_uncertain_state():
+    """写操作最终超时时提示状态未确认，不能暗示可以安全重试。参数：无；返回：None；异常：断言失败。"""
+    @tool
+    async def create_ticket(description: str) -> dict:
+        """模拟持续超时。参数：描述；返回：不返回；异常：TimeoutError。"""
+        raise TimeoutError()
+
+    # 写操作语义由工具自身 tags 声明，测试探针必须与真实工具一致。
+    create_ticket.tags = ["write"]
+
+    registry, store = ToolRegistry(), ResultStore()
+    registry.register(create_ticket)
+    result = await ToolExecutor(registry, store, None, max_retries=0).execute(
+        call("create_ticket", {"description": "x"}), context(), ignore_status)
+    assert result.ok is False and result.error.code == "TOOL_TIMEOUT"
+    assert "状态未确认" in result.error.message
+
+
+async def test_read_tool_still_retries_on_transient_error():
+    """只读工具保留一次重试，修复写操作时不能连带砍掉读重试。参数：无；返回：None；异常：断言失败。"""
+    attempts = []
+
+    @tool
+    async def query_order(order_id: str) -> dict:
+        """模拟只读瞬时故障后成功。参数：订单号；返回：业务字典；异常：首次 TimeoutError。"""
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise TimeoutError()
+        return {"order_id": order_id}
+
+    registry, store = ToolRegistry(), ResultStore()
+    registry.register(query_order)
+    result = await ToolExecutor(registry, store, None, max_retries=1, retry_delay_seconds=0).execute(
+        call("query_order", {"order_id": "1001"}), context(), ignore_status)
+    assert len(attempts) == 2 and result.ok and result.data == {"order_id": "1001"}

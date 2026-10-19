@@ -38,6 +38,41 @@ async function httpErrorMessage(response) {
 }
 
 /**
+ * 根据写操作状态生成失败提示，避免在结果未知或已提交时引导重复建单。
+ * @param {object} options 本轮失败、取消及各调用的最新状态。
+ * @param {Error} options.error 接口错误；retry_safe 为服务端可选的安全重试判断。
+ * @param {boolean} options.stopped 是否由用户停止接收。
+ * @param {Iterable<object>} options.toolStatuses 各工具调用最新状态。
+ * @returns {{restoreMessage: boolean, note: string, status: string, feedback: string}} 页面提示及原话回填决策。
+ * @throws {Error} 无主动抛出的业务异常。
+ */
+export function failurePresentation({ error, stopped, toolStatuses = [] }) {
+  const ticketMayExist = Array.from(toolStatuses).some(function hasPendingOrSavedTicket(tool) {
+    // 参数 tool 为调用最新状态；返回 boolean；无业务异常。failed 表示服务端已确定未执行。
+    return tool.name === "create_ticket" && ["running", "retrying", "succeeded"].includes(tool.status);
+  });
+  if (error?.retry_safe === false || ticketMayExist) {
+    return {
+      restoreMessage: false,
+      note: "工单可能已提交，请先核实已提交结果，避免重复建单。已收到的文字和工单号会保留在本页。",
+      status: stopped ? "回复已停止，请先核实工单结果" : "回复未完成，请先核实工单结果",
+      // 网络错误的通用文案可能带有重试建议，这里统一采用适用于写操作的提示。
+      feedback: "请保留本页已收到的工单号和回复，核实提交结果后再继续。",
+    };
+  }
+  return {
+    restoreMessage: true,
+    note: stopped
+      ? "已停止接收；是否保存本轮上下文，以服务端实际完成情况为准。"
+      : "回复未完成；请稍后重试。",
+    status: stopped ? "已停止，可编辑问题后重新发送" : "发送未完成，请稍后重试",
+    feedback: error instanceof TypeError
+      ? "连接失败，请确认后端服务仍在运行，再重新发送。"
+      : (error?.message || "请求失败，请稍后重试。"),
+  };
+}
+
+/**
  * 发起一轮聊天，在每个有效增量帧到达时立即通知调用方。
  * @param {object} options 当前轮请求参数。
  * @param {string} options.sessionId 当前页面内保持不变的会话标识。
@@ -50,7 +85,30 @@ async function httpErrorMessage(response) {
  * @throws {Error} HTTP 失败、SSE 错误、非法数据、空回复或缺少完成帧时抛出。
  * @throws {DOMException} 请求被取消时透传 AbortError。
  */
-export async function streamChat({ sessionId, message, signal, onDelta, onToolStatus }, fetcher = globalThis.fetch) {
+export async function streamChat(options, fetcher = globalThis.fetch) {
+  if (options.signal?.aborted) {
+    // 尚未发出请求的取消可以安全回填；发出请求后的断流不能据此推断写入结果。
+    const error = new DOMException("请求已取消", "AbortError");
+    error.retry_safe = true;
+    throw error;
+  }
+  try {
+    return await receiveChatStream(options, fetcher);
+  } catch (error) {
+    // 状态帧可能尚未送达；仅凭没有徽章，不能认定服务端没有创建工单。
+    if (typeof error.retry_safe !== "boolean") error.retry_safe = false;
+    throw error;
+  }
+}
+
+/**
+ * 发送请求并解码响应；由 streamChat 统一标记无法确认提交结果的错误。
+ * @param {object} options 会话、消息、取消信号和增量回调。
+ * @param {typeof fetch} fetcher 浏览器 fetch 或离线网络替身。
+ * @returns {Promise<string>} 收到完成帧后的完整回答。
+ * @throws {Error} HTTP、网络或协议错误；取消时抛出 AbortError。
+ */
+async function receiveChatStream({ sessionId, message, signal, onDelta, onToolStatus }, fetcher) {
   // EventSource 不支持此处需要的 POST JSON，因此使用 fetch 的可读响应流。
   const response = await fetcher("/api/chat", {
     method: "POST",
@@ -58,7 +116,12 @@ export async function streamChat({ sessionId, message, signal, onDelta, onToolSt
     body: JSON.stringify({ session_id: sessionId, message }),
     signal,
   });
-  if (!response.ok) throw new Error(await httpErrorMessage(response));
+  if (!response.ok) {
+    const error = new Error(await httpErrorMessage(response));
+    // 参数校验失败发生在业务执行前，用户修改输入后可以重新发送。
+    if (response.status === 422) error.retry_safe = true;
+    throw error;
+  }
   if (!response.headers.get("content-type")?.includes("text/event-stream") || !response.body) {
     throw new Error("服务器未返回 SSE 数据流，请确认正在访问本项目的聊天接口。");
   }
@@ -90,7 +153,9 @@ export async function streamChat({ sessionId, message, signal, onDelta, onToolSt
           throw new Error("收到无法解析的 SSE 数据，请检查接口响应。");
         }
         if (event.event === "error") {
-          throw new Error(typeof payload?.error === "string" ? payload.error : "模型暂时不可用，请稍后重试。");
+          const error = new Error(typeof payload?.error === "string" ? payload.error : "模型暂时不可用，请稍后重试。");
+          if (typeof payload?.retry_safe === "boolean") error.retry_safe = payload.retry_safe;
+          throw error;
         }
         if (event.event === "tool_status") {
           if (typeof payload?.tool_call_id !== "string" || typeof payload?.name !== "string" ||

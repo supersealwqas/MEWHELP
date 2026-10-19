@@ -38,7 +38,12 @@ class Settings(BaseSettings):
         gt=0,
         # 优先使用参考项目的名称，同时兼容已有 .env 中的旧配置键。
         validation_alias=AliasChoices("token_budget", "chat_token_budget"),
-        description="多轮会话上下文裁剪保留的 Token 上限预算",
+        description="对话消息估算预算，包含当前问题和工具事实，不含系统提示及工具定义，并非模型真实 Token 上限",
+    )
+    request_token_budget: int = Field(
+        default=16000,
+        gt=0,
+        description="完整输入估算预算，包含系统提示、对话和本阶段工具定义，不含模型输出，并非真实上下文窗口",
     )
 
     # 本章 MySQL 持久化及工具的有限执行配置。

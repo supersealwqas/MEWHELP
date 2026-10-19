@@ -10,6 +10,8 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.datastructures import MutableHeaders
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.api.chat import router as chat_router
 from app.api.extract import router as extract_router
@@ -29,6 +31,41 @@ setup_logging()
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
+class SecurityHeadersMiddleware:
+    """统一提供聊天 HTML 防护与 MIME 保护，仅修改响应头，不处理流正文或取消。
+
+    首页和静态 HTML 使用同源资源策略；API 文档保留自身的外部脚本加载方式。
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        """保存下游应用。参数：app 为 ASGI 应用；返回：None；异常：无。"""
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """转发请求并补头。参数：scope 请求环境、receive 接收、send 发送；返回：None；异常：透传下游异常与取消。"""
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_headers(message: Message) -> None:
+            """修改首帧后原样发送。参数：message 为响应帧；返回：None；异常：透传网络错误和取消。"""
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                headers["X-Content-Type-Options"] = "nosniff"
+                is_chat_path = scope["path"] == "/" or scope["path"].startswith("/static/")
+                if is_chat_path and headers.get("content-type", "").startswith("text/html"):
+                    # 首页和静态 HTML 共用策略，避免直接访问 index.html 绕过防护。
+                    headers["Content-Security-Policy"] = (
+                        "default-src 'self'; script-src 'self'; style-src 'self'; "
+                        "img-src 'self'; connect-src 'self'; "
+                        "base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+                    )
+            # 不建立额外任务或缓冲正文，SSE 增量和取消直接交给原有调用链。
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
+
+
 async def chat_page() -> FileResponse:
     """返回可直接连接本服务聊天 API 的网页。
 
@@ -42,16 +79,7 @@ async def chat_page() -> FileResponse:
     return FileResponse(
         STATIC_DIR / "index.html",
         media_type="text/html",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Content-Type-Options": "nosniff",
-            # 脚本、样式及网络请求只允许同源；页面没有外部 CDN 依赖。
-            "Content-Security-Policy": (
-                "default-src 'self'; script-src 'self'; style-src 'self'; "
-                "img-src 'self'; connect-src 'self'; "
-                "base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
-            ),
-        },
+        headers={"Cache-Control": "no-cache"},
     )
 
 
@@ -85,6 +113,7 @@ def create_app(runtime_factory=None) -> FastAPI:
 
     application = FastAPI(title="MewHelp E-Commerce Customer Service",
         description="MewHelp 电商智能客服系统与售后工单结构化提取服务 API", version="0.1.0", lifespan=lifespan)
+    application.add_middleware(SecurityHeadersMiddleware)
     application.include_router(extract_router)
     application.include_router(chat_router)
     application.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

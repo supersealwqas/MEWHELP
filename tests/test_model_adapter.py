@@ -43,6 +43,22 @@ async def test_truncated_json_not_accepted_by_partial_json_parser(monkeypatch):
         await llm.ChatModelAdapter().decide([], [])
 
 
+@pytest.mark.parametrize("raw", ['{"keyword":"退货"', "", "[]",
+    '{"keyword":NaN}', '{"keyword":Infinity}', '{"keyword":-Infinity}',
+    '{"keyword":1e999}', '{"keyword":{"nested":[NaN]}}'])
+async def test_invalid_arguments_preserve_raw_audit(monkeypatch, raw):
+    """非法参数保留原始诊断而不伪造合法调用。参数：替换器、原参数；返回：None；异常：断言失败。"""
+    from app.core import llm
+    from app.schemas.chat import InvalidToolDecision
+    model = ChunkModel([AIMessageChunk(content="", tool_call_chunks=[
+        {"name": "query_faq", "id": "bad", "args": raw, "index": 0}])])
+    monkeypatch.setattr(llm, "get_chat_model", lambda **kwargs: model)
+    with pytest.raises(InvalidToolDecision) as failure:
+        await llm.ChatModelAdapter().decide([], [])
+    assert failure.value.audit_record["type"] == "invalid_tool_decision"
+    assert failure.value.audit_record["tool_call_chunks"][0]["args"] == raw
+
+
 async def test_final_model_unbound_filters_reasoning_and_rejects_tool_calls(monkeypatch):
     """回答阶段不能继续选工具，也不能展示推理块。参数：替换器；返回：None；异常：断言失败。"""
     from app.core import llm

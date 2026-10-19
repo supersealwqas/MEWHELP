@@ -19,6 +19,13 @@ def send(client, message="你好", session_id="api-session"):
     return client.post("/api/chat", json={"session_id": session_id, "message": message})
 
 
+def test_message_length_limit_is_validated_before_service(client, offline_chat_runtime):
+    """超出4000字符时不进入业务服务。参数：客户端、隔离依赖；返回：None；异常：断言失败。"""
+    response = send(client, "好" * 4001)
+    assert response.status_code == 422
+    assert not offline_chat_runtime[1].turns and not offline_chat_runtime[-1].inputs
+
+
 def test_chat_sse_normal_multi_chunk_stream(client, offline_chat_runtime):
     """验证真实增量和完成帧，数据库完成在 done 之前。参数：客户端、依赖；返回：None；异常：断言失败。"""
     _, repo, _, model = offline_chat_runtime
@@ -80,7 +87,7 @@ def test_oversized_current_message_is_not_dropped(client, offline_chat_runtime, 
 def test_tool_named_event_precedes_text_and_is_not_text(client, offline_chat_runtime):
     """工具状态必须独立于回答流。参数：客户端、依赖；返回：None；异常：断言失败。"""
     offline_chat_runtime[-1].decision = AIMessage(content="", tool_calls=[
-        {"name": "query_logistics", "id": "c1", "args": {"order_id": "1001"}}])
+        {"name": "query_logistics", "id": "c1", "args": {"tracking_no": "MOCK213502378238"}}])
     response = send(client, "订单 1001 的物流到哪了")
     assert response.text.count("event: tool_status") == 2
     assert response.text.index("event: tool_status") < response.text.index('"delta"')

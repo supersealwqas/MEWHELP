@@ -86,7 +86,10 @@ class ChatRepository:
         return result
 
     async def finish_turn(self, context: ToolContext, content: str) -> None:
-        """原子保存最终回复与完成状态。参数：上下文及完整回复；返回：None；异常：数据库写入失败。"""
+        """原子保存最终回复与完成状态。参数：上下文及完整回复；返回：None；异常：正文过长 ValueError 或数据库错误。"""
+        # MySQL TEXT 上限按字节计算，不能用中文字符数代替；在打开事务前拒绝溢出。
+        if len(content.encode("utf-8")) > 65535:
+            raise ValueError("回答正文过长，无法保存")
         async with self.factory.begin() as session:
             session.add(Message(conversation_id=context.conversation_id, turn_id=context.turn_id,
                                 role="assistant", content=content, turn_status="completed"))

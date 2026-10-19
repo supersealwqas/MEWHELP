@@ -1,11 +1,14 @@
 """客服会话历史内存存储与 Token 裁剪模块。
 
-提供客服服务端纯内存会话历史管理器 (SessionStore) 与
-基于 LangChain trim_messages 封装的上下文预算裁剪函数 (trim_history)。
+提供旧版纯内存历史与裁剪接口，以及持久化工具轮次恢复、整轮裁剪和完整输入预算。
+新预算按 ASCII 约四字符一单位、非 ASCII 约每字符两单位估算，不代表模型真实分词。
 """
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage, trim_messages
-from langchain_core.messages.utils import count_tokens_approximately
+import json
+
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage, trim_messages
+from langchain_core.tools import BaseTool
+from langchain_core.utils.function_calling import convert_to_openai_tool
 from app.schemas.history import StoredTurn
 
 
@@ -163,13 +166,82 @@ def assemble_turns(turns: list[StoredTurn]) -> list[list[BaseMessage]]:
 
 
 def trim_turns(history: list[list[BaseMessage]], current: list[BaseMessage], max_tokens: int) -> list[BaseMessage]:
-    """按整轮保留最近历史。参数：历史轮、不可裁剪当前轮和预算；返回：平铺消息；异常：ContextBudgetExceeded。"""
-    if count_tokens_approximately(current) > max_tokens:
+    """按整轮保留最近历史。
+
+    参数：history 按时间排列的历史轮；current 不可裁剪的当前消息；max_tokens 对话估算预算。
+    返回：list[BaseMessage]，保留最近连续完整轮及当前消息的平铺列表。
+    异常：ContextBudgetExceeded 表示当前问题或工具事实本身已超预算。
+    """
+    used = _estimate_message_tokens(current)
+    if used > max_tokens:
         raise ContextBudgetExceeded("当前消息或工具结果过长，请缩短问题后重试")
     kept = list(current)
     for turn in reversed(history):
-        candidate = [*turn, *kept]
-        if count_tokens_approximately(candidate) > max_tokens:
+        turn_tokens = _estimate_message_tokens(turn)
+        # 当前轮不可拆分；旧轮也必须连同工具申请和结果一起保留或舍弃。
+        if used + turn_tokens > max_tokens:
             break
-        kept = candidate
+        kept = [*turn, *kept]
+        used += turn_tokens
     return kept
+
+
+def _estimate_token_units(value: object) -> int:
+    """用真实 Unicode 序列化估算文本与协议字段的预算。
+
+    参数：value 可 JSON 序列化的消息字段或工具定义。
+    返回：int，ASCII 四字符约一单位、非 ASCII 每字符约两单位，向上取整。
+    异常：TypeError 表示输入含不可 JSON 序列化的数据。
+    """
+    # 禁止 ASCII 转义，以免把同一中文字符当作六个 ASCII 字符重新计价。
+    serialized = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    quarter_units = sum(1 if character.isascii() else 8 for character in serialized)
+    return (quarter_units + 3) // 4
+
+
+def _estimate_message_tokens(messages: list[BaseMessage]) -> int:
+    """估算对话正文与会影响请求长度的消息协议字段。
+
+    参数：messages 当前轮或完整历史轮的 LangChain 消息列表。
+    返回：int，逐条累加的近似输入单位数，不是模型真实 Token 数。
+    异常：TypeError 表示消息正文或工具参数不能 JSON 序列化。
+    """
+    total = 0
+    for message in messages:
+        fields = {"role": message.type, "content": message.content}
+        if message.name:
+            fields["name"] = message.name
+        if isinstance(message, AIMessage) and message.tool_calls:
+            fields["tool_calls"] = message.tool_calls
+        if isinstance(message, ToolMessage):
+            fields["tool_call_id"] = message.tool_call_id
+        total += _estimate_token_units(fields)
+    return total
+
+
+def prepare_messages(
+    history: list[list[BaseMessage]],
+    current: list[BaseMessage],
+    max_tokens: int,
+    *,
+    system_text: str,
+    tools: list[BaseTool | dict] | None = None,
+    request_max_tokens: int = 16000,
+) -> list[BaseMessage]:
+    """按对话和完整输入两层预算组装模型消息，完整保留当前问题及工具事实。
+
+    参数：history 按时间排列的完整旧轮；current 不可裁剪当前轮；max_tokens 对话估算预算；
+        system_text 本阶段系统提示；tools 仅决策阶段传入的工具或 OpenAI 工具定义；
+        request_max_tokens 包含系统、对话和工具定义的完整输入估算预算，默认 16000，不含输出。
+    返回：list[BaseMessage]，系统消息在首位，其后为裁剪后的完整对话。
+    异常：ContextBudgetExceeded 表示固定提示、工具定义与当前消息无法共同放入预算；
+        TypeError、ValueError 表示工具定义或消息内容无法转换为合法 JSON 数据。
+    """
+    system = SystemMessage(content=system_text)
+    fixed_tokens = _estimate_message_tokens([system])
+    if tools:
+        fixed_tokens += _estimate_token_units([convert_to_openai_tool(tool) for tool in tools])
+    # 固定说明只扣完整输入预算，不能挤占独立的 2000 单位对话预算。
+    available = min(max_tokens, request_max_tokens - fixed_tokens)
+    messages = trim_turns(history, current, available)
+    return [system, *messages]

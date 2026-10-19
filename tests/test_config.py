@@ -13,15 +13,19 @@ from app.config import Settings, settings
 
 @pytest.fixture(autouse=True)
 def configured_chat(monkeypatch: pytest.MonkeyPatch) -> None:
-    """为配置测试提供完整的虚拟账号信息。
+    """只在配置专项测试中清理业务环境，并提供完整虚拟账号信息。
 
     参数:
         monkeypatch: 隔离进程环境变量的测试夹具。
     返回值:
-        None: 将三个必填项写入测试环境。
+        None: 清理已有配置键，随后将三个必填项写入测试环境。
     异常:
         无业务异常。
     """
+    for field in Settings.model_fields:
+        monkeypatch.delenv(field.upper(), raising=False)
+    # 旧预算名称是字段别名，需单独清理，避免覆盖默认预算断言。
+    monkeypatch.delenv("CHAT_TOKEN_BUDGET", raising=False)
     monkeypatch.setenv("CHAT_BASE_URL", "http://test.invalid/v1")
     monkeypatch.setenv("CHAT_MODEL", "test-model")
     monkeypatch.setenv("CHAT_API_KEY", "test-key")
@@ -47,11 +51,13 @@ def test_missing_chat_configuration_fails_at_startup(
     assert any(item["loc"] == (field.lower(),) for item in error.value.errors())
 
 
+@pytest.mark.parametrize("field", ["token_budget", "request_token_budget"])
 @pytest.mark.parametrize("budget", [0, -1])
-def test_token_budget_must_be_positive(budget: int) -> None:
-    """验证上下文预算不能配置为零或负数。
+def test_token_budget_must_be_positive(field: str, budget: int) -> None:
+    """验证对话与完整输入预算都不能配置为零或负数。
 
     参数:
+        field: 被验证的对话预算或完整输入预算字段。
         budget: 不合法的预算值。
     返回值:
         None: 断言配置校验拒绝该值。
@@ -59,7 +65,7 @@ def test_token_budget_must_be_positive(budget: int) -> None:
         AssertionError: 非法预算被接受时抛出。
     """
     with pytest.raises(ValidationError):
-        Settings(_env_file=None, token_budget=budget)
+        Settings(_env_file=None, **{field: budget})
 
 
 def test_default_config(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -77,6 +83,7 @@ def test_default_config(monkeypatch: pytest.MonkeyPatch) -> None:
         "CHAT_MODEL",
         "CHAT_API_KEY",
         "TOKEN_BUDGET",
+        "REQUEST_TOKEN_BUDGET",
         "CHAT_TOKEN_BUDGET",
         "EMBED_BASE_URL",
         "EMBED_MODEL",
@@ -95,6 +102,7 @@ def test_default_config(monkeypatch: pytest.MonkeyPatch) -> None:
     assert conf.chat_model == "test-model"
     assert conf.chat_api_key == "test-key"
     assert conf.token_budget == 2000
+    assert conf.request_token_budget == 16000
 
     assert conf.embed_base_url is None
     assert conf.embed_model is None
@@ -118,6 +126,7 @@ def test_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CHAT_MODEL", "custom-model")
     monkeypatch.setenv("CHAT_API_KEY", "custom-token-123")
     monkeypatch.setenv("TOKEN_BUDGET", "4000")
+    monkeypatch.setenv("REQUEST_TOKEN_BUDGET", "24000")
     monkeypatch.setenv("EMBED_BASE_URL", "http://embed-host:9001")
     monkeypatch.setenv("EMBED_MODEL", "bge-m3")
     monkeypatch.setenv("EMBED_API_KEY", "embed-key-456")
@@ -131,6 +140,8 @@ def test_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
     assert conf.chat_api_key == "custom-token-123"
     assert conf.token_budget == 4000
     assert isinstance(conf.token_budget, int)
+    assert conf.request_token_budget == 24000
+    assert isinstance(conf.request_token_budget, int)
 
     assert conf.embed_base_url == "http://embed-host:9001"
     assert conf.embed_model == "bge-m3"

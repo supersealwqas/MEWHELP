@@ -2,7 +2,7 @@
  * MewHelp 聊天界面控制器：管理本页会话、消息气泡、逐字展示及请求状态。
  * 刷新或新建会话会换用新标识；页面不读取密钥、不保存本地聊天记录。
  */
-import { streamChat } from "./chat-api.mjs";
+import { failurePresentation, streamChat } from "./chat-api.mjs";
 
 const ui = {
   form: document.querySelector("#chat-form"),
@@ -244,11 +244,13 @@ async function sendMessage(event) {
   }
 
   const badges = new Map();
+  const toolStatuses = new Map();
   const toolNames = { query_order: "订单查询", query_product: "商品查询", query_logistics: "物流查询",
     query_faq: "常见问题查询", create_ticket: "人工工单" };
 
   /** 更新同一个调用的徽章；所有文字均作为纯文本展示。 */
   function onToolStatus(status) {
+    toolStatuses.set(status.tool_call_id, status);
     let badge = badges.get(status.tool_call_id);
     if (!badge) {
       badge = document.createElement("span");
@@ -276,26 +278,23 @@ async function sendMessage(event) {
   } catch (error) {
     renderer.flush();
     const stopped = controller.signal.aborted;
+    const presentation = failurePresentation({ error, stopped, toolStatuses: toolStatuses.values() });
     for (const badge of badges.values()) {
       if (["running", "retrying"].includes(badge.dataset.status)) {
         badge.dataset.status = "interrupted";
         badge.textContent += " · 已中断，结果待核实";
       }
     }
-    if (!renderer.hasText()) reply.bubble.textContent = stopped ? "本次回复已停止。" : "这次没能收到回复。";
-    reply.note.textContent = stopped
-      ? "已停止接收；是否保存本轮上下文，以服务端实际完成情况为准。"
-      : "回复未完成；请重试，或新建会话后继续。";
+    if (!renderer.hasText()) reply.bubble.textContent = presentation.status;
+    reply.note.textContent = presentation.note;
     reply.note.hidden = false;
-    ui.status.textContent = stopped ? "已停止，可编辑问题后重新发送" : "发送未完成，请稍后重试";
+    ui.status.textContent = presentation.status;
     if (!stopped) {
-      ui.feedback.textContent = error instanceof TypeError
-        ? "连接失败，请确认后端服务仍在运行，再重新发送。"
-        : (error.message || "请求失败，请稍后重试。");
+      ui.feedback.textContent = presentation.feedback;
       ui.feedback.hidden = false;
     }
-    // 不自动重试，避免在连接状态不确定时重复写入服务端会话。
-    ui.input.value = message;
+    // 工单已开始或服务端明确不可重试时，不自动回填建单原话。
+    ui.input.value = presentation.restoreMessage ? message : "";
   } finally {
     reply.article.classList.remove("is-pending", "is-streaming");
     activeController = null;

@@ -6,8 +6,21 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from app.config import Settings, settings
 
 
-def create_database(config: Settings = settings, *, database: str | None = None) -> tuple[AsyncEngine, async_sessionmaker[AsyncSession]]:
-    """创建连接资源。参数：config 配置，database 可覆盖库名；返回：引擎及会话工厂；异常：密码缺失时 ValueError。"""
+def create_database(config: Settings | None = None, *, database: str | None = None) -> tuple[AsyncEngine, async_sessionmaker[AsyncSession]]:
+    """创建异步数据库连接资源，不在此处连接数据库。
+
+    参数:
+        config: 显式配置；为 None 时使用调用时的模块配置。
+        database: 可选数据库名；为空时使用配置中的业务数据库名。
+    返回值:
+        tuple[AsyncEngine, async_sessionmaker[AsyncSession]]: 引擎及会话工厂。
+    异常:
+        ValueError: MySQL 密码缺失时抛出。
+        sqlalchemy.exc.ArgumentError、ImportError: 引擎配置或驱动不可用时抛出。
+    """
+    # 运行时取值，避免函数默认参数永久保留导入时的旧配置。
+    if config is None:
+        config = settings
     password = config.mysql_password.get_secret_value()
     if not password:
         raise ValueError("请先在 .env 配置 MYSQL_PASSWORD 并初始化 MySQL")

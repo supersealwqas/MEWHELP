@@ -2,7 +2,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { setImmediate } from "node:timers/promises";
-import { streamChat } from "../../app/static/chat-api.mjs";
+import { failurePresentation, streamChat } from "../../app/static/chat-api.mjs";
 
 const encoder = new TextEncoder();
 const headers = { "Content-Type": "text/event-stream; charset=utf-8" };
@@ -116,6 +116,62 @@ test("流中错误会失败，同时保留已经交给页面的部分回复", as
   assert.deepEqual(deltas, ["部分内容"]);
 });
 
+/** 无参数；返回 Promise<void>；错误帧的安全重试标志丢失时断言失败。 */
+test("保留服务端错误的 retry_safe，同时保留已收到的工单号", async function retrySafetySignal() {
+  const deltas = [];
+  const response = makeResponse([
+    'data: {"delta":"工单 T-123 已创建。"}\n\n',
+    'event: error\ndata: {"error":"后续回复失败，请核实工单。","retry_safe":false}\n\n',
+  ]);
+  await assert.rejects(receive(response, deltas), {
+    message: "后续回复失败，请核实工单。", retry_safe: false,
+  });
+  assert.deepEqual(deltas, ["工单 T-123 已创建。"]);
+});
+
+// 工单已经开始或成功时，断流和用户取消都不能鼓励再次提交原话。
+for (const status of ["running", "retrying", "succeeded"]) {
+  for (const stopped of [false, true]) {
+    /** 无参数；返回 void；未知或成功的写操作仍被提示重试时断言失败。 */
+    test(`工单 ${status} 后${stopped ? "取消" : "断流"}先核实结果且不回填`, function uncertainTicket() {
+      const presentation = failurePresentation({
+        error: new TypeError("连接失败，请重试。"), stopped,
+        toolStatuses: [{ name: "create_ticket", status }],
+      });
+      assert.equal(presentation.restoreMessage, false);
+      assert.match(presentation.note, /核实.*结果|结果.*核实/);
+      assert.match(presentation.note, /避免重复/);
+      assert.doesNotMatch(`${presentation.note}${presentation.status}${presentation.feedback}`, /重试|重新发送|新建会话/);
+    });
+  }
+}
+
+/** 无参数；返回 void；服务端明确不可重试但页面仍鼓励重复提交时断言失败。 */
+test("服务端 retry_safe=false 优先于缺失或失败徽章", function explicitUnsafeRetry() {
+  for (const toolStatuses of [[], [{ name: "create_ticket", status: "failed" }]]) {
+    const presentation = failurePresentation({
+      error: Object.assign(new Error("请重试。"), { retry_safe: false }),
+      stopped: false, toolStatuses,
+    });
+    assert.equal(presentation.restoreMessage, false);
+    assert.match(presentation.status, /核实/);
+    assert.doesNotMatch(`${presentation.note}${presentation.feedback}`, /重试|重新发送|新建会话/);
+  }
+});
+
+/** 无参数；返回 void；普通失败或确定未执行的工单被禁止手动重试时断言失败。 */
+test("普通失败与已确定失败的工具仍可回填后手动重试", function ordinaryFailure() {
+  for (const toolStatuses of [[], [{ name: "query_order", status: "succeeded" }],
+    [{ name: "create_ticket", status: "failed" }]]) {
+    const presentation = failurePresentation({
+      error: new Error("服务暂时不可用。"), stopped: false, toolStatuses,
+    });
+    assert.equal(presentation.restoreMessage, true);
+    assert.match(presentation.status, /重试/);
+    assert.equal(presentation.feedback, "服务暂时不可用。");
+  }
+});
+
 // 参数化覆盖非法帧：错误条件必须显式报告，不能当作正常完成。
 for (const [name, frame, pattern] of [
   ["无效 JSON", 'data: not-json\n\n', /无法解析/],
@@ -171,4 +227,39 @@ test("透传请求取消，让页面恢复输入状态", async function abortedR
     options.signal.throwIfAborted();
     return makeResponse([]);
   }), { name: "AbortError" });
+});
+
+// 状态帧尚未送达不代表服务端没有开始写入；这些传输故障必须保守提示核实。
+for (const mode of ["fetch-disconnect", "early-eof", "broken-status"]) {
+  /** 无参数；返回 Promise<void>；没有状态帧就鼓励重复提交时断言失败。 */
+  test(`无工具徽章时 ${mode} 也不回填建单原话`, async function missingStatus() {
+    await assert.rejects(streamChat({
+      sessionId: "s", message: "请创建工单", signal: new AbortController().signal,
+      /** 无有效增量；返回 void；收到意外文字时断言失败。 */
+      onDelta() { assert.fail("不应收到文字"); },
+    }, async function disconnectedFetch() {
+      // 无参数；返回本地响应；模拟真实 fetch 的连接错误。
+      if (mode === "fetch-disconnect") throw new TypeError("连接失败");
+      return makeResponse(mode === "early-eof" ? [] : [
+        'event: tool_status\ndata: {"name":"create_ticket","status":"running"}\n\n',
+      ]);
+    }), function checkUnsafe(error) {
+      // 参数 error 为客户端异常；返回 boolean；提示可重试时断言失败。
+      const presentation = failurePresentation({ error, stopped: false });
+      assert.equal(presentation.restoreMessage, false);
+      assert.doesNotMatch(presentation.feedback, /重试|重新发送/);
+      return true;
+    });
+  });
+}
+
+/** 无参数；返回 Promise<void>；明确安全的服务端错误被客户端错误覆盖时断言失败。 */
+test("服务端明确允许重试时保留原话回填", async function safeRetry() {
+  await assert.rejects(receive(makeResponse([
+    'event: error\ndata: {"error":"暂时不可用","retry_safe":true}\n\n',
+  ])), function checkSafe(error) {
+    // 参数 error 为服务端异常；返回 boolean；丢失明确安全状态时断言失败。
+    assert.equal(failurePresentation({ error, stopped: false }).restoreMessage, true);
+    return true;
+  });
 });
