@@ -13,9 +13,11 @@ from app.knowledge.schemas import (
     ChunkDraft,
     ChunkSnapshot,
     CompletedTurn,
+    EvidenceItem,
     ExtractedQA,
     ExtractionBatch,
     Publication,
+    RelationDecision,
     StagedQA,
     StoreFrame,
     VectorHit,
@@ -555,3 +557,50 @@ class MemoryVectorIndex:
     async def aclose(self) -> None:
         """标记索引关闭。参数：无；返回：None；异常：无。"""
         self.closed = True
+
+
+class ScriptedKnowledgeModel:
+    """返回预置抽取/关系结果的知识模型替身。"""
+
+    def __init__(
+        self,
+        *,
+        extract_qas: list[ExtractedQA] | None = None,
+        relation_decisions: list[RelationDecision] | None = None,
+        extract_error: Exception | None = None,
+        relation_error: Exception | None = None,
+    ) -> None:
+        """保存预置结果与异常。
+
+        参数:
+            extract_qas: 抽取返回的候选知识。
+            relation_decisions: 关系判定返回。
+            extract_error: 抽取时抛出的异常。
+            relation_error: 关系判定时抛出的异常。
+        返回值:
+            None
+        异常:
+            无
+        """
+        self.extract_qas = list(extract_qas or [])
+        self.relation_decisions = list(relation_decisions or [])
+        self.extract_error = extract_error
+        self.relation_error = relation_error
+        self.batches: list[ExtractionBatch] = []
+        self.relation_inputs: list[tuple[list[EvidenceItem], list[tuple[str, str]]]] = []
+
+    async def extract(self, batch: ExtractionBatch) -> list[ExtractedQA]:
+        """记录批次并返回预置 QA。参数：批次；返回：QA；异常：预置异常。"""
+        self.batches.append(batch)
+        if self.extract_error is not None:
+            raise self.extract_error
+        return list(self.extract_qas)
+
+    async def relate(
+        self, items: list[EvidenceItem], pairs: list[tuple[str, str]]
+    ) -> list[RelationDecision]:
+        """记录输入并返回预置关系。参数：证据与 pair；返回：决策；异常：预置异常。"""
+        self.relation_inputs.append((items, pairs))
+        if self.relation_error is not None:
+            raise self.relation_error
+        return list(self.relation_decisions)

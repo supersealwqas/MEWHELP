@@ -1,0 +1,6 @@
+{
+  "min_score": 0.8028108360242129,
+  "embedding_revision": "bge-m3:flagembedding-1.4.2:fp16:cls:normalized:max2048:v1",
+  "prompt_version": "ch03-relation-v1",
+  "calibration_digest": "2e5209563b58bdd58dadfb604e1d71d532c37a29be3b22896fb4939b9f323d2c"
+}

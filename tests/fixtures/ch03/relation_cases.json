@@ -1,0 +1,171 @@
+{
+  "items": [
+    {
+      "ref": "shipping_6",
+      "origin": "document",
+      "text": {
+        "category": "开票与配送",
+        "questions": "运费与包邮",
+        "answer": "未满 99 元收 6 元基础运费。"
+      },
+      "source_refs": ["data/kb/billing-shipping.md"]
+    },
+    {
+      "ref": "shipping_10",
+      "origin": "conversation",
+      "text": {
+        "category": "开票与配送",
+        "questions": "运费怎么算",
+        "answer": "未满 99 元收 10 元运费。"
+      },
+      "source_refs": ["qa:old-shipping"]
+    },
+    {
+      "ref": "shipping_6_alias",
+      "origin": "document",
+      "text": {
+        "category": "商品与购物 FAQ",
+        "questions": "运费怎么算",
+        "answer": "满 99 元包邮，未满收 6 元运费。"
+      },
+      "source_refs": ["data/kb/product-faq.md"]
+    },
+    {
+      "ref": "remote_fee",
+      "origin": "document",
+      "text": {
+        "category": "开票与配送",
+        "questions": "偏远地区运费",
+        "answer": "偏远地区加收 12 元附加运费，该附加运费不参与包邮。"
+      },
+      "source_refs": ["data/kb/billing-shipping.md"]
+    },
+    {
+      "ref": "remote_free",
+      "origin": "conversation",
+      "text": {
+        "category": "开票与配送",
+        "questions": "偏远地区运费",
+        "answer": "偏远地区也包邮。"
+      },
+      "source_refs": ["qa:remote-free"]
+    },
+    {
+      "ref": "refund_arrival",
+      "origin": "document",
+      "text": {
+        "category": "退货退款政策",
+        "questions": "退款时效",
+        "answer": "到账时效以平台售后规则为准，不承诺具体到账天数。"
+      },
+      "source_refs": ["data/kb/returns-policy.md"]
+    },
+    {
+      "ref": "refund_processing",
+      "origin": "document",
+      "text": {
+        "category": "售后手册",
+        "questions": "常见问题处理时限",
+        "answer": "退款处理时限为 3 个工作日。"
+      },
+      "source_refs": ["data/kb/after-sales-manual.md"]
+    },
+    {
+      "ref": "member_discount",
+      "origin": "document",
+      "text": {
+        "category": "会员权益",
+        "questions": "会员等级",
+        "answer": "银卡享商品 9 折，金卡享商品 95 折。"
+      },
+      "source_refs": ["data/kb/member-benefits.md"]
+    },
+    {
+      "ref": "member_discount_alias",
+      "origin": "conversation",
+      "text": {
+        "category": "会员权益",
+        "questions": "会员有什么折扣",
+        "answer": "银卡 9 折，金卡 95 折。"
+      },
+      "source_refs": ["qa:member-alias"]
+    },
+    {
+      "ref": "lite",
+      "origin": "document",
+      "text": {
+        "category": "商品规格手册",
+        "questions": "智能猫砂盆 Lite",
+        "answer": "Lite 不含 App 联网功能，也没有 App 远程监控与健康记录。"
+      },
+      "source_refs": ["data/kb/product-specs.md"]
+    },
+    {
+      "ref": "pro",
+      "origin": "document",
+      "text": {
+        "category": "商品规格手册",
+        "questions": "智能猫砂盆 Pro",
+        "answer": "Pro 支持 App 远程监控与健康记录。"
+      },
+      "source_refs": ["data/kb/product-specs.md"]
+    },
+    {
+      "ref": "unrelated",
+      "origin": "document",
+      "text": {
+        "category": "商品规格手册",
+        "questions": "猫砂盆清理",
+        "answer": "猫砂盆建议每 5 至 7 天倾倒一次废砂盒。"
+      },
+      "source_refs": ["data/kb/product-specs.md"]
+    }
+  ],
+  "cases": [
+    {
+      "left": "shipping_6",
+      "right": "shipping_10",
+      "expected": ["conflict"]
+    },
+    {
+      "left": "shipping_6",
+      "right": "shipping_6_alias",
+      "expected": ["same"]
+    },
+    {
+      "left": "shipping_6",
+      "right": "remote_fee",
+      "expected": ["complementary"]
+    },
+    {
+      "left": "remote_fee",
+      "right": "remote_free",
+      "expected": ["conflict"]
+    },
+    {
+      "left": "refund_arrival",
+      "right": "refund_processing",
+      "expected": ["complementary", "unrelated"]
+    },
+    {
+      "left": "lite",
+      "right": "pro",
+      "expected": ["complementary", "unrelated"]
+    },
+    {
+      "left": "member_discount",
+      "right": "member_discount_alias",
+      "expected": ["same"]
+    },
+    {
+      "left": "member_discount",
+      "right": "shipping_6",
+      "expected": ["unrelated"]
+    },
+    {
+      "left": "shipping_6",
+      "right": "unrelated",
+      "expected": ["unrelated"]
+    }
+  ]
+}
