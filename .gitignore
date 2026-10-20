@@ -21,3 +21,9 @@ build/
 /learning-guide/
 *.ipynb
 .ipynb_checkpoints/
+
+# 本地模型权重（约 11GB，不入库；app/models/ 为业务代码不受影响）
+/models/
+
+# 知识库运行时缓存；manifest 与校准策略仍需正常跟踪
+/data/knowledge/cache/

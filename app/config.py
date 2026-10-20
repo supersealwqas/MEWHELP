@@ -57,6 +57,52 @@ class Settings(BaseSettings):
     tool_max_retries: int = Field(default=1, ge=0, le=1, description="工具最大故障重试次数")
     tool_retry_delay_seconds: float = Field(default=0.2, ge=0, le=5, description="可取消的重试等待秒数")
 
+    # CH03 知识库与 Dense 检索配置。模型与向量库名称是本章固定选型，不在此处提供降级开关。
+    knowledge_model_path: str = Field(
+        default="models/bge-m3",
+        min_length=1,
+        description="本地 BGE-M3 模型目录，必须包含权重与 tokenizer，不在请求中联网下载",
+    )
+    milvus_uri: str = Field(
+        default="http://127.0.0.1:19530",
+        min_length=1,
+        description="已有 Milvus 2.4.x 实例连接地址，不升级或清理原项目资源",
+    )
+    milvus_database: str = Field(
+        default="mewhelp_ch03",
+        min_length=1,
+        description="本章独立 Milvus 数据库，隔离于原项目默认库",
+    )
+    milvus_collection: str = Field(
+        default="knowledge",
+        min_length=1,
+        description="本章 Milvus 集合名，初始化前必须校验所有权与 schema",
+    )
+    milvus_token: SecretStr = Field(
+        default=SecretStr(""),
+        description="Milvus 鉴权令牌；本地无鉴权时为空，日志与报告中隐藏",
+    )
+    knowledge_test_database: str = Field(
+        default="mewhelp_ch03_test",
+        min_length=1,
+        description="CH03 真实集成测试专用 MySQL 数据库，不重建 CH02 测试库",
+    )
+    milvus_test_database: str = Field(
+        default="mewhelp_ch03_test",
+        min_length=1,
+        description="CH03 真实集成测试专用 Milvus 数据库",
+    )
+    knowledge_policy_path: str = Field(
+        default="data/knowledge/retrieval-policy.json",
+        min_length=1,
+        description="在线 Dense 检索的校准策略文件路径",
+    )
+    knowledge_relation_policy_path: str = Field(
+        default="data/knowledge/relation-policy.json",
+        min_length=1,
+        description="离线知识关系判定的校准策略文件路径",
+    )
+
     # 预留向量嵌入模型配置
     embed_base_url: str | None = Field(
         default=None,
