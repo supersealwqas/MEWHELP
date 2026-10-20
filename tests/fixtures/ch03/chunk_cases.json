@@ -1,0 +1,14 @@
+{
+  "sentence_overlap": {
+    "source": "# 甲\n## 乙\n\n第一句。第二句。第三句。\n",
+    "target_tokens": 21,
+    "overlap_tokens": 4,
+    "expected_answers": [
+      "第一句。第二句。",
+      "第二句。第三句。"
+    ]
+  },
+  "large_table_rows": 80,
+  "crlf_source": "# 甲\r\n## 乙\r\n\r\n第一句。第二句。第三句。\r\n",
+  "oversize_characters": 1601
+}

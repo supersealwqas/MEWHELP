@@ -1,0 +1,54 @@
+{
+  "documents": [
+    {
+      "path": "product-faq.md",
+      "content_type": "faq",
+      "key_sections": [
+        "运费怎么算",
+        "会员运费权益",
+        "价格保护怎么申请",
+        "猫窝是否可以机洗"
+      ]
+    },
+    {
+      "path": "returns-policy.md",
+      "content_type": "policy",
+      "key_sections": [
+        "适用范围",
+        "退款时效",
+        "换货运费",
+        "退换货运费承担",
+        "不支持退货的商品"
+      ]
+    },
+    {
+      "path": "billing-shipping.md",
+      "content_type": "policy",
+      "key_sections": [
+        "运费与包邮"
+      ]
+    },
+    {
+      "path": "member-benefits.md",
+      "content_type": "policy",
+      "key_sections": [
+        "会员等级",
+        "积分怎么用"
+      ]
+    },
+    {
+      "path": "after-sales-manual.md",
+      "content_type": "manual",
+      "key_sections": [
+        "保修说明",
+        "维修寄修流程",
+        "会员专属售后权益"
+      ]
+    },
+    {
+      "path": "product-specs.md",
+      "content_type": "manual",
+      "key_sections": []
+    }
+  ]
+}

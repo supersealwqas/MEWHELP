@@ -27,3 +27,4 @@ build/
 
 # 知识库运行时缓存；manifest 与校准策略仍需正常跟踪
 /data/knowledge/cache/
+/.pytest-tmp/

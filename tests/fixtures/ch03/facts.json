@@ -1,0 +1,151 @@
+{
+  "conflict_history": "2026-10-19 核查发现 product-faq.md 与 ch03 合成对话使用 10 元，billing-shipping.md 与 member-benefits.md 使用 6 元；用户裁定按配送规则统一为 6 元，本章同步后 10 元不得继续作为现行事实。",
+  "cases": [
+    {
+      "id": "shipping_base_fee",
+      "source": "billing-shipping.md",
+      "section": "开票与配送 / 运费与包邮",
+      "must_include": [
+        "未满收取 6 元基础运费",
+        "满 99 元包邮"
+      ],
+      "must_not_include": [
+        "10 元",
+        "10元"
+      ]
+    },
+    {
+      "id": "remote_shipping_fee",
+      "source": "billing-shipping.md",
+      "section": "开票与配送 / 运费与包邮",
+      "must_include": [
+        "加收 12 元附加运费",
+        "该附加运费不参与包邮"
+      ],
+      "must_not_include": [
+        "12 元参与包邮"
+      ]
+    },
+    {
+      "id": "refund_arrival",
+      "source": "returns-policy.md",
+      "section": "退货退款政策 / 无理由退货 / 退款时效",
+      "must_include": [
+        "到账时效以平台售后规则为准",
+        "不承诺具体到账天数"
+      ],
+      "must_not_include": [
+        "3 个工作日到账",
+        "三个工作日到账"
+      ]
+    },
+    {
+      "id": "member_discount",
+      "source": "member-benefits.md",
+      "section": "会员权益 / 会员等级",
+      "must_include": [
+        "银卡享商品 9 折",
+        "金卡享商品 95 折"
+      ],
+      "must_not_include": [
+        "银卡享商品 95 折",
+        "金卡享商品 9 折"
+      ]
+    },
+    {
+      "id": "member_shipping_benefit",
+      "source": "product-faq.md",
+      "section": "商品与购物 FAQ / 会员运费权益",
+      "must_include": [
+        "金卡会员每月享 3 次免运费权益",
+        "银卡会员享 1 次",
+        "不与偏远地区附加运费冲抵"
+      ],
+      "must_not_include": [
+        "金卡会员每月享 1 次",
+        "银卡会员享 3 次",
+        "抵扣偏远地区附加运费"
+      ]
+    },
+    {
+      "id": "model_difference",
+      "source": "product-specs.md",
+      "section": "商品规格手册 / 智能猫砂盆 Lite(型号 MH-LP50)",
+      "must_include": [
+        "不含 App 联网功能",
+        "Lite 无 App 远程监控与健康记录"
+      ],
+      "must_not_include": [
+        "Lite 支持 App 远程监控",
+        "Lite 含 App 联网"
+      ]
+    },
+    {
+      "id": "cleaning_parts_specs",
+      "source": "product-specs.md",
+      "section": "商品规格手册 / 四季保暖猫窝(型号 MH-NEST20)",
+      "must_include": [
+        "外套可手洗",
+        "内部垫芯不可机洗"
+      ],
+      "must_not_include": [
+        "内部垫芯可机洗",
+        "外套不可手洗"
+      ]
+    },
+    {
+      "id": "cleaning_cover_faq",
+      "source": "product-faq.md",
+      "section": "商品与购物 FAQ / 猫窝是否可以机洗",
+      "must_include": [
+        "猫窝外套可以机洗",
+        "内部垫芯不可机洗"
+      ],
+      "must_not_include": [
+        "内部垫芯可以机洗"
+      ]
+    },
+    {
+      "id": "price_protection_start",
+      "source": "product-faq.md",
+      "section": "商品与购物 FAQ / 价格保护怎么申请",
+      "must_include": [
+        "自下单时间起算",
+        "签收之日起算"
+      ],
+      "must_not_include": [
+        "价保的 7 天自签收起算"
+      ]
+    },
+    {
+      "id": "refund_processing_vs_arrival",
+      "source": "after-sales-manual.md",
+      "section": "售后手册 / 常见问题处理时限",
+      "must_include": [
+        "退款",
+        "3 个工作日"
+      ],
+      "must_not_include": []
+    },
+    {
+      "id": "shipping_conflict_resolved",
+      "source": "product-faq.md",
+      "section": "商品与购物 FAQ / 运费怎么算",
+      "must_include": [
+        "未满收取 6 元运费",
+        "满 99 元包邮"
+      ],
+      "must_not_include": [
+        "10 元",
+        "10元"
+      ]
+    }
+  ],
+  "seed_files": [
+    "app/db/seed.py",
+    "sql/ch02-seed.sql",
+    "sql/ch03-seed.sql",
+    "sql/README.md",
+    "data/kb/product-faq.md"
+  ]
+}
