@@ -83,6 +83,7 @@ def milvus_test_config() -> Settings:
         pydantic.ValidationError: 真实 .env 配置不合法时抛出。
     """
     config = Settings(_env_file=Path(__file__).resolve().parents[2] / ".env")
+    assert config.milvus_test_database == "mewhelp_ch03_test"
     return config.model_copy(update={"milvus_database": config.milvus_test_database})
 
 

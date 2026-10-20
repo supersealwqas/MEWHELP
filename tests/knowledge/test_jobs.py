@@ -6,6 +6,9 @@ import json
 import tempfile
 from pathlib import Path
 
+import pytest
+
+from app.knowledge.chunking import ChunkingError
 from app.knowledge.jobs import KnowledgeJobs, _batch_from_turns
 from app.knowledge.llm import KnowledgeModelError
 from app.knowledge.lifecycle import KnowledgeLifecycle
@@ -219,6 +222,42 @@ async def test_model_failure_keeps_batch_recoverable() -> None:
     report = await jobs.recover_pending()
     assert report.batch_count == 1
     assert report.kept == 1
+
+
+async def test_import_documents_is_atomic_on_chunk_failure() -> None:
+    """后续文档切分失败时不发布前面的文档。参数：无；返回：None；异常：无。"""
+    _TEMP_BASE.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="ch03-atomic-", dir=_TEMP_BASE) as temp:
+        root = Path(temp)
+        (root / "good.md").write_text("# 甲\n\n## 乙\n\n正常知识。\n", encoding="utf-8")
+        (root / "bad.md").write_text("# 甲\n\n## 乙\n\n" + "长" * 1601 + "\n", encoding="utf-8")
+        (root / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "documents": [
+                        {"path": "good.md", "content_type": "faq", "key_sections": []},
+                        {"path": "bad.md", "content_type": "faq", "key_sections": []},
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        jobs, store, _, _ = _jobs([], [])
+        with pytest.raises(ChunkingError):
+            await jobs.import_documents(root / "manifest.json")
+        async with store.writer() as writer:
+            assert (await writer.frame()).chunks == []
+
+
+async def test_over_turn_input_budget_is_rejected_before_batch() -> None:
+    """单轮超过输入预算时在预留批次前失败。参数：无；返回：None；异常：无。"""
+    turn = _turn(1, 1, "长" * 9000, "答" * 9000)
+    jobs, store, _, model = _jobs([turn], [])
+    with pytest.raises(ValueError, match="单轮"):
+        await jobs.mine_once()
+    assert store._batches == {}
+    assert model.batches == []
 
 
 async def test_sync_pending_marks_done() -> None:

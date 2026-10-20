@@ -26,6 +26,7 @@ from app.knowledge.sync import VectorSynchronizer
 
 _MAX_CONVERSATIONS_PER_BATCH = 20
 _TURN_SCAN_LIMIT = 200
+_BATCH_INPUT_CHAR_BUDGET = 8000
 
 
 def _turns_digest(turns) -> str:
@@ -48,6 +49,54 @@ def _batch_from_turns(turns, upper_id: int) -> ExtractionBatch:
         prompt_version=EXTRACTION_PROMPT_VERSION,
         turns=ordered,
     )
+
+
+def _estimate_turns(turns) -> int:
+    """估算轮次序列的字符量。参数：轮次；返回：字符数；异常：无。"""
+    return len(
+        json.dumps(
+            [turn.model_dump(mode="json") for turn in turns],
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+
+
+def _split_batches(turns) -> list[list]:
+    """按会话边界、20 会话和输入预算切分批次。参数：轮次；返回：批次轮次；异常：ValueError。"""
+    grouped: dict[int, list] = {}
+    for turn in turns:
+        grouped.setdefault(turn.conversation_id, []).append(turn)
+    batches: list[list] = []
+    current: list = []
+
+    def flush() -> None:
+        """提交当前批次。参数：无；返回：None；异常：无。"""
+        nonlocal current
+        if current:
+            batches.append(current)
+            current = []
+
+    for group in grouped.values():
+        current_conversations = {turn.conversation_id for turn in current}
+        group_conversations = {turn.conversation_id for turn in group}
+        if current and (
+            len(current_conversations | group_conversations)
+            > _MAX_CONVERSATIONS_PER_BATCH
+            or _estimate_turns(current + group) > _BATCH_INPUT_CHAR_BUDGET
+        ):
+            flush()
+        if _estimate_turns(group) > _BATCH_INPUT_CHAR_BUDGET:
+            for turn in group:
+                if _estimate_turns([turn]) > _BATCH_INPUT_CHAR_BUDGET:
+                    raise ValueError(f"单轮超过知识模型输入预算: {turn.message_id}")
+                if current and _estimate_turns(current + [turn]) > _BATCH_INPUT_CHAR_BUDGET:
+                    flush()
+                current.append(turn)
+        else:
+            current.extend(group)
+    flush()
+    return batches
 
 
 class KnowledgeJobs:
@@ -87,11 +136,19 @@ class KnowledgeJobs:
         """导入清单内全部文档并同步向量。参数：清单路径；返回：报告；异常：切分/模型/存储错误。"""
         root = manifest_path.parent
         specs = load_manifest(manifest_path, root=root)
+        # 先完成全部解析/切分；任一文件失败时不发布任何部分文档。
+        prepared_drafts = []
+        source_keys: list[str] = []
+        for spec in specs:
+            source = spec.path.read_text(encoding="utf-8")
+            prepared_drafts.extend(
+                chunk_markdown(source, spec, self.encoder.count_tokens)
+            )
+            source_keys.append(spec.source_key)
         async with self.store.writer() as writer:
-            for spec in specs:
-                source = spec.path.read_text(encoding="utf-8")
-                drafts = chunk_markdown(source, spec, self.encoder.count_tokens)
-                await self.lifecycle.publish_documents(writer, drafts, [spec.source_key])
+            await self.lifecycle.publish_documents(
+                writer, prepared_drafts, source_keys
+            )
             sync = await self.synchronizer.run(writer)
         return JobReport(
             batch_count=0,
@@ -118,21 +175,10 @@ class KnowledgeJobs:
         """领取未分配轮次并按会话边界抽取。参数：写入器；返回：批次数/抽取数/暂存 ID；异常：模型/存储错误。"""
         upper = await writer.source_upper_id()
         turns = await writer.unassigned_turns(upper, 0, _TURN_SCAN_LIMIT)
-        grouped: dict[int, list] = {}
-        for turn in turns:
-            grouped.setdefault(turn.conversation_id, []).append(turn)
         batches = 0
         extracted = 0
         staged_ids: list[int] = []
-        conversations = list(grouped.values())
-        for start in range(0, len(conversations), _MAX_CONVERSATIONS_PER_BATCH):
-            selected = [
-                turn
-                for group in conversations[start : start + _MAX_CONVERSATIONS_PER_BATCH]
-                for turn in group
-            ]
-            if not selected:
-                continue
+        for selected in _split_batches(turns):
             batch = _batch_from_turns(selected, upper)
             reserved = await writer.reserve_batch(batch)
             qas = await self.model.extract(reserved)

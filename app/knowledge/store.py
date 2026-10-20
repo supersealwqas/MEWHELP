@@ -139,11 +139,6 @@ class KnowledgeStore:
         finally:
             await lease.release()
 
-    async def writer_for_test(self) -> "KnowledgeWriter":
-        """仅供显式集成测试创建写入器。参数：无；返回：写入器；异常：与 writer 相同。"""
-        lease = await MySqlWriteLease.acquire(self._lease_engine)
-        return KnowledgeWriter(self._factory, lease)
-
     async def get_chunks(self, ids: list[int]) -> list[ChunkSnapshot]:
         """按主键读取知识快照。参数：主键列表；返回：快照；异常：无。"""
         if not ids:
@@ -346,7 +341,7 @@ class KnowledgeWriter:
             if await self._token(session) != change.expected_token:
                 raise SnapshotChanged("知识库快照已变化，拒绝发布")
 
-            rows_by_id: dict[int, KnowledgeChunk] = {}
+            affected_rows: list[KnowledgeChunk] = []
             affected_sources: set[str] = set(change.replace_sources)
 
             for draft in change.drafts:
@@ -395,7 +390,7 @@ class KnowledgeWriter:
                         existing.vector_id = None
                     row = existing
                 affected_sources.add(draft.source_key)
-                rows_by_id[row.id] = row
+                affected_rows.append(row)
 
             await session.flush()
 
@@ -429,7 +424,7 @@ class KnowledgeWriter:
                 row.vector_id = None
                 row.vectorize_status = "pending"
                 affected_sources.add(row.source_key)
-                rows_by_id[row.id] = row
+                affected_rows.append(row)
 
             for stage_change in change.stage_changes:
                 staged = await session.scalar(
@@ -459,11 +454,10 @@ class KnowledgeWriter:
             for source_key in affected_sources:
                 await self._repair_pointers(session, source_key)
 
-            return [
-                _snapshot_from_row(row)
-                for identifier, row in rows_by_id.items()
-                if row.id is not None
-            ]
+            result_rows = {
+                row.id: row for row in affected_rows if row.id is not None
+            }
+            return [_snapshot_from_row(row) for row in result_rows.values()]
 
     async def mark_vectorized(self, snapshot: ChunkSnapshot) -> bool:
         """条件回填向量完成状态。参数：已编码快照；返回：是否成功；异常：存储异常。"""

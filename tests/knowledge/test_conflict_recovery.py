@@ -190,6 +190,48 @@ async def test_one_sided_rerun_and_new_alias_cannot_unquarantine() -> None:
     assert (await _frame(store)).staged == frame.staged
 
 
+async def test_uncertain_candidate_is_not_published() -> None:
+    """关系不确定的候选留在 extracted，不发布。参数：无；返回：None；异常：无。"""
+    store = MemoryKnowledgeStore(
+        staged=[
+            _staged(1, "模棱两可的问题", answer="答案一。"),
+            _staged(2, "模棱两可的问题", answer="答案二。"),
+        ]
+    )
+    model = ScriptedKnowledgeModel(
+        relation_decisions=[_decision("staged:1", "staged:2", "uncertain")]
+    )
+    async with store.writer() as writer:
+        await _lifecycle(model).reconcile_staging(writer)
+    frame = await _frame(store)
+    assert frame.chunks == []
+    assert all(row.status == "extracted" for row in frame.staged)
+
+
+async def test_published_conflict_requarantines_kept_staging() -> None:
+    """已发布 QA 被新候选推翻时，原 kept 暂存同事务回到隔离组。参数：无；返回：None；异常：无。"""
+    chunk = _snapshot(10, _text(answer="偏远地区包邮。"))
+    store = MemoryKnowledgeStore(
+        snapshots=[chunk],
+        staged=[
+            _staged(1, "偏远地区包邮吗", answer="偏远地区包邮。", status="kept", knowledge_id=10),
+            _staged(2, "偏远地区包邮吗", answer="偏远地区不包邮。"),
+        ],
+    )
+    model = ScriptedKnowledgeModel(
+        relation_decisions=[_decision("staged:2", "chunk:10", "conflict")]
+    )
+    async with store.writer() as writer:
+        await _lifecycle(model).reconcile_staging(writer)
+    frame = await _frame(store)
+    published = next(row for row in frame.chunks if row.id == 10)
+    kept = next(row for row in frame.staged if row.id == 1)
+    new = next(row for row in frame.staged if row.id == 2)
+    assert published.is_active is False
+    assert kept.status == "extracted" and kept.conflict_group
+    assert new.status == "extracted" and new.conflict_group == kept.conflict_group
+
+
 async def test_document_not_covering_group_does_not_release_it() -> None:
     """文档不覆盖隔离组时不能解封。参数：无；返回：None；异常：无。"""
     store = MemoryKnowledgeStore(

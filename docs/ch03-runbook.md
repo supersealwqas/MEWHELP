@@ -5,7 +5,8 @@
 - Python 3.12、uv；本地 BGE-M3 位于 `models/bge-m3`，不重复下载。
 - MySQL 8.4（Compose，映射 `127.0.0.1:3307`）；应用库 `mewhelp`。
 - 已有 Milvus 2.4.10（`127.0.0.1:19530`）；本项目只用独立数据库 `mewhelp_ch03` 的 `knowledge` 集合，不触碰原项目数据。
-- 测试库：MySQL `mewhelp_ch03_test`、Milvus `mewhelp_ch03_test`。
+- 测试库：MySQL `mewhelp_ch03_test`、Milvus `mewhelp_ch03_test`；代码会同时校验两个库名，拒绝半边测试半边应用。
+- 空数据卷首次启动 MySQL 时，`docker/mysql/init/02-ch03-test-db.sql` 自动创建测试库并授权；已有数据卷需由管理员执行该文件中的语句，不要删除已有数据库。
 - 先复制 `.env.example` 到 `.env` 并填写本地凭据；不要提交真实 `.env`。
 
 ## 测试库流程

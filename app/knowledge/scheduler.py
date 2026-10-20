@@ -8,11 +8,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timedelta
 from typing import Awaitable, Callable
 from zoneinfo import ZoneInfo
 
 _BEIJING = ZoneInfo("Asia/Shanghai")
+_LOGGER = logging.getLogger(__name__)
 _SLEEP_CHUNK_SECONDS = 60.0
 
 
@@ -75,9 +77,13 @@ async def run_schedule(
             break
         try:
             await job()
-        except Exception:
+        except Exception as error:
+            _LOGGER.warning("knowledge scheduled job failed: %s", type(error).__name__)
             await sleep(_SLEEP_CHUNK_SECONDS)
             try:
                 await recover()
-            except Exception:
-                pass
+            except Exception as recovery_error:
+                _LOGGER.warning(
+                    "knowledge scheduled recovery failed: %s",
+                    type(recovery_error).__name__,
+                )

@@ -26,6 +26,11 @@ def _config(test: bool) -> Settings:
     """按 --test 切换两类测试库。参数：是否测试；返回：配置；异常：无。"""
     config = Settings()
     if test:
+        if (
+            config.knowledge_test_database != "mewhelp_ch03_test"
+            or config.milvus_test_database != "mewhelp_ch03_test"
+        ):
+            raise SystemExit("CH03 测试库必须是 mewhelp_ch03_test")
         config = config.model_copy(
             update={
                 "mysql_database": config.knowledge_test_database,

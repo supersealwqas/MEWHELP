@@ -238,3 +238,62 @@ async def test_cross_batch_synonyms_merge_real_questions_only() -> None:
     statuses = {row.id: row.status for row in frame.staged}
     assert statuses == {1: "kept", 2: "discarded"}
     assert not any(row.source_key == "qa:2" for row in frame.chunks)
+
+
+async def test_document_uncertain_stops_switch() -> None:
+    """文档关系不确定时不得切换旧知识。参数：无；返回：None；异常：无。"""
+    chunk = _snapshot(10, "qa:1", _text(answer="旧知识。", questions="旧问法"))
+    store = MemoryKnowledgeStore(snapshots=[chunk])
+    model = ScriptedKnowledgeModel(
+        relation_decisions=[_decision("draft:doc:a.md:0", "chunk:10", "uncertain")]
+    )
+    before = await _frame(store)
+    with pytest.raises(KnowledgeModelError):
+        async with store.writer() as writer:
+            await _lifecycle(model).publish_documents(
+                writer, [_draft(answer="新文档知识。")], ["doc:a.md"]
+            )
+    assert await _frame(store) == before
+
+
+class _PairModel:
+    """按请求 pair 返回无关关系并记录输入证据。"""
+
+    def __init__(self) -> None:
+        """初始化记录。参数：无；返回：None；异常：无。"""
+        self.calls: list[tuple[list, list]] = []
+
+    async def relate(self, items, pairs):
+        """按请求 pair 返回 unrelated。参数：证据/pair；返回：决策；异常：无。"""
+        self.calls.append((list(items), list(pairs)))
+        return [_decision(left, right, "unrelated") for left, right in pairs]
+
+
+async def test_relation_model_receives_only_pair_items() -> None:
+    """大批已发布知识只按候选对裁剪证据，并分批调用模型。参数：无；返回：None；异常：无。"""
+    snapshots = [
+        _snapshot(identifier, f"qa:{identifier}", _text(answer=f"旧知识{identifier}。"))
+        for identifier in range(100, 125)
+    ]
+    store = MemoryKnowledgeStore(snapshots=snapshots)
+    model = _PairModel()
+    async with store.writer() as writer:
+        await _lifecycle(model).publish_documents(
+            writer, [_draft(answer="新文档知识。")], ["doc:a.md"]
+        )
+    assert model.calls
+    assert all(len(items) <= 9 for items, _ in model.calls)
+    assert all(len(pairs) <= 8 for _, pairs in model.calls)
+    assert sum(len(pairs) for _, pairs in model.calls) == 25
+
+
+async def test_oversized_candidate_not_published() -> None:
+    """单条候选超过硬限时保留 extracted 且不发布。参数：无；返回：None；异常：无。"""
+    store = MemoryKnowledgeStore(
+        staged=[_staged(1, "超长问法", answer="长" * 1601)]
+    )
+    async with store.writer() as writer:
+        await _lifecycle(ScriptedKnowledgeModel()).reconcile_staging(writer)
+    frame = await _frame(store)
+    assert frame.chunks == []
+    assert next(row for row in frame.staged if row.id == 1).status == "extracted"

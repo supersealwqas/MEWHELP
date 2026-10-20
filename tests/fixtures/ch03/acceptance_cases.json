@@ -2,7 +2,7 @@
   "cases": [
     {
       "id": "shipping",
-      "query": "邮费是多少",
+      "query": "运费是多少",
       "expect_empty": false,
       "must_include": [
         "6 元",
@@ -17,7 +17,7 @@
     },
     {
       "id": "shipping_paraphrase",
-      "query": "配送费用怎么收",
+      "query": "快递费怎么算",
       "expect_empty": false,
       "must_include": [
         "6 元",
@@ -30,7 +30,7 @@
     },
     {
       "id": "refund_arrival",
-      "query": "退款多久到账",
+      "query": "退款什么时候能到",
       "expect_empty": false,
       "must_include": [
         "不承诺"
@@ -48,7 +48,7 @@
     },
     {
       "id": "refund_processing",
-      "query": "退款处理要多久",
+      "query": "退款审核要几天",
       "expect_empty": false,
       "must_include": [
         "3 个工作日"
@@ -60,7 +60,7 @@
     },
     {
       "id": "member_discount",
-      "query": "银卡和金卡分别打几折",
+      "query": "金卡和银卡折扣一样吗",
       "expect_empty": false,
       "must_include": [
         "9 折",
@@ -72,7 +72,7 @@
     },
     {
       "id": "lite_app",
-      "query": "智能猫砂盆 Lite 有 App 联网功能吗",
+      "query": "Lite 款猫砂盆支持 App 吗",
       "expect_empty": false,
       "must_include": [],
       "must_not_include": [
@@ -89,7 +89,7 @@
     },
     {
       "id": "nest_cleaning",
-      "query": "猫窝内部垫芯可以机洗吗",
+      "query": "猫窝垫芯怎么清洗",
       "expect_empty": false,
       "must_include": [
         "内部垫芯不可机洗"
@@ -100,7 +100,7 @@
     },
     {
       "id": "negative_weather",
-      "query": "今天天气怎么样",
+      "query": "明天会下雨吗",
       "expect_empty": true,
       "must_not_include": [
         "6 元",

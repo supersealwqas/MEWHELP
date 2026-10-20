@@ -114,8 +114,11 @@ def _config(test: bool) -> Settings:
     if not test:
         raise SystemExit("verify_ch03_live 只允许 --test，避免触碰应用库")
     config = Settings()
-    if config.knowledge_test_database != "mewhelp_ch03_test":
-        raise SystemExit("knowledge_test_database 不是 mewhelp_ch03_test")
+    if (
+        config.knowledge_test_database != "mewhelp_ch03_test"
+        or config.milvus_test_database != "mewhelp_ch03_test"
+    ):
+        raise SystemExit("CH03 测试库必须是 mewhelp_ch03_test")
     return config.model_copy(
         update={
             "mysql_database": config.knowledge_test_database,
