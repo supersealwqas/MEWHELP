@@ -24,19 +24,58 @@ with patch.dict(os.environ, {
     config.settings = _OFFLINE_SETTINGS
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """注册 CH03 真实集成测试开关。
+
+    参数:
+        parser: pytest 参数解析器。
+    返回值:
+        None
+    异常:
+        无
+    """
+    parser.addoption(
+        "--run-knowledge-integration",
+        action="store_true",
+        default=False,
+        help="仅操作 mewhelp_ch03_test 的 CH03 真实 MySQL/Milvus 集成测试",
+    )
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """默认跳过 CH03 集成测试，显式开关后才收集执行。
+
+    参数:
+        config: pytest 配置。
+        items: 当前收集的测试项。
+    返回值:
+        None
+    异常:
+        无
+    """
+    if config.getoption("--run-knowledge-integration"):
+        return
+    skip = pytest.mark.skip(reason="需要显式 --run-knowledge-integration")
+    for item in items:
+        if "knowledge_integration" in item.keywords:
+            item.add_marker(skip)
+
+
 @pytest.fixture
 def offline_settings(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest):
     """为离线消费者注入完整虚拟配置，覆盖模块已保存的旧引用。
 
     参数:
         monkeypatch: pytest 提供的属性替换夹具，测试结束后自动还原。
-        request: 当前测试请求；带 mysql 标记时保留显式集成配置。
+        request: 当前测试请求；带 mysql 或 knowledge_integration 标记时保留显式集成配置。
     返回值:
-        Settings | None: 每个离线测试独立的配置；MySQL 测试返回 None。
+        Settings | None: 每个离线测试独立的配置；集成测试返回 None。
     异常:
         pydantic.ValidationError: 测试配置与生产字段约束不一致时抛出。
     """
-    if request.node.get_closest_marker("mysql"):
+    if request.node.get_closest_marker("mysql") or request.node.get_closest_marker(
+        "knowledge_integration"
+    ):
         return None
     from app import main
     from app.core import llm
@@ -52,7 +91,9 @@ def offline_settings(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureReq
 @pytest.fixture(autouse=True)
 def offline_chat_runtime(monkeypatch, request, offline_settings):
     """提供离线聊天边界。参数：替换器、测试请求、隔离配置；返回：服务依赖；异常：无。"""
-    if request.node.get_closest_marker("mysql"):
+    if request.node.get_closest_marker("mysql") or request.node.get_closest_marker(
+        "knowledge_integration"
+    ):
         yield None
         return
     from app import main

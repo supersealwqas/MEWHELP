@@ -32,7 +32,10 @@ dev = [
 
 [tool.pytest.ini_options]
 addopts = "-m 'not mysql'"
-markers = ["mysql: 仅操作 mewhelp_test 的真实 MySQL 集成测试"]
+markers = [
+    "mysql: 仅操作 mewhelp_test 的真实 MySQL 集成测试",
+    "knowledge_integration: 显式开启并仅操作 mewhelp_ch03_test 的 CH03 集成测试",
+]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["."]
