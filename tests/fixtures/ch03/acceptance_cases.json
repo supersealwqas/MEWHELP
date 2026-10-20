@@ -1,0 +1,112 @@
+{
+  "cases": [
+    {
+      "id": "shipping",
+      "query": "邮费是多少",
+      "expect_empty": false,
+      "must_include": [
+        "6 元",
+        "99 元",
+        "12 元",
+        "不参与包邮"
+      ],
+      "must_not_include": [
+        "10 元",
+        "10元"
+      ]
+    },
+    {
+      "id": "shipping_paraphrase",
+      "query": "配送费用怎么收",
+      "expect_empty": false,
+      "must_include": [
+        "6 元",
+        "99 元"
+      ],
+      "must_not_include": [
+        "10 元",
+        "10元"
+      ]
+    },
+    {
+      "id": "refund_arrival",
+      "query": "退款多久到账",
+      "expect_empty": false,
+      "must_include": [
+        "不承诺"
+      ],
+      "must_not_include": [
+        "3 个工作日到账",
+        "三个工作日到账"
+      ],
+      "must_include_any": [
+        [
+          "到账时效",
+          "到账时间"
+        ]
+      ]
+    },
+    {
+      "id": "refund_processing",
+      "query": "退款处理要多久",
+      "expect_empty": false,
+      "must_include": [
+        "3 个工作日"
+      ],
+      "must_not_include": [
+        "3 个工作日到账",
+        "三个工作日到账"
+      ]
+    },
+    {
+      "id": "member_discount",
+      "query": "银卡和金卡分别打几折",
+      "expect_empty": false,
+      "must_include": [
+        "9 折",
+        "95 折"
+      ],
+      "must_not_include": [
+        "8 折"
+      ]
+    },
+    {
+      "id": "lite_app",
+      "query": "智能猫砂盆 Lite 有 App 联网功能吗",
+      "expect_empty": false,
+      "must_include": [],
+      "must_not_include": [
+        "Lite 支持 App",
+        "Lite 含 App 联网"
+      ],
+      "must_include_any": [
+        [
+          "不含 App 联网",
+          "不支持 App 联网",
+          "没有 App 联网"
+        ]
+      ]
+    },
+    {
+      "id": "nest_cleaning",
+      "query": "猫窝内部垫芯可以机洗吗",
+      "expect_empty": false,
+      "must_include": [
+        "内部垫芯不可机洗"
+      ],
+      "must_not_include": [
+        "内部垫芯可以机洗"
+      ]
+    },
+    {
+      "id": "negative_weather",
+      "query": "今天天气怎么样",
+      "expect_empty": true,
+      "must_not_include": [
+        "6 元",
+        "99 元",
+        "12 元"
+      ]
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 # MewHelp
 
-喵购商城客服演示项目：在同一个聊天页面完成“模型选工具 → 执行 → 按结果流式回答”。后端使用 FastAPI、SQLAlchemy 和 Docker MySQL，工具使用 LangChain `@tool`。
+喵购商城客服演示项目：在同一个聊天页面完成“模型选工具 → 执行 → 按结果流式回答”。后端使用 FastAPI、SQLAlchemy 和 Docker MySQL，工具使用 LangChain `@tool`；CH03 起 `query_faq` 使用 BGE-M3 + Milvus 的 Dense 语义检索，MySQL 保存权威原文与发布状态。
 
 ## 启动与演示
 
@@ -10,20 +10,23 @@
 uv sync
 docker compose up -d --wait mysql
 uv run python -m app.db.init_db
+# CH03 知识库初始化、六份资料导入与向量同步（应用库/应用 Milvus 库）
+uv run python -m app.knowledge.cli init
+uv run python -m app.knowledge.cli import-docs --manifest data/kb/manifest.json
 uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
 浏览器访问 [客服聊天页](http://127.0.0.1:8000/)。页面与 API 同源，不需要 npm 或单独启动前端。普通初始化只创建缺失表、补缺失种子，不清空已有聊天。
 
-FAQ 种子以 [sql/ch02-seed.sql](sql/ch02-seed.sql) 的 6 条问答为准，已同步到 `app/db/seed.py`，涵盖退货、退款、换货、发货、运费和发票。已有数据库中的旧答案不会被普通初始化覆盖；仅修改种子代码不会自动刷新已保存的数据。手动 SQL 的用途与执行顺序见 [sql/README.md](sql/README.md)。
+CH03 起 `query_faq` 的在线数据来自 `data/kb` 六份权威文档构建的 Dense 知识库，不再使用 FAQ LIKE；FAQ 表保留为旧数据。启动服务前必须有版本匹配的 `data/knowledge/retrieval-policy.json`，生成/校准、测试库和恢复命令见 [CH03 runbook](docs/ch03-runbook.md)。已有数据库中的旧答案不会被普通初始化覆盖；仅修改种子代码不会自动刷新已保存的数据。手动 SQL 的用途与执行顺序见 [sql/README.md](sql/README.md)。
 
 依次发送：
 
 1. `订单 1001 的物流到哪了`：本轮只执行一次 `query_order`，回答给出订单状态与物流单号 `MOCK213502378238`，并提示可把该单号发来查轨迹。
 2. `物流单号 MOCK213502378238 到哪了`：出现“物流查询”徽章，回答引用返回节点并注明演示数据。
-3. `退货政策是什么`：`query_faq` 用 SQL LIKE 命中 FAQ。
-4. `邮费是多少`：实际查 `邮费`，结果为空，回答说明未查到。这是**预期的关键词漏召回**。
-5. 对照 `运费是多少`：能查到 10 元、满 99 元包邮的演示政策。
+3. `退货政策是什么`：`query_faq` 走向量知识库，命中退货政策。
+4. `邮费是多少`：原词“邮费”经 Dense 检索命中 6 元基础运费、满 99 元包邮，并保留偏远地区 12 元附加费不参与包邮的例外；不再要求“邮费零命中”。
+5. 对照 `运费是多少`：同样命中知识库，不再使用 10 元旧口径。
 6. `请帮我创建人工工单，订单 1001 一直未送达`：在 MySQL 写入待处理工单，回答给出真实保存的工单号。
 7. `帮我查订单 2003`：该单属于另一个演示用户，工具返回 `order_not_owned`，页面直接回固定文本“没有找到您的这笔订单，请确认订单号或物流单号后重试。”，不经过模型改写。
 
@@ -49,11 +52,11 @@ FAQ 种子以 [sql/ch02-seed.sql](sql/ch02-seed.sql) 的 6 条问答为准，已
 - SSE 保留 `data: {"delta":"…"}`、`data: [DONE]` 和 `event: error`，增加 `event: tool_status`；完成记录提交后才发送 DONE。错误载荷中的可选 `retry_safe=false` 表示应先核实提交结果，不能直接重发原话。
 - `POST /api/extract` 保持原有结构化提取功能；可在 [接口文档](http://127.0.0.1:8000/docs) 查看。
 
-每条消息最多执行一个工具。决策后最终模型请求不携带工具，不进入 Agent Loop。FAQ 只做原话关键词 LIKE，不做同义词扩展、向量检索或 RAG。
+每条消息最多执行一个工具。决策后最终模型请求不携带工具，不进入 Agent Loop。CH03 起 `query_faq` 只做 BGE-M3 Dense 单路检索：关键词仍取用户原话、不做同义词改写；命中按 MySQL active/done/指纹回读，低分是正常空结果，索引失配或后端异常是工具错误，不伪装为空命中。
 
 ## 测试
 
-对话使用两层近似预算：`TOKEN_BUDGET=2000` 限制历史消息、当前问题及工具事实；`REQUEST_TOKEN_BUDGET=16000` 另限制包含系统提示和本阶段工具定义的完整输入。ASCII 每四字符约一单位，非 ASCII 每字符约两单位，协议字段同样计入，JSON 保留真实 Unicode。它们不是模型实际分词数或上下文窗口；16000 也不含模型输出，需结合实际网关限制留出输出空间。历史只能按整轮裁剪；当前问题或工具结果仍超限时明确失败，不丢掉事实继续回答。较长的 FAQ 结果可能触及对话预算，应缩小问题范围或按模型容量同时调整两层配置。
+对话使用两层近似预算：`TOKEN_BUDGET=12000` 限制历史消息、当前问题及工具事实；`REQUEST_TOKEN_BUDGET=16000` 另限制包含系统提示和本阶段工具定义的完整输入。ASCII 每四字符约一单位，非 ASCII 每字符约两单位，协议字段同样计入，JSON 保留真实 Unicode。它们不是模型实际分词数或上下文窗口；16000 也不含模型输出，需结合实际网关限制留出输出空间。历史只能按整轮裁剪；当前问题或工具结果仍超限时明确失败，不丢掉事实继续回答。较长的 FAQ 结果可能触及对话预算，应缩小问题范围或按模型容量同时调整两层配置。
 
 离线测试在首次导入时禁用项目 `.env` 文件来源，并为实际使用配置的模块注入隔离配置；单文件与整套运行都不依赖本机模型凭据。配置读取测试使用虚构配置文件。非法工具申请会留作数据库审计，但不会执行，也不会以损坏的工具协议回传模型。
 
@@ -62,28 +65,25 @@ FAQ 种子以 [sql/ch02-seed.sql](sql/ch02-seed.sql) 的 6 条问答为准，已
 uv run --offline --locked pytest -q
 node --test tests/frontend/chat-api.test.mjs
 
-# 真实数据库测试：只允许 mewhelp_test；先停止使用测试库的评估服务。
+# 真实 MySQL：CH02 mewhelp_test
 uv run python -m app.db.init_db --test
 uv run pytest -m mysql tests/integration -q
+
+# CH03 专用 MySQL 与 Milvus 测试库；先确认 Docker 和 milvus-standalone 运行
+uv run pytest tests/knowledge_integration --run-knowledge-integration -q
 ```
 
-数据库测试会重建 **mewhelp_test** 中的四表，不操作应用库 mewhelp。覆盖约束、LIKE 转义、种子恢复、工单与结果防重、提交确认丢失、取消及启动恢复。
+CH02 数据库测试会重建 **mewhelp_test** 中的四表，不操作应用库 mewhelp。CH03 集成测试只清理 **mewhelp_ch03_test** 与 Milvus 测试库自己的数据，覆盖发布、批次、来源补扫、向量重写与恢复。
 
-真实模型评估：
+CH03 当前验收入口（只操作 `mewhelp_ch03_test` 与 Milvus 测试库；会使用真实 BGE-M3、Milvus、MySQL 和模型额度）：
 
 ```bash
-# 先停止旧评估服务及数据库测试；仅刷新测试库。
-uv run python -m app.db.init_db --test --reset
-MYSQL_DATABASE=mewhelp_test uv run uvicorn app.main:app --host 127.0.0.1 --port 8001
+uv run python tests/verify_ch03_live.py calibrate --test --report dev-notes/ch03-calibration.md
+uv run python tests/verify_ch03_live.py evaluate --test --report dev-notes/ch03-evaluation.md
+uv run python tests/verify_ch03_live.py recovery --test --report dev-notes/ch03-recovery.md
 ```
 
-在另一个 Git Bash 终端运行：
-
-```bash
-uv run python tests/verify_ch02_live.py --base-url http://127.0.0.1:8001 --report dev-notes/ch02-evaluation.md
-```
-
-评估会先核对数据库 FAQ 是否与当前种子完全一致，再发送 14 条真实模型样例（含同会话连续三问），记录工具名、参数、结果、回答、状态顺序和增量数量；会使用模型额度。路由自动判定，回答忠实度需逐例复核。种子改变后必须停评估服务、重新执行测试库 reset，不能用普通幂等初始化替代刷新。
+`calibrate` 重建测试知识库并生成 `data/knowledge/retrieval-policy.json`；`evaluate` 运行真实检索与聊天模型验收；`recovery` 演示向量写入后中断与重跑。CH02 的 `verify_ch02_live.py` 和 `ch02-evaluation.md` 保留为历史记录，不再要求“邮费零命中”或 10 元口径。完整命令、应用库初始化和启动方式见 [CH03 runbook](docs/ch03-runbook.md)。
 
 ## 文件与运行限制
 
@@ -93,7 +93,8 @@ uv run python tests/verify_ch02_live.py --base-url http://127.0.0.1:8001 --repor
 - `app/services/chat.py`：单工具聊天编排、同会话互斥、取消与持久化。
 - `app/core/`：模型工厂与适配、完整轮次历史裁剪、提示词。
 - `app/static/`：纯文本安全渲染与工具轨迹，无外部 CDN。
-- [开发记录](dev-notes/ch02.md)、[真实模型评估](dev-notes/ch02-evaluation.md)。
+- [CH02 开发记录](dev-notes/ch02.md)、[CH02 历史评估](dev-notes/ch02-evaluation.md)。
+- [CH03 开发记录](dev-notes/ch03.md)、[CH03 校准](dev-notes/ch03-calibration.md)、[CH03 验收](dev-notes/ch03-evaluation.md)、[CH03 运行手册](docs/ch03-runbook.md)。
 
 使用**单实例、单 worker**；不要启动多个服务同时使用同一数据库。启动时将旧 running 轮标为 cancelled，保留已提交工具事实；恢复失败会阻止启动。同会话重叠请求被拒绝，不同会话可以并发。
 

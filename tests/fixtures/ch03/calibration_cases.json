@@ -1,0 +1,56 @@
+{
+  "cases": [
+    {
+      "id": "shipping_direct",
+      "query": "邮费是多少",
+      "source": "billing-shipping.md",
+      "section": "开票与配送 / 运费与包邮",
+      "expect_empty": false
+    },
+    {
+      "id": "shipping_paraphrase",
+      "query": "配送要收多少钱",
+      "source": "billing-shipping.md",
+      "section": "开票与配送 / 运费与包邮",
+      "expect_empty": false
+    },
+    {
+      "id": "refund_arrival",
+      "query": "退款多久到账",
+      "source": "returns-policy.md",
+      "section": "退货退款政策 / 无理由退货 / 退款时效",
+      "expect_empty": false
+    },
+    {
+      "id": "member_discount",
+      "query": "银卡和金卡分别打几折",
+      "source": "member-benefits.md",
+      "section": "会员权益 / 会员等级",
+      "expect_empty": false
+    },
+    {
+      "id": "lite_app",
+      "query": "智能猫砂盆 Lite 有 App 联网功能吗",
+      "source": "product-specs.md",
+      "section": "商品规格手册 / 智能猫砂盆 Lite(型号 MH-LP50)",
+      "expect_empty": false
+    },
+    {
+      "id": "nest_cleaning",
+      "query": "猫窝内部垫芯可以机洗吗",
+      "source": "product-specs.md",
+      "section": "商品规格手册 / 四季保暖猫窝(型号 MH-NEST20)",
+      "expect_empty": false
+    },
+    {
+      "id": "negative_weather",
+      "query": "今天天气怎么样",
+      "expect_empty": true
+    },
+    {
+      "id": "negative_greeting",
+      "query": "你好",
+      "expect_empty": true
+    }
+  ]
+}
