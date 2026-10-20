@@ -1,30 +1,41 @@
-"""Markdown 结构感知切分。
+"""基于 LangChain splitter 的 Markdown 结构感知切分。
 
-从 markdown-it 的结构 token 与原始行恢复标题层级、段落、列表、代码围栏和
-表格；按完整句子/完整列表项/完整表格行聚合，保留父节引言和重复标题，
-不把围栏内伪标题当章节，不在硬限处截断句子或表格行。
+使用 `MarkdownHeaderTextSplitter` 按 h1–h4 分节并保留 header metadata，
+`RecursiveCharacterTextSplitter` 按中文段落/句末标点递归切分；再以完整句
+尾部做重叠，表格按完整数据行切分并复制表头。单个完整句子/代码块/表格行
+超过硬限时拒绝整份文档，不静默截断。
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Callable
 
-from markdown_it import MarkdownIt
+from langchain_core.documents import Document
+from langchain_text_splitters import (
+    MarkdownHeaderTextSplitter,
+    RecursiveCharacterTextSplitter,
+)
 
 from app.knowledge.manifest import DocumentSpec
 from app.knowledge.schemas import ChunkDraft, KnowledgeText
 from app.knowledge.text import format_knowledge
 
-CHUNKING_VERSION = "ch03-v1"
+CHUNKING_VERSION = "ch03-v2"
+
+HEADERS = [("#", "h1"), ("##", "h2"), ("###", "h3"), ("####", "h4")]
+# 中文无词边界：优先段落/换行，再句末标点，最后逐字兜底。
+CJK_SEPARATORS = ["\n\n", "\n", "。", "！", "？", "；", "!", "?", ";", "，", " ", ""]
+_SENTENCE_RE = re.compile(r"[^。！？!?…\n]*[。！？!?…\n]|[^。！？!?…\n]+$")
+_TABLE_SEP_RE = re.compile(r"^\s*\|?[\s:|-]+\|?\s*$")
+_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
 
 _DEFAULT_TARGET_TOKENS = 512
 _DEFAULT_OVERLAP_TOKENS = 64
 _DEFAULT_MAX_TOKENS = 2048
 _DEFAULT_MAX_CHARACTERS = 1600
-_SENTENCE_ENDS = "。！？!?"
-_CLOSING_CHARS = "”’」』）)】》"
 
 
 class ChunkingError(ValueError):
@@ -60,433 +71,285 @@ class ChunkingError(ValueError):
         super().__init__(f"{location}: {reason}")
 
 
-@dataclass
-class _Unit:
-    """一个按原文顺序排列的结构原子集合。"""
+@dataclass(frozen=True)
+class _Context:
+    """当前 section 的三格与元数据上下文。"""
 
-    kind: Literal["text", "list_item", "code", "table"]
-    line_start: int
-    line_end: int
-    text: str = ""
-    table_header: str = ""
-    table_separator: str = ""
-    table_rows: list[tuple[int, str]] = field(default_factory=list)
+    category: str
+    questions: str
+    section_path: str | None
+    is_key_clause: bool
 
 
-@dataclass
-class _Section:
-    """同一标题路径下按原文顺序排列的内容单元。"""
+def split_sections(markdown: str) -> list[Document]:
+    """按 Markdown 标题分节并保留 header metadata。
 
-    stack: list[str]
-    units: list[_Unit] = field(default_factory=list)
+    参数:
+        markdown: Markdown 原文。
+    返回值:
+        list[Document]: 带 h1–h4 metadata 的 section 文档。
+    异常:
+        无
+    """
+    splitter = MarkdownHeaderTextSplitter(
+        headers_to_split_on=HEADERS,
+        strip_headers=True,
+    )
+    return splitter.split_text(markdown)
 
 
-@dataclass
-class _Atom:
-    """切分时可独立保留的完整句子或结构项。"""
+def recursive_split(
+    text: str, chunk_size: int, count_tokens: Callable[[str], int]
+) -> list[str]:
+    """按中文分隔符递归切分 section 文本。
 
-    text: str
-    line_start: int
-    line_end: int
-    newline_before: bool
+    参数:
+        text: section 正文。
+        chunk_size: 以 count_tokens 计的最大块大小。
+        count_tokens: token 计数函数。
+    返回值:
+        list[str]: 递归切分结果。
+    异常:
+        ValueError: chunk_size 非正时抛出。
+    """
+    if chunk_size <= 0:
+        raise ValueError("chunk_size 必须为正数")
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=0,
+        separators=CJK_SEPARATORS,
+        is_separator_regex=False,
+        length_function=count_tokens,
+        # 分隔符归入前一块，避免句号被推到下一块开头而丢失完整句。
+        keep_separator="end",
+    )
+    return splitter.split_text(text)
 
 
 def _split_sentences(text: str) -> list[str]:
-    """按中文句末标点拆分完整句子并保留闭合引号。
-
-    参数:
-        text: 段落或列表项的原始文本。
-    返回值:
-        list[str]: 非空完整句子；没有句末标点时返回整段。
-    异常:
-        无
-    """
-    sentences: list[str] = []
-    start = 0
-    for index, character in enumerate(text):
-        if character not in _SENTENCE_ENDS:
-            continue
-        end = index + 1
-        while end < len(text) and text[end] in _CLOSING_CHARS:
-            end += 1
-        sentence = text[start:end]
-        if sentence.strip():
-            sentences.append(sentence)
-        start = end
-    tail = text[start:]
-    if tail.strip():
-        sentences.append(tail)
-    return sentences
+    """按句末标点/换行拆分完整句。参数：文本；返回：句子；异常：无。"""
+    return [match for match in _SENTENCE_RE.findall(text) if match]
 
 
-def _map_of(token) -> tuple[int, int]:
-    """读取 token 的 0 基行范围。
+def _trailing_sentences(
+    text: str, max_tokens: int, count_tokens: Callable[[str], int]
+) -> str:
+    """取尾部完整句作为重叠，超预算时仍保留最后一个完整句。参数：文本/预算/计数；返回：重叠文本；异常：无。"""
+    if max_tokens <= 0:
+        return ""
+    selected: list[str] = []
+    total = 0
+    for sentence in reversed(_split_sentences(text)):
+        weight = count_tokens(sentence)
+        if selected and total + weight > max_tokens:
+            break
+        selected.insert(0, sentence)
+        total += weight
+    return "".join(selected)
 
-    参数:
-        token: markdown-it token。
-    返回值:
-        tuple[int, int]: 起止行；缺失时返回 (0, 0)。
-    异常:
-        无
-    """
-    if not token.map:
-        return 0, 0
-    return int(token.map[0]), int(token.map[1])
+
+def apply_sentence_overlap(
+    chunks: list[str],
+    overlap_tokens: int,
+    count_tokens: Callable[[str], int],
+) -> list[str]:
+    """为后续块添加上一块尾部完整句重叠。参数：块/预算/计数；返回：重叠后块；异常：无。"""
+    if not chunks:
+        return []
+    result = [chunks[0]]
+    for index in range(1, len(chunks)):
+        overlap = _trailing_sentences(chunks[index - 1], overlap_tokens, count_tokens)
+        result.append(overlap + chunks[index] if overlap else chunks[index])
+    return result
 
 
-def _table_unit(lines: list[str], start: int, end: int) -> _Unit | None:
-    """把表格原始行整理为表头、分隔行和数据行。
+def _find_table_header(lines: list[str]) -> int:
+    """查找表头行下标。参数：非空行；返回：表头下标或 -1；异常：无。"""
+    for index in range(len(lines) - 1):
+        if (
+            lines[index].lstrip().startswith("|")
+            and _TABLE_SEP_RE.match(lines[index + 1])
+            and "-" in lines[index + 1]
+        ):
+            return index
+    return -1
 
-    参数:
-        lines: 原文按行拆分结果。
-        start: 表格起始行。
-        end: 表格结束行（不含）。
-    返回值:
-        _Unit | None: 表格单元；不足表头与分隔行时返回 None。
-    异常:
-        无
-    """
-    raw = [
-        (index, lines[index].strip())
-        for index in range(start, min(end, len(lines)))
-        if lines[index].strip()
+
+def is_table_block(text: str) -> bool:
+    """判断文本是否含 Markdown 表格。参数：文本；返回：是否表格；异常：无。"""
+    lines = [line for line in text.strip().splitlines() if line.strip()]
+    return _find_table_header(lines) != -1
+
+
+def split_table_rows(table_markdown: str, max_rows: int) -> list[str]:
+    """按完整数据行切表格并复制表头。参数：表格文本/最大行数；返回：表格块；异常：无。"""
+    if max_rows <= 0:
+        raise ValueError("max_rows 必须为正数")
+    lines = [line for line in table_markdown.strip().splitlines() if line.strip()]
+    header_index = _find_table_header(lines)
+    if header_index == -1:
+        return [table_markdown.strip()]
+    preamble = lines[:header_index]
+    header, separator = lines[header_index], lines[header_index + 1]
+    rows = lines[header_index + 2 :]
+    if len(rows) <= max_rows:
+        return [table_markdown.strip()]
+    blocks: list[str] = []
+    for block_index, start in enumerate(range(0, len(rows), max_rows)):
+        group = rows[start : start + max_rows]
+        block = (
+            [*preamble, header, separator, *group]
+            if block_index == 0
+            else [header, separator, *group]
+        )
+        blocks.append("\n".join(block))
+    return blocks
+
+
+def _context(metadata: dict, document: DocumentSpec) -> _Context:
+    """从 header metadata 推导三格与章节元数据。参数：metadata/文档；返回：上下文；异常：无。"""
+    headings = [
+        str(metadata[key])
+        for key in ("h1", "h2", "h3", "h4")
+        if metadata.get(key)
     ]
-    if len(raw) < 2:
-        return None
-    return _Unit(
-        kind="table",
-        line_start=start,
-        line_end=end,
-        table_header=raw[0][1],
-        table_separator=raw[1][1],
-        table_rows=raw[2:],
+    if headings:
+        questions = headings[-1]
+        category = " / ".join(headings[:-1]) if len(headings) > 1 else headings[-1]
+        return _Context(
+            category=category,
+            questions=questions,
+            section_path=" / ".join(headings),
+            is_key_clause=headings[-1] in document.key_sections,
+        )
+    fallback = document.path.stem or document.source_key
+    return _Context(
+        category=fallback,
+        questions=fallback,
+        section_path=None,
+        is_key_clause=False,
     )
 
 
-def _collect_sections(source: str, document: DocumentSpec) -> list[_Section]:
-    """按 Markdown 结构收集带标题上下文的原子单元。
-
-    参数:
-        source: Markdown 原文。
-        document: 文档描述，用于章节层级和关键条款判断。
-    返回值:
-        list[_Section]: 仅含实际内容的章节。
-    异常:
-        无；结构异常由后续硬限或空内容处理。
-    """
-    del document
-    lines = source.splitlines()
-    tokens = MarkdownIt("commonmark").enable("table").parse(source)
-    sections: list[_Section] = []
-    stack: list[str] = []
-    current: _Section | None = None
-
-    def ensure_section() -> _Section:
-        """取得当前标题下的内容容器。参数：无；返回：章节；异常：无。"""
-        nonlocal current
-        if current is None:
-            current = _Section(stack=list(stack))
-            sections.append(current)
-        return current
-
-    index = 0
-    while index < len(tokens):
-        token = tokens[index]
-        if token.type == "heading_open":
-            level = int(token.tag[1])
-            title = tokens[index + 1].content.strip() if index + 1 < len(tokens) else ""
-            if title:
-                del stack[level - 1 :]
-                stack.append(title)
-                current = None
-            index += 1
-        elif token.type == "paragraph_open":
-            start, end = _map_of(token)
-            text = "\n".join(lines[start:end]).strip()
-            if text:
-                ensure_section().units.append(_Unit("text", start, end, text=text))
-            index += 1
-        elif token.type in ("fence", "code_block"):
-            start, end = _map_of(token)
-            text = token.content.rstrip("\n") if token.type == "fence" else "\n".join(lines[start:end]).strip()
-            if text.strip():
-                ensure_section().units.append(_Unit("code", start, end, text=text))
-            index += 1
-        elif token.type == "table_open":
-            start, end = _map_of(token)
-            unit = _table_unit(lines, start, end)
-            if unit is not None:
-                ensure_section().units.append(unit)
-            cursor = index + 1
-            while cursor < len(tokens) and tokens[cursor].type != "table_close":
-                cursor += 1
-            index = cursor
-        elif token.type in ("bullet_list_open", "ordered_list_open"):
-            depth = 1
-            cursor = index + 1
-            while cursor < len(tokens) and depth > 0:
-                inner = tokens[cursor]
-                if inner.type in ("bullet_list_open", "ordered_list_open"):
-                    depth += 1
-                elif inner.type in ("bullet_list_close", "ordered_list_close"):
-                    depth -= 1
-                    if depth == 0:
-                        break
-                elif inner.type == "list_item_open" and depth == 1:
-                    start, end = _map_of(inner)
-                    text = "\n".join(lines[start:end]).strip()
-                    if text:
-                        ensure_section().units.append(_Unit("list_item", start, end, text=text))
-                cursor += 1
-            index = cursor
-        else:
-            index += 1
-    return [section for section in sections if section.units]
+def _line_range(source: str, content: str) -> tuple[int, int]:
+    """按 section 内容定位源文件行范围。参数：原文/内容；返回：起止行；异常：无。"""
+    normalized_source = source.replace("\r\n", "\n").replace("\r", "\n")
+    normalized_content = content.replace("\r\n", "\n").replace("\r", "\n")
+    index = normalized_source.find(normalized_content)
+    if index < 0:
+        return 0, max(1, normalized_source.count("\n") + 1)
+    start = normalized_source[:index].count("\n")
+    end = start + normalized_content.count("\n") + 1
+    return start, end
 
 
-def _context(stack: list[str], document: DocumentSpec) -> tuple[str, str, str | None, bool]:
-    """从标题栈推导三格文本的 category/questions 与元数据。
-
-    参数:
-        stack: 当前完整标题路径。
-        document: 文档描述，用于根分类和关键条款。
-    返回值:
-        tuple: category、questions、section_path、is_key_clause。
-    异常:
-        无
-    """
-    if stack:
-        questions = stack[-1]
-        category = " / ".join(stack[:-1]) if len(stack) > 1 else stack[-1]
-        section_path = " / ".join(stack)
-        return category, questions, section_path, stack[-1] in document.key_sections
-    fallback = document.path.stem or document.source_key
-    return fallback, fallback, None, False
-
-
-def _atoms_for_unit(unit: _Unit) -> list[_Atom]:
-    """把文本/列表/代码单元转换为完整原子。
-
-    参数:
-        unit: 结构单元。
-    返回值:
-        list[_Atom]: 句子或原子项。
-    异常:
-        无
-    """
-    if unit.kind == "text":
-        return [
-            _Atom(sentence, unit.line_start, unit.line_end, index == 0)
-            for index, sentence in enumerate(_split_sentences(unit.text))
-        ]
-    return [_Atom(unit.text, unit.line_start, unit.line_end, True)]
-
-
-class _ChunkBuilder:
-    """在固定章节上下文中生成受限额约束的 ChunkDraft。"""
-
-    def __init__(
-        self,
-        *,
-        document: DocumentSpec,
-        category: str,
-        questions: str,
-        section_path: str | None,
-        is_key_clause: bool,
-        count_tokens: Callable[[str], int],
-        target_tokens: int,
-        overlap_tokens: int,
-        max_tokens: int,
-        max_characters: int,
-        chunks: list[ChunkDraft],
-    ) -> None:
-        """保存上下文与限额。
-
-        参数:
-            document: 当前文档。
-            category: 三格分类。
-            questions: 三格问法。
-            section_path: 完整章节路径。
-            is_key_clause: 是否关键条款。
-            count_tokens: token 计数函数。
-            target_tokens: 软目标。
-            overlap_tokens: 重叠预算。
-            max_tokens: 格式化后 token 硬限。
-            max_characters: 三格字符硬限。
-            chunks: 全文档结果容器。
-        返回值:
-            None
-        异常:
-            无
-        """
-        self.document = document
-        self.category = category
-        self.questions = questions
-        self.section_path = section_path
-        self.is_key_clause = is_key_clause
-        self.count_tokens = count_tokens
-        self.target_tokens = target_tokens
-        self.overlap_tokens = overlap_tokens
-        self.max_tokens = max_tokens
-        self.max_characters = max_characters
-        self.chunks = chunks
-
-    def _join(self, atoms: list[_Atom]) -> str:
-        """按原子边界拼接答案文本。参数：原子列表；返回：答案；异常：无。"""
-        parts: list[str] = []
-        for atom in atoms:
-            if parts and atom.newline_before:
-                parts.append("\n")
-            parts.append(atom.text)
-        return "".join(parts)
-
-    def _tokens(self, answer: str) -> int:
-        """计算格式化后的 token 数。参数：答案；返回：token 数；异常：计数函数异常。"""
-        return self.count_tokens(
+def _hard_overflow(
+    category: str,
+    questions: str,
+    answer: str,
+    count_tokens: Callable[[str], int],
+    max_tokens: int,
+    max_characters: int,
+) -> bool:
+    """判断三格文本是否超过字符/token 硬限。参数：三格与限额；返回：是否超限；异常：无。"""
+    if len(category) + len(questions) + len(answer) > max_characters:
+        return True
+    return (
+        count_tokens(
             format_knowledge(
-                KnowledgeText(category=self.category, questions=self.questions, answer=answer)
+                KnowledgeText(category=category, questions=questions, answer=answer)
             )
         )
+        > max_tokens
+    )
 
-    def _overflow(self, atoms: list[_Atom]) -> bool:
-        """判断原子集合是否超过硬限。参数：原子列表；返回：是否超限；异常：无。"""
-        answer = self._join(atoms)
-        if len(self.category) + len(self.questions) + len(answer) > self.max_characters:
-            return True
-        return self._tokens(answer) > self.max_tokens
 
-    def _error(self, reason: str, line_start: int, line_end: int) -> None:
-        """抛出带位置的切分错误。参数：原因与行范围；返回：无；异常：ChunkingError。"""
-        raise ChunkingError(
-            reason,
-            path=self.document.path,
-            section_path=self.section_path,
-            line_start=line_start,
-            line_end=line_end,
-        )
+def _raise_overflow(
+    *,
+    document: DocumentSpec,
+    context: _Context,
+    source: str,
+    content: str,
+    reason: str,
+) -> None:
+    """抛出带章节/行范围的切分错误。参数：文档/上下文/原文/内容/原因；返回：不返回；异常：ChunkingError。"""
+    line_start, line_end = _line_range(source, content)
+    raise ChunkingError(
+        reason,
+        path=document.path,
+        section_path=context.section_path,
+        line_start=line_start,
+        line_end=line_end,
+    )
 
-    def _emit(self, atoms: list[_Atom]) -> None:
-        """提交一个知识块。参数：原子列表；返回：无；异常：无。"""
-        answer = self._join(atoms)
-        if not answer.strip():
-            return
-        self.chunks.append(
-            ChunkDraft(
-                source_key=self.document.source_key,
-                ordinal=len(self.chunks),
-                text=KnowledgeText(
-                    category=self.category,
-                    questions=self.questions,
-                    answer=answer,
-                ),
-                section_path=self.section_path,
-                content_type=self.document.content_type,
-                is_key_clause=self.is_key_clause,
+
+def _validate_atomic(
+    *,
+    content: str,
+    document: DocumentSpec,
+    context: _Context,
+    source: str,
+    count_tokens: Callable[[str], int],
+    max_tokens: int,
+    max_characters: int,
+) -> None:
+    """拒绝超硬限的完整句子或代码块。参数：内容/上下文/限额；返回：None；异常：ChunkingError。"""
+    for fence in _FENCE_RE.findall(content):
+        if _hard_overflow(
+            context.category,
+            context.questions,
+            fence,
+            count_tokens,
+            max_tokens,
+            max_characters,
+        ):
+            _raise_overflow(
+                document=document,
+                context=context,
+                source=source,
+                content=content,
+                reason="完整代码块超过硬限",
             )
-        )
-
-    def _overlap_tail(self, atoms: list[_Atom]) -> list[_Atom]:
-        """取满足重叠预算的完整尾部原子。参数：当前原子；返回：重叠原子；异常：无。"""
-        tail: list[_Atom] = []
-        used = 0
-        for atom in reversed(atoms):
-            weight = self.count_tokens(atom.text)
-            if weight > self.overlap_tokens - used:
-                break
-            tail.insert(0, atom)
-            used += weight
-        return tail
-
-    def add_text(self, atoms: list[_Atom]) -> None:
-        """把完整句子/列表项聚合为受目标与硬限约束的知识块。
-
-        参数:
-            atoms: 按原文顺序排列的原子。
-        返回值:
-            None
-        异常:
-            ChunkingError: 单个完整原子超过硬限。
-        """
-        current: list[_Atom] = []
-        for atom in atoms:
-            if not current:
-                if self._overflow([atom]):
-                    self._error("单个完整原子超过硬限", atom.line_start, atom.line_end)
-                current = [atom]
-                continue
-            candidate = current + [atom]
-            if self._overflow(candidate):
-                self._emit(current)
-                current = self._overlap_tail(current)
-                if self._overflow(current + [atom]):
-                    current = []
-                    if self._overflow([atom]):
-                        self._error("单个完整原子超过硬限", atom.line_start, atom.line_end)
-            elif self._tokens(self._join(candidate)) > self.target_tokens:
-                self._emit(current)
-                current = self._overlap_tail(current)
-                if self._tokens(self._join(current + [atom])) > self.target_tokens:
-                    current = []
-            current.append(atom)
-        if current:
-            self._emit(current)
-
-    def add_table(self, unit: _Unit) -> None:
-        """把表格按完整数据行分组并复制表头。
-
-        参数:
-            unit: 表格单元。
-        返回值:
-            None
-        异常:
-            ChunkingError: 表头加单行超过硬限。
-        """
-        rows = unit.table_rows
-        if not rows:
-            return
-
-        def render(selected: list[tuple[int, str]]) -> str:
-            """组装含表头与分隔行的表格文本。参数：数据行；返回：表格文本；异常：无。"""
-            return "\n".join(
-                [unit.table_header, unit.table_separator] + [line for _, line in selected]
+    for sentence in _split_sentences(content):
+        if _hard_overflow(
+            context.category,
+            context.questions,
+            sentence,
+            count_tokens,
+            max_tokens,
+            max_characters,
+        ):
+            _raise_overflow(
+                document=document,
+                context=context,
+                source=source,
+                content=content,
+                reason="完整句子超过硬限",
             )
 
-        current: list[tuple[int, str]] = []
-        for row in rows:
-            candidate = current + [row]
-            answer = render(candidate)
-            hard = (
-                len(self.category) + len(self.questions) + len(answer) > self.max_characters
-                or self._tokens(answer) > self.max_tokens
-            )
-            if hard:
-                if not current:
-                    self._error("表格表头与单行超过硬限", row[0], row[0] + 1)
-                self._emit(
-                    [
-                        _Atom(render(current), current[0][0], current[-1][0] + 1, True)
-                    ]
-                )
-                current = [row]
-                single = render(current)
-                if (
-                    len(self.category) + len(self.questions) + len(single) > self.max_characters
-                    or self._tokens(single) > self.max_tokens
-                ):
-                    self._error("表格表头与单行超过硬限", row[0], row[0] + 1)
-            elif current and self._tokens(render(candidate)) > self.target_tokens:
-                self._emit(
-                    [
-                        _Atom(render(current), current[0][0], current[-1][0] + 1, True)
-                    ]
-                )
-                current = [row]
-            else:
-                current = candidate
-        if current:
-            self._emit(
-                [_Atom(render(current), current[0][0], current[-1][0] + 1, True)]
-            )
+
+def _max_table_rows(
+    *,
+    content: str,
+    context: _Context,
+    target_tokens: int,
+    count_tokens: Callable[[str], int],
+) -> int:
+    """按目标预算计算表格每块数据行数。参数：表格/上下文/目标/计数；返回：行数；异常：无。"""
+    lines = [line for line in content.strip().splitlines() if line.strip()]
+    header_index = _find_table_header(lines)
+    if header_index == -1:
+        return 1
+    header_block = "\n".join(lines[header_index : header_index + 2])
+    rows = lines[header_index + 2 :]
+    if not rows:
+        return 1
+    row_size = max(count_tokens(row) for row in rows)
+    overhead = count_tokens(
+        f"分类：{context.category}\n问法：{context.questions}\n答案："
+    )
+    available = target_tokens - overhead - count_tokens(header_block)
+    return max(1, available // max(1, row_size))
 
 
 def chunk_markdown(
@@ -499,50 +362,93 @@ def chunk_markdown(
     max_tokens: int = _DEFAULT_MAX_TOKENS,
     max_characters: int = _DEFAULT_MAX_CHARACTERS,
 ) -> list[ChunkDraft]:
-    """把一份 Markdown 切分为可导入的知识块。
+    """把 Markdown 切分为可导入知识块。
 
     参数:
         source: Markdown 原文。
         document: 文档描述与清单元数据。
         count_tokens: 与编码器一致的 token 计数函数。
-        target_tokens: 软目标 token 数，不用于硬截断。
-        overlap_tokens: 完整句子重叠预算。
+        target_tokens: 软目标 token 数。
+        overlap_tokens: 完整句重叠预算。
         max_tokens: 格式化后 token 硬限。
-        max_characters: category/questions/answer 三格字符硬限。
+        max_characters: 三格字符硬限。
     返回值:
-        list[ChunkDraft]: 序号从 0 连续、按原文顺序排列的知识块。
+        list[ChunkDraft]: 序号从 0 连续的知识块。
     异常:
-        ValueError: 限额参数不合法。
-        ChunkingError: 完整原子超过硬限。
+        ChunkingError: 完整句子/代码块/表格行超过硬限。
     """
     if target_tokens <= 0 or overlap_tokens < 0 or max_tokens <= 0 or max_characters <= 0:
         raise ValueError("切分限额必须为正数，overlap_tokens 不得为负")
 
     chunks: list[ChunkDraft] = []
-    for section in _collect_sections(source, document):
-        category, questions, section_path, is_key_clause = _context(section.stack, document)
-        builder = _ChunkBuilder(
+
+    def append(answer: str, context: _Context, content: str) -> None:
+        """追加一个知识块。参数：答案/上下文/源 section；返回：None；异常：ChunkingError。"""
+        cleaned = answer.strip()
+        if not cleaned:
+            return
+        if _hard_overflow(
+            context.category,
+            context.questions,
+            cleaned,
+            count_tokens,
+            max_tokens,
+            max_characters,
+        ):
+            _raise_overflow(
+                document=document,
+                context=context,
+                source=source,
+                content=content,
+                reason="切分块超过硬限",
+            )
+        chunks.append(
+            ChunkDraft(
+                source_key=document.source_key,
+                ordinal=len(chunks),
+                text=KnowledgeText(
+                    category=context.category,
+                    questions=context.questions,
+                    answer=cleaned,
+                ),
+                section_path=context.section_path,
+                content_type=document.content_type,
+                is_key_clause=context.is_key_clause,
+            )
+        )
+
+    for section in split_sections(source):
+        content = section.page_content.replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not content:
+            continue
+        context = _context(section.metadata, document)
+        if is_table_block(content):
+            max_rows = _max_table_rows(
+                content=content,
+                context=context,
+                target_tokens=target_tokens,
+                count_tokens=count_tokens,
+            )
+            for table_block in split_table_rows(content, max_rows):
+                append(table_block, context, content)
+            continue
+        _validate_atomic(
+            content=content,
             document=document,
-            category=category,
-            questions=questions,
-            section_path=section_path,
-            is_key_clause=is_key_clause,
+            context=context,
+            source=source,
             count_tokens=count_tokens,
-            target_tokens=target_tokens,
-            overlap_tokens=overlap_tokens,
             max_tokens=max_tokens,
             max_characters=max_characters,
-            chunks=chunks,
         )
-        pending: list[_Atom] = []
-        for unit in section.units:
-            if unit.kind == "table":
-                if pending:
-                    builder.add_text(pending)
-                    pending = []
-                builder.add_table(unit)
-            else:
-                pending.extend(_atoms_for_unit(unit))
-        if pending:
-            builder.add_text(pending)
+        overhead = count_tokens(
+            f"分类：{context.category}\n问法：{context.questions}\n答案："
+        )
+        parts = recursive_split(
+            content,
+            max(1, target_tokens - overhead),
+            count_tokens,
+        )
+        for part in apply_sentence_overlap(parts, overlap_tokens, count_tokens):
+            append(part, context, content)
     return chunks
