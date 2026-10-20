@@ -10,6 +10,8 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.pool import NullPool
 from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -19,6 +21,11 @@ from app.core.logging import setup_logging
 from app.config import settings
 from app.core.llm import ChatModelAdapter
 from app.db.session import create_database
+from app.knowledge.chunking import CHUNKING_VERSION
+from app.knowledge.embedding import BgeM3Encoder
+from app.knowledge.search import KnowledgeSearch, load_retrieval_policy
+from app.knowledge.store import KnowledgeStore
+from app.knowledge.vector import MilvusVectorIndex
 from app.repositories.chat import ChatRepository
 from app.repositories.support import SupportRepository
 from app.services.chat import ChatService
@@ -85,13 +92,53 @@ async def chat_page() -> FileResponse:
 
 @asynccontextmanager
 async def database_runtime():
-    """建立单 worker 运行时并恢复中断轮。参数：无；返回：聊天服务；异常：恢复/连接失败阻止启动。"""
+    """建立单 worker 运行时、恢复中断轮并加载知识检索。
+
+    参数:
+        无
+    返回值:
+        ChatService: 共享数据库、编码器、Milvus 与检索策略的聊天服务。
+    异常:
+        恢复/数据库/模型/向量/策略初始化失败均阻止启动。
+    """
     engine, factory = create_database()
+    lease_engine = None
+    encoder = None
+    index = None
     try:
         repository = ChatRepository(factory)
         await repository.recover_interrupted_turns()
-        yield ChatService(repository, SupportRepository(factory), ChatModelAdapter(), build_registry(), settings)
+        lease_engine = create_async_engine(
+            engine.url,
+            poolclass=NullPool,
+            connect_args={"connect_timeout": 5},
+        )
+        store = KnowledgeStore(factory, lease_engine)
+        encoder = BgeM3Encoder(settings)
+        index = MilvusVectorIndex(settings)
+        await index.ensure_ready(create=False)
+        policy = load_retrieval_policy(
+            Path(settings.knowledge_policy_path),
+            embedding_revision=encoder.revision,
+            chunking_version=CHUNKING_VERSION,
+        )
+        # 模型与客户端在 lifespan 内共享；启动即验证本地权重可用，避免首问才失败。
+        await encoder.encode(["知识库启动预热"])
+        search = KnowledgeSearch(store, encoder, index, policy)
+        yield ChatService(
+            repository,
+            SupportRepository(factory, search),
+            ChatModelAdapter(),
+            build_registry(),
+            settings,
+        )
     finally:
+        if encoder is not None:
+            await encoder.aclose()
+        if index is not None:
+            await index.aclose()
+        if lease_engine is not None:
+            await lease_engine.dispose()
         await engine.dispose()
 
 

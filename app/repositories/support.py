@@ -1,10 +1,13 @@
-"""FAQ 字面查询和工单原子写入，不依赖模型或 SSE。"""
+"""客服 FAQ 知识检索注入和工单原子写入，不依赖模型或 SSE。"""
 
 import hashlib
 import json
-from sqlalchemy import or_, select
+
 from sqlalchemy.exc import IntegrityError
-from app.models.customer_service import Conversation, FAQ, Message, Ticket
+
+from app.knowledge.schemas import KnowledgeUnavailable
+from app.knowledge.search import KnowledgeSearch
+from app.models.customer_service import Conversation, Message, Ticket
 from app.repositories.chat import ChatRepository, PersistenceUncertain, result_query
 from app.schemas.tools import ToolContext, ToolResult
 
@@ -12,21 +15,41 @@ from app.schemas.tools import ToolContext, ToolResult
 class SupportRepository:
     """查询和写入客服业务数据，每次调用独占短事务。"""
 
-    def __init__(self, session_factory):
-        """保存会话工厂。参数：session_factory 异步工厂；返回：None；异常：无。"""
+    def __init__(
+        self,
+        session_factory,
+        knowledge_search: KnowledgeSearch | None = None,
+    ) -> None:
+        """保存会话工厂与可选知识检索。
+
+        参数:
+            session_factory: 异步会话工厂。
+            knowledge_search: 在线 Dense 检索；为 None 时 FAQ 明确不可用，但工单仍可用。
+        返回值:
+            None
+        异常:
+            无
+        """
         self.factory = session_factory
+        self.knowledge_search = knowledge_search
 
     async def query_faq(self, keyword: str, limit: int = 3) -> list[dict]:
-        """LIKE 字面关键词查询。参数：非空 keyword，limit 取 1–3；返回：问答列表；异常：校验或数据库错误。"""
-        if not keyword.strip() or not 1 <= limit <= 3:
+        """通过注入的知识检索查询 FAQ。
+
+        参数:
+            keyword: 用户原话中的关键词，1–100 字符。
+            limit: 返回条数，1–3。
+        返回值:
+            list[dict]: id/question/answer/category 列表。
+        异常:
+            ValueError: 参数不合法。
+            KnowledgeUnavailable: 检索未配置或依赖不可用，不回退旧 LIKE。
+        """
+        if not keyword.strip() or len(keyword) > 100 or not 1 <= limit <= 3:
             raise ValueError("FAQ 关键词或条数不合法")
-        # 自动转义通配符，并使用绑定参数而非拼接 SQL。
-        statement = select(FAQ).where(or_(*(field.contains(keyword, autoescape=True)
-            for field in [FAQ.question, FAQ.answer, FAQ.category]))).order_by(FAQ.id).limit(limit)
-        async with self.factory() as session:
-            rows = (await session.scalars(statement)).all()
-            return [{"id": row.id, "question": row.question, "answer": row.answer[:2000],
-                     "category": row.category} for row in rows]
+        if self.knowledge_search is None:
+            raise KnowledgeUnavailable("知识检索未配置")
+        return await self.knowledge_search.query_faq(keyword, limit)
 
     async def create_ticket(self, context: ToolContext, description: str, ticket_type: str) -> ToolResult:
         """幂等创建工单并保存成功事实。参数：可信上下文、描述、售后/投诉/咨询；返回：原工单结果；异常：数据库或一致性错误。"""

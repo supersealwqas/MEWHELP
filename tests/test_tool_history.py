@@ -75,7 +75,7 @@ def test_message_name_and_call_id_consume_dialog_budget():
 
 
 def test_prepare_counts_system_without_charging_it_to_dialog_budget():
-    """把系统说明算入2000对话预算或漏掉完整请求预算都会失败。参数：无；返回：None；异常：断言失败。"""
+    """把系统说明算入对话预算或漏掉完整请求预算都会失败。参数：无；返回：None；异常：断言失败。"""
     from app.core import memory
     current = [HumanMessage(content="你好")]
     prepared = memory.prepare_messages([], current, 30, system_text="中" * 100, request_max_tokens=300)

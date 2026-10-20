@@ -6,7 +6,9 @@ from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSessionTransaction
 
 from app.db.seed import seed_database
+from app.knowledge.schemas import KnowledgeUnavailable
 from app.models.customer_service import Conversation, FAQ, Message, Ticket
+from app.repositories.support import SupportRepository
 from app.schemas.tools import ToolContext, ToolResult
 
 pytestmark = pytest.mark.mysql
@@ -127,14 +129,24 @@ async def test_result_role_and_id_constraints(database, repositories):
             await session.commit()
 
 
-async def test_faq_literal_like(database, repositories):
-    """中文与 SQL 通配符均按字面查询。参数：测试夹具；返回：None；异常：断言失败。"""
+async def test_faq_requires_injected_knowledge_search(database, repositories):
+    """FAQ 不再回退 LIKE：无检索失败关闭，注入检索后按契约返回。参数：测试夹具；返回：None；异常：断言失败。"""
     _, support = repositories
-    async with database[1].begin() as session:
-        session.add_all([FAQ(question=q, answer="演示答案", category="测试") for q in ["退货政策", "折扣100%", "规格_a", "路径\\a"]])
-    for keyword in ["退货", "%", "_", "\\"]:
-        assert len(await support.query_faq(keyword)) == 1
-    assert await support.query_faq("不存在") == []
+    with pytest.raises(KnowledgeUnavailable):
+        await support.query_faq("退货")
+
+    class _Search:
+        """最小知识检索替身。"""
+
+        async def query_faq(self, keyword, limit=3):
+            """按固定关键词返回命中。参数：关键词/条数；返回：问答；异常：无。"""
+            if keyword == "退货":
+                return [{"id": 1, "question": "退货政策", "answer": "演示答案", "category": "售后"}]
+            return []
+
+    injected = SupportRepository(database[1], _Search())
+    assert (await injected.query_faq("退货"))[0]["id"] == 1
+    assert await injected.query_faq("不存在") == []
 
 
 async def test_seed_idempotent(database):

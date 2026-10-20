@@ -101,7 +101,7 @@ def test_default_config(monkeypatch: pytest.MonkeyPatch) -> None:
     assert conf.chat_base_url == "http://test.invalid/v1"
     assert conf.chat_model == "test-model"
     assert conf.chat_api_key == "test-key"
-    assert conf.token_budget == 2000
+    assert conf.token_budget == 12000
     assert conf.request_token_budget == 16000
 
     assert conf.embed_base_url is None

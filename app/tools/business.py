@@ -37,7 +37,7 @@ query_order.tags = ["mock"]
 # 当前 LangChain 版本的 tool() 不接受 tags 关键字，只能事后赋值；删掉这行会退回真实数据语义。
 
 
-@tool(args_schema=KeywordArgs, description="根据商品名称或编号查询商品价格、库存和规格，适用于商品咨询和购买前的信息确认。")
+@tool(args_schema=KeywordArgs, description="根据商品名称或编号查询演示价格、库存和基础规格，仅用于价格/库存类商品咨询；知识库中的型号、使用方法和售后政策应使用 query_faq。")
 async def query_product(keyword: str) -> dict:
     """查询商品价格、库存与规格。
 
@@ -88,7 +88,7 @@ query_logistics.tags = ["mock"]
 # 同上：tags 事后赋值，缺这行则该工具的演示数据会被当作真实数据播报。
 
 
-@tool(args_schema=KeywordArgs, description="按关键词查询退换货、配送、发票等商城政策和常见问题，返回最多三条相关问答。关键词必须取自当前用户原话的连续片段，不能改成同义词；例如邮费不能改成运费。无匹配时 hits 为空列表。")
+@tool(args_schema=KeywordArgs, description="按当前用户原话中的关键词查询知识库，覆盖退换货、配送、发票、商品规格/使用、会员权益和售后流程，返回最多三条相关问答。关键词必须取自当前用户原话的连续片段，不能改成同义词；例如邮费不能改成运费。无匹配时 hits 为空列表。")
 async def query_faq(keyword: str, config: RunnableConfig) -> dict:
     """查询商城政策和常见问答。
 

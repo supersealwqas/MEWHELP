@@ -34,11 +34,11 @@ class Settings(BaseSettings):
         description="上游对话模型调用的 API 鉴权密钥",
     )
     token_budget: int = Field(
-        default=2000,
+        default=12000,
         gt=0,
         # 优先使用参考项目的名称，同时兼容已有 .env 中的旧配置键。
         validation_alias=AliasChoices("token_budget", "chat_token_budget"),
-        description="对话消息估算预算，包含当前问题和工具事实，不含系统提示及工具定义，并非模型真实 Token 上限",
+        description="对话消息估算预算，CH03 起默认 12000 以容纳三条知识事实，不含系统提示及工具定义，并非模型真实 Token 上限",
     )
     request_token_budget: int = Field(
         default=16000,

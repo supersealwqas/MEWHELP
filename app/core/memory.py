@@ -82,7 +82,7 @@ class SessionStore:
         self._sessions.pop(session_id, None)
 
 
-def trim_history(messages: list[BaseMessage], max_tokens: int = 2000) -> list[BaseMessage]:
+def trim_history(messages: list[BaseMessage], max_tokens: int = 12000) -> list[BaseMessage]:
     """基于 Token 预算控制的历史消息裁剪函数。
 
     使用 LangChain 官方 `trim_messages` 工具实现，确保对话历史在超出预算时
@@ -90,7 +90,7 @@ def trim_history(messages: list[BaseMessage], max_tokens: int = 2000) -> list[Ba
 
     参数:
         messages (list[BaseMessage]): 待裁剪的消息列表
-        max_tokens (int): 允许保留的最大 Token 上限，默认为 2000
+        max_tokens (int): 允许保留的最大 Token 上限，默认为 12000
 
     返回值:
         list[BaseMessage]: 裁剪后的消息列表；若输入为空则返回空列表
@@ -241,7 +241,7 @@ def prepare_messages(
     fixed_tokens = _estimate_message_tokens([system])
     if tools:
         fixed_tokens += _estimate_token_units([convert_to_openai_tool(tool) for tool in tools])
-    # 固定说明只扣完整输入预算，不能挤占独立的 2000 单位对话预算。
+    # 固定说明只扣完整输入预算，不能挤占独立的 12000 单位对话预算。
     available = min(max_tokens, request_max_tokens - fixed_tokens)
     messages = trim_turns(history, current, available)
     return [system, *messages]

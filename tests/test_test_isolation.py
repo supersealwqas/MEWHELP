@@ -33,7 +33,7 @@ def test_offline_settings_ignore_dotenv_and_cached_bindings(import_order: str) -
     assert model.model_name == "test-model"
     assert str(model.openai_api_base).rstrip("/") == "http://test.invalid/v1"
     assert model.openai_api_key.get_secret_value() == "test-key"
-    assert config.settings.token_budget == 2000
+    assert config.settings.token_budget == 12000
     assert config.settings.mysql_host == "127.0.0.1"
     assert config.settings.mysql_password.get_secret_value() == ""
     service, _, _, _ = offline_chat_runtime
