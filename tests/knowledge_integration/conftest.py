@@ -12,6 +12,7 @@ from sqlalchemy.pool import NullPool
 from app.config import Settings
 from app.db.session import create_database
 from app.knowledge.store import KnowledgeStore
+from app.knowledge.vector import MilvusVectorIndex
 from app.models.customer_service import Base as CustomerBase
 from app.models.knowledge import KnowledgeBase
 
@@ -68,3 +69,41 @@ async def knowledge_store(knowledge_database):
     """
     _, factory, lease_engine = knowledge_database
     yield KnowledgeStore(factory, lease_engine)
+
+
+@pytest.fixture
+def milvus_test_config() -> Settings:
+    """提供指向独立 Milvus 测试库的配置。
+
+    参数:
+        无
+    返回值:
+        Settings: milvus_database 已切换到测试库。
+    异常:
+        pydantic.ValidationError: 真实 .env 配置不合法时抛出。
+    """
+    config = Settings(_env_file=Path(__file__).resolve().parents[2] / ".env")
+    return config.model_copy(update={"milvus_database": config.milvus_test_database})
+
+
+@pytest.fixture
+async def milvus_index(milvus_test_config: Settings):
+    """提供真实 Milvus 测试集合，进入与退出时清理本章向量。
+
+    参数:
+        milvus_test_config: 独立测试库配置。
+    返回值:
+        MilvusVectorIndex: 已就绪索引。
+    异常:
+        VectorIndexUnavailable: 初始化或清理失败。
+    """
+    index = MilvusVectorIndex(milvus_test_config)
+    await index.ensure_ready(create=True)
+    async for ids in index.iter_ids(1000):
+        await index.delete(ids)
+    try:
+        yield index
+    finally:
+        async for ids in index.iter_ids(1000):
+            await index.delete(ids)
+        await index.aclose()

@@ -18,8 +18,11 @@ from app.knowledge.schemas import (
     Publication,
     StagedQA,
     StoreFrame,
+    VectorHit,
+    VectorRecord,
 )
 from app.knowledge.text import content_fingerprint
+from app.knowledge.vector import VectorIndexUnavailable
 
 
 def make_settings(**overrides: object) -> Settings:
@@ -469,3 +472,86 @@ class MemoryKnowledgeWriter:
     async def source_upper_id(self) -> int:
         """返回完成轮次最大消息 ID。参数：无；返回：ID；异常：无。"""
         return max((turn.message_id for turn in self.store._turns), default=0)
+
+
+class MemoryVectorIndex:
+    """与 MilvusVectorIndex 同接口的内存向量索引。
+
+    支持写入成功后抛错、删除失败和主键分页；只用于离线契约测试，不替代
+    Milvus 真实集合的所有权与持久化证据。
+    """
+
+    def __init__(self, *, fail_after_upsert: bool = False, fail_delete: bool = False) -> None:
+        """初始化内存索引。
+
+        参数:
+            fail_after_upsert: 写入后模拟确认丢失。
+            fail_delete: 删除时模拟故障。
+        返回值:
+            None
+        异常:
+            无
+        """
+        self.records: dict[int, VectorRecord] = {}
+        self.fail_after_upsert = fail_after_upsert
+        self.fail_delete = fail_delete
+        self.drop_calls = 0
+        self.closed = False
+
+    @property
+    def ids(self) -> set[int]:
+        """返回当前主键集合。参数：无；返回：集合；异常：无。"""
+        return set(self.records)
+
+    async def ensure_ready(self, create: bool = False) -> None:
+        """模拟初始化。参数：create；返回：None；异常：无。"""
+        del create
+
+    async def upsert(self, records: list[VectorRecord]) -> None:
+        """写入或覆盖记录。参数：记录；返回：None；异常：VectorIndexUnavailable。"""
+        for record in records:
+            self.records[record.id] = record
+        if self.fail_after_upsert:
+            raise VectorIndexUnavailable("模拟 Milvus 写入确认丢失")
+
+    async def search(self, vector: list[float], limit: int) -> list[VectorHit]:
+        """按余弦相似度返回固定主键命中。参数：向量与数量；返回：命中；异常：无。"""
+        if limit <= 0:
+            raise ValueError("limit 必须为正数")
+        query_norm = sum(value * value for value in vector) ** 0.5
+        scored: list[VectorHit] = []
+        for record in self.records.values():
+            record_norm = sum(value * value for value in record.vector) ** 0.5
+            score = 0.0
+            if query_norm and record_norm:
+                score = sum(a * b for a, b in zip(vector, record.vector)) / (
+                    query_norm * record_norm
+                )
+            scored.append(
+                VectorHit(
+                    id=record.id,
+                    score=float(score),
+                    content_hash=record.content_hash,
+                    embedding_revision=record.embedding_revision,
+                )
+            )
+        return sorted(scored, key=lambda hit: hit.score, reverse=True)[:limit]
+
+    async def iter_ids(self, batch_size: int = 1000):
+        """分页迭代主键。参数：页大小；返回：异步批次；异常：ValueError。"""
+        if batch_size <= 0:
+            raise ValueError("batch_size 必须为正数")
+        identifiers = sorted(self.records)
+        for offset in range(0, len(identifiers), batch_size):
+            yield identifiers[offset : offset + batch_size]
+
+    async def delete(self, ids: list[int]) -> None:
+        """按主键删除记录。参数：主键；返回：None；异常：VectorIndexUnavailable。"""
+        if self.fail_delete:
+            raise VectorIndexUnavailable("模拟 Milvus 删除失败")
+        for identifier in ids:
+            self.records.pop(identifier, None)
+
+    async def aclose(self) -> None:
+        """标记索引关闭。参数：无；返回：None；异常：无。"""
+        self.closed = True
