@@ -23,7 +23,16 @@ from app.knowledge.scheduler import run_schedule
 
 
 def _config(test: bool) -> Settings:
-    """按 --test 切换两类测试库。参数：是否测试；返回：配置；异常：无。"""
+    """加载命令行配置，并按 --test 同时切换两类测试库。
+
+    参数:
+        test: 为 True 时使用 CH03 专用 MySQL 与 Milvus 测试库，否则保留应用库配置。
+    返回值:
+        Settings: 已校验的配置；测试模式下两个数据库均为 mewhelp_ch03_test。
+    异常:
+        pydantic.ValidationError: 必需配置缺失或字段不合法。
+        SystemExit: 测试模式下任一测试库名称不是 mewhelp_ch03_test。
+    """
     config = Settings()
     if test:
         if (

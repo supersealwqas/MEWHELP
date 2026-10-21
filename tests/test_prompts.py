@@ -70,8 +70,12 @@ class TestCustomerServicePrompt:
     def test_refund_timing_rule_distinguishes_processing_and_arrival(self) -> None:
         """测试提示词区分处理时限与到账时效，避免把不承诺到账扩大成不承诺审核。
 
+        参数:
+            无外部参数；使用 pytest 提供的测试实例。
         返回值:
             None: 无返回值，断言两条提示词都保留处理时限与到账时效的分离约束。
+        异常:
+            AssertionError: 提示词缺少处理时限与到账时效的分离约束。
         """
         from app.core.prompts import CUSTOMER_SERVICE_SYSTEM, FINAL_ANSWER_SYSTEM
 

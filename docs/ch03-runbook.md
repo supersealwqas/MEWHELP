@@ -84,6 +84,7 @@ uv run python -m app.knowledge.cli sync --test
 
 ## 故障与恢复
 
+- 索引完全为空但 MySQL 仍有 active 原文：在线查询明确失败，不再伪装为“没有相关政策”；执行 `uv run python -m app.knowledge.cli sync` 修复后再查询。真正空库或只有已撤回知识时允许空结果，正常低分未命中不受影响。
 - MySQL 已 pending、编码前中断：重新执行 `sync`/`import-docs`/`mine-once` 会按主键捡起。
 - Milvus upsert 后回填前中断：重跑以同一主键全量 upsert，再条件回填 done。
 - MySQL仍done但Milvus向量丢失：同步会按MySQL权威指纹补回。恢复报告逐阶段保存同一主键、三格正文、内容hash、编码输入hash、vector_id、active/pending/done及实际查询结果，恢复演示结束只清理本次临时source。

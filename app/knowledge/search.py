@@ -112,6 +112,10 @@ class KnowledgeSearch:
         while True:
             hits = await self.index.search(vector, pool)
             if not hits:
+                # 空索引与低分未命中不同：只读一条有效原文即可识别丢向量或尚未同步。
+                # 真正空库或仅有已撤回知识时才允许空结果；状态读取失败直接向上传播。
+                if await self.store.active_page(after_id=0, limit=1):
+                    raise KnowledgeSearchUnavailable("知识索引为空，但仍有有效原文，需完成向量同步")
                 return []
             candidate_hits = [hit for hit in hits if hit.score >= self.policy.min_score]
             if not candidate_hits:

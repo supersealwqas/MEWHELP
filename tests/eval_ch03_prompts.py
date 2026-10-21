@@ -178,7 +178,19 @@ def _evaluate_extraction(extraction: dict, qas: list[ExtractedQA]) -> dict:
 
 
 async def _evaluate_relation(model, encoder, relation: dict) -> dict:
-    """评估关系判定并计算可保留全部标注正例的最高候选阈值。"""
+    """评估关系判定并计算可保留全部标注正例的最高候选阈值。
+
+    参数:
+        model: 提供 relate 接口的知识模型，可使用真实模型或测试替身。
+        encoder: 提供 encode 接口与 revision 标识的编码器。
+        relation: 包含 items 证据和 cases 标注的字典，案例引用必须对应证据。
+    返回值:
+        dict: 通过状态、逐例结果、失败原因、相似度分数、阈值与可选校准策略。
+    异常:
+        KeyError、ValueError: 标注字段、证据引用或模型字段不合法。
+        RuntimeError: 编码器返回的向量数量与证据数量不一致。
+        模型、编码器与上游网络异常向调用方传播。
+    """
     items = [EvidenceItem.model_validate(item) for item in relation["items"]]
     refs = {item.ref for item in items}
     pairs = [(case["left"], case["right"]) for case in relation["cases"]]

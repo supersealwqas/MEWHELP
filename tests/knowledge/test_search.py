@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import pytest
+from langchain_core.messages import AIMessage, ToolMessage
 
+from app.knowledge.errors import KnowledgeStoreUnavailable
 from app.knowledge.schemas import (
     ChunkSnapshot,
     KnowledgeText,
@@ -12,10 +14,14 @@ from app.knowledge.schemas import (
     VectorRecord,
 )
 from app.knowledge.search import KnowledgeSearch, KnowledgeSearchUnavailable
+from app.knowledge.sync import VectorSynchronizer
 from app.knowledge.text import content_fingerprint
 from app.knowledge.vector import VectorIndexUnavailable
 from app.repositories.support import SupportRepository
+from app.schemas.chat import ChatRequest
+from app.schemas.tools import ToolResult
 from app.tools.registry import build_registry
+from tests.chat_fakes import make_chat_service
 from tests.knowledge.fakes import FakeEncoder, MemoryKnowledgeStore, MemoryVectorIndex
 
 REVISION = "fake-encoder-v1"
@@ -148,6 +154,95 @@ async def test_unrelated_scores_empty_but_no_like_fallback() -> None:
         min_score=0.9,
     )
     assert await search.query_faq("邮费") == []
+
+
+@pytest.mark.parametrize("status", ["done", "pending"])
+async def test_empty_index_with_active_knowledge_reports_sync_failure(status: str) -> None:
+    """仍有有效原文时，空索引不能被当作正常未命中。
+
+    参数：status 为原文的 done 或 pending 同步状态。
+    返回：None，断言显式报告同步故障。
+    异常：断言失败。
+    """
+    snapshot = _snapshot(1, "未满99元收6元。").model_copy(update={"vectorize_status": status})
+    search, _, _ = _search([snapshot], [])
+    with pytest.raises(KnowledgeSearchUnavailable):
+        await search.query_faq("邮费")
+
+
+@pytest.mark.parametrize("has_inactive", [False, True], ids=["empty-database", "only-withdrawn"])
+async def test_empty_index_without_active_knowledge_remains_empty(has_inactive: bool) -> None:
+    """真正空库或只有已撤回知识时，允许正常空结果。
+
+    参数：has_inactive 是否保留一条已撤回原文。
+    返回：None，断言查询没有误报同步故障。
+    异常：断言失败。
+    """
+    snapshots = [_snapshot(1, "已撤回的答案。", active=False)] if has_inactive else []
+    search, _, _ = _search(snapshots, [])
+    assert await search.query_faq("邮费") == []
+
+
+async def test_empty_index_cannot_hide_unavailable_source_status(monkeypatch) -> None:
+    """无法核实原文状态时，不能把空索引包装成正常未命中。
+
+    参数：monkeypatch 用于模拟原文状态读取故障。
+    返回：None，断言原文读取错误向上层传播。
+    异常：断言失败。
+    """
+    search, _, _ = _search([], [])
+
+    async def unavailable_page(after_id: int, limit: int):
+        """模拟原文读取失败。参数：游标、页大小；返回：不返回；异常：KnowledgeStoreUnavailable。"""
+        raise KnowledgeStoreUnavailable("原文状态暂时不可用")
+
+    monkeypatch.setattr(search.store, "active_page", unavailable_page)
+    with pytest.raises(KnowledgeStoreUnavailable):
+        await search.query_faq("邮费")
+
+
+async def test_missing_vectors_report_failure_until_same_id_is_restored() -> None:
+    """丢失向量后先报告故障，显式同步恢复后重新返回原知识。
+
+    参数：无。
+    返回：None，断言完整、丢失、恢复三个状态的查询结果。
+    异常：断言失败。
+    """
+    snapshot = _snapshot(1, "未满99元收6元。")
+    search, encoder, index = _search([snapshot], [_record(snapshot, QUERY_VECTOR)])
+    assert [hit["id"] for hit in await search.query_faq("邮费")] == [1]
+    # 只删除外部索引替身的数据，原文保持有效，真实检索和恢复逻辑继续运行。
+    index.records.clear()
+    with pytest.raises(KnowledgeSearchUnavailable):
+        await search.query_faq("邮费")
+    async with search.store.writer() as writer:
+        await VectorSynchronizer(search.store, encoder, index).run(writer)
+    hits = await search.query_faq("邮费")
+    assert [hit["id"] for hit in hits] == [1]
+    assert hits[0]["answer"] == "未满99元收6元。"
+
+
+async def test_empty_index_reaches_chat_as_failed_tool_fact() -> None:
+    """聊天层须保存并回传失败事实，不能生成成功的零命中事实。
+
+    参数：无。
+    返回：None，核对工具状态、持久化结果及回答阶段收到的事实。
+    异常：断言失败。
+    """
+    search, _, _ = _search([_snapshot(1, "未满99元收6元。")], [])
+    service, repository, _, model = make_chat_service(
+        AIMessage(content="", tool_calls=[{"id": "faq", "name": "query_faq", "args": {"keyword": "邮费"}}]),
+        chunks=["知识查询暂时不可用，请稍后重试。"],
+    )
+    service.executor.support = SupportRepository(None, search)
+    events = [event async for event in service.stream_turn(ChatRequest(session_id="empty-index", message="邮费是多少"))]
+    assert [event.data["status"] for event in events if event.event == "tool_status"] == ["running", "failed"]
+    saved = next(iter(repository.results.values()))
+    assert not saved.ok and saved.data is None
+    answer_facts = [message for message in model.inputs[-1][1] if isinstance(message, ToolMessage)]
+    assert len(answer_facts) == 1 and not ToolResult.model_validate_json(answer_facts[0].content).ok
+    assert [phase for phase, _ in model.inputs] == ["decide", "answer"]
+    assert events[-1].event == "done"
 
 
 async def test_query_faq_rejects_invalid_limit_and_blank_keyword() -> None:

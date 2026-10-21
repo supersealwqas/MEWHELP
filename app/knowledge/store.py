@@ -143,7 +143,15 @@ class KnowledgeStore:
             await lease.release()
 
     async def get_chunks(self, ids: list[int]) -> list[ChunkSnapshot]:
-        """按主键读取知识快照。参数：主键列表；返回：快照；异常：无。"""
+        """按主键读取知识快照。
+
+        参数:
+            ids: 待读取的知识主键列表，允许为空。
+        返回值:
+            list[ChunkSnapshot]: 已存在的知识快照；空输入返回空列表。
+        异常:
+            数据库连接或查询异常向调用方传播；快照字段不合法时抛出 pydantic.ValidationError。
+        """
         if not ids:
             return []
         async with self._factory() as session:
@@ -172,7 +180,15 @@ class KnowledgeStore:
             return [_snapshot_from_row(row) for row in rows]
 
     async def active_ids(self, ids: list[int]) -> set[int]:
-        """返回仍 active 的主键。参数：主键列表；返回：集合；异常：无。"""
+        """返回仍具备发布资格的知识主键。
+
+        参数:
+            ids: 待核对的知识主键列表，允许为空。
+        返回值:
+            set[int]: 输入中仍为 active 的主键；空输入返回空集合。
+        异常:
+            数据库连接或查询异常向调用方传播。
+        """
         if not ids:
             return set()
         async with self._factory() as session:
