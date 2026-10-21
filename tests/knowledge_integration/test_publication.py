@@ -19,8 +19,7 @@ from app.knowledge.schemas import (
 from app.knowledge.text import content_fingerprint
 from app.models.knowledge import KnowledgeChunk, QAExtractionStaging
 from app.models.customer_service import Conversation, Message
-from tests.knowledge.fakes import FakeEncoder, ScriptedKnowledgeModel
-from tests.knowledge.test_lifecycle import _MappedModel
+from tests.knowledge.fakes import FakeEncoder, MappedKnowledgeModel, ScriptedKnowledgeModel
 
 pytestmark = pytest.mark.knowledge_integration
 
@@ -236,7 +235,7 @@ async def test_same_active_keeps_stable_id_and_source_audit_in_real_mysql(knowle
         await writer.mark_vectorized(old)
     first = await _source_staged(factory, "旧问", "可信答。", knowledge_id=old.id, status="kept")
     second = await _source_staged(factory, "新问", "可信答。")
-    lifecycle = KnowledgeLifecycle(FakeEncoder(), _MappedModel({(f"staged:{second}", f"chunk:{old.id}"): "same"}), POLICY)
+    lifecycle = KnowledgeLifecycle(FakeEncoder(), MappedKnowledgeModel({(f"staged:{second}", f"chunk:{old.id}"): "same"}), POLICY)
     async with knowledge_store.writer() as writer:
         await lifecycle.reconcile_staging(writer)
         frame = await writer.frame()
@@ -251,7 +250,7 @@ async def test_document_snapshot_survives_same_ordinal_update_in_real_mysql(know
     """文档覆盖暂存后同ordinal更新仍可审计旧路径hash三格与source。参数：测试库/存储；返回：None；异常：断言失败。"""
     _, factory, _ = knowledge_database
     identifier = await _source_staged(factory, "旧问", "旧答。")
-    model = _MappedModel({})
+    model = MappedKnowledgeModel({})
     lifecycle = KnowledgeLifecycle(FakeEncoder(), model, POLICY)
     first = _draft("旧权威答。").model_copy(update={"section_path": "旧章/旧节"})
     async with knowledge_store.writer() as writer:
@@ -274,7 +273,7 @@ async def test_document_snapshot_survives_same_ordinal_update_in_real_mysql(know
 @pytest.mark.parametrize("old_document", [False, True])
 async def test_document_conflict_has_zero_real_mysql_publication(knowledge_store, old_document) -> None:
     """新权威相互或与未更新权威冲突时真实事务零发布。参数：存储/old_document；返回：None；异常：断言失败。"""
-    model = _MappedModel({})
+    model = MappedKnowledgeModel({})
     lifecycle = KnowledgeLifecycle(FakeEncoder(), model, POLICY)
     one, two = _draft("包邮。"), _draft("不包邮。").model_copy(update={"source_key": "doc:b.md"})
     async with knowledge_store.writer() as writer:
@@ -306,7 +305,7 @@ async def test_all_document_judgment_snapshots_retained_in_one_publication(knowl
         row.knowledge_id = published[0].id
         row.status = "kept"
     first, second = _draft("权威答。"), _draft("权威答。").model_copy(update={"source_key": "doc:b.md"})
-    model = _MappedModel({("draft:doc:a.md:0", f"chunk:{published[0].id}"): "conflict",
+    model = MappedKnowledgeModel({("draft:doc:a.md:0", f"chunk:{published[0].id}"): "conflict",
                           ("draft:doc:b.md:0", f"chunk:{published[0].id}"): "conflict"})
     async with knowledge_store.writer() as writer:
         await KnowledgeLifecycle(FakeEncoder(), model, POLICY).publish_documents(writer, [first, second], [first.source_key, second.source_key])
@@ -321,7 +320,7 @@ async def test_conflict_uncertain_chain_is_quarantined_in_real_transaction(knowl
     _, factory, _ = knowledge_database
     identifiers = [await _source_staged(factory, f"问{i}", f"答{i}。") for i in range(3)]
     one, two, three = identifiers
-    model = _MappedModel({(f"staged:{one}", f"staged:{two}"): "conflict",
+    model = MappedKnowledgeModel({(f"staged:{one}", f"staged:{two}"): "conflict",
                           (f"staged:{two}", f"staged:{three}"): "uncertain"})
     async with knowledge_store.writer() as writer:
         await KnowledgeLifecycle(FakeEncoder(), model, POLICY).reconcile_staging(writer)

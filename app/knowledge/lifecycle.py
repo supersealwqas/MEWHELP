@@ -10,9 +10,10 @@ from __future__ import annotations
 import hashlib
 import math
 from collections.abc import Callable
+from dataclasses import dataclass
 
-from app.knowledge.llm import KnowledgeModel, KnowledgeModelError
-from app.knowledge.contracts import KnowledgeEncoder
+from app.knowledge.contracts import KnowledgeEncoder, KnowledgeModel
+from app.knowledge.llm import KnowledgeModelError
 from app.knowledge.limits import knowledge_overflow
 from app.knowledge.prompts import EXTRACTION_INPUT_BUDGET, relation_input_size
 from app.knowledge.relations import relation_components
@@ -26,11 +27,32 @@ from app.knowledge.schemas import (
     RelationPolicy,
     StageChange,
     StagedQA,
+    StoreFrame,
 )
 from app.knowledge.text import content_fingerprint, format_knowledge
 
 _DOCUMENT_PREFIX = "doc:"
 _MINING_PREFIX = "qa:"
+
+
+@dataclass(frozen=True)
+class _StagingRelations:
+    """暂存关系判定的完整结果，集中保存组成员、风险与文档审计证据。"""
+
+    components: list[list[str]]  # 包含历史来源约束的稳定引用组。
+    risky_refs: set[str]  # 存在冲突或不确定关系的知识引用。
+    uncertain_refs: set[str]  # 与权威文档关系仍不确定的知识引用。
+    document_coverage: dict[str, list[tuple[ChunkSnapshot, RelationDecision]]]  # 文档对知识的明确裁定。
+    evidence_by_ref: dict[str, list[str | dict]]  # 每个引用对应的关系和文档快照审计。
+
+
+@dataclass(frozen=True)
+class _StagingChanges:
+    """暂存各组的处置结果，等待发布前检查点通过后组成一次Publication。"""
+
+    drafts: list[ChunkDraft]  # 各组产生的新增或合并草案，保持组处置顺序。
+    inactive_ids: set[int]  # 需要撤回的已发布知识主键。
+    stage_changes: dict[int, StageChange]  # 暂存主键到最终处置，保持首次加入顺序。
 
 
 def _cosine(left: list[float], right: list[float]) -> float:
@@ -417,8 +439,39 @@ class KnowledgeLifecycle:
         ]
         if not raw_candidates:
             return []
+
+        candidates, oversized_changes = self._prepare_staging_candidates(raw_candidates)
+        relations = await self._staging_relations(frame, candidates)
+        changes = self._staging_group_changes(
+            frame, candidates, relations, oversized_changes
+        )
+        if not changes.drafts and not changes.inactive_ids and not changes.stage_changes:
+            return []
+
+        self._checkpoint("before_staging_publish")
+        published = await writer.publish(
+            Publication(
+                expected_token=frame.token,
+                drafts=changes.drafts,
+                embedding_revision=self.encoder.revision,
+                inactive_ids=sorted(changes.inactive_ids),
+                stage_changes=list(changes.stage_changes.values()),
+            )
+        )
+        self._checkpoint("after_staging_publish")
+        return published
+
+    def _prepare_staging_candidates(
+        self, raw_candidates: list[StagedQA]
+    ) -> tuple[list[StagedQA], dict[int, StageChange]]:
+        """筛出可参与关系判定的候选，并保留超限候选的审计处置。
+
+        参数：raw_candidates为尚未隔离、状态为extracted的暂存记录，保持读取顺序。
+        返回：合规候选列表，以及按暂存主键索引的超限处置。
+        异常：Pydantic字段校验失败或编码器计数异常。
+        """
         oversized_changes: dict[int, StageChange] = {}
-        candidates = []
+        candidates: list[StagedQA] = []
         for row in raw_candidates:
             text = KnowledgeText(
                 category=row.category, questions=row.question, answer=row.answer
@@ -432,7 +485,17 @@ class KnowledgeLifecycle:
                 )
             else:
                 candidates.append(row)
+        return candidates, oversized_changes
 
+    async def _staging_relations(
+        self, frame: StoreFrame, candidates: list[StagedQA]
+    ) -> _StagingRelations:
+        """收齐候选关系，并补判候选触达的历史知识与权威文档的关系。
+
+        参数：frame为固定发布快照；candidates为已通过单块硬限的候选，允许为空。
+        返回：完整关系组、风险引用及可用于整组处置的文档审计证据。
+        异常：KnowledgeModelError、编码器异常或关系引用不存在时的KeyError。
+        """
         active_mined = [
             row
             for row in frame.chunks
@@ -444,7 +507,6 @@ class KnowledgeLifecycle:
             if row.is_active and row.source_key.startswith(_DOCUMENT_PREFIX)
         ]
         quarantined = [row for row in frame.staged if row.conflict_group]
-        candidate_by_id = {row.id: row for row in candidates}
         chunk_by_id = {row.id: row for row in active_mined + active_documents}
         items = (
             [self._staged_item(row) for row in candidates]
@@ -466,12 +528,22 @@ class KnowledgeLifecycle:
         # 稳定ref图包含所有暂存审计来源，不能先排除存在风险的节点。
         staged_by_id = {row.id: row for row in frame.staged}
         qa_chunks = {row.id: row for row in frame.chunks if row.source_key.startswith(_MINING_PREFIX)}
-        qa_decisions = [decision for decision in decisions.values()
-                        if not (decision.right_ref.startswith("chunk:")
-                                and chunk_by_id[int(decision.right_ref.removeprefix("chunk:"))].source_key.startswith(_DOCUMENT_PREFIX))]
+        qa_decisions = [
+            decision for decision in decisions.values()
+            if not (
+                decision.right_ref.startswith("chunk:")
+                and chunk_by_id[int(decision.right_ref.removeprefix("chunk:"))].source_key.startswith(
+                    _DOCUMENT_PREFIX
+                )
+            )
+        ]
         components = relation_components(frame.staged, list(qa_chunks.values()), qa_decisions)
         candidate_refs = {f"staged:{row.id}" for row in candidates}
-        reached = {ref for members in components if set(members) & candidate_refs for ref in members}
+        reached = {
+            ref for members in components
+            if set(members) & candidate_refs
+            for ref in members
+        }
         # 只对新候选触达的实际旧知识补文档裁定，关联来源审计由其知识块承接。
         authority_items = []
         for ref in sorted(reached - candidate_refs):
@@ -482,14 +554,36 @@ class KnowledgeLifecycle:
                 if row.knowledge_id not in qa_chunks:
                     authority_items.append(self._staged_item(row))
         document_items = [self._chunk_item(row) for row in active_documents]
-        authority_pairs = [(item.ref, document.ref) for item in authority_items for document in document_items]
+        authority_pairs = [
+            (item.ref, document.ref)
+            for item in authority_items
+            for document in document_items
+        ]
         decisions.update(await self._relations(authority_items + document_items, authority_pairs))
+        return self._summarize_staging_relations(components, decisions, chunk_by_id)
+
+    def _summarize_staging_relations(
+        self,
+        components: list[list[str]],
+        decisions: dict[tuple[str, str], RelationDecision],
+        chunk_by_id: dict[int, ChunkSnapshot],
+    ) -> _StagingRelations:
+        """按知识引用归集风险、文档覆盖和审计证据，不改变关系组。
+
+        参数：components为QA关系组；decisions为收齐且保持判定顺序的关系；
+        chunk_by_id为候选判定所使用的有效挖掘和文档知识。
+        返回：供组处置使用的关系结果；文档裁定仅形成覆盖证据，不连接组。
+        异常：决定引用不存在的知识块时抛出KeyError。
+        """
         risky_refs: set[str] = set()
         uncertain_refs: set[str] = set()
         document_coverage: dict[str, list[tuple[ChunkSnapshot, RelationDecision]]] = {}
         evidence_by_ref: dict[str, list[str | dict]] = {}
         for (left, right), decision in decisions.items():
-            if right.startswith("chunk:") and chunk_by_id[int(right.removeprefix("chunk:"))].source_key.startswith(_DOCUMENT_PREFIX):
+            if (
+                right.startswith("chunk:")
+                and chunk_by_id[int(right.removeprefix("chunk:"))].source_key.startswith(_DOCUMENT_PREFIX)
+            ):
                 document = chunk_by_id[int(right.removeprefix("chunk:"))]
                 if decision.relation in ("same", "conflict"):
                     document_coverage.setdefault(left, []).append((document, decision))
@@ -505,36 +599,83 @@ class KnowledgeLifecycle:
             for ref in (left, right):
                 evidence_by_ref.setdefault(ref, []).extend([left, right])
 
+        return _StagingRelations(
+            components=components,
+            risky_refs=risky_refs,
+            uncertain_refs=uncertain_refs,
+            document_coverage=document_coverage,
+            evidence_by_ref=evidence_by_ref,
+        )
+
+    def _staging_group_changes(
+        self,
+        frame: StoreFrame,
+        candidates: list[StagedQA],
+        relations: _StagingRelations,
+        oversized_changes: dict[int, StageChange],
+    ) -> _StagingChanges:
+        """依次按文档裁定、风险隔离、同义合并处置各组。
+
+        参数：frame为固定发布快照；candidates为合规候选；relations为完整关系结果；
+        oversized_changes为候选筛选时保留的超限审计处置，不在本方法中修改。
+        返回：按原有顺序累积的草案、撤回主键与暂存处置，允许全部为空。
+        异常：Pydantic字段校验失败、编码器计数异常或组引用不存在时的KeyError。
+        """
+        candidate_by_id = {row.id: row for row in candidates}
+        candidate_refs = {f"staged:{row.id}" for row in candidates}
+        staged_by_id = {row.id: row for row in frame.staged}
+        qa_chunks = {
+            row.id: row for row in frame.chunks
+            if row.source_key.startswith(_MINING_PREFIX)
+        }
         drafts: list[ChunkDraft] = []
         stage_changes: dict[int, StageChange] = dict(oversized_changes)
         inactive_ids: set[int] = set()
-        for component in components:
+        for component in relations.components:
             member_refs = set(component)
             new_refs = member_refs & candidate_refs
             if not new_refs:
                 continue
-            member_staged = sorted([staged_by_id[int(ref.removeprefix("staged:"))]
-                                    for ref in component if ref.startswith("staged:")], key=lambda row: row.id)
-            related_active = sorted([qa_chunks[int(ref.removeprefix("chunk:"))]
-                                     for ref in component if ref.startswith("chunk:")
-                                     and qa_chunks[int(ref.removeprefix("chunk:"))].is_active],
-                                    key=lambda row: row.id)
+            member_staged = sorted(
+                [staged_by_id[int(ref.removeprefix("staged:"))]
+                 for ref in component if ref.startswith("staged:")],
+                key=lambda row: row.id,
+            )
+            related_active = sorted(
+                [qa_chunks[int(ref.removeprefix("chunk:"))]
+                 for ref in component if ref.startswith("chunk:")
+                 and qa_chunks[int(ref.removeprefix("chunk:"))].is_active],
+                key=lambda row: row.id,
+            )
             existing_groups = {row.conflict_group for row in member_staged if row.conflict_group}
             evidence: list[str | dict] = list(sorted(member_refs))
             for ref in sorted(member_refs):
-                evidence.extend(evidence_by_ref.get(ref, []))
-            has_risk = bool(member_refs & risky_refs or existing_groups)
+                evidence.extend(relations.evidence_by_ref.get(ref, []))
+            has_risk = bool(member_refs & relations.risky_refs or existing_groups)
             # 文档不作为图边；只有覆盖整组实际知识的决定才能整体处置。
             actual_refs = {ref for ref in member_refs if ref.startswith("chunk:")}
-            actual_refs.update(f"staged:{row.id}" for row in member_staged if row.knowledge_id not in qa_chunks)
-            covered = actual_refs.issubset(document_coverage) and not bool(member_refs & uncertain_refs)
+            actual_refs.update(
+                f"staged:{row.id}" for row in member_staged
+                if row.knowledge_id not in qa_chunks
+            )
+            covered = actual_refs.issubset(relations.document_coverage) and not bool(
+                member_refs & relations.uncertain_refs
+            )
             if covered:
                 inactive_ids.update(row.id for row in related_active)
                 for row in member_staged:
-                    ref = f"chunk:{row.knowledge_id}" if row.knowledge_id in qa_chunks else f"staged:{row.id}"
-                    choices = document_coverage[ref]
-                    reason = "被文档推翻" if any(decision.relation == "conflict" for _, decision in choices) else "文档重复"
-                    stage_changes[row.id] = StageChange(id=row.id, status="discarded", reason=reason, evidence_refs=evidence)
+                    ref = (
+                        f"chunk:{row.knowledge_id}" if row.knowledge_id in qa_chunks
+                        else f"staged:{row.id}"
+                    )
+                    choices = relations.document_coverage[ref]
+                    reason = (
+                        "被文档推翻" if any(decision.relation == "conflict" for _, decision in choices)
+                        else "文档重复"
+                    )
+                    stage_changes[row.id] = StageChange(
+                        id=row.id, status="discarded", reason=reason, evidence_refs=evidence
+                    )
                 continue
             if has_risk:
                 # 单个历史组保留原身份；桥接多个旧组时全部成员获得统一新身份。
@@ -545,8 +686,10 @@ class KnowledgeLifecycle:
                         id=row.id, status="extracted", conflict_group=group,
                         reason="关系组存在冲突或不确定，等待权威资料", evidence_refs=evidence)
                 continue
-            new_candidates = sorted([candidate_by_id[int(ref.removeprefix("staged:"))]
-                                     for ref in new_refs], key=lambda row: row.id)
+            new_candidates = sorted(
+                [candidate_by_id[int(ref.removeprefix("staged:"))] for ref in new_refs],
+                key=lambda row: row.id,
+            )
             merged = self._merged_draft(new_candidates, related_active)
             if merged is None:
                 for row in new_candidates:
@@ -569,17 +712,8 @@ class KnowledgeLifecycle:
                         reason="同义合并" if len(new_candidates) > 1 else "保留",
                         knowledge_source_key=merged.source_key, evidence_refs=evidence)
 
-        if not drafts and not inactive_ids and not stage_changes:
-            return []
-        self._checkpoint("before_staging_publish")
-        published = await writer.publish(
-            Publication(
-                expected_token=frame.token,
-                drafts=drafts,
-                embedding_revision=self.encoder.revision,
-                inactive_ids=sorted(inactive_ids),
-                stage_changes=list(stage_changes.values()),
-            )
+        return _StagingChanges(
+            drafts=drafts,
+            inactive_ids=inactive_ids,
+            stage_changes=stage_changes,
         )
-        self._checkpoint("after_staging_publish")
-        return published

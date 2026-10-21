@@ -648,6 +648,41 @@ class MemoryVectorIndex:
         self.closed = True
 
 
+class MappedKnowledgeModel:
+    """按实际请求引用对返回指定关系，未配置时返回无关，并保留完整调用记录。"""
+
+    def __init__(self, relations: dict[tuple[str, str], str]) -> None:
+        """保存关系映射并初始化调用记录。
+
+        参数：relations为有方向的引用对到关系名称的映射，缺省关系为unrelated。
+        返回：None。
+        异常：无。
+        """
+        self.relations = relations
+        self.calls: list[tuple[list[EvidenceItem], list[tuple[str, str]]]] = []
+
+    async def relate(
+        self, items: list[EvidenceItem], pairs: list[tuple[str, str]]
+    ) -> list[RelationDecision]:
+        """记录请求副本并按请求顺序返回完整关系决定。
+
+        参数：items为请求证据；pairs为待判定的有方向引用对，顺序保持不变。
+        返回：与pairs等长的决定列表，每条包含左右引用、关系和固定测试理由。
+        异常：Pydantic字段校验失败时抛出ValidationError。
+        """
+        self.calls.append((list(items), list(pairs)))
+        return [
+            RelationDecision(
+                left_ref=left,
+                right_ref=right,
+                relation=self.relations.get((left, right), "unrelated"),
+                evidence_refs=[left, right],
+                reason="测试关系",
+            )
+            for left, right in pairs
+        ]
+
+
 class ScriptedKnowledgeModel:
     """返回预置抽取/关系结果的知识模型替身。"""
 

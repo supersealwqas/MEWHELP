@@ -30,7 +30,7 @@ CH03 起 `query_faq` 的在线数据来自 `data/kb` 六份权威文档构建的
 6. `请帮我创建人工工单，订单 1001 一直未送达`：在 MySQL 写入待处理工单，回答给出真实保存的工单号。
 7. `帮我查订单 2003`：该单属于另一个演示用户，工具返回 `order_not_owned`，页面直接回固定文本“没有找到您的这笔订单，请确认订单号或物流单号后重试。”，不经过模型改写。
 
-订单、商品、物流在工具内部按入参生成可复现的演示数据，不连接公司业务系统，不建额外业务表。订单和物流共用以 `order:{order_id}` 为种子的独立 `random.Random`，商品使用 `product:{keyword}`；同一入参在相同代码和 Python 版本下，重复调用、交错查询、重启进程都返回相同数据。物流时间使用固定演示时间，不读取当前时钟；未发货订单没有承运方和物流单号。FAQ 来自演示政策表；工单会真实写入本地数据库，但没有人工坐席自动接入。
+订单、商品、物流在工具内部按入参生成可复现的演示数据，不连接公司业务系统，不建额外业务表。订单和物流共用以 `order:{order_id}` 为种子的独立 `random.Random`，商品使用 `product:{keyword}`；同一入参在相同代码和 Python 版本下，重复调用、交错查询、重启进程都返回相同数据。物流时间使用固定演示时间，不读取当前时钟；未发货订单没有承运方和物流单号。FAQ 来自 `data/kb` 构建的语义知识库；工单会真实写入本地数据库，但没有人工坐席自动接入。
 
 每轮最多执行一个工具，不做两步顺序调用。`query_logistics` 只接受 `tracking_no`，不接受订单号；只给订单号问物流时，本轮只能查订单并告知单号，物流轨迹需用户下一轮发送该单号。`query_order` 与 `query_logistics` 的 `user_id` 由执行器从 `ToolContext` 注入，模型看不到也填不了；模型夹带身份字段会被判为非法参数。归属不符与订单不存在返回同一 `order_not_owned`，最终回复由服务端固定文本给出，保证两种情况措辞完全一致、不泄露订单是否存在。
 
@@ -75,26 +75,30 @@ uv run pytest tests/knowledge_integration --run-knowledge-integration -q
 
 CH02 数据库测试会重建 **mewhelp_test** 中的四表，不操作应用库 mewhelp。CH03 集成测试只清理 **mewhelp_ch03_test** 与 Milvus 测试库自己的数据，覆盖发布、批次、来源补扫、向量重写与恢复。
 
-CH03 当前验收入口（只操作 `mewhelp_ch03_test` 与 Milvus 测试库；会使用真实 BGE-M3、Milvus、MySQL 和模型额度）：
+CH03 当前验收范围为链路正确性，检索与生成质量留待后续优化。以下入口只操作 `mewhelp_ch03_test` 与 Milvus 测试库，会使用真实 BGE-M3、Milvus、MySQL 和模型额度：
 
 ```bash
-uv run python tests/verify_ch03_live.py calibrate --test --report dev-notes/ch03-calibration.md
-uv run python tests/verify_ch03_live.py evaluate --test --report dev-notes/ch03-evaluation.md
+uv run python tests/verify_ch03_live.py pipeline --test --report dev-notes/ch03-pipeline.md
 uv run python tests/verify_ch03_live.py recovery --test --report dev-notes/ch03-recovery.md
 ```
 
-`calibrate` 重建测试知识库并生成 `data/knowledge/retrieval-policy.json`；`evaluate` 运行真实检索与聊天模型验收；`recovery` 演示向量写入后中断与重跑。CH02 的 `verify_ch02_live.py` 和 `ch02-evaluation.md` 保留为历史记录，不再要求“邮费零命中”或 10 元口径。完整命令、应用库初始化和启动方式见 [CH03 runbook](docs/ch03-runbook.md)。
+`pipeline` 要求测试库已导入当前资料，检查知识快照、真实工具调用、SSE 和消息落库；`recovery` 演示向量写入后中断与重跑。检索策略当前是未完成质量校准的链路基线。后续质量优化可使用 `calibrate` 和 `evaluate`：前者重建测试知识库，只有校准全部通过才覆盖策略，后者运行独立固定问法的质量验收。CH02 的 `verify_ch02_live.py` 和 `ch02-evaluation.md` 保留为历史记录，不再要求“邮费零命中”或 10 元口径。完整命令、应用库初始化和启动方式见 [CH03 runbook](docs/ch03-runbook.md)。
 
 ## 文件与运行限制
 
-- `app/models/`、`app/db/`：四表模型、连接及显式初始化。
-- `app/repositories/`：会话消息、FAQ 与工单短事务。
+- `app/api/`：接收聊天与结构化提取请求，输出 HTTP/SSE 响应。
+- `app/models/`、`app/db/`：客服与知识库表模型、连接及显式初始化。
+- `app/repositories/`：会话与工单存储，以及调用知识检索的客服入口。
+- `app/knowledge/`：集中处理知识库业务。`jobs.py` 编排导入和挖掘，`lifecycle.py` 决定发布/合并/隔离，`store.py` 负责原文与审计事务，`sync.py` 对照并同步向量，`search.py` 执行在线检索；编码与 Milvus 访问分别在 `embedding.py`、`vector.py`。
 - `app/tools/`：五工具、注册、参数校验、5 秒默认超时和最多 1 次重试。
 - `app/services/chat.py`：单工具聊天编排、同会话互斥、取消与持久化。
 - `app/core/`：模型工厂与适配、完整轮次历史裁剪、提示词。
 - `app/static/`：纯文本安全渲染与工具轨迹，无外部 CDN。
+- `tests/knowledge/`、`tests/knowledge_integration/`：离线知识规则测试与真实存储集成测试，共享替身集中在 `tests/knowledge/fakes.py`。
 - [CH02 开发记录](dev-notes/ch02.md)、[CH02 历史评估](dev-notes/ch02-evaluation.md)。
 - [CH03 开发记录](dev-notes/ch03.md)、[CH03 校准](dev-notes/ch03-calibration.md)、[CH03 验收](dev-notes/ch03-evaluation.md)、[CH03 运行手册](docs/ch03-runbook.md)。
+
+当前 embedding 使用本地 BGE-M3。`EMBED_BASE_URL`、`EMBED_MODEL`、`EMBED_API_KEY` 仍是预留配置，填写它们不会切换编码器；云端接入与配置切换后续单独实现。
 
 使用**单实例、单 worker**；不要启动多个服务同时使用同一数据库。启动时将旧 running 轮标为 cancelled，保留已提交工具事实；恢复失败会阻止启动。同会话重叠请求被拒绝，不同会话可以并发。
 

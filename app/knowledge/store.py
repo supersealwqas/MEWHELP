@@ -372,137 +372,213 @@ class KnowledgeWriter:
             # 直接调用生命周期也必须补证，不能绕过jobs发布无来源的旧候选。
             await self._ground_staging(session)
 
-            affected_rows: list[KnowledgeChunk] = []
-            affected_sources: set[str] = set(change.replace_sources)
-
-            for draft in change.drafts:
-                existing = await session.scalar(
-                    select(KnowledgeChunk)
-                    .where(
-                        KnowledgeChunk.source_key == draft.source_key,
-                        KnowledgeChunk.ordinal == draft.ordinal,
-                    )
-                    .with_for_update()
-                )
-                content_hash = content_fingerprint(draft.text)
-                if existing is None:
-                    row = KnowledgeChunk(
-                        source_key=draft.source_key,
-                        ordinal=draft.ordinal,
-                        category=draft.text.category,
-                        questions=draft.text.questions,
-                        answer=draft.text.answer,
-                        section_path=draft.section_path,
-                        content_type=draft.content_type,
-                        is_key_clause=draft.is_key_clause,
-                        content_hash=content_hash,
-                        embedding_revision=change.embedding_revision,
-                        is_active=True,
-                        vectorize_status="pending",
-                    )
-                    session.add(row)
-                else:
-                    input_changed = (
-                        content_hash != existing.content_hash
-                        or change.embedding_revision != existing.embedding_revision
-                        or not existing.is_active
-                    )
-                    existing.category = draft.text.category
-                    existing.questions = draft.text.questions
-                    existing.answer = draft.text.answer
-                    existing.section_path = draft.section_path
-                    existing.content_type = draft.content_type
-                    existing.is_key_clause = draft.is_key_clause
-                    existing.content_hash = content_hash
-                    existing.embedding_revision = change.embedding_revision
-                    existing.is_active = True
-                    if input_changed:
-                        existing.vectorize_status = "pending"
-                        existing.vector_id = None
-                    row = existing
-                affected_sources.add(draft.source_key)
-                affected_rows.append(row)
-
+            # 所有步骤复用当前会话；辅助方法不提交，任一步失败都由外层整体回滚。
+            affected_rows = await self._save_drafts(
+                session, change.drafts, change.embedding_revision
+            )
+            affected_sources = set(change.replace_sources)
+            affected_sources.update(draft.source_key for draft in change.drafts)
+            # 保持原有刷新位置：先取得新主键，再撤回旧块和关联暂存记录。
             await session.flush()
 
-            for source_key in change.replace_sources:
-                incoming = {
-                    draft.ordinal for draft in change.drafts if draft.source_key == source_key
-                }
-                old_rows = (
-                    await session.scalars(
-                        select(KnowledgeChunk)
-                        .where(KnowledgeChunk.source_key == source_key)
-                        .with_for_update()
-                    )
-                ).all()
-                for row in old_rows:
-                    if row.ordinal not in incoming:
-                        row.is_active = False
-                        row.vector_id = None
-                        row.vectorize_status = "pending"
-                        # 先断开撤回块两侧，再为剩余有效块重建邻接。
-                        row.prev_chunk_id = None
-                        row.next_chunk_id = None
-                affected_sources.add(source_key)
-
-            for identifier in change.inactive_ids:
-                row = await session.scalar(
-                    select(KnowledgeChunk)
-                    .where(KnowledgeChunk.id == identifier)
-                    .with_for_update()
-                )
-                if row is None:
-                    raise SnapshotChanged("待撤回知识不存在")
-                row.is_active = False
-                row.vector_id = None
-                row.vectorize_status = "pending"
-                # 显式撤回也不能留下通向有效知识的旧指针。
-                row.prev_chunk_id = None
-                row.next_chunk_id = None
-                affected_sources.add(row.source_key)
-                affected_rows.append(row)
-
-            for stage_change in change.stage_changes:
-                staged = await session.scalar(
-                    select(QAExtractionStaging)
-                    .where(QAExtractionStaging.id == stage_change.id)
-                    .with_for_update()
-                )
-                if staged is None:
-                    raise SnapshotChanged("暂存记录不存在")
-                staged.status = stage_change.status
-                staged.conflict_group = stage_change.conflict_group
-                if stage_change.reason:
-                    staged.reason = stage_change.reason
-                if stage_change.evidence_refs:
-                    # JSON对象按内容去重，保留首次出现顺序及所有历史原文快照。
-                    audit = []
-                    seen = set()
-                    for item in list(staged.evidence_refs or []) + list(stage_change.evidence_refs):
-                        fingerprint = json.dumps(item, ensure_ascii=False, sort_keys=True)
-                        if fingerprint not in seen:
-                            audit.append(item)
-                            seen.add(fingerprint)
-                    staged.evidence_refs = audit
-                if stage_change.knowledge_source_key:
-                    related = await session.scalar(
-                        select(KnowledgeChunk)
-                        .where(KnowledgeChunk.source_key == stage_change.knowledge_source_key)
-                        .order_by(KnowledgeChunk.ordinal)
-                        .limit(1)
-                    )
-                    staged.knowledge_id = related.id if related else None
-                    affected_sources.add(stage_change.knowledge_source_key)
+            await self._withdraw_missing_chunks(
+                session, change.replace_sources, change.drafts
+            )
+            withdrawn = await self._withdraw_chunks(session, change.inactive_ids)
+            affected_rows.extend(withdrawn)
+            affected_sources.update(row.source_key for row in withdrawn)
+            affected_sources.update(
+                await self._apply_stage_changes(session, change.stage_changes)
+            )
 
             await session.flush()
             for source_key in affected_sources:
                 await self._repair_pointers(session, source_key)
 
-            result_rows = {
-                row.id: row for row in affected_rows if row.id is not None
-            }
+            result_rows = {row.id: row for row in affected_rows if row.id is not None}
             return [_snapshot_from_row(row) for row in result_rows.values()]
+
+    async def _save_drafts(
+        self, session: AsyncSession, drafts: list[ChunkDraft], embedding_revision: str
+    ) -> list[KnowledgeChunk]:
+        """按来源和序号保存草案，保持知识主键稳定。
+
+        参数:
+            session: publish 持有的同一事务会话，本方法不提交。
+            drafts: 按原发布顺序排列的草案。
+            embedding_revision: 本次发布采用的编码规范标识。
+        返回值:
+            list[KnowledgeChunk]: 与草案顺序对应的已新增或更新实体。
+        异常:
+            数据库异常由调用方整体回滚。
+        """
+        rows: list[KnowledgeChunk] = []
+        for draft in drafts:
+            existing = await session.scalar(
+                select(KnowledgeChunk)
+                .where(
+                    KnowledgeChunk.source_key == draft.source_key,
+                    KnowledgeChunk.ordinal == draft.ordinal,
+                )
+                .with_for_update()
+            )
+            content_hash = content_fingerprint(draft.text)
+            if existing is None:
+                row = KnowledgeChunk(
+                    source_key=draft.source_key,
+                    ordinal=draft.ordinal,
+                    category=draft.text.category,
+                    questions=draft.text.questions,
+                    answer=draft.text.answer,
+                    section_path=draft.section_path,
+                    content_type=draft.content_type,
+                    is_key_clause=draft.is_key_clause,
+                    content_hash=content_hash,
+                    embedding_revision=embedding_revision,
+                    is_active=True,
+                    vectorize_status="pending",
+                )
+                session.add(row)
+            else:
+                input_changed = (
+                    content_hash != existing.content_hash
+                    or embedding_revision != existing.embedding_revision
+                    or not existing.is_active
+                )
+                existing.category = draft.text.category
+                existing.questions = draft.text.questions
+                existing.answer = draft.text.answer
+                existing.section_path = draft.section_path
+                existing.content_type = draft.content_type
+                existing.is_key_clause = draft.is_key_clause
+                existing.content_hash = content_hash
+                existing.embedding_revision = embedding_revision
+                existing.is_active = True
+                # 元数据更新仍保留 done，只有编码输入或发布资格变化才重新同步。
+                if input_changed:
+                    existing.vectorize_status = "pending"
+                    existing.vector_id = None
+                row = existing
+            rows.append(row)
+        return rows
+
+    @staticmethod
+    def _deactivate_chunk(row: KnowledgeChunk) -> None:
+        """清除知识发布资格、向量关联及旧邻接指针。
+
+        参数:
+            row: 当前事务中已经锁定的知识实体。
+        返回值:
+            None；只修改实体字段，不执行提交。
+        异常:
+            无。
+        """
+        row.is_active = False
+        row.vector_id = None
+        row.vectorize_status = "pending"
+        # 两种撤回入口使用同一规则，旧块不能继续指向有效知识。
+        row.prev_chunk_id = None
+        row.next_chunk_id = None
+
+    async def _withdraw_missing_chunks(
+        self, session: AsyncSession, source_keys: list[str], drafts: list[ChunkDraft]
+    ) -> None:
+        """撤回替换来源中未出现在新草案里的旧块。
+
+        参数:
+            session: publish 持有的同一事务会话。
+            source_keys: 本次完整替换的来源；空列表不撤回。
+            drafts: 本次全部草案，用于确定各来源保留的序号。
+        返回值:
+            None；保留旧实体作为历史记录。
+        异常:
+            数据库异常由调用方整体回滚。
+        """
+        for source_key in source_keys:
+            incoming = {draft.ordinal for draft in drafts if draft.source_key == source_key}
+            old_rows = (
+                await session.scalars(
+                    select(KnowledgeChunk)
+                    .where(KnowledgeChunk.source_key == source_key)
+                    .with_for_update()
+                )
+            ).all()
+            for row in old_rows:
+                if row.ordinal not in incoming:
+                    self._deactivate_chunk(row)
+
+    async def _withdraw_chunks(
+        self, session: AsyncSession, identifiers: list[int]
+    ) -> list[KnowledgeChunk]:
+        """按显式主键撤回知识，并返回需要汇报的实体。
+
+        参数:
+            session: publish 持有的同一事务会话。
+            identifiers: 按原发布顺序排列的待撤回主键。
+        返回值:
+            list[KnowledgeChunk]: 已撤回实体，保留传入顺序。
+        异常:
+            SnapshotChanged: 任一目标不存在；数据库异常由调用方整体回滚。
+        """
+        rows: list[KnowledgeChunk] = []
+        for identifier in identifiers:
+            row = await session.scalar(
+                select(KnowledgeChunk)
+                .where(KnowledgeChunk.id == identifier)
+                .with_for_update()
+            )
+            if row is None:
+                raise SnapshotChanged("待撤回知识不存在")
+            self._deactivate_chunk(row)
+            rows.append(row)
+        return rows
+
+    async def _apply_stage_changes(
+        self, session: AsyncSession, changes: list[StageChange]
+    ) -> set[str]:
+        """更新暂存处置、追加历史审计并关联已发布知识。
+
+        参数:
+            session: publish 持有的同一事务会话。
+            changes: 按原发布顺序排列的暂存处置；空字段沿用原规则。
+        返回值:
+            set[str]: 需要重建邻接指针的知识来源。
+        异常:
+            SnapshotChanged: 暂存目标不存在；数据库异常由调用方整体回滚。
+        """
+        affected_sources: set[str] = set()
+        for change in changes:
+            staged = await session.scalar(
+                select(QAExtractionStaging)
+                .where(QAExtractionStaging.id == change.id)
+                .with_for_update()
+            )
+            if staged is None:
+                raise SnapshotChanged("暂存记录不存在")
+            staged.status = change.status
+            staged.conflict_group = change.conflict_group
+            if change.reason:
+                staged.reason = change.reason
+            if change.evidence_refs:
+                # 按JSON内容去重并保留首次出现顺序，旧版本原文快照不能被覆盖。
+                audit = []
+                seen = set()
+                for item in list(staged.evidence_refs or []) + list(change.evidence_refs):
+                    fingerprint = json.dumps(item, ensure_ascii=False, sort_keys=True)
+                    if fingerprint not in seen:
+                        audit.append(item)
+                        seen.add(fingerprint)
+                staged.evidence_refs = audit
+            if change.knowledge_source_key:
+                related = await session.scalar(
+                    select(KnowledgeChunk)
+                    .where(KnowledgeChunk.source_key == change.knowledge_source_key)
+                    .order_by(KnowledgeChunk.ordinal)
+                    .limit(1)
+                )
+                staged.knowledge_id = related.id if related else None
+                affected_sources.add(change.knowledge_source_key)
+        return affected_sources
 
     async def mark_vectorized(self, snapshot: ChunkSnapshot) -> bool:
         """条件回填向量完成状态。参数：已编码快照；返回：是否成功；异常：存储异常。"""
