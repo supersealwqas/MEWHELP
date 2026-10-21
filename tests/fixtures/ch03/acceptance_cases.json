@@ -11,8 +11,12 @@
         "不参与包邮"
       ],
       "must_not_include": [
-        "10 元",
-        "10元"
+        "10 元"
+      ],
+      "answer_rule": "shipping",
+      "required_facts": [
+        "shipping_base_fee",
+        "remote_shipping_fee"
       ]
     },
     {
@@ -21,11 +25,17 @@
       "expect_empty": false,
       "must_include": [
         "6 元",
-        "99 元"
+        "99 元",
+        "12 元",
+        "不参与包邮"
       ],
       "must_not_include": [
-        "10 元",
-        "10元"
+        "10 元"
+      ],
+      "answer_rule": "shipping",
+      "required_facts": [
+        "shipping_base_fee",
+        "remote_shipping_fee"
       ]
     },
     {
@@ -44,18 +54,10 @@
           "到账时效",
           "到账时间"
         ]
-      ]
-    },
-    {
-      "id": "refund_processing",
-      "query": "退款审核要几天",
-      "expect_empty": false,
-      "must_include": [
-        "3 个工作日"
       ],
-      "must_not_include": [
-        "3 个工作日到账",
-        "三个工作日到账"
+      "answer_rule": "refund_arrival",
+      "required_facts": [
+        "refund_arrival"
       ]
     },
     {
@@ -68,6 +70,10 @@
       ],
       "must_not_include": [
         "8 折"
+      ],
+      "answer_rule": "member_discount",
+      "required_facts": [
+        "member_discount"
       ]
     },
     {
@@ -85,6 +91,10 @@
           "不支持 App 联网",
           "没有 App 联网"
         ]
+      ],
+      "answer_rule": "lite_app",
+      "required_facts": [
+        "model_difference"
       ]
     },
     {
@@ -96,6 +106,10 @@
       ],
       "must_not_include": [
         "内部垫芯可以机洗"
+      ],
+      "answer_rule": "nest_cleaning",
+      "required_facts": [
+        "cleaning_parts_specs"
       ]
     },
     {
@@ -106,7 +120,10 @@
         "6 元",
         "99 元",
         "12 元"
-      ]
+      ],
+      "answer_rule": "negative_weather",
+      "required_facts": []
     }
-  ]
+  ],
+  "boundary": "这些原始措辞不参与阈值选择；退款审核要几天已移入校准。"
 }

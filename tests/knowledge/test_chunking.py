@@ -269,4 +269,216 @@ def test_chunking_version_is_stable() -> None:
     异常:
         无
     """
-    assert CHUNKING_VERSION == "ch03-v2"
+    assert CHUNKING_VERSION == "ch03-v3"
+
+
+def test_long_sentence_below_hard_limit_stays_whole() -> None:
+    """长句允许超过软目标。参数：无；返回：None；异常：无。"""
+    sentence = "退货前必须确保商品包装与配件齐全，" * 70 + "才可申请。"
+    chunks = _chunk("# 甲\n## 乙\n\n" + sentence, target_tokens=80)
+    assert [chunk.text.answer for chunk in chunks] == [sentence]
+
+
+def test_closing_quotes_belong_to_the_complete_sentence() -> None:
+    """闭合引号必须跟随句末。参数：无；返回：None；异常：无。"""
+    chunks = _chunk("# 甲\n## 乙\n客服说：“可以退货。”另一个问题？", target_tokens=20)
+    assert [chunk.text.answer for chunk in chunks] == ["客服说：“可以退货。”", "另一个问题？"]
+
+
+def test_complete_list_items_keep_continuations_and_nested_items() -> None:
+    """列表无句号也不切开，缩进与后续说明保留。参数：无；返回：None；异常：无。"""
+    first = "- " + "必须保留包装与配件" * 10 + "\n  另附订单截图\n  - 内层凭证"
+    second = "- " + "确认商品型号" * 10
+    chunks = _chunk("# 甲\n## 乙\n\n" + first + "\n" + second, target_tokens=35, overlap_tokens=0)
+    assert [chunk.text.answer for chunk in chunks] == [first, second]
+
+
+@pytest.mark.parametrize("marker", ["```", "~~~", "````"])
+def test_fences_are_atomic_and_preserve_original_indentation(marker: str) -> None:
+    """代码含伪标题和标点仍完整保留。参数：marker 围栏；返回：None；异常：无。"""
+    code = marker + "python\n# 不是标题\nif True:\n    print('句号。')\n" + marker
+    chunks = _chunk("# 甲\n## 乙\n\n前文。\n\n" + code + "\n\n后文。", target_tokens=28, overlap_tokens=0)
+    assert [chunk.text.answer for chunk in chunks] == ["前文。", code, "后文。"]
+    assert all(chunk.section_path == "甲 / 乙" for chunk in chunks)
+
+
+def test_multiple_tables_only_repeat_their_own_headers_in_original_order() -> None:
+    """多表、正文、代码按原序，表头不串表。参数：无；返回：None；异常：无。"""
+    first = "| 项 | 值 |\n| --- | --- |\n| 重量 | 8kg |\n| 功率 | 30W |"
+    second = "| 型号 | 是否联网 |\n| --- | --- |\n| Lite | 不支持 |\n| Pro | 支持 |"
+    code = "```text\n| 不是 | 表格 |\n```"
+    source = "# 甲\n## 乙\n\n表前。\n\n" + first + "\n\n表间。\n\n" + code + "\n\n" + second + "\n\n表后。"
+    answers = [chunk.text.answer for chunk in _chunk(source, target_tokens=42, overlap_tokens=0)]
+    assert answers == [
+        "表前。", "| 项 | 值 |\n| --- | --- |\n| 重量 | 8kg |",
+        "| 项 | 值 |\n| --- | --- |\n| 功率 | 30W |", "表间。", code,
+        "| 型号 | 是否联网 |\n| --- | --- |\n| Lite | 不支持 |",
+        "| 型号 | 是否联网 |\n| --- | --- |\n| Pro | 支持 |", "表后。",
+    ]
+
+
+def test_long_body_after_table_uses_sentence_boundaries() -> None:
+    """表后长正文可以独立拆分。参数：无；返回：None；异常：无。"""
+    table = "| 项 | 值 |\n| --- | --- |\n| 重量 | 8kg |"
+    body = "请保留商品包装。" * 260
+    answers = [chunk.text.answer for chunk in _chunk("# 甲\n## 乙\n" + table + "\n\n" + body, overlap_tokens=0)]
+    assert answers[0] == table
+    assert "".join(answers[1:]) == body
+    assert all(answer.endswith("。") for answer in answers[1:])
+
+
+def test_six_level_headers_supply_complete_context_and_reset() -> None:
+    """六级标题进入问法/路径并在上级重置。参数：无；返回：None；异常：无。"""
+    source = "# 一\n## 二\n### 三\n#### 四\n##### 五\n五级正文。\n###### 六\n六级正文。\n## 新二\n新正文。"
+    chunks = _chunk(source, spec=_spec(key_sections=["六"]))
+    assert [(c.text.questions, c.text.category, c.section_path, c.is_key_clause) for c in chunks] == [
+        ("五", "一 / 二 / 三 / 四", "一 / 二 / 三 / 四 / 五", False),
+        ("六", "一 / 二 / 三 / 四 / 五", "一 / 二 / 三 / 四 / 五 / 六", True),
+        ("新二", "一", "一 / 新二", False),
+    ]
+
+
+@pytest.mark.parametrize("limit_name,limit", [("max_tokens", 34), ("max_characters", 23)])
+def test_overlap_drops_whole_atoms_to_respect_formatted_hard_limit(limit_name: str, limit: int) -> None:
+    """重叠挤占标签/三格预算时丢整句而不拒绝可拆正文。参数：限额；返回：None；异常：无。"""
+    source = "# 甲\n## 乙\n" + "一" * 10 + "。" + "二" * 10 + "。" + "三" * 10 + "。"
+    chunks = chunk_markdown(source, _spec(), len, target_tokens=28, overlap_tokens=64, **{limit_name: limit})
+    assert [c.text.answer for c in chunks] == ["一" * 10 + "。", "二" * 10 + "。", "三" * 10 + "。"]
+
+
+def test_character_hard_limit_can_split_many_short_sentences_below_token_target() -> None:
+    """字符先达上限时仍按完整句切块。参数：无；返回：None；异常：无。"""
+    body = "商品必须保留原包装。" * 200
+    chunks = chunk_markdown("# 甲\n## 乙\n" + body, _spec(), lambda text: len(text) // 10 + 2, overlap_tokens=0)
+    assert "".join(c.text.answer for c in chunks) == body
+    assert len(chunks) > 1
+    assert all(len(c.text.category + c.text.questions + c.text.answer) <= 1600 for c in chunks)
+
+
+def test_quote_ending_counts_toward_atomic_hard_limit() -> None:
+    """闭合引号计入原子硬限。参数：无；返回：None；异常：无。"""
+    with pytest.raises(ChunkingError):
+        chunk_markdown("# 甲\n## 乙\n“" + "长" * 10 + "。”", _spec(), len, max_characters=14)
+
+
+def test_long_list_with_short_sentences_rejects_as_one_item() -> None:
+    """完整列表条目超硬限不能借句号拆开。参数：无；返回：None；异常：无。"""
+    with pytest.raises(ChunkingError):
+        _chunk("# 甲\n## 乙\n- " + "先验货。" * 500)
+
+
+def test_atomic_table_row_fits_soft_target_but_not_formatted_hard_limit() -> None:
+    """复制表头和格式标签都计入硬限。参数：无；返回：None；异常：无。"""
+    table = "| 项 | 值 |\n| --- | --- |\n| 重量 | 8kg |"
+    with pytest.raises(ChunkingError):
+        chunk_markdown("# 甲\n## 乙\n" + table, _spec(), len, target_tokens=100, max_tokens=len(table) + 12)
+
+
+def test_overlap_with_multiple_previous_atoms_is_removed_when_new_sentence_fills_hard_limit() -> None:
+    """真实多句尾部重叠必须让位于新完整句。参数：无；返回：None；异常：无。"""
+    chunks = chunk_markdown("# 甲\n## 乙\n一一一一一。二二二二二。" + "三" * 15 + "。",
+                            _spec(), len, target_tokens=27, overlap_tokens=64, max_tokens=31)
+    assert [c.text.answer for c in chunks] == ["一一一一一。二二二二二。", "三" * 15 + "。"]
+
+
+def test_overlap_keeps_closed_quoted_sentence_and_never_half_quote() -> None:
+    """多句重叠保持完整中文引语。参数：无；返回：None；异常：无。"""
+    chunks = _chunk("# 甲\n## 乙\n先验货。客服说：“可以退货。”最后再退款。", target_tokens=29, overlap_tokens=5)
+    assert [c.text.answer for c in chunks] == ["先验货。客服说：“可以退货。”", "客服说：“可以退货。”最后再退款。"]
+
+
+def test_unclosed_fence_reports_actual_section_and_original_lines() -> None:
+    """未闭合围栏不能丢失原文。参数：无；返回：None；异常：无。"""
+    with pytest.raises(ChunkingError) as failure:
+        _chunk("# 甲\n\n## 乙\n\n前文。\n\n```python\n# 伪标题\nprint(1)")
+    assert failure.value.section_path == "甲 / 乙"
+    assert (failure.value.line_start, failure.value.line_end) == (6, 9)
+
+
+def test_short_inner_fence_does_not_close_a_longer_fence() -> None:
+    """更短围栏和伪标题都是外层代码内容。参数：无；返回：None；异常：无。"""
+    code = "````markdown\n```\n# 伪标题\n```\n````"
+    chunks = _chunk("# 甲\n## 乙\n" + code, target_tokens=25)
+    assert [c.text.answer for c in chunks] == [code]
+    assert chunks[0].section_path == "甲 / 乙"
+
+
+def test_plain_line_break_does_not_create_half_sentence() -> None:
+    """段内折行不等于句末。参数：无；返回：None；异常：无。"""
+    sentence = "退货前必须确保\n全部配件和包装齐全，\n才可受理。"
+    assert [c.text.answer for c in _chunk("# 甲\n## 乙\n" + sentence, target_tokens=24)] == [sentence]
+
+
+def test_new_section_with_repeated_title_does_not_overlap_prior_content() -> None:
+    """同名章节也是独立边界。参数：无；返回：None；异常：无。"""
+    chunks = _chunk("# 甲\n## 乙\n第一句。第二句。\n## 乙\n第三句。", target_tokens=24)
+    assert [c.text.answer for c in chunks] == ["第一句。第二句。", "第三句。"]
+
+
+def test_table_without_data_is_rejected_instead_of_publishing_only_header() -> None:
+    """表头无数据不能生成知识块。参数：无；返回：None；异常：无。"""
+    with pytest.raises(ChunkingError):
+        _chunk("# 甲\n## 乙\n| 项 | 值 |\n| --- | --- |")
+
+
+def test_compact_table_without_outer_pipes_keeps_separate_header() -> None:
+    """无外侧竖线的 Markdown 表格仍逐行保留。参数：无；返回：None；异常：无。"""
+    chunks = _chunk("# 甲\n## 乙\n型号 | 联网\n--- | ---\nLite | 否\nPro | 是", target_tokens=22)
+    assert [c.text.answer for c in chunks] == [
+        "型号 | 联网\n--- | ---\nLite | 否", "型号 | 联网\n--- | ---\nPro | 是",
+    ]
+
+
+@pytest.mark.parametrize("marker,padding", [("- ", "  "), ("10. ", "    ")])
+def test_list_internal_heading_preserves_item_and_following_sibling_context(marker: str, padding: str) -> None:
+    """条目内部标题不污染同级条目。参数：marker 列表标记；padding 达到条目内容缩进的空白；返回：None；异常：无。"""
+    item = marker + "先确认订单\n" + padding + "### 检查附件\n" + padding + "请保留完整附件"
+    sibling = marker + "申请退货"
+    chunks = _chunk("# 甲\n## 乙\n" + item + "\n" + sibling, target_tokens=20, overlap_tokens=0)
+    assert [c.text.answer for c in chunks] == [item, sibling]
+    assert [c.section_path for c in chunks] == ["甲 / 乙", "甲 / 乙"]
+    assert [c.text.questions for c in chunks] == ["乙", "乙"]
+
+
+@pytest.mark.parametrize("padding", ["", " ", "  ", "   "])
+def test_heading_below_list_content_indent_is_an_external_section(padding: str) -> None:
+    """未达到条目内容缩进的标题仍建立章节。参数：padding 为 0–3 个空格；返回：None；异常：无。"""
+    source = "# 甲\n## 乙\n10. 先确认订单\n" + padding + "### 外部条款\n后续规则。\n- 新条目"
+    chunks = _chunk(source, target_tokens=20, overlap_tokens=0)
+    assert [c.text.answer for c in chunks] == ["10. 先确认订单", "后续规则。", "- 新条目"]
+    assert [c.section_path for c in chunks] == ["甲 / 乙", "甲 / 乙 / 外部条款", "甲 / 乙 / 外部条款"]
+
+
+def test_unindented_heading_after_internal_list_heading_changes_real_section() -> None:
+    """离开含内部标题的条目后正常更新全局标题。参数：无；返回：None；异常：无。"""
+    item = "- 先确认订单\n  ### 检查附件\n  请保留完整附件"
+    source = "# 甲\n## 乙\n" + item + "\n- 申请退货\n### 退款规则\n请先验货。"
+    chunks = _chunk(source, target_tokens=20, overlap_tokens=0)
+    assert [c.text.answer for c in chunks] == [item, "- 申请退货", "请先验货。"]
+    assert [c.section_path for c in chunks] == ["甲 / 乙", "甲 / 乙", "甲 / 乙 / 退款规则"]
+
+
+@pytest.mark.parametrize("marker,fence_indent", [("- ", ""), ("10. ", "  ")])
+def test_fence_below_list_content_indent_ends_item_without_blank_line(marker: str, fence_indent: str) -> None:
+    """列表外围栏无空行也独立成块。参数：marker 列表标记；fence_indent 为不足条目内容缩进的空白；返回：None；异常：无。"""
+    item = marker + "先确认订单"
+    fence = fence_indent + "```text\n" + "a" * 25 + "\n" + fence_indent + "```"
+    body = "后续正文必须保持完整。" * 3
+    chunks = chunk_markdown("# 甲\n## 乙\n" + item + "\n" + fence + "\n" + body,
+                            _spec(), len, target_tokens=40, max_characters=60, overlap_tokens=0)
+    assert [c.text.answer for c in chunks[:2]] == [item, fence.strip()]
+    # 三句正文加三格标签超过软目标，允许按完整句分块，但不能丢失或并入围栏。
+    assert "".join(c.text.answer for c in chunks[2:]) == body
+    assert all(c.text.answer.endswith("。") for c in chunks[2:])
+    assert all(c.section_path == "甲 / 乙" for c in chunks)
+
+
+@pytest.mark.parametrize("marker,padding", [("- ", "  "), ("10. ", "    ")])
+def test_fence_at_list_content_indent_remains_inside_complete_item(marker: str, padding: str) -> None:
+    """内部围栏与完整条目一起保留。参数：marker 列表标记；padding 达到条目内容缩进的空白；返回：None；异常：无。"""
+    item = (marker + "先确认订单\n" + padding + "```text\n" + padding + "# 不是全局标题\n"
+            + padding + "凭证\n" + padding + "```\n" + padding + "请保留附件")
+    sibling = marker + "申请退货"
+    chunks = _chunk("# 甲\n## 乙\n" + item + "\n" + sibling, target_tokens=20, overlap_tokens=0)
+    assert [c.text.answer for c in chunks] == [item, sibling]
+    assert all(c.section_path == "甲 / 乙" for c in chunks)

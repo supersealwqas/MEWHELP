@@ -1,6 +1,6 @@
 {
   "min_score": 0.6256920099258423,
   "embedding_revision": "bge-m3:flagembedding-1.4.2:fp16:cls:normalized:max2048:v1",
-  "chunking_version": "ch03-v2",
-  "calibration_digest": "dc045df0062d2774d8fda14686966e442180db93d1c6a29a92bab2a4f04bec45"
+  "chunking_version": "ch03-v3",
+  "calibration_digest": "pipeline-baseline-not-quality-calibrated:preserved-min-score:dc045df0062d2774d8fda14686966e442180db93d1c6a29a92bab2a4f04bec45"
 }

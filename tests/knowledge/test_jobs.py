@@ -281,3 +281,152 @@ async def test_sync_pending_marks_done() -> None:
     assert report.marked_done == 1
     assert (await store.get_chunks([1]))[0].vectorize_status == "done"
     assert index.ids == {1}
+
+
+async def test_complete_snapshot_reserves_all_201_turns_before_extract() -> None:
+    """201轮必须先全预留再调用模型。参数：无；返回：None；异常：无。"""
+    turns = [_turn(i, i, "你好", "您好。") for i in range(1, 202)]
+    jobs, store, _, model = _jobs(turns, [])
+    original = model.extract
+    async def checked(batch):
+        """验证预留数量。参数：批次；返回：QA；异常：断言失败。"""
+        assert sum(len(b.source_ids) for b in store._batches.values()) == 201
+        return await original(batch)
+    model.extract = checked
+    await jobs.mine_once()
+    assert sum(len(b.source_ids) for b in store._batches.values()) == 201
+    assert set(store._batch_status.values()) == {"done"}
+
+
+async def test_recovery_completes_old_done_half_snapshot_without_new_upper() -> None:
+    """恢复旧done半快照时补完upper内，不能领取upper后的来源。参数：无；返回：None；异常：无。"""
+    turns = [_turn(i, i, "你好", "您好。") for i in range(1, 204)]
+    jobs, store, _, model = _jobs(turns, [])
+    batch = _batch_from_turns(turns[:20], 201)
+    async with store.writer() as writer:
+        await writer.reserve_batch(batch)
+        await writer.complete_batch(batch.batch_no, [])
+    await jobs.recover_pending()
+    assigned = {i for batch in store._batches.values() for i in batch.source_ids}
+    assert assigned == set(range(1, 202))
+    assert all(batch.batch_no != b.batch_no for b in model.batches)
+
+
+async def test_reserved_source_change_is_rejected() -> None:
+    """预留后修改原文时hash核验必须拒绝。参数：无；返回：None；异常：无。"""
+    from app.knowledge.errors import SnapshotChanged
+    turn = _turn(1, 1, "邮费怎么算", "未满99元收6元。")
+    jobs, store, _, model = _jobs([turn], [])
+    async with store.writer() as writer:
+        await writer.reserve_batch(_batch_from_turns([turn], 1))
+    store._turns[0] = turn.model_copy(update={"answer": "未满99元收600元。"})
+    with pytest.raises(SnapshotChanged, match="指纹|来源"):
+        await jobs.recover_pending()
+    assert model.batches == []
+
+
+async def test_complete_batch_validates_all_qas_before_done() -> None:
+    """第二条候选伪造时不能部分写入或done。参数：无；返回：None；异常：无。"""
+    from app.knowledge.grounding import GroundingError
+    turn = _turn(1, 1, "邮费怎么算", "未满99元收6元。")
+    _, store, _, _ = _jobs([turn], [])
+    batch = _batch_from_turns([turn], 1)
+    async with store.writer() as writer:
+        await writer.reserve_batch(batch)
+        with pytest.raises(GroundingError):
+            await writer.complete_batch(batch.batch_no, [_qa([1], turn.question, turn.answer), _qa([1], turn.question, "未满99元收600元。")])
+        assert (await writer.frame()).staged == []
+        assert len(await writer.pending_batches()) == 1
+
+
+async def test_evidence_persisted_and_disposition_preserves_it() -> None:
+    """暂存原句审计经过发布处置仍可重读。参数：无；返回：None；异常：无。"""
+    jobs, store, _, _ = _jobs([_turn(1, 1, "邮费怎么算", "未满99元收6元。")], [_qa([1], "邮费怎么算", "未满99元收6元。")])
+    await jobs.mine_once()
+    async with store.writer() as writer:
+        row = (await writer.frame()).staged[0]
+    assert row.source_evidence[0]["message_id"] == 1
+    assert row.source_evidence[0]["quote"] == "未满99元收6元。"
+    assert row.source_evidence[0]["verification_version"]
+    assert row.source_evidence[0]["end"] > row.source_evidence[0]["start"]
+
+
+async def test_pending_old_prompt_keeps_identity_uses_new_prompt() -> None:
+    """旧pending恢复稳定批次身份同时执行当前Prompt。参数：无；返回：None；异常：无。"""
+    from app.knowledge.prompts import EXTRACTION_PROMPT_VERSION
+    turn = _turn(1, 1, "邮费怎么算", "未满99元收6元。")
+    jobs, store, _, model = _jobs([turn], [])
+    batch = _batch_from_turns([turn], 1).model_copy(update={"prompt_version": "ch03-extraction-v1"})
+    async with store.writer() as writer:
+        await writer.reserve_batch(batch)
+    await jobs.recover_pending()
+    assert model.batches[0].batch_no == batch.batch_no
+    assert model.batches[0].prompt_version == EXTRACTION_PROMPT_VERSION
+
+
+async def test_failure_resumes_complete_upper_then_reconciles_once() -> None:
+    """第二批失败后恢复全upper，只在全部抽取完成才统一去重。参数：无；返回：None；异常：无。"""
+    jobs, store, _, model = _jobs([_turn(i, i, "你好", "您好。") for i in range(1, 202)], [])
+    calls = []
+    original = model.extract
+    async def fail_second(batch):
+        """模拟第二批失败。参数：batch；返回：QA；异常：KnowledgeModelError。"""
+        if len(model.batches) == 1:
+            raise KnowledgeModelError("第二批暂失败")
+        return await original(batch)
+    async def reconcile(writer):
+        """校验所有批次完成才去重。参数：writer；返回：None；异常：断言失败。"""
+        assert set(store._batch_status.values()) == {"done"}
+        calls.append("reconcile")
+    model.extract = fail_second
+    jobs.lifecycle.reconcile_staging = reconcile
+    with pytest.raises(KnowledgeModelError):
+        await jobs.mine_once()
+    assert sum(len(batch.source_ids) for batch in store._batches.values()) == 201
+    assert calls == []
+    store._turns.append(_turn(202, 202, "新轮", "新答。"))
+    model.extract = original
+    await jobs.recover_pending()
+    assert calls == ["reconcile"]
+    assert 202 not in {i for batch in store._batches.values() for i in batch.source_ids}
+
+
+async def test_legacy_staging_missing_source_blocks_publish() -> None:
+    """旧无源kept阻发布并保留历史记录。参数：无；返回：None；异常：无。"""
+    from app.knowledge.schemas import StagedQA, Publication
+    from app.knowledge.grounding import GroundingError
+    row = StagedQA(id=1, source_ids=[99], question="旧问题", answer="旧回答。", category="分类", status="kept")
+    store = MemoryKnowledgeStore(staged=[row])
+    async with store.writer() as writer:
+        frame = await writer.frame()
+        with pytest.raises(GroundingError):
+            await writer.publish(Publication(expected_token=frame.token, embedding_revision="fake-encoder-v1"))
+        assert (await writer.frame()).staged == [row]
+
+
+async def test_mine_once_resumes_pending_without_new_upper() -> None:
+    """完整挖掘入口恢复中断时也不能领旧upper之后来源。参数：无；返回：None；异常：无。"""
+    turns = [_turn(i, i, "你好", "您好。") for i in range(1, 4)]
+    jobs, store, _, _ = _jobs(turns, [])
+    async with store.writer() as writer:
+        await writer.reserve_batch(_batch_from_turns(turns[:1], 2))
+    await jobs.mine_once()
+    assert {i for batch in store._batches.values() for i in batch.source_ids} == {1, 2}
+
+
+async def test_done_batch_idempotent_read_rechecks_source_hash() -> None:
+    """done重读也核来源，变更拒绝且保留原暂存审计。参数：无；返回：None；异常：无。"""
+    from app.knowledge.errors import SnapshotChanged
+    turn = _turn(1, 1, "邮费怎么算", "运费6元。")
+    _, store, _, model = _jobs([turn], [])
+    batch = _batch_from_turns([turn], 1)
+    async with store.writer() as writer:
+        await writer.reserve_batch(batch)
+        before = await writer.complete_batch(batch.batch_no, [_qa([1], turn.question, turn.answer)])
+        assert await writer.complete_batch(batch.batch_no, []) == before
+        store._turns[0] = turn.model_copy(update={"answer": "运费600元。"})
+        with pytest.raises(SnapshotChanged, match="指纹"):
+            await writer.complete_batch(batch.batch_no, [])
+        assert (await writer.frame()).staged == before
+    assert store._batch_status[batch.batch_no] == "done"
+    assert model.batches == []

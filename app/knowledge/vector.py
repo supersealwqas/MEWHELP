@@ -7,21 +7,31 @@
 
 from __future__ import annotations
 
-import math
 from functools import partial
 from typing import Any, Callable
 
 import anyio
 
 from app.config import Settings
+from app.knowledge.limits import VECTOR_DIM, valid_dense_vector
 from app.knowledge.schemas import KnowledgeUnavailable, VectorHit, VectorRecord
 
 OWNERSHIP_MARKER = "mewhelp-ch03:knowledge:v1"
-VECTOR_DIM = 1024
 MAX_SIGNED_INT64 = 2**63 - 1
 _RPC_TIMEOUT_SECONDS = 10.0
 _INDEX_TYPE = "AUTOINDEX"
 _METRIC_TYPE = "COSINE"
+
+
+async def _run_rpc(call: Callable[[], Any]) -> Any:
+    """对同步 RPC 设置调用方有界等待。
+
+    参数：call 为已绑定 SDK timeout 的同步调用。返回：SDK 结果。
+    异常：TimeoutError 或 SDK 异常；超时只停止等待，底层请求仍可能完成。
+    """
+    # 取消时最多等本次期限；未确认的变更留给后续持锁 sync 对照修复。
+    with anyio.fail_after(_RPC_TIMEOUT_SECONDS, shield=True):
+        return await anyio.to_thread.run_sync(call, abandon_on_cancel=True)
 
 
 class VectorIndexUnavailable(KnowledgeUnavailable):
@@ -286,10 +296,8 @@ class MilvusVectorIndex:
         """验证待写入记录。参数：记录；返回：None；异常：VectorIndexUnavailable。"""
         self._validate_ids([record.id for record in records])
         for record in records:
-            if len(record.vector) != VECTOR_DIM:
-                raise VectorIndexUnavailable("向量维度不是 1024")
-            if not all(math.isfinite(value) for value in record.vector):
-                raise VectorIndexUnavailable("向量包含非有限数值")
+            if not valid_dense_vector(record.vector):
+                raise VectorIndexUnavailable("向量维度或数值不合法")
 
     async def upsert(self, records: list[VectorRecord]) -> None:
         """按主键全量写入向量。参数：记录；返回：None；异常：VectorIndexUnavailable。"""
@@ -307,7 +315,7 @@ class MilvusVectorIndex:
             for record in records
         ]
         try:
-            await anyio.to_thread.run_sync(
+            await _run_rpc(
                 partial(
                     client.upsert,
                     self._config.milvus_collection,
@@ -322,11 +330,11 @@ class MilvusVectorIndex:
         """按 COSINE 搜索向量。参数：查询向量与数量；返回：命中；异常：VectorIndexUnavailable。"""
         if limit <= 0:
             raise ValueError("limit 必须为正数")
-        if len(vector) != VECTOR_DIM or not all(math.isfinite(value) for value in vector):
+        if not valid_dense_vector(vector):
             raise VectorIndexUnavailable("查询向量维度或数值不合法")
         client = self._require_client()
         try:
-            results = await anyio.to_thread.run_sync(
+            results = await _run_rpc(
                 partial(
                     client.search,
                     self._config.milvus_collection,
@@ -360,13 +368,37 @@ class MilvusVectorIndex:
             )
         return hits
 
+    async def get_fingerprints(self, ids: list[int]) -> dict[int, tuple[str, str]]:
+        """按主键强一致读取同步指纹。参数：主键；返回：内容/编码指纹；异常：VectorIndexUnavailable。"""
+        if not ids:
+            return {}
+        self._validate_ids(ids)
+        client = self._require_client()
+        try:
+            rows = await _run_rpc(
+                partial(
+                    client.get,
+                    self._config.milvus_collection,
+                    ids=list(ids),
+                    output_fields=["id", "content_hash", "embedding_revision"],
+                    consistency_level="Strong",
+                    timeout=_RPC_TIMEOUT_SECONDS,
+                )
+            )
+            return {
+                int(row["id"]): (str(row["content_hash"]), str(row["embedding_revision"]))
+                for row in rows
+            }
+        except Exception as error:
+            raise VectorIndexUnavailable("Milvus 同步指纹读取失败") from error
+
     async def iter_ids(self, batch_size: int = 1000):
         """分页迭代集合主键。参数：页大小；返回：异步主键批次；异常：VectorIndexUnavailable。"""
         if batch_size <= 0:
             raise ValueError("batch_size 必须为正数")
         client = self._require_client()
         try:
-            iterator = await anyio.to_thread.run_sync(
+            iterator = await _run_rpc(
                 partial(
                     client.query_iterator,
                     self._config.milvus_collection,
@@ -374,6 +406,8 @@ class MilvusVectorIndex:
                     limit=-1,
                     filter="",
                     output_fields=["id"],
+                    consistency_level="Strong",
+                    timeout=_RPC_TIMEOUT_SECONDS,
                 )
             )
         except Exception as error:
@@ -381,7 +415,7 @@ class MilvusVectorIndex:
         try:
             while True:
                 try:
-                    batch = await anyio.to_thread.run_sync(iterator.next)
+                    batch = await _run_rpc(iterator.next)
                 except Exception as error:
                     raise VectorIndexUnavailable("Milvus 主键分页失败") from error
                 if not batch:
@@ -391,7 +425,7 @@ class MilvusVectorIndex:
                     yield ids
         finally:
             try:
-                await anyio.to_thread.run_sync(iterator.close)
+                await _run_rpc(iterator.close)
             except Exception:
                 pass
 
@@ -402,7 +436,7 @@ class MilvusVectorIndex:
         self._validate_ids(ids)
         client = self._require_client()
         try:
-            await anyio.to_thread.run_sync(
+            await _run_rpc(
                 partial(
                     client.delete,
                     self._config.milvus_collection,

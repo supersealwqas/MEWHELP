@@ -78,6 +78,14 @@
       "must_not_include": [
         "Lite 支持 App 远程监控",
         "Lite 含 App 联网"
+      ],
+      "support_groups": [
+        [
+          "不含 App 联网功能"
+        ],
+        [
+          "Lite 无 App 远程监控与健康记录"
+        ]
       ]
     },
     {
@@ -91,6 +99,11 @@
       "must_not_include": [
         "内部垫芯可机洗",
         "外套不可手洗"
+      ],
+      "support_groups": [
+        [
+          "内部垫芯不可机洗"
+        ]
       ]
     },
     {
@@ -125,7 +138,13 @@
         "退款",
         "3 个工作日"
       ],
-      "must_not_include": []
+      "must_not_include": [],
+      "support_groups": [
+        [
+          "处理时限",
+          "| 退款 | 2 小时 | 3 个工作日 |"
+        ]
+      ]
     },
     {
       "id": "shipping_conflict_resolved",

@@ -9,6 +9,8 @@ from typing import Any
 
 from app.config import Settings
 from app.knowledge.errors import ConcurrentKnowledgeWrite, SnapshotChanged
+from app.knowledge.grounding import turns_digest, validate_grounding
+from app.knowledge.prompts import EXTRACTION_PROMPT_VERSION
 from app.knowledge.schemas import (
     ChunkDraft,
     ChunkSnapshot,
@@ -204,6 +206,13 @@ class MemoryKnowledgeStore:
             if identifier in self._snapshots and self._snapshots[identifier].is_active
         }
 
+    async def active_page(self, after_id: int, limit: int) -> list[ChunkSnapshot]:
+        """分页读取全部 active 快照。参数：游标、正页大小；返回：快照；异常：ValueError。"""
+        if limit <= 0:
+            raise ValueError("limit 必须为正数")
+        return [row for row in sorted(self._snapshots.values(), key=lambda item: item.id)
+                if row.id > after_id and row.is_active][:limit]
+
 
 class MemoryKnowledgeWriter:
     """内存 KnowledgeWriter 实现。"""
@@ -211,6 +220,23 @@ class MemoryKnowledgeWriter:
     def __init__(self, store: MemoryKnowledgeStore) -> None:
         """保存所属存储。参数：存储；返回：None；异常：无。"""
         self.store = store
+
+    async def assert_held(self) -> None:
+        """内存写入器默认持锁。参数：无；返回：None；异常：无。"""
+
+    async def mark_pending(self, snapshot: ChunkSnapshot) -> bool:
+        """条件恢复 done 为 pending。参数：对照快照；返回：是否成功；异常：无。"""
+        await self.assert_held()
+        current = self.store._snapshots.get(snapshot.id)
+        if (current is None or not current.is_active
+                or snapshot.vectorize_status != "done" or current.vectorize_status != "done"
+                or current.vector_id != snapshot.vector_id
+                or current.content_hash != snapshot.content_hash
+                or current.embedding_revision != snapshot.embedding_revision):
+            return False
+        self.store._snapshots[current.id] = current.model_copy(
+            update={"vector_id": None, "vectorize_status": "pending"})
+        return True
 
     async def frame(self) -> StoreFrame:
         """返回当前快照与令牌。参数：无；返回：StoreFrame；异常：无。"""
@@ -255,6 +281,7 @@ class MemoryKnowledgeWriter:
 
         snapshots = dict(self.store._snapshots)
         staged = dict(self.store._staged)
+        staged = self._ground_staging_rows(staged)
         affected_sources: set[str] = set(change.replace_sources)
         published_ids: list[int] = []
 
@@ -318,6 +345,8 @@ class MemoryKnowledgeWriter:
                             "is_active": False,
                             "vector_id": None,
                             "vectorize_status": "pending",
+                            "prev_chunk_id": None,
+                            "next_chunk_id": None,
                         }
                     )
             affected_sources.add(source_key)
@@ -331,6 +360,8 @@ class MemoryKnowledgeWriter:
                     "is_active": False,
                     "vector_id": None,
                     "vectorize_status": "pending",
+                    "prev_chunk_id": None,
+                    "next_chunk_id": None,
                 }
             )
             affected_sources.add(row.source_key)
@@ -366,6 +397,7 @@ class MemoryKnowledgeWriter:
 
     async def mark_vectorized(self, snapshot: ChunkSnapshot) -> bool:
         """条件回填向量完成状态。参数：快照；返回：是否成功；异常：无。"""
+        await self.assert_held()
         current = self.store._snapshots.get(snapshot.id)
         if (
             current is None
@@ -381,15 +413,15 @@ class MemoryKnowledgeWriter:
 
     async def reserve_batch(self, batch: ExtractionBatch) -> ExtractionBatch:
         """幂等预留批次并拒绝同源双批次。参数：批次；返回：批次；异常：ConcurrentKnowledgeWrite。"""
+        self._reload_batch(batch)
         existing = self.store._batches.get(batch.batch_no)
         if existing is not None:
             if (
                 existing.source_ids == batch.source_ids
                 and existing.snapshot_upper_id == batch.snapshot_upper_id
                 and existing.input_hash == batch.input_hash
-                and existing.prompt_version == batch.prompt_version
             ):
-                return existing
+                return self._reload_batch(existing)
             raise ConcurrentKnowledgeWrite("批次号已被其他输入占用")
         assigned = {
             identifier
@@ -405,7 +437,7 @@ class MemoryKnowledgeWriter:
     async def pending_batches(self) -> list[ExtractionBatch]:
         """返回 pending 批次。参数：无；返回：批次；异常：无。"""
         return [
-            batch
+            self._reload_batch(batch).model_copy(update={"prompt_version": EXTRACTION_PROMPT_VERSION})
             for batch_no, batch in self.store._batches.items()
             if self.store._batch_status.get(batch_no) == "pending"
         ]
@@ -416,13 +448,15 @@ class MemoryKnowledgeWriter:
         """把批次 QA 写入暂存并标记 done。参数：批次号与 QA；返回：暂存行；异常：SnapshotChanged。"""
         if batch_no not in self.store._batches:
             raise SnapshotChanged("抽取批次不存在")
+        batch = self._reload_batch(self.store._batches[batch_no])
         if self.store._batch_status.get(batch_no) == "done":
             return [
                 row
                 for identifier, row in self.store._staged.items()
                 if self.store._staged_batch.get(identifier) == batch_no
             ]
-        for qa in qas:
+        verified = [validate_grounding(qa, batch.turns) for qa in qas]
+        for qa, audit in verified:
             payload = json.dumps(
                 {
                     "source_ids": sorted(qa.source_ids),
@@ -444,10 +478,13 @@ class MemoryKnowledgeWriter:
                     answer=qa.answer,
                     category=qa.category,
                     status="extracted",
+                    answer_excerpts=qa.answer_excerpts,
+                    source_evidence=audit,
                 )
                 self.store._staged_fingerprints[fingerprint] = identifier
             self.store._staged_batch[identifier] = batch_no
         self.store._batch_status[batch_no] = "done"
+        self.store._batches[batch_no] = batch.model_copy(update={"prompt_version": EXTRACTION_PROMPT_VERSION})
         return [
             row
             for identifier, row in self.store._staged.items()
@@ -474,6 +511,52 @@ class MemoryKnowledgeWriter:
     async def source_upper_id(self) -> int:
         """返回完成轮次最大消息 ID。参数：无；返回：ID；异常：无。"""
         return max((turn.message_id for turn in self.store._turns), default=0)
+
+    def _reload_batch(self, batch: ExtractionBatch) -> ExtractionBatch:
+        """回核持久来源指纹。参数：batch稳定批次；返回：重建批次；异常：SnapshotChanged。"""
+        sources = {turn.message_id: turn for turn in self.store._turns}
+        if not set(batch.source_ids).issubset(sources):
+            raise SnapshotChanged("批次来源缺失")
+        turns = [sources[i] for i in sorted(batch.source_ids)]
+        if turns_digest(turns) != batch.input_hash or turns_digest(batch.turns) != batch.input_hash:
+            raise SnapshotChanged("批次来源指纹已变化")
+        return batch.model_copy(update={"turns": turns})
+
+    async def recovery_upper_id(self) -> int:
+        """读取全部持久批次上界含done。参数：无；返回：int；异常：无。"""
+        return max((batch.snapshot_upper_id for batch in self.store._batches.values()), default=0)
+
+    def _ground_staging_rows(self, rows: dict[int, StagedQA]) -> dict[int, StagedQA]:
+        """纯补证暂存副本，失败不改原状态。参数：rows暂存；返回：副本；异常：校验失败。"""
+        result = dict(rows)
+        for row in rows.values():
+            if row.status == "discarded":
+                continue
+            batch = self.store._batches.get(self.store._staged_batch.get(row.id, ""))
+            turns = self._reload_batch(batch).turns if batch else self.store._turns
+            qa, audit = validate_grounding(row, turns)
+            if row.source_evidence and row.source_evidence != audit:
+                raise SnapshotChanged("暂存来源证据指纹已变化")
+            result[row.id] = row.model_copy(update={"answer_excerpts": qa.answer_excerpts, "source_evidence": audit})
+        return result
+
+    async def ensure_staging_grounded(self) -> None:
+        """关系判定前补证。参数：无；返回：None；异常：校验失败。"""
+        self.store._staged = self._ground_staging_rows(self.store._staged)
+
+
+def source_backed_store(**kwargs) -> MemoryKnowledgeStore:
+    """为旧生命周期测试显式建立来源夹具，不改变内存存储默认安全行为。
+
+    参数：kwargs为MemoryKnowledgeStore参数，staged表示固定标注的历史原答。
+    返回：MemoryKnowledgeStore，同时持有完整CompletedTurn来源。
+    异常：模型字段校验失败。
+    """
+    rows = kwargs.get("staged", [])
+    kwargs["turns"] = [CompletedTurn(message_id=row.source_ids[0], conversation_id=row.id,
+                                      turn_id=f"fixture-{row.id}", question=row.question, answer=row.answer)
+                       for row in rows]
+    return MemoryKnowledgeStore(**kwargs)
 
 
 class MemoryVectorIndex:
@@ -546,6 +629,12 @@ class MemoryVectorIndex:
         identifiers = sorted(self.records)
         for offset in range(0, len(identifiers), batch_size):
             yield identifiers[offset : offset + batch_size]
+
+    async def get_fingerprints(self, ids: list[int]) -> dict[int, tuple[str, str]]:
+        """读取完整同步指纹。参数：主键；返回：内容/编码指纹；异常：无。"""
+        return {identifier: (self.records[identifier].content_hash,
+                             self.records[identifier].embedding_revision)
+                for identifier in ids if identifier in self.records}
 
     async def delete(self, ids: list[int]) -> None:
         """按主键删除记录。参数：主键；返回：None；异常：VectorIndexUnavailable。"""

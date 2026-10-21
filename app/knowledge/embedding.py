@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import math
 import sys
 import threading
 from typing import Any
@@ -15,10 +14,10 @@ from typing import Any
 import anyio
 
 from app.config import Settings
+from app.knowledge.limits import MAX_INPUT_TOKENS, VECTOR_DIM, valid_dense_vector
 from app.knowledge.schemas import KnowledgeUnavailable
 
-EMBEDDING_DIM = 1024
-MAX_INPUT_TOKENS = 2048
+EMBEDDING_DIM = VECTOR_DIM
 EMBEDDING_REVISION = "bge-m3:flagembedding-1.4.2:fp16:cls:normalized:max2048:v1"
 
 
@@ -171,10 +170,8 @@ class BgeM3Encoder:
         if len(vectors) != len(texts):
             raise EmbeddingUnavailable("本地 BGE-M3 返回向量数量不一致")
         for vector in vectors:
-            if len(vector) != EMBEDDING_DIM:
-                raise EmbeddingUnavailable("本地 BGE-M3 返回向量维度不是 1024")
-            if not all(math.isfinite(value) for value in vector):
-                raise EmbeddingUnavailable("本地 BGE-M3 返回非有限向量")
+            if not valid_dense_vector(vector):
+                raise EmbeddingUnavailable("本地 BGE-M3 返回向量维度或数值不合法")
         return vectors
 
     def _encode_sync(self, model: Any, texts: list[str]) -> list[list[float]]:

@@ -5,52 +5,201 @@
       "query": "邮费是多少",
       "source": "billing-shipping.md",
       "section": "开票与配送 / 运费与包邮",
-      "expect_empty": false
+      "expect_empty": false,
+      "answer_rule": "shipping",
+      "required_facts": [
+        "shipping_base_fee",
+        "remote_shipping_fee"
+      ],
+      "must_include": [
+        "6 元",
+        "99 元",
+        "12 元",
+        "不参与包邮"
+      ],
+      "must_not_include": [
+        "10 元"
+      ]
     },
     {
       "id": "shipping_paraphrase",
       "query": "配送要收多少钱",
       "source": "billing-shipping.md",
       "section": "开票与配送 / 运费与包邮",
-      "expect_empty": false
+      "expect_empty": false,
+      "answer_rule": "shipping",
+      "required_facts": [
+        "shipping_base_fee",
+        "remote_shipping_fee"
+      ],
+      "must_include": [
+        "6 元",
+        "99 元",
+        "12 元",
+        "不参与包邮"
+      ],
+      "must_not_include": [
+        "10 元"
+      ]
     },
     {
       "id": "refund_arrival",
       "query": "退款多久到账",
       "source": "returns-policy.md",
       "section": "退货退款政策 / 无理由退货 / 退款时效",
-      "expect_empty": false
+      "expect_empty": false,
+      "answer_rule": "refund_arrival",
+      "required_facts": [
+        "refund_arrival"
+      ],
+      "must_include": [
+        "不承诺"
+      ],
+      "must_include_any": [
+        [
+          "到账时效",
+          "到账时间"
+        ]
+      ]
     },
     {
       "id": "member_discount",
       "query": "银卡和金卡分别打几折",
       "source": "member-benefits.md",
       "section": "会员权益 / 会员等级",
-      "expect_empty": false
+      "expect_empty": false,
+      "answer_rule": "member_discount",
+      "required_facts": [
+        "member_discount"
+      ],
+      "must_include": [
+        "9 折",
+        "95 折"
+      ]
     },
     {
       "id": "lite_app",
       "query": "智能猫砂盆 Lite 有 App 联网功能吗",
       "source": "product-specs.md",
       "section": "商品规格手册 / 智能猫砂盆 Lite(型号 MH-LP50)",
-      "expect_empty": false
+      "expect_empty": false,
+      "answer_rule": "lite_app",
+      "required_facts": [
+        "model_difference"
+      ]
     },
     {
       "id": "nest_cleaning",
       "query": "猫窝内部垫芯可以机洗吗",
       "source": "product-specs.md",
       "section": "商品规格手册 / 四季保暖猫窝(型号 MH-NEST20)",
-      "expect_empty": false
+      "expect_empty": false,
+      "answer_rule": "nest_cleaning",
+      "required_facts": [
+        "cleaning_parts_specs"
+      ],
+      "must_include": [
+        "内部垫芯不可机洗"
+      ],
+      "must_not_include": [
+        "内部垫芯可以机洗"
+      ]
     },
     {
       "id": "negative_weather",
       "query": "今天天气怎么样",
-      "expect_empty": true
+      "expect_empty": true,
+      "answer_rule": "negative_weather",
+      "required_facts": [],
+      "must_not_include": [
+        "6 元",
+        "99 元",
+        "12 元"
+      ]
     },
     {
       "id": "negative_greeting",
       "query": "你好",
-      "expect_empty": true
+      "expect_empty": true,
+      "answer_rule": "negative_greeting",
+      "required_facts": [],
+      "must_not_include": [
+        "6 元",
+        "99 元",
+        "12 元"
+      ]
+    },
+    {
+      "id": "member_short",
+      "query": "会员折扣",
+      "expect_empty": false,
+      "answer_rule": "member_discount",
+      "required_facts": [
+        "member_discount"
+      ],
+      "must_include": [
+        "9 折",
+        "95 折"
+      ]
+    },
+    {
+      "id": "member_question",
+      "query": "会员有什么折扣",
+      "expect_empty": false,
+      "answer_rule": "member_discount",
+      "required_facts": [
+        "member_discount"
+      ],
+      "must_include": [
+        "9 折",
+        "95 折"
+      ]
+    },
+    {
+      "id": "lite_short",
+      "query": "Lite支持App吗",
+      "expect_empty": false,
+      "answer_rule": "lite_app",
+      "required_facts": [
+        "model_difference"
+      ]
+    },
+    {
+      "id": "shipping_short",
+      "query": "邮费",
+      "expect_empty": false,
+      "answer_rule": "shipping",
+      "required_facts": [
+        "shipping_base_fee",
+        "remote_shipping_fee"
+      ],
+      "must_include": [
+        "6 元",
+        "99 元",
+        "12 元",
+        "不参与包邮"
+      ],
+      "must_not_include": [
+        "10 元"
+      ]
+    },
+    {
+      "id": "refund_processing",
+      "query": "退款审核要几天",
+      "expect_empty": false,
+      "must_include": [
+        "3 个工作日"
+      ],
+      "must_not_include": [
+        "3 个工作日到账",
+        "三个工作日到账"
+      ],
+      "answer_rule": "refund_processing",
+      "required_facts": [
+        "refund_processing_vs_arrival",
+        "refund_arrival"
+      ]
     }
-  ]
+  ],
+  "boundary": "包含固定失败短问及原退款审核验收问法；用于调参和校准回归，不作为独立验收。"
 }

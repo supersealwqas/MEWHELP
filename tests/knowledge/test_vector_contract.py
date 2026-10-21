@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from typing import Any
+import asyncio
+import threading
 
 import pytest
 
@@ -104,3 +106,86 @@ async def test_schema_or_owner_mismatch_never_drops() -> None:
     assert client.drop_calls == 0
     assert client.closed is True
     assert bootstrap.closed is True
+
+
+async def test_get_fingerprints_reads_only_sync_fields_with_strong_consistency() -> None:
+    """对照只读主键及两种指纹并显式强一致。参数：无；返回：None；异常：断言失败。"""
+    class Client:
+        """验证实际 SDK get 边界参数。"""
+
+        def get(self, name, ids, output_fields, timeout, **kwargs):
+            """返回一个存在的主键。参数：SDK 参数；返回：结果行；异常：断言失败。"""
+            assert name == "knowledge" and ids == [1, 2]
+            assert output_fields == ["id", "content_hash", "embedding_revision"]
+            assert timeout > 0 and kwargs["consistency_level"] == "Strong"
+            return [{"id": 1, "content_hash": "a" * 64, "embedding_revision": "rev"}]
+
+    index = MilvusVectorIndex(make_settings())
+    index._ready, index._client = True, Client()
+    assert callable(getattr(index, "get_fingerprints", None)), "缺少主键指纹回读接口"
+    assert await index.get_fingerprints([1, 2]) == {1: ("a" * 64, "rev")}
+
+
+@pytest.mark.parametrize("operation", ["upsert", "delete", "get", "iterator", "next"])
+async def test_sdk_operations_have_bounded_wait(monkeypatch, operation) -> None:
+    """SDK 不遵守 timeout 时调用方仍有界退出。参数：补丁、操作；返回：None；异常：断言失败。"""
+    from app.knowledge import vector as vector_module
+
+    entered, finish = threading.Event(), threading.Event()
+
+    class Client:
+        """仅选中操作阻塞的 SDK 替身。"""
+
+        def _call(self, name):
+            """阻塞指定操作。参数：操作名；返回：None；异常：无。"""
+            if operation == name:
+                entered.set()
+                finish.wait(1)
+
+        def upsert(self, *args, **kwargs):
+            """模拟写入。参数：SDK 参数；返回：None；异常：无。"""
+            self._call("upsert")
+
+        def delete(self, *args, **kwargs):
+            """模拟删除。参数：SDK 参数；返回：None；异常：无。"""
+            self._call("delete")
+
+        def get(self, *args, **kwargs):
+            """模拟回读。参数：SDK 参数；返回：行；异常：无。"""
+            self._call("get")
+            return []
+
+        def query_iterator(self, *args, **kwargs):
+            """模拟分页初始化。参数：SDK 参数；返回：迭代器；异常：无。"""
+            assert kwargs.get("timeout", 0) > 0
+            assert kwargs.get("consistency_level") == "Strong"
+            self._call("iterator")
+            return self
+
+        def next(self):
+            """模拟翻页。参数：无；返回：空页；异常：无。"""
+            self._call("next")
+            return []
+
+        def close(self):
+            """结束迭代。参数：无；返回：None；异常：无。"""
+
+    index = MilvusVectorIndex(make_settings())
+    index._ready, index._client = True, Client()
+    monkeypatch.setattr(vector_module, "_RPC_TIMEOUT_SECONDS", 0.02)
+    if operation == "get":
+        assert callable(getattr(index, "get_fingerprints", None)), "缺少主键指纹回读接口"
+        call = index.get_fingerprints([1])
+    elif operation == "upsert":
+        call = index.upsert([VectorRecord(id=1, vector=[1.0] * 1024,
+                                        content_hash="a" * 64, embedding_revision="rev")])
+    elif operation == "delete":
+        call = index.delete([1])
+    else:
+        call = anext(index.iter_ids(1))
+    try:
+        with pytest.raises(VectorIndexUnavailable):
+            await asyncio.wait_for(call, timeout=0.2)
+        assert entered.is_set(), "失败必须发生在真实边界调用后"
+    finally:
+        finish.set()

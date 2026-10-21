@@ -49,6 +49,7 @@ def _valid_extraction() -> str:
                     "question": "邮费怎么算",
                     "answer": "未满99元收6元。",
                     "category": "物流",
+                    "answer_excerpts": [{"message_id": 1, "quote": "未满99元收6元。"}],
                 }
             ]
         },
@@ -144,6 +145,94 @@ async def test_aggregate_stream_before_json_validation() -> None:
     assert len(qas) == 1
     assert qas[0].source_ids == [1]
     assert stream.closed is True
+
+
+@pytest.mark.parametrize("answer", ["未满99元收600元。", "满99元包邮。"])
+async def test_grounding_rejects_invented_amount_or_shipping(answer: str) -> None:
+    """原文不支持的金额或包邮政策必须拒绝。参数：伪造答案；返回：None；异常：无。"""
+    raw = json.loads(_valid_extraction())
+    raw["qas"][0]["answer"] = answer
+    model, _ = _model(_ScriptedStream([AIMessageChunk(content=json.dumps(raw, ensure_ascii=False))]))
+    with pytest.raises(KnowledgeModelError, match="原句|证据|答案"):
+        await model.extract(_batch())
+
+
+async def test_grounding_accepts_ordered_complete_sentence_summary() -> None:
+    """允许省略寒暄并组合多个完整原句。参数：无；返回：None；异常：无。"""
+    batch = _batch()
+    turn = batch.turns[0].model_copy(update={"answer": "您好。未满99元收6元。欢迎咨询。偏远地区不包邮。"})
+    batch = batch.model_copy(update={"turns": [turn]})
+    raw = json.loads(_valid_extraction())
+    raw["qas"][0].update(answer="未满99元收6元。\n偏远地区不包邮。", answer_excerpts=[
+        {"message_id": 1, "quote": "未满99元收6元。"},
+        {"message_id": 1, "quote": "偏远地区不包邮。"},
+    ])
+    model, _ = _model(_ScriptedStream([AIMessageChunk(content=json.dumps(raw, ensure_ascii=False))]))
+    assert len(await model.extract(batch)) == 1
+
+
+@pytest.mark.parametrize("answer,quotes", [
+    ("未满99元收6元。", ["未满99元收6元。"]),
+    ("偏远地区包邮。", ["偏远地区包邮。"]),
+    ("未满99元收600元。偏远地区不包邮。", ["未满99元收600元。", "偏远地区不包邮。"]),
+])
+async def test_grounding_rejects_omitted_condition_or_fake_excerpt(answer, quotes) -> None:
+    """伪摘录与漏掉偏远不包邮条件不可发布。参数：答案与摘录；返回：None；异常：无。"""
+    batch = _batch()
+    batch = batch.model_copy(update={"turns": [batch.turns[0].model_copy(update={"answer": "未满99元收6元。偏远地区不包邮。"})]})
+    raw = json.loads(_valid_extraction())
+    raw["qas"][0].update(answer=answer, answer_excerpts=[{"message_id": 1, "quote": quote} for quote in quotes])
+    model, _ = _model(_ScriptedStream([AIMessageChunk(content=json.dumps(raw, ensure_ascii=False))]))
+    with pytest.raises(KnowledgeModelError, match="原句|条件|证据"):
+        await model.extract(batch)
+
+
+async def test_grounding_rejects_omitted_activity_end_condition() -> None:
+    """无否定关键词的活动截止条件也必须保留。参数：无；返回：None；异常：无。"""
+    batch = _batch()
+    batch = batch.model_copy(update={"turns": [batch.turns[0].model_copy(update={"answer": "商品售价6元。活动结束后恢复原价。"})]})
+    raw = json.loads(_valid_extraction())
+    raw["qas"][0].update(answer="商品售价6元。", answer_excerpts=[{"message_id": 1, "quote": "商品售价6元。"}])
+    model, _ = _model(_ScriptedStream([AIMessageChunk(content=json.dumps(raw, ensure_ascii=False))]))
+    with pytest.raises(KnowledgeModelError, match="条件"):
+        await model.extract(batch)
+
+
+async def test_grounding_preserves_closing_quote() -> None:
+    """原句的闭合引号不可被当作可删除碎片。参数：无；返回：None；异常：无。"""
+    batch = _batch()
+    quote = "客服说明：“未满99元收6元。”"
+    batch = batch.model_copy(update={"turns": [batch.turns[0].model_copy(update={"answer": quote})]})
+    raw = json.loads(_valid_extraction())
+    raw["qas"][0].update(answer=quote, answer_excerpts=[{"message_id": 1, "quote": quote}])
+    model, _ = _model(_ScriptedStream([AIMessageChunk(content=json.dumps(raw, ensure_ascii=False))]))
+    assert (await model.extract(batch))[0].answer == quote
+
+
+@pytest.mark.parametrize("answer,accepted", [("商品售价6元。", False), ("活动结束后恢复原价\n商品售价6元。", True)])
+async def test_grounding_covers_unpunctuated_business_lines(answer, accepted) -> None:
+    """无句号业务行不得被跳过，完整多行合法。参数：答案/是否通过；返回：None；异常：无。"""
+    batch = _batch()
+    batch = batch.model_copy(update={"turns": [batch.turns[0].model_copy(update={"answer": "活动结束后恢复原价\n商品售价6元。"})]})
+    raw = json.loads(_valid_extraction())
+    raw["qas"][0].update(answer=answer, answer_excerpts=[{"message_id": 1, "quote": quote} for quote in answer.splitlines()])
+    model, _ = _model(_ScriptedStream([AIMessageChunk(content=json.dumps(raw, ensure_ascii=False))]))
+    if accepted:
+        assert len(await model.extract(batch)) == 1
+    else:
+        with pytest.raises(KnowledgeModelError):
+            await model.extract(batch)
+
+
+async def test_grounding_never_normalizes_number_internal_space() -> None:
+    """6 00不得在原句核验时变为600。参数：无；返回：None；异常：无。"""
+    batch = _batch()
+    batch = batch.model_copy(update={"turns": [batch.turns[0].model_copy(update={"answer": "运费6 00元。"})]})
+    raw = json.loads(_valid_extraction())
+    raw["qas"][0].update(answer="运费600元。", answer_excerpts=[{"message_id": 1, "quote": "运费600元。"}])
+    model, _ = _model(_ScriptedStream([AIMessageChunk(content=json.dumps(raw, ensure_ascii=False))]))
+    with pytest.raises(KnowledgeModelError):
+        await model.extract(batch)
 
 
 @pytest.mark.parametrize(

@@ -24,6 +24,7 @@ from app.config import Settings
 from app.core.llm import get_chat_model
 from app.knowledge.embedding import BgeM3Encoder
 from app.knowledge.llm import KnowledgeModel
+from app.knowledge.grounding import GroundingError, turns_digest, validate_grounding
 from app.knowledge.prompts import (
     EXTRACTION_PROMPT_VERSION,
     RELATION_PROMPT_VERSION,
@@ -85,7 +86,7 @@ def _extraction_batch(extraction: dict) -> ExtractionBatch:
         batch_no=f"eval-{payload_digest[:12]}",
         source_ids=sorted(set(identifiers)),
         snapshot_upper_id=max(identifiers),
-        input_hash=payload_digest,
+        input_hash=turns_digest(turns),
         prompt_version=EXTRACTION_PROMPT_VERSION,
         turns=turns,
     )
@@ -102,6 +103,11 @@ def _evaluate_extraction(extraction: dict, qas: list[ExtractedQA]) -> dict:
             all_case_ids.add(int(turn["message_id"]))
             conversation_by_id[int(turn["message_id"])] = int(turn["conversation_id"])
     for qa in qas:
+        try:
+            validate_grounding(qa, [CompletedTurn.model_validate(turn)
+                                    for case in extraction["cases"] for turn in case["turns"]])
+        except GroundingError as error:
+            failures.append(f"{qa.question}: 原句证据核验失败: {error}")
         if not set(qa.source_ids).issubset(all_case_ids):
             failures.append(f"{qa.question}: 来源不在标注批次")
         conversations = {
@@ -331,7 +337,8 @@ async def _run(args: argparse.Namespace) -> dict:
         json.dumps(result, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    if result.get("policy"):
+    # 只发布整套固定标注已通过的策略；失败报告可保留候选，但不得覆盖旧有效文件。
+    if result.get("passed") is True and result.get("policy"):
         policy_path = DEFAULT_POLICY
         policy_path.parent.mkdir(parents=True, exist_ok=True)
         policy_path.write_text(

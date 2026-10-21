@@ -8,15 +8,15 @@
 from __future__ import annotations
 
 import json
-import math
 from pathlib import Path
 
 from pydantic import ValidationError
 
 from app.knowledge.chunking import CHUNKING_VERSION
+from app.knowledge.contracts import KnowledgeEncoder, VectorIndex
+from app.knowledge.limits import valid_dense_vector
 from app.knowledge.schemas import KnowledgeUnavailable, RetrievalPolicy
 from app.knowledge.store import KnowledgeStore
-from app.knowledge.vector import MilvusVectorIndex
 
 MAX_RESULTS = 3
 _MAX_KEYWORD_LENGTH = 100
@@ -61,8 +61,8 @@ class KnowledgeSearch:
     def __init__(
         self,
         store: KnowledgeStore,
-        encoder,
-        index: MilvusVectorIndex,
+        encoder: KnowledgeEncoder,
+        index: VectorIndex,
         policy: RetrievalPolicy,
     ) -> None:
         """保存检索依赖。
@@ -103,8 +103,7 @@ class KnowledgeSearch:
         vectors = await self.encoder.encode([keyword])
         if (
             len(vectors) != 1
-            or len(vectors[0]) != 1024
-            or not all(math.isfinite(value) for value in vectors[0])
+            or not valid_dense_vector(vectors[0])
         ):
             raise KnowledgeSearchUnavailable("查询编码结果不合法")
         vector = vectors[0]

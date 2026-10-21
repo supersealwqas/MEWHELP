@@ -6,7 +6,7 @@ import pytest
 
 from app.knowledge.lifecycle import KnowledgeLifecycle
 from app.knowledge.llm import KnowledgeModelError
-from app.knowledge.prompts import RELATION_PROMPT_VERSION
+from app.knowledge.prompts import RELATION_PROMPT_VERSION, relation_input_size
 from app.knowledge.schemas import (
     ChunkDraft,
     ChunkSnapshot,
@@ -18,7 +18,7 @@ from app.knowledge.schemas import (
 from app.knowledge.text import content_fingerprint
 from tests.knowledge.fakes import (
     FakeEncoder,
-    MemoryKnowledgeStore,
+    source_backed_store as MemoryKnowledgeStore,
     ScriptedKnowledgeModel,
 )
 
@@ -297,3 +297,394 @@ async def test_oversized_candidate_not_published() -> None:
     frame = await _frame(store)
     assert frame.chunks == []
     assert next(row for row in frame.staged if row.id == 1).status == "extracted"
+
+
+class _MappedModel:
+    """为每个实际请求返回指定关系，其余为无关，记录真实预算。"""
+
+    def __init__(self, relations: dict[tuple[str, str], str]) -> None:
+        """保存关系表。参数：relations引用对映射；返回：None；异常：无。"""
+        self.relations = relations
+        self.calls = []
+
+    async def relate(self, items, pairs):
+        """逐对返回决定。参数：items证据/pairs请求；返回：决定列表；异常：无。"""
+        self.calls.append((list(items), list(pairs)))
+        return [_decision(left, right, self.relations.get((left, right), "unrelated"))
+                for left, right in pairs]
+
+
+@pytest.mark.parametrize("relations", [
+    {("staged:1", "staged:2"): "conflict", ("staged:2", "staged:3"): "uncertain"},
+    {("staged:1", "staged:2"): "same", ("staged:2", "staged:3"): "conflict"},
+])
+async def test_constraint_chain_quarantines_all_members(relations) -> None:
+    """冲突或不确定通过整条关系链传播。参数：relations链关系；返回：None；异常：断言失败。"""
+    store = MemoryKnowledgeStore(staged=[_staged(i, f"问题{i}", answer=f"答案{i}。") for i in (1, 2, 3)])
+    async with store.writer() as writer:
+        await _lifecycle(_MappedModel(relations)).reconcile_staging(writer)
+    frame = await _frame(store)
+    assert frame.chunks == []
+    assert len({row.conflict_group for row in frame.staged}) == 1
+    assert all(row.conflict_group and row.status == "extracted" for row in frame.staged)
+
+
+async def test_uncertain_alias_joins_old_quarantine() -> None:
+    """新不确定成员不能绕过持久隔离组。参数：无；返回：None；异常：断言失败。"""
+    store = MemoryKnowledgeStore(staged=[_staged(1, "旧一", conflict_group="cg:old"),
+                                        _staged(2, "旧二", conflict_group="cg:old"),
+                                        _staged(3, "新")])
+    async with store.writer() as writer:
+        await _lifecycle(_MappedModel({("staged:3", "staged:1"): "uncertain"})).reconcile_staging(writer)
+    frame = await _frame(store)
+    assert {row.conflict_group for row in frame.staged} == {"cg:old"}
+    assert frame.chunks == []
+
+
+async def test_alias_same_active_and_conflict_with_other_withdraws_all() -> None:
+    """已有active不能切断same接conflict关系。参数：无；返回：None；异常：断言失败。"""
+    store = MemoryKnowledgeStore(snapshots=[_snapshot(10, "qa:1", _text(answer="旧答", questions="旧问"))],
+                                 staged=[_staged(1, "旧问", answer="旧答", status="kept", knowledge_id=10),
+                                         _staged(2, "新问", answer="旧答"), _staged(3, "相反", answer="另一答")])
+    model = _MappedModel({("staged:2", "chunk:10"): "same", ("staged:2", "staged:3"): "conflict"})
+    async with store.writer() as writer:
+        await _lifecycle(model).reconcile_staging(writer)
+    frame = await _frame(store)
+    assert all(not row.is_active for row in frame.chunks)
+    assert len({row.conflict_group for row in frame.staged}) == 1
+    assert all(row.conflict_group and row.status == "extracted" for row in frame.staged)
+
+
+async def test_new_bridge_unifies_every_old_group_member() -> None:
+    """新成员桥接两个旧组时旧组全部身份统一。参数：无；返回：None；异常：断言失败。"""
+    store = MemoryKnowledgeStore(staged=[_staged(1, "甲一", conflict_group="cg:a"),
+                                        _staged(2, "甲二", conflict_group="cg:a"),
+                                        _staged(3, "乙一", conflict_group="cg:b"),
+                                        _staged(4, "乙二", conflict_group="cg:b"), _staged(5, "新问")])
+    async with store.writer() as writer:
+        await _lifecycle(_MappedModel({("staged:5", "staged:1"): "same", ("staged:5", "staged:3"): "uncertain"})).reconcile_staging(writer)
+    frame = await _frame(store)
+    assert len({row.conflict_group for row in frame.staged}) == 1
+    assert all(row.conflict_group for row in frame.staged)
+
+
+async def test_same_chain_merges_multiple_active_and_relinks_discarded_sources() -> None:
+    """same组保留稳定主键、全部真实问法并撤回重关联重复块。参数：无；返回：None；异常：断言失败。"""
+    store = MemoryKnowledgeStore(snapshots=[_snapshot(10, "qa:1", _text(answer="可信答", questions="旧问一\n旧问二")),
+                                          _snapshot(20, "qa:3", _text(answer="可信答", questions="旧问三"))],
+                                 staged=[_staged(1, "旧问一", answer="可信答", status="kept", knowledge_id=10),
+                                         _staged(2, "旧问二", answer="可信答", status="discarded", knowledge_id=10),
+                                         _staged(3, "旧问三", answer="可信答", status="kept", knowledge_id=20),
+                                         _staged(4, "新问四", answer="可信答")])
+    model = _MappedModel({("staged:4", "chunk:10"): "same", ("staged:4", "chunk:20"): "same"})
+    async with store.writer() as writer:
+        await _lifecycle(model).reconcile_staging(writer)
+    frame = await _frame(store)
+    main = next(row for row in frame.chunks if row.id == 10)
+    assert main.source_key == "qa:1" and main.vectorize_status == "pending" and main.vector_id is None
+    assert main.text.questions.splitlines() == ["旧问一", "旧问二", "旧问三", "新问四"]
+    assert next(row for row in frame.chunks if row.id == 20).is_active is False
+    assert all(row.knowledge_id == 10 for row in frame.staged)
+
+
+async def test_cross_batch_same_overflow_keeps_original_without_truncating() -> None:
+    """合并超限不截断旧块或新问法。参数：无；返回：None；异常：断言失败。"""
+    old = _snapshot(10, "qa:1", _text(answer="答。", questions="旧" * 900))
+    store = MemoryKnowledgeStore(snapshots=[old], staged=[_staged(1, "旧" * 900, answer="答。", status="kept", knowledge_id=10),
+                                                         _staged(2, "新" * 900, answer="答。")])
+    async with store.writer() as writer:
+        await _lifecycle(_MappedModel({("staged:2", "chunk:10"): "same"})).reconcile_staging(writer)
+    frame = await _frame(store)
+    assert next(row for row in frame.chunks if row.id == 10) == old
+    assert next(row for row in frame.staged if row.id == 2).status == "extracted"
+
+
+async def test_exact_duplicate_is_deduplicated_without_model() -> None:
+    """精确QA可独立于Dense阈值及模型故障去重。参数：无；返回：None；异常：断言失败。"""
+    store = MemoryKnowledgeStore(staged=[_staged(1, "问原话", answer="收6 00元。"),
+                                        _staged(2, "问原话", answer="收6 00元。")])
+    model = ScriptedKnowledgeModel(relation_error=KnowledgeModelError("不可用"))
+    async with store.writer() as writer:
+        await _lifecycle(model).reconcile_staging(writer)
+    frame = await _frame(store)
+    assert len(frame.chunks) == 1 and model.relation_inputs == []
+
+
+async def test_exact_duplicate_normalization_preserves_internal_number_spaces() -> None:
+    """句内数字空白不同不能误合并。参数：无；返回：None；异常：断言失败。"""
+    store = MemoryKnowledgeStore(staged=[_staged(1, "问", answer="收6 00元。"), _staged(2, "问", answer="收600元。")])
+    model = _MappedModel({})
+    async with store.writer() as writer:
+        await _lifecycle(model).reconcile_staging(writer)
+    assert len((await _frame(store)).chunks) == 2
+    assert model.calls
+
+
+@pytest.mark.parametrize("existing", [False, True])
+async def test_conflicting_documents_publish_nothing_even_below_dense(existing) -> None:
+    """新文档之间及未更新权威文档相反时零发布。参数：existing旧权威；返回：None；异常：断言失败。"""
+    drafts = [_draft(answer="包邮。")]
+    snapshots = []
+    if existing:
+        snapshots = [_snapshot(20, "doc:b.md", _text(answer="不包邮。"))]
+        pair = ("draft:doc:a.md:0", "chunk:20")
+    else:
+        drafts.append(_draft(source_key="doc:b.md", answer="不包邮。", section_path="完全不同章节"))
+        pair = ("draft:doc:a.md:0", "draft:doc:b.md:0")
+    store = MemoryKnowledgeStore(snapshots=snapshots)
+    model = _MappedModel({pair: "conflict"})
+    before = await _frame(store)
+    with pytest.raises(KnowledgeModelError):
+        async with store.writer() as writer:
+            await _lifecycle(model).publish_documents(writer, drafts, [draft.source_key for draft in drafts])
+    assert await _frame(store) == before
+
+
+async def test_relation_batches_respect_actual_system_and_items_budget() -> None:
+    """八条长证据按实际system消息预算拆组。参数：无；返回：None；异常：断言失败。"""
+    store = MemoryKnowledgeStore(snapshots=[_snapshot(i, f"qa:{i}", _text(answer="文" * 1500, questions=f"旧问{i}")) for i in range(10, 18)])
+    model = _MappedModel({})
+    async with store.writer() as writer:
+        await _lifecycle(model).publish_documents(writer, [_draft()], ["doc:a.md"])
+    assert sum(len(pairs) for _, pairs in model.calls) == 8
+    assert len(model.calls) > 1
+    assert all(relation_input_size(items, pairs) <= 12000 for items, pairs in model.calls)
+
+
+async def test_relation_duplicate_decisions_and_forged_evidence_stop_publication() -> None:
+    """重复决定或未知证据必须在任何发布前拒绝。参数：无；返回：None；异常：断言失败。"""
+    store = MemoryKnowledgeStore(staged=[_staged(1, "甲"), _staged(2, "乙")])
+    relation = _decision("staged:1", "staged:2", "same")
+    model = ScriptedKnowledgeModel(relation_decisions=[relation, relation])
+    before = await _frame(store)
+    with pytest.raises(KnowledgeModelError):
+        async with store.writer() as writer:
+            await _lifecycle(model).reconcile_staging(writer)
+    assert await _frame(store) == before
+
+
+@pytest.mark.parametrize("full", [False, True])
+async def test_document_can_judge_actual_conflict_group_without_joining_unrelated(full) -> None:
+    """文档完整覆盖可裁定，局部覆盖不能释放未覆盖成员。参数：full完整覆盖；返回：None；异常：断言失败。"""
+    store = MemoryKnowledgeStore(snapshots=[_snapshot(50, "doc:policy.md", _text(answer="权威答。"))],
+                                 staged=[_staged(1, "甲问", answer="甲答。", conflict_group="cg:old"),
+                                         _staged(2, "乙问", answer="乙答。", conflict_group="cg:old"),
+                                         _staged(3, "新甲问", answer="甲答。"), _staged(4, "无关问", answer="无关答。")])
+    relations = {("staged:3", "staged:1"): "same", ("staged:3", "chunk:50"): "conflict",
+                 ("staged:1", "chunk:50"): "conflict", ("staged:4", "chunk:50"): "same"}
+    if full:
+        relations[("staged:2", "chunk:50")] = "same"
+    async with store.writer() as writer:
+        await _lifecycle(_MappedModel(relations)).reconcile_staging(writer)
+    frame = await _frame(store)
+    rows = {row.id: row for row in frame.staged}
+    assert rows[4].status == "discarded" and rows[4].conflict_group is None
+    assert not any(row.source_key.startswith("qa:") and row.is_active for row in frame.chunks)
+    if full:
+        assert all(rows[i].status == "discarded" and rows[i].conflict_group is None for i in (1, 2, 3))
+    else:
+        assert rows[2].status == "extracted" and rows[2].conflict_group == "cg:old"
+
+
+async def test_document_judges_active_content_without_rechecking_each_source_audit() -> None:
+    """active三格被权威覆盖后关联审计不能使整组裁定死锁。参数：无；返回：None；异常：断言失败。"""
+    store = MemoryKnowledgeStore(snapshots=[_snapshot(10, "qa:1", _text(answer="旧答。", questions="旧问一\n旧问二")),
+                                          _snapshot(50, "doc:policy.md", _text(answer="权威答。"))],
+                                 staged=[_staged(1, "旧问一", answer="旧答。", status="kept", knowledge_id=10),
+                                         _staged(2, "旧问二", answer="旧答。", status="discarded", knowledge_id=10),
+                                         _staged(3, "新问", answer="新答。")])
+    model = _MappedModel({("staged:3", "chunk:10"): "conflict",
+                          ("staged:3", "chunk:50"): "same", ("chunk:10", "chunk:50"): "conflict"})
+    async with store.writer() as writer:
+        await _lifecycle(model).reconcile_staging(writer)
+    frame = await _frame(store)
+    assert all(row.status == "discarded" and row.conflict_group is None for row in frame.staged)
+    assert next(row for row in frame.chunks if row.id == 10).is_active is False
+    assert not any(left in ("staged:1", "staged:2") for _, pairs in model.calls for left, _ in pairs)
+
+
+async def test_uncertain_document_pair_cannot_release_other_covered_member() -> None:
+    """额外不确定权威证据不能被same裁定覆盖。参数：无；返回：None；异常：断言失败。"""
+    store = MemoryKnowledgeStore(snapshots=[_snapshot(50, "doc:one.md", _text()), _snapshot(60, "doc:two.md", _text())],
+                                 staged=[_staged(1, "问", answer="答。")])
+    model = _MappedModel({("staged:1", "chunk:50"): "same", ("staged:1", "chunk:60"): "uncertain"})
+    async with store.writer() as writer:
+        await _lifecycle(model).reconcile_staging(writer)
+    frame = await _frame(store)
+    assert frame.staged[0].status == "extracted" and frame.staged[0].conflict_group
+
+
+class _LowDenseEncoder(FakeEncoder):
+    """为不同证据返回正交向量，保证相似度低于真实候选阈值。"""
+
+    async def encode(self, texts):
+        """返回正交向量。参数：texts待编码三格；返回：1024维列表；异常：无。"""
+        self.inputs.extend(texts)
+        return [[float(index == position) for position in range(1024)] for index, _ in enumerate(texts)]
+
+
+@pytest.mark.parametrize("encoder_type", [FakeEncoder, _LowDenseEncoder])
+@pytest.mark.parametrize("historical_question", ["旧问一", "旧问二\n补充条件"])
+async def test_historical_exact_qa_reuses_merged_chunk_without_model(
+    encoder_type, historical_question: str
+) -> None:
+    """历史完整问法重现仍复用主键并保留原文证据。
+
+    参数：encoder_type为正常或低Dense编码器；historical_question覆盖kept/discarded完整问法。
+    返回：None。
+    异常：断言失败；精确关系错误进入不可用模型时抛出KnowledgeModelError。
+    """
+    store = MemoryKnowledgeStore(staged=[_staged(1, "旧问一", answer="可信答。"),
+                                        _staged(2, "旧问二\n补充条件", answer="可信答。")])
+    async with store.writer() as writer:
+        await _lifecycle(_MappedModel({("staged:1", "staged:2"): "same"})).reconcile_staging(writer)
+    merged = await _frame(store)
+    assert [(row.id, row.text.questions) for row in merged.chunks] == [(1, "旧问一\n旧问二\n补充条件")]
+    assert [row.status for row in merged.staged] == ["kept", "discarded"]
+    assert all(row.source_evidence for row in merged.staged)
+
+    store = MemoryKnowledgeStore(snapshots=merged.chunks,
+                                 staged=merged.staged + [_staged(3, historical_question, answer="可信答。")])
+    model = ScriptedKnowledgeModel(relation_error=KnowledgeModelError("模型不可用"))
+    lifecycle = KnowledgeLifecycle(encoder_type(), model, POLICY.model_copy(update={"min_score": 0.8}))
+    async with store.writer() as writer:
+        await lifecycle.reconcile_staging(writer)
+    frame = await _frame(store)
+    assert [(row.id, row.source_key, row.text.questions) for row in frame.chunks if row.is_active] == [
+        (1, "qa:1", "旧问一\n旧问二\n补充条件")]
+    assert [(row.status, row.knowledge_id) for row in frame.staged] == [
+        ("kept", 1), ("discarded", 1), ("discarded", 1)]
+    for previous, current in zip(merged.staged, frame.staged):
+        assert (current.question, current.answer, current.source_ids, current.source_evidence) == (
+            previous.question, previous.answer, previous.source_ids, previous.source_evidence)
+    assert frame.staged[2].source_evidence and not model.relation_inputs
+
+
+async def test_historical_multiline_fragment_is_not_an_exact_qa() -> None:
+    """多行原问的单行片段不能冒充历史完整问法。参数：无；返回：None；异常：断言失败。"""
+    original = _snapshot(10, "qa:1", _text(questions="旧问一\n旧问二\n补充条件", answer="可信答。"))
+    store = MemoryKnowledgeStore(snapshots=[original], staged=[
+        _staged(1, "旧问一", answer="可信答。", status="kept", knowledge_id=10),
+        _staged(2, "旧问二\n补充条件", answer="可信答。", status="discarded", knowledge_id=10),
+        _staged(3, "补充条件", answer="可信答。")])
+    model = ScriptedKnowledgeModel(relation_error=KnowledgeModelError("模型不可用"))
+    lifecycle = KnowledgeLifecycle(_LowDenseEncoder(), model, POLICY.model_copy(update={"min_score": 0.8}))
+    async with store.writer() as writer:
+        await lifecycle.reconcile_staging(writer)
+    frame = await _frame(store)
+    assert frame.chunks[0] == original
+    assert [(row.id, row.status, row.knowledge_id) for row in frame.staged] == [
+        (1, "kept", 10), (2, "discarded", 10), (3, "kept", 11)]
+    assert not model.relation_inputs
+
+
+async def test_historical_expired_answer_does_not_match_current_chunk() -> None:
+    """过期历史答案不能把新候选接到当前可信知识。参数：无；返回：None；异常：断言失败。"""
+    original = _snapshot(10, "qa:1", _text(questions="旧问一\n旧问二", answer="当前可信答。"))
+    store = MemoryKnowledgeStore(snapshots=[original, _snapshot(50, "doc:policy.md", _text(answer="当前可信答。"))],
+                                 staged=[_staged(1, "旧问一", answer="当前可信答。", status="kept", knowledge_id=10),
+                                         _staged(2, "旧问二", answer="过期答。", status="discarded", knowledge_id=10),
+                                         _staged(3, "旧问二", answer="过期答。")])
+    model = _MappedModel({("staged:3", "chunk:50"): "conflict"})
+    async with store.writer() as writer:
+        await _lifecycle(model).reconcile_staging(writer)
+    frame = await _frame(store)
+    assert frame.chunks[0] == original
+    assert len(frame.chunks) == 2
+    assert [(row.status, row.knowledge_id) for row in frame.staged] == [
+        ("kept", 10), ("discarded", 10), ("discarded", None)]
+
+
+async def test_historical_document_withdrawal_cannot_reactivate_old_chunk() -> None:
+    """文档已撤回的历史精确QA不得重新激活旧块。参数：无；返回：None；异常：断言失败。"""
+    store = MemoryKnowledgeStore(snapshots=[_snapshot(10, "qa:1", _text(questions="旧问一\n旧问二", answer="过期答。"))],
+                                 staged=[_staged(1, "旧问一", answer="过期答。", status="kept", knowledge_id=10),
+                                         _staged(2, "旧问二", answer="过期答。", status="discarded", knowledge_id=10)])
+    async with store.writer() as writer:
+        await _lifecycle(_MappedModel({("draft:doc:a.md:0", "chunk:10"): "conflict"})).publish_documents(
+            writer, [_draft(answer="当前可信答。")], ["doc:a.md"])
+    withdrawn = await _frame(store)
+    assert not withdrawn.chunks[0].is_active
+    assert all(row.status == "discarded" for row in withdrawn.staged)
+
+    store = MemoryKnowledgeStore(snapshots=withdrawn.chunks,
+                                 staged=withdrawn.staged + [_staged(3, "旧问二", answer="过期答。")])
+    model = _MappedModel({("staged:3", "chunk:11"): "conflict"})
+    async with store.writer() as writer:
+        await _lifecycle(model).reconcile_staging(writer)
+    frame = await _frame(store)
+    assert frame.chunks == withdrawn.chunks
+    assert all(row.status == "discarded" and not row.conflict_group for row in frame.staged)
+    assert frame.staged[2].knowledge_id is None
+
+
+async def test_document_conflict_detection_bypasses_low_dense_threshold() -> None:
+    """文档全pair检查不受Dense低分影响。参数：无；返回：None；异常：断言失败。"""
+    model = _MappedModel({("draft:doc:a.md:0", "draft:doc:a.md:1"): "conflict"})
+    store = MemoryKnowledgeStore()
+    lifecycle = KnowledgeLifecycle(_LowDenseEncoder(), model, POLICY.model_copy(update={"min_score": 0.8}))
+    with pytest.raises(KnowledgeModelError):
+        async with store.writer() as writer:
+            await lifecycle.publish_documents(writer, [_draft(answer="包邮。"), _draft(ordinal=1, answer="不包邮。")], ["doc:a.md"])
+    assert model.calls and (await _frame(store)).chunks == []
+
+
+async def test_exact_qa_matches_before_dense_and_preserves_unicode_distinctions() -> None:
+    """边界strip行尾规范可去重，Unicode数字仍逐字区分。参数：无；返回：None；异常：断言失败。"""
+    store = MemoryKnowledgeStore(staged=[_staged(1, " 问\r\n", answer="答①。\r\n"), _staged(2, "问", answer="答①。")])
+    model = ScriptedKnowledgeModel(relation_error=KnowledgeModelError("模型不可用"))
+    lifecycle = KnowledgeLifecycle(_LowDenseEncoder(), model, POLICY.model_copy(update={"min_score": 0.8}))
+    async with store.writer() as writer:
+        await lifecycle.reconcile_staging(writer)
+    assert len((await _frame(store)).chunks) == 1 and not model.relation_inputs
+    assert lifecycle._exact_qa(_text(answer="答①。")) != lifecycle._exact_qa(_text(answer="答1。"))
+
+
+async def test_complete_authority_resolves_uncertain_group_with_inactive_old_chunk() -> None:
+    """充分权威可裁定不确定组及旧撤回块，不会永久隔离。参数：无；返回：None；异常：断言失败。"""
+    store = MemoryKnowledgeStore(snapshots=[_snapshot(10, "qa:1", _text(answer="旧答。", questions="旧问"), active=False),
+                                          _snapshot(50, "doc:policy.md", _text(answer="权威答。"))],
+                                 staged=[_staged(1, "旧问", answer="旧答。", conflict_group="cg:old", knowledge_id=10),
+                                         _staged(2, "新问", answer="新答。")])
+    model = _MappedModel({("staged:2", "staged:1"): "uncertain", ("staged:2", "chunk:50"): "same",
+                          ("chunk:10", "chunk:50"): "conflict"})
+    async with store.writer() as writer:
+        await _lifecycle(model).reconcile_staging(writer)
+    frame = await _frame(store)
+    assert all(row.status == "discarded" and row.conflict_group is None for row in frame.staged)
+    assert all(not row.is_active for row in frame.chunks if row.source_key.startswith("qa:"))
+
+
+async def test_partial_document_conflict_cannot_publish_same_group() -> None:
+    """same链只有局部被文档推翻时整组不能发布。参数：无；返回：None；异常：断言失败。"""
+    store = MemoryKnowledgeStore(snapshots=[_snapshot(50, "doc:policy.md", _text())],
+                                 staged=[_staged(1, "问一", answer="答一。"), _staged(2, "问二", answer="答二。")])
+    model = _MappedModel({("staged:1", "staged:2"): "same", ("staged:1", "chunk:50"): "conflict"})
+    async with store.writer() as writer:
+        await _lifecycle(model).reconcile_staging(writer)
+    frame = await _frame(store)
+    assert all(not row.source_key.startswith("qa:") for row in frame.chunks)
+    assert all(row.status == "extracted" and row.conflict_group for row in frame.staged)
+
+
+async def test_single_relation_pair_over_budget_fails_before_model_and_publication() -> None:
+    """单pair也超限时安全失败且零模型调用。参数：无；返回：None；异常：断言失败。"""
+    store = MemoryKnowledgeStore(snapshots=[_snapshot(10, "qa:old", _text(answer="旧" * 12000))])
+    model = _MappedModel({})
+    before = await _frame(store)
+    with pytest.raises(KnowledgeModelError, match="单对"):
+        async with store.writer() as writer:
+            await _lifecycle(model).publish_documents(writer, [_draft()], ["doc:a.md"])
+    assert not model.calls and await _frame(store) == before
+
+
+async def test_forged_relation_evidence_ref_fails_before_publication() -> None:
+    """模型伪造证据引用不能进入发布。参数：无；返回：None；异常：断言失败。"""
+    store = MemoryKnowledgeStore(staged=[_staged(1, "问一"), _staged(2, "问二")])
+    decision = _decision("staged:1", "staged:2", "same").model_copy(update={"evidence_refs": ["missing:1"]})
+    model = ScriptedKnowledgeModel(relation_decisions=[decision])
+    before = await _frame(store)
+    with pytest.raises(KnowledgeModelError, match="引用"):
+        async with store.writer() as writer:
+            await _lifecycle(model).reconcile_staging(writer)
+    assert await _frame(store) == before

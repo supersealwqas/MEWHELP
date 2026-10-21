@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 import pytest
+from sqlalchemy import select
 
 from app.knowledge.errors import SnapshotChanged
+from app.knowledge.grounding import validate_grounding
 from app.knowledge.schemas import (
     ChunkDraft,
+    CompletedTurn,
+    ExtractedQA,
     KnowledgeText,
     Publication,
     StageChange,
 )
+from app.knowledge.text import content_fingerprint
+from app.models.customer_service import Conversation, Message
+from app.models.knowledge import QAExtractionStaging
 
 pytestmark = pytest.mark.knowledge_integration
 
@@ -117,8 +124,127 @@ async def test_pointer_repair_and_shortened_source(knowledge_store) -> None:
         rows = await writer.chunks_by_sources(["doc:a.md"])
     by_ordinal = {row.ordinal: row for row in rows}
     assert by_ordinal[1].is_active is False
+    assert by_ordinal[1].prev_chunk_id is None
+    assert by_ordinal[1].next_chunk_id is None
     assert by_ordinal[0].next_chunk_id == by_ordinal[2].id
     assert by_ordinal[2].prev_chunk_id == by_ordinal[0].id
+
+
+async def test_explicit_withdrawal_clears_both_pointers_and_repairs_neighbors(
+    knowledge_store,
+) -> None:
+    """显式撤回断开旧块两侧指针并重新连接有效块。
+
+    参数：knowledge_store 为独立真实测试库存储。返回：None。异常：断言或数据库错误。
+    """
+    original = await _publish(knowledge_store, [_draft(ordinal=index) for index in range(3)])
+    await _publish(knowledge_store, [], inactive_ids=[original[1].id])
+    async with knowledge_store.writer() as writer:
+        rows = await writer.chunks_by_sources(["doc:a.md"])
+    first, withdrawn, last = sorted(rows, key=lambda row: row.ordinal)
+    assert withdrawn.is_active is False
+    assert withdrawn.prev_chunk_id is None
+    assert withdrawn.next_chunk_id is None
+    assert first.prev_chunk_id is None
+    assert first.next_chunk_id == last.id
+    assert last.prev_chunk_id == first.id
+    assert last.next_chunk_id is None
+
+
+async def test_stage_audit_appends_stable_unique_document_snapshots(
+    knowledge_store, knowledge_database,
+) -> None:
+    """同序号文档更新仍保留来源、旧处置和完整历史文档快照。
+
+    参数：knowledge_store、knowledge_database 均仅指向 mewhelp_ch03_test。
+    返回：None。异常：断言、来源校验或数据库错误。
+    """
+    _, factory, _ = knowledge_database
+    async with factory.begin() as session:
+        conversation = Conversation(session_id="store-audit", user_id="ch03-test-user")
+        session.add(conversation)
+        await session.flush()
+        user = Message(
+            conversation_id=conversation.id, role="user", content="问法",
+            turn_id="audit-1", turn_status="completed",
+        )
+        assistant = Message(
+            conversation_id=conversation.id, role="assistant", content="第一版答案。",
+            turn_id="audit-1", turn_status="completed",
+        )
+        session.add_all([user, assistant])
+        await session.flush()
+        turn = CompletedTurn(
+            message_id=assistant.id, conversation_id=conversation.id, turn_id="audit-1",
+            question=user.content, answer=assistant.content,
+        )
+        qa = ExtractedQA(
+            source_ids=[assistant.id], question=user.content,
+            answer=assistant.content, category="分类",
+        )
+        _, source_audit = validate_grounding(qa, [turn])
+        staged = QAExtractionStaging(
+            batch_no="legacy-store-audit", source_ids=[assistant.id],
+            source_fingerprint="b" * 64, question=qa.question, answer=qa.answer,
+            category=qa.category, status="extracted",
+            evidence_refs=source_audit + ["old:relation"],
+        )
+        session.add(staged)
+        await session.flush()
+        stage_id = staged.id
+
+    old = (await _publish(knowledge_store, [_draft(section_path="甲 / 旧章节")]))[0]
+    old_document = {
+        "kind": "document", "source_key": old.source_key, "ordinal": old.ordinal,
+        "id": old.id, "section_path": old.section_path, "content_hash": old.content_hash,
+        "text": old.text.model_dump(mode="json"), "relation": "same",
+    }
+    first_change = StageChange(
+        id=stage_id, status="kept", reason="旧文档支持",
+        evidence_refs=[
+            old_document, old_document, source_audit[0],
+            "current:relation", "current:relation",
+        ],
+    )
+    await _publish(knowledge_store, [], stage_changes=[first_change])
+    async with factory() as session:
+        stored = await session.scalar(
+            select(QAExtractionStaging).where(QAExtractionStaging.id == stage_id)
+        )
+        assert stored.evidence_refs == source_audit + ["old:relation", old_document, "current:relation"]
+
+    new_draft = _draft(answer="第二版答案。", section_path="乙 / 新章节")
+    new_document = {
+        "kind": "document", "source_key": old.source_key, "ordinal": old.ordinal,
+        "id": old.id, "section_path": new_draft.section_path,
+        "content_hash": content_fingerprint(new_draft.text),
+        "text": new_draft.text.model_dump(mode="json"), "relation": "conflict",
+    }
+    # JSON对象键顺序不同仍是同一证据；首个快照的顺序和内容必须保持稳定。
+    reordered_old = dict(reversed(list(old_document.items())))
+    reordered_old["text"] = dict(reversed(list(old_document["text"].items())))
+    second_change = StageChange(
+        id=stage_id, status="kept", reason="新文档判定",
+        evidence_refs=[reordered_old, new_document, "current:relation"],
+    )
+    updated = (await _publish(knowledge_store, [new_draft], stage_changes=[second_change]))[0]
+    await _publish(knowledge_store, [], stage_changes=[second_change])
+    assert updated.id == old.id
+    assert updated.content_hash != old.content_hash
+    async with factory() as session:
+        stored = await session.scalar(
+            select(QAExtractionStaging).where(QAExtractionStaging.id == stage_id)
+        )
+        assert stored.evidence_refs == source_audit + [
+            "old:relation", old_document, "current:relation", new_document,
+        ]
+        historical = next(
+            item for item in stored.evidence_refs
+            if isinstance(item, dict) and item.get("kind") == "document"
+        )
+        assert historical["section_path"] == "甲 / 旧章节"
+        assert historical["content_hash"] == old.content_hash
+        assert historical["text"] == old.text.model_dump(mode="json")
 
 
 async def test_mark_vectorized_rejects_stale_snapshot(knowledge_store) -> None:
@@ -142,3 +268,44 @@ async def test_publish_atomic_on_missing_stage_change(knowledge_store) -> None:
         )
     async with knowledge_store.writer() as writer:
         assert await writer.chunks_by_sources(["doc:a.md"]) == []
+
+
+@pytest.mark.parametrize("changed", ["content", "revision", "inactive", "pending"])
+async def test_mark_pending_rejects_changed_done_snapshot(knowledge_store, changed) -> None:
+    """旧 done 对照结果不能覆盖新的原文或状态。参数：真实存储、变化；返回：None；异常：断言失败。"""
+    from sqlalchemy import update
+    from app.models.knowledge import KnowledgeChunk
+
+    original = (await _publish(knowledge_store, [_draft()]))[0]
+    async with knowledge_store.writer() as writer:
+        await writer.mark_vectorized(original)
+    snapshot = (await knowledge_store.get_chunks([original.id]))[0]
+    changes = {"content": {"content_hash": "f" * 64},
+               "revision": {"embedding_revision": "new-revision"},
+               "inactive": {"is_active": False},
+               "pending": {"vectorize_status": "pending", "vector_id": None}}[changed]
+    async with knowledge_store._factory() as session:
+        await session.execute(update(KnowledgeChunk).where(KnowledgeChunk.id == original.id).values(**changes))
+        await session.commit()
+    async with knowledge_store.writer() as writer:
+        assert callable(getattr(writer, "mark_pending", None)), "缺少条件恢复 pending 接口"
+        assert await writer.mark_pending(snapshot) is False
+    current = (await knowledge_store.get_chunks([original.id]))[0]
+    for field, value in changes.items():
+        assert getattr(current, field) == value
+
+
+async def test_active_pages_and_conditional_pending_recovery(knowledge_store) -> None:
+    """active 分页覆盖 done 并可条件重置。参数：真实存储；返回：None；异常：断言失败。"""
+    rows = await _publish(knowledge_store, [_draft(ordinal=0), _draft(ordinal=1), _draft(ordinal=2)])
+    await _publish(knowledge_store, [], inactive_ids=[rows[1].id])
+    async with knowledge_store.writer() as writer:
+        await writer.mark_vectorized(rows[0])
+    assert callable(getattr(knowledge_store, "active_page", None)), "缺少 active 主键分页"
+    first = await knowledge_store.active_page(0, 1)
+    second = await knowledge_store.active_page(first[0].id, 1)
+    assert [first[0].id, second[0].id] == [rows[0].id, rows[2].id]
+    async with knowledge_store.writer() as writer:
+        assert await writer.mark_pending(first[0]) is True
+    restored = (await knowledge_store.get_chunks([rows[0].id]))[0]
+    assert restored.vectorize_status == "pending" and restored.vector_id is None

@@ -10,9 +10,12 @@ from __future__ import annotations
 import hashlib
 import math
 from collections.abc import Callable
-from typing import Any
 
 from app.knowledge.llm import KnowledgeModel, KnowledgeModelError
+from app.knowledge.contracts import KnowledgeEncoder
+from app.knowledge.limits import knowledge_overflow
+from app.knowledge.prompts import EXTRACTION_INPUT_BUDGET, relation_input_size
+from app.knowledge.relations import relation_components
 from app.knowledge.schemas import (
     ChunkDraft,
     ChunkSnapshot,
@@ -39,33 +42,12 @@ def _cosine(left: list[float], right: list[float]) -> float:
     return sum(a * b for a, b in zip(left, right)) / (left_norm * right_norm)
 
 
-class _DisjointSet:
-    """候选同义合并的最小并查集。"""
-
-    def __init__(self, values: list[int]) -> None:
-        """初始化集合。参数：候选 ID；返回：None；异常：无。"""
-        self.parent = {value: value for value in values}
-
-    def find(self, value: int) -> int:
-        """查找根。参数：ID；返回：根；异常：无。"""
-        while self.parent[value] != value:
-            self.parent[value] = self.parent[self.parent[value]]
-            value = self.parent[value]
-        return value
-
-    def union(self, left: int, right: int) -> None:
-        """合并两个集合。参数：ID；返回：None；异常：KeyError。"""
-        left_root, right_root = self.find(left), self.find(right)
-        if left_root != right_root:
-            self.parent[right_root] = left_root
-
-
 class KnowledgeLifecycle:
     """执行文档权威切换与挖掘知识全局去重。"""
 
     def __init__(
         self,
-        encoder,
+        encoder: KnowledgeEncoder,
         model: KnowledgeModel,
         relation_policy: RelationPolicy,
         checkpoint: Callable[[str], None] | None = None,
@@ -127,13 +109,14 @@ class KnowledgeLifecycle:
         )
 
     async def _relations(
-        self, items: list[EvidenceItem], pairs: list[tuple[str, str]]
+        self, items: list[EvidenceItem], pairs: list[tuple[str, str]], *, dense: bool = True
     ) -> dict[tuple[str, str], RelationDecision]:
         """用 Dense 候选阈值筛选后请求关系判定。
 
         参数:
             items: 证据项。
-            pairs: 待筛候选组合。
+            pairs: 待筛候选组合；不得重复或引用不存在的证据。
+            dense: 是否使用Dense阈值；文档相互检查必须为False。
         返回值:
             dict: pair 到关系结论。
         异常:
@@ -141,40 +124,116 @@ class KnowledgeLifecycle:
         """
         if not pairs:
             return {}
-        vectors = await self.encoder.encode([format_knowledge(item.text) for item in items])
-        if len(vectors) != len(items):
-            raise KnowledgeModelError("关系候选编码数量不一致")
-        by_ref = {item.ref: vector for item, vector in zip(items, vectors)}
-        candidates = [
-            pair
-            for pair in pairs
-            if _cosine(by_ref[pair[0]], by_ref[pair[1]]) >= self.relation_policy.min_score
-        ]
-        if not candidates:
-            return {}
+        item_map = {item.ref: item for item in items}
+        if len(item_map) != len(items) or len(set(pairs)) != len(pairs):
+            raise KnowledgeModelError("关系请求包含重复证据或pair")
+        if any(left not in item_map or right not in item_map for left, right in pairs):
+            raise KnowledgeModelError("关系请求引用未知证据")
         mapped: dict[tuple[str, str], RelationDecision] = {}
-        # 只把候选对实际引用的证据交给模型，并按小批控制输入预算。
-        for start in range(0, len(candidates), 8):
-            group = candidates[start : start + 8]
+        candidates = []
+        for left, right in pairs:
+            first, second = item_map[left], item_map[right]
+            # 精确QA只规范边界与行尾，不能改变句内数字、空白或Unicode字符。
+            if (first.origin == second.origin == "conversation"
+                    and self._exact_qa(first.text) == self._exact_qa(second.text)):
+                mapped[(left, right)] = RelationDecision(
+                    left_ref=left, right_ref=right, relation="same",
+                    evidence_refs=[left, right], reason="精确问题与答案一致")
+            else:
+                candidates.append((left, right))
+        if dense and candidates:
+            needed = {ref for pair in candidates for ref in pair}
+            encoded_items = [item for item in items if item.ref in needed]
+            vectors = await self.encoder.encode([format_knowledge(item.text) for item in encoded_items])
+            if len(vectors) != len(encoded_items):
+                raise KnowledgeModelError("关系候选编码数量不一致")
+            by_ref = {item.ref: vector for item, vector in zip(encoded_items, vectors)}
+            candidates = [pair for pair in candidates
+                          if _cosine(by_ref[pair[0]], by_ref[pair[1]]) >= self.relation_policy.min_score]
+
+        def group_items(group: list[tuple[str, str]]) -> list[EvidenceItem]:
+            """裁剪当前请求证据。参数：group引用对；返回：证据列表；异常：无。"""
             needed = {ref for pair in group for ref in pair}
-            group_items = [item for item in items if item.ref in needed]
-            decisions = await self.model.relate(group_items, group)
-            group_map = {
-                (decision.left_ref, decision.right_ref): decision for decision in decisions
-            }
-            if set(group_map) != set(group):
+            return [item for item in items if item.ref in needed]
+
+        groups: list[list[tuple[str, str]]] = []
+        current: list[tuple[str, str]] = []
+        for pair in candidates:
+            trial = current + [pair]
+            if len(trial) > 8 or relation_input_size(group_items(trial), trial) > EXTRACTION_INPUT_BUDGET:
+                if current:
+                    groups.append(current)
+                current = [pair]
+                if relation_input_size(group_items(current), current) > EXTRACTION_INPUT_BUDGET:
+                    raise KnowledgeModelError("单对关系证据超过输入预算")
+            else:
+                current = trial
+        if current:
+            groups.append(current)
+        # 所有决定收齐且逐条校验后才允许调用者构造一次Publication。
+        for group in groups:
+            evidence = group_items(group)
+            decisions = await self.model.relate(evidence, group)
+            refs = {item.ref for item in evidence}
+            group_map = {}
+            for decision in decisions:
+                pair = (decision.left_ref, decision.right_ref)
+                if pair not in group or pair in group_map or not set(decision.evidence_refs).issubset(refs):
+                    raise KnowledgeModelError("关系判定包含重复pair或未知引用")
+                group_map[pair] = decision
+            if len(decisions) != len(group) or set(group_map) != set(group):
                 raise KnowledgeModelError("关系判定没有覆盖全部候选 pair")
             mapped.update(group_map)
         return mapped
 
+    @staticmethod
+    def _exact_qa(text: KnowledgeText) -> tuple[str, str]:
+        """获得精确QA键。参数：text三格；返回：边界规范的问题与答案；异常：无。"""
+        return tuple(value.replace("\r\n", "\n").replace("\r", "\n").strip()
+                     for value in (text.questions, text.answer))
+
+    def _historical_exact_relations(
+        self, candidates: list[StagedQA], staged: list[StagedQA], active: list[ChunkSnapshot]
+    ) -> dict[tuple[str, str], RelationDecision]:
+        """把历史完整QA的精确重现连接到当前有效知识。
+
+        参数：candidates为本次候选；staged为全部历史暂存审计；active仅含有效挖掘知识块。
+        返回：候选与旧知识引用对到same决定的映射，供既有关系组件统一处理。
+        异常：Pydantic字段校验失败。
+        """
+        active_by_id = {row.id: row for row in active}
+        exact_chunks: dict[tuple[str, str], set[int]] = {}
+        for row in staged:
+            chunk = active_by_id.get(row.knowledge_id)
+            if chunk is None or row.status not in ("kept", "discarded"):
+                continue
+            # 历史问法必须取完整原问；旧答案已变化时不能凭历史关联复活过期事实。
+            key = self._exact_qa(self._staged_item(row).text)
+            if key[1] == self._exact_qa(chunk.text)[1]:
+                exact_chunks.setdefault(key, set()).add(chunk.id)
+        decisions = {}
+        for candidate in candidates:
+            key = self._exact_qa(self._staged_item(candidate).text)
+            for chunk_id in sorted(exact_chunks.get(key, set())):
+                left, right = f"staged:{candidate.id}", f"chunk:{chunk_id}"
+                decisions[(left, right)] = RelationDecision(
+                    left_ref=left, right_ref=right, relation="same",
+                    evidence_refs=[left, right], reason="历史完整问题与当前有效答案精确一致")
+        return decisions
+
+    @staticmethod
+    def _document_audit(document: ChunkDraft, decision: RelationDecision) -> dict:
+        """固定文档裁定时快照。参数：document草案/快照与decision决定；返回：JSON证据；异常：无。"""
+        return {"kind": "document", "source_key": document.source_key,
+                "ordinal": document.ordinal, "id": getattr(document, "id", None),
+                "section_path": document.section_path,
+                "content_hash": getattr(document, "content_hash", content_fingerprint(document.text)),
+                "text": document.text.model_dump(mode="json"),
+                "decision": decision.model_dump(mode="json")}
+
     def _too_large(self, text: KnowledgeText) -> bool:
         """判断单条候选是否超过三格/token 硬限。参数：三格；返回：是否超限；异常：无。"""
-        if len(text.category) + len(text.questions) + len(text.answer) > 1600:
-            return True
-        count_tokens = getattr(self.encoder, "count_tokens", None)
-        if count_tokens is None:
-            return False
-        return count_tokens(format_knowledge(text)) > 2048
+        return knowledge_overflow(text, self.encoder.count_tokens)
 
     def _unchanged(self, drafts: list[ChunkDraft], old: list[ChunkSnapshot]) -> list[ChunkSnapshot] | None:
         """判断文档是否完全未变化。参数：草案与旧块；返回：旧快照或 None；异常：无。"""
@@ -222,6 +281,19 @@ class KnowledgeLifecycle:
         if unchanged is not None:
             return unchanged
 
+        # 本次草案替换其来源旧块，其他active文档继续作为权威语料。
+        retained_documents = [row for row in frame.chunks
+                              if row.is_active and row.source_key.startswith(_DOCUMENT_PREFIX)
+                              and row.source_key not in source_keys]
+        document_items = ([self._draft_item(draft) for draft in drafts]
+                          + [self._chunk_item(row) for row in retained_documents])
+        document_pairs = [(left.ref, right.ref)
+                          for index, left in enumerate(document_items)
+                          for right in document_items[index + 1:]]
+        document_decisions = await self._relations(document_items, document_pairs, dense=False)
+        if any(decision.relation in ("conflict", "uncertain") for decision in document_decisions.values()):
+            raise KnowledgeModelError("权威文档存在冲突或不确定，停止文档切换")
+
         active_mined = [
             row
             for row in frame.chunks
@@ -244,6 +316,7 @@ class KnowledgeLifecycle:
         inactive_ids: set[int] = set()
         stage_changes: dict[int, StageChange] = {}
         quarantined_by_id = {row.id: row for row in quarantined}
+        documents_by_ref = {self._draft_item(draft).ref: draft for draft in drafts}
         for (draft_ref, right_ref), decision in decisions.items():
             if decision.relation not in ("conflict", "same"):
                 continue
@@ -252,22 +325,26 @@ class KnowledgeLifecycle:
                 chunk_id = int(right_ref.removeprefix("chunk:"))
                 inactive_ids.add(chunk_id)
                 for staged in frame.staged:
-                    if staged.knowledge_id == chunk_id and staged.status != "discarded":
+                    if staged.knowledge_id == chunk_id:
+                        previous = stage_changes.get(staged.id)
                         stage_changes[staged.id] = StageChange(
                             id=staged.id,
                             status="discarded",
                             reason=reason,
-                            evidence_refs=[draft_ref, right_ref],
+                            evidence_refs=(list(previous.evidence_refs) if previous else [])
+                            + [draft_ref, right_ref, self._document_audit(documents_by_ref[draft_ref], decision)],
                         )
             elif right_ref.startswith("staged:"):
                 staged_id = int(right_ref.removeprefix("staged:"))
                 if staged_id in quarantined_by_id:
+                    previous = stage_changes.get(staged_id)
                     stage_changes[staged_id] = StageChange(
                         id=staged_id,
                         status="discarded",
                         conflict_group=None,
                         reason=reason,
-                        evidence_refs=[draft_ref, right_ref],
+                        evidence_refs=(list(previous.evidence_refs) if previous else [])
+                        + [draft_ref, right_ref, self._document_audit(documents_by_ref[draft_ref], decision)],
                     )
 
         self._checkpoint("before_document_publish")
@@ -290,26 +367,32 @@ class KnowledgeLifecycle:
         digest = hashlib.sha256("|".join(sorted(refs)).encode("utf-8")).hexdigest()
         return f"cg:{digest[:16]}"
 
-    def _merged_draft(self, candidates: list[StagedQA]) -> ChunkDraft | None:
-        """合并同义候选的真实问法。参数：候选；返回：草案或 None；异常：无。"""
+    def _merged_draft(
+        self, candidates: list[StagedQA], active: list[ChunkSnapshot] | None = None
+    ) -> ChunkDraft | None:
+        """合并已有知识与新候选的真实问法。
+
+        参数：candidates非空新候选，active按稳定主键排序的旧知识。
+        返回：保留旧来源答案的草案；超过三格或token硬限时为None。
+        异常：Pydantic字段校验失败。
+        """
         ordered = sorted(candidates, key=lambda row: row.id)
+        existing = sorted(active or [], key=lambda row: row.id)
         questions: list[str] = []
-        for candidate in ordered:
-            for question in candidate.question.splitlines():
+        texts = [row.text.questions for row in existing] + [row.question for row in ordered]
+        for value in texts:
+            for question in value.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
                 if question and question not in questions:
                     questions.append(question)
         merged_questions = "\n".join(questions)
-        answer, category = ordered[0].answer, ordered[0].category
-        if len(category) + len(merged_questions) + len(answer) > 1600:
+        answer = existing[0].text.answer if existing else ordered[0].answer
+        category = existing[0].text.category if existing else ordered[0].category
+        text = KnowledgeText(category=category, questions=merged_questions, answer=answer)
+        if self._too_large(text):
             return None
-        count_tokens = getattr(self.encoder, "count_tokens", None)
-        if count_tokens is not None:
-            text = KnowledgeText(category=category, questions=merged_questions, answer=answer)
-            if count_tokens(format_knowledge(text)) > 2048:
-                return None
         return ChunkDraft(
-            source_key=f"qa:{ordered[0].id}",
-            ordinal=0,
+            source_key=existing[0].source_key if existing else f"qa:{ordered[0].id}",
+            ordinal=existing[0].ordinal if existing else 0,
             text=KnowledgeText(category=category, questions=merged_questions, answer=answer),
             section_path=None,
             content_type="faq",
@@ -361,7 +444,6 @@ class KnowledgeLifecycle:
             if row.is_active and row.source_key.startswith(_DOCUMENT_PREFIX)
         ]
         quarantined = [row for row in frame.staged if row.conflict_group]
-        quarantined_by_id = {row.id: row for row in quarantined}
         candidate_by_id = {row.id: row for row in candidates}
         chunk_by_id = {row.id: row for row in active_mined + active_documents}
         items = (
@@ -377,209 +459,115 @@ class KnowledgeLifecycle:
                 pairs.append((f"staged:{left.id}", f"staged:{row.id}"))
             for chunk in active_mined + active_documents:
                 pairs.append((f"staged:{left.id}", f"chunk:{chunk.id}"))
-        decisions = await self._relations(items, pairs)
+        decisions = self._historical_exact_relations(candidates, frame.staged, active_mined)
+        # 历史精确匹配先于Dense/模型；仍进入同一组件、文档裁定与来源发布门禁。
+        decisions.update(await self._relations(items, [pair for pair in pairs if pair not in decisions]))
 
-        doc_discard: dict[int, str] = {}
-        active_same: dict[int, ChunkSnapshot] = {}
-        active_conflict: dict[int, list[ChunkSnapshot]] = {}
-        same_edges: list[tuple[int, int]] = []
-        conflict_edges: set[tuple[int, int]] = set()
-        decision_evidence: dict[int, list[str]] = {}
-        quarantine_join: dict[int, str] = {}
-        uncertain_candidates: set[int] = set()
-
-        for (left_ref, right_ref), decision in decisions.items():
-            if left_ref.startswith("staged:") and right_ref.startswith("staged:"):
-                left_id = int(left_ref.removeprefix("staged:"))
-                right_id = int(right_ref.removeprefix("staged:"))
-                quarantined_id = (
-                    right_id if right_id in quarantined_by_id else left_id
-                )
-                if quarantined_id in quarantined_by_id:
-                    if decision.relation in ("same", "conflict"):
-                        candidate_id = left_id if quarantined_id == right_id else right_id
-                        if candidate_id not in quarantined_by_id:
-                            quarantine_join[candidate_id] = quarantined_by_id[
-                                quarantined_id
-                            ].conflict_group
-                    continue
-                if decision.relation == "uncertain":
-                    uncertain_candidates.update((left_id, right_id))
-                elif decision.relation == "same":
-                    same_edges.append((left_id, right_id))
-                elif decision.relation == "conflict":
-                    conflict_edges.add((min(left_id, right_id), max(left_id, right_id)))
-            elif left_ref.startswith("staged:") and right_ref.startswith("chunk:"):
-                staged_id = int(left_ref.removeprefix("staged:"))
-                chunk = chunk_by_id[int(right_ref.removeprefix("chunk:"))]
-                if decision.relation == "uncertain":
-                    uncertain_candidates.add(staged_id)
-                elif chunk.source_key.startswith(_DOCUMENT_PREFIX):
-                    if decision.relation in ("conflict", "same"):
-                        doc_discard[staged_id] = (
-                            "被文档推翻" if decision.relation == "conflict" else "文档重复"
-                        )
-                elif decision.relation == "conflict":
-                    active_conflict.setdefault(staged_id, []).append(chunk)
-                elif decision.relation == "same":
-                    active_same[staged_id] = chunk
-            decision_evidence.setdefault(
-                int(left_ref.removeprefix("staged:")), []
-            ).extend([left_ref, right_ref])
-
-        excluded = (
-            set(doc_discard)
-            | set(active_same)
-            | set(active_conflict)
-            | set(quarantine_join)
-            | uncertain_candidates
-        )
-        dsu = _DisjointSet([row.id for row in candidates if row.id not in excluded])
-        for left_id, right_id in same_edges + list(conflict_edges):
-            if left_id in dsu.parent and right_id in dsu.parent:
-                dsu.union(left_id, right_id)
+        # 稳定ref图包含所有暂存审计来源，不能先排除存在风险的节点。
+        staged_by_id = {row.id: row for row in frame.staged}
+        qa_chunks = {row.id: row for row in frame.chunks if row.source_key.startswith(_MINING_PREFIX)}
+        qa_decisions = [decision for decision in decisions.values()
+                        if not (decision.right_ref.startswith("chunk:")
+                                and chunk_by_id[int(decision.right_ref.removeprefix("chunk:"))].source_key.startswith(_DOCUMENT_PREFIX))]
+        components = relation_components(frame.staged, list(qa_chunks.values()), qa_decisions)
+        candidate_refs = {f"staged:{row.id}" for row in candidates}
+        reached = {ref for members in components if set(members) & candidate_refs for ref in members}
+        # 只对新候选触达的实际旧知识补文档裁定，关联来源审计由其知识块承接。
+        authority_items = []
+        for ref in sorted(reached - candidate_refs):
+            if ref.startswith("chunk:"):
+                authority_items.append(self._chunk_item(qa_chunks[int(ref.removeprefix("chunk:"))]))
+            else:
+                row = staged_by_id[int(ref.removeprefix("staged:"))]
+                if row.knowledge_id not in qa_chunks:
+                    authority_items.append(self._staged_item(row))
+        document_items = [self._chunk_item(row) for row in active_documents]
+        authority_pairs = [(item.ref, document.ref) for item in authority_items for document in document_items]
+        decisions.update(await self._relations(authority_items + document_items, authority_pairs))
+        risky_refs: set[str] = set()
+        uncertain_refs: set[str] = set()
+        document_coverage: dict[str, list[tuple[ChunkSnapshot, RelationDecision]]] = {}
+        evidence_by_ref: dict[str, list[str | dict]] = {}
+        for (left, right), decision in decisions.items():
+            if right.startswith("chunk:") and chunk_by_id[int(right.removeprefix("chunk:"))].source_key.startswith(_DOCUMENT_PREFIX):
+                document = chunk_by_id[int(right.removeprefix("chunk:"))]
+                if decision.relation in ("same", "conflict"):
+                    document_coverage.setdefault(left, []).append((document, decision))
+                    if decision.relation == "conflict":
+                        risky_refs.add(left)
+                elif decision.relation == "uncertain":
+                    risky_refs.add(left)
+                    uncertain_refs.add(left)
+                evidence_by_ref.setdefault(left, []).extend([left, right, self._document_audit(document, decision)])
+                continue
+            if decision.relation in ("conflict", "uncertain"):
+                risky_refs.update((left, right))
+            for ref in (left, right):
+                evidence_by_ref.setdefault(ref, []).extend([left, right])
 
         drafts: list[ChunkDraft] = []
         stage_changes: dict[int, StageChange] = dict(oversized_changes)
         inactive_ids: set[int] = set()
-
-        for staged_id, reason in doc_discard.items():
-            stage_changes[staged_id] = StageChange(
-                id=staged_id,
-                status="discarded",
-                reason=reason,
-                evidence_refs=decision_evidence.get(staged_id, []),
-            )
-        for staged_id, chunk in active_same.items():
-            stage_changes[staged_id] = StageChange(
-                id=staged_id,
-                status="discarded",
-                reason="已有同义知识",
-                knowledge_source_key=chunk.source_key,
-                evidence_refs=decision_evidence.get(staged_id, []),
-            )
-        for staged_id, group in quarantine_join.items():
-            stage_changes[staged_id] = StageChange(
-                id=staged_id,
-                status="extracted",
-                conflict_group=group,
-                reason="并入持久隔离组",
-                evidence_refs=decision_evidence.get(staged_id, []),
-            )
-        for staged_id in uncertain_candidates:
-            stage_changes[staged_id] = StageChange(
-                id=staged_id,
-                status="extracted",
-                reason="关系不确定，等待权威资料",
-                evidence_refs=decision_evidence.get(staged_id, []),
-            )
-        for staged_id, chunks in active_conflict.items():
-            refs = [f"staged:{staged_id}"] + [f"chunk:{chunk.id}" for chunk in chunks]
-            group = self._group_id(refs)
-            inactive_ids.update(chunk.id for chunk in chunks)
-            stage_changes[staged_id] = StageChange(
-                id=staged_id,
-                status="extracted",
-                conflict_group=group,
-                reason="无文档裁定的互斥冲突",
-                evidence_refs=decision_evidence.get(staged_id, []),
-            )
-            for chunk in chunks:
-                for staged in frame.staged:
-                    if (
-                        staged.knowledge_id == chunk.id
-                        and staged.status in ("kept", "extracted")
-                        and not staged.conflict_group
-                    ):
-                        stage_changes[staged.id] = StageChange(
-                            id=staged.id,
-                            status="extracted",
-                            conflict_group=group,
-                            reason="无文档裁定的互斥冲突",
-                            evidence_refs=[f"chunk:{chunk.id}"],
-                        )
-
-        components: dict[int, list[int]] = {}
-        for identifier in dsu.parent:
-            components.setdefault(dsu.find(identifier), []).append(identifier)
-        for component in components.values():
-            component_set = set(component)
-            if component_set & uncertain_candidates:
-                for identifier in component:
-                    stage_changes[identifier] = StageChange(
-                        id=identifier,
-                        status="extracted",
-                        reason="同组关系不确定，等待权威资料",
-                        evidence_refs=[f"staged:{identifier}"],
-                    )
+        for component in components:
+            member_refs = set(component)
+            new_refs = member_refs & candidate_refs
+            if not new_refs:
                 continue
-            related_active: list[ChunkSnapshot] = []
-            for identifier in component:
-                related_active.extend(active_conflict.get(identifier, []))
-            has_conflict = any(
-                left in component_set and right in component_set
-                for left, right in conflict_edges
-            ) or bool(related_active)
-            if has_conflict:
-                refs = [f"staged:{identifier}" for identifier in component] + [
-                    f"chunk:{chunk.id}" for chunk in related_active
-                ]
-                group = self._group_id(refs)
-                inactive_ids.update(chunk.id for chunk in related_active)
-                for identifier in component:
-                    stage_changes[identifier] = StageChange(
-                        id=identifier,
-                        status="extracted",
-                        conflict_group=group,
-                        reason="无文档裁定的互斥冲突",
-                        evidence_refs=[f"staged:{identifier}"]
-                        + [f"chunk:{chunk.id}" for chunk in related_active],
-                    )
+            member_staged = sorted([staged_by_id[int(ref.removeprefix("staged:"))]
+                                    for ref in component if ref.startswith("staged:")], key=lambda row: row.id)
+            related_active = sorted([qa_chunks[int(ref.removeprefix("chunk:"))]
+                                     for ref in component if ref.startswith("chunk:")
+                                     and qa_chunks[int(ref.removeprefix("chunk:"))].is_active],
+                                    key=lambda row: row.id)
+            existing_groups = {row.conflict_group for row in member_staged if row.conflict_group}
+            evidence: list[str | dict] = list(sorted(member_refs))
+            for ref in sorted(member_refs):
+                evidence.extend(evidence_by_ref.get(ref, []))
+            has_risk = bool(member_refs & risky_refs or existing_groups)
+            # 文档不作为图边；只有覆盖整组实际知识的决定才能整体处置。
+            actual_refs = {ref for ref in member_refs if ref.startswith("chunk:")}
+            actual_refs.update(f"staged:{row.id}" for row in member_staged if row.knowledge_id not in qa_chunks)
+            covered = actual_refs.issubset(document_coverage) and not bool(member_refs & uncertain_refs)
+            if covered:
+                inactive_ids.update(row.id for row in related_active)
+                for row in member_staged:
+                    ref = f"chunk:{row.knowledge_id}" if row.knowledge_id in qa_chunks else f"staged:{row.id}"
+                    choices = document_coverage[ref]
+                    reason = "被文档推翻" if any(decision.relation == "conflict" for _, decision in choices) else "文档重复"
+                    stage_changes[row.id] = StageChange(id=row.id, status="discarded", reason=reason, evidence_refs=evidence)
                 continue
-            if len(component) > 1:
-                merged = self._merged_draft([candidate_by_id[identifier] for identifier in component])
-                if merged is None:
-                    for identifier in component:
-                        stage_changes[identifier] = StageChange(
-                            id=identifier,
-                            status="extracted",
-                            reason="合并超过单块硬限",
-                            evidence_refs=[f"staged:{identifier}"],
-                        )
-                    continue
-                ordered = sorted(component)
-                drafts.append(merged)
-                for index, identifier in enumerate(ordered):
-                    stage_changes[identifier] = StageChange(
-                        id=identifier,
-                        status="kept" if index == 0 else "discarded",
-                        reason="同义合并",
-                        knowledge_source_key=merged.source_key,
-                        evidence_refs=[f"staged:{identifier}"],
-                    )
+            if has_risk:
+                # 单个历史组保留原身份；桥接多个旧组时全部成员获得统一新身份。
+                group = next(iter(existing_groups)) if len(existing_groups) == 1 else self._group_id(component)
+                inactive_ids.update(row.id for row in related_active)
+                for row in member_staged:
+                    stage_changes[row.id] = StageChange(
+                        id=row.id, status="extracted", conflict_group=group,
+                        reason="关系组存在冲突或不确定，等待权威资料", evidence_refs=evidence)
+                continue
+            new_candidates = sorted([candidate_by_id[int(ref.removeprefix("staged:"))]
+                                     for ref in new_refs], key=lambda row: row.id)
+            merged = self._merged_draft(new_candidates, related_active)
+            if merged is None:
+                for row in new_candidates:
+                    stage_changes[row.id] = StageChange(
+                        id=row.id, status="extracted", reason="合并超过单块硬限", evidence_refs=evidence)
+                continue
+            drafts.append(merged)
+            if related_active:
+                primary = related_active[0]
+                inactive_ids.update(row.id for row in related_active[1:])
+                for row in member_staged:
+                    status = row.status if row not in new_candidates else "discarded"
+                    stage_changes[row.id] = StageChange(
+                        id=row.id, status=status, reason="同义合并至已有知识",
+                        knowledge_source_key=primary.source_key, evidence_refs=evidence)
             else:
-                identifier = component[0]
-                candidate = candidate_by_id[identifier]
-                draft = ChunkDraft(
-                    source_key=f"qa:{identifier}",
-                    ordinal=0,
-                    text=KnowledgeText(
-                        category=candidate.category,
-                        questions=candidate.question,
-                        answer=candidate.answer,
-                    ),
-                    section_path=None,
-                    content_type="faq",
-                    is_key_clause=False,
-                )
-                drafts.append(draft)
-                stage_changes[identifier] = StageChange(
-                    id=identifier,
-                    status="kept",
-                    reason="保留",
-                    knowledge_source_key=draft.source_key,
-                    evidence_refs=[f"staged:{identifier}"],
-                )
+                for row in new_candidates:
+                    stage_changes[row.id] = StageChange(
+                        id=row.id, status="kept" if row.id == new_candidates[0].id else "discarded",
+                        reason="同义合并" if len(new_candidates) > 1 else "保留",
+                        knowledge_source_key=merged.source_key, evidence_refs=evidence)
 
         if not drafts and not inactive_ids and not stage_changes:
             return []

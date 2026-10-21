@@ -67,6 +67,21 @@ class TestCustomerServicePrompt:
         assert len(messages) == 1
         assert isinstance(messages[0], SystemMessage)
 
+    def test_refund_timing_rule_distinguishes_processing_and_arrival(self) -> None:
+        """测试提示词区分处理时限与到账时效，避免把不承诺到账扩大成不承诺审核。
+
+        返回值:
+            None: 无返回值，断言两条提示词都保留处理时限与到账时效的分离约束。
+        """
+        from app.core.prompts import CUSTOMER_SERVICE_SYSTEM, FINAL_ANSWER_SYSTEM
+
+        assert "处理时限" in CUSTOMER_SERVICE_SYSTEM
+        assert "到账时间" in CUSTOMER_SERVICE_SYSTEM
+        assert "退款审核要几天" in CUSTOMER_SERVICE_SYSTEM
+        assert "不能截成" in CUSTOMER_SERVICE_SYSTEM
+        assert "处理/审核时限" in FINAL_ANSWER_SYSTEM
+        assert "不能因为不承诺到账就否认知识库给出的处理时限" in FINAL_ANSWER_SYSTEM
+
     def test_customer_service_system_prompt_content(self) -> None:
         """测试客服 System Prompt 文本包含官方人设、严禁臆造虚假单号、礼貌引导等核心业务约束。
 

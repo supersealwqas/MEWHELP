@@ -22,6 +22,8 @@ from app.knowledge.errors import (
     SnapshotChanged,
 )
 from app.knowledge.lease import MySqlWriteLease
+from app.knowledge.grounding import turns_digest, validate_grounding
+from app.knowledge.prompts import EXTRACTION_PROMPT_VERSION
 from app.knowledge.schemas import (
     ChunkDraft,
     ChunkSnapshot,
@@ -83,6 +85,7 @@ def _staged_from_row(row: QAExtractionStaging) -> StagedQA:
         status=row.status,
         conflict_group=row.conflict_group,
         knowledge_id=row.knowledge_id,
+        source_evidence=[item for item in (row.evidence_refs or []) if isinstance(item, dict) and item.get("kind") == "source"],
     )
 
 
@@ -183,6 +186,21 @@ class KnowledgeStore:
             ).all()
         return set(rows)
 
+    async def active_page(self, after_id: int, limit: int) -> list[ChunkSnapshot]:
+        """按主键分页读取全部 active 行。参数：游标、正页大小；返回：快照；异常：ValueError/存储异常。"""
+        if limit <= 0:
+            raise ValueError("limit 必须为正数")
+        async with self._factory() as session:
+            rows = (
+                await session.scalars(
+                    select(KnowledgeChunk)
+                    .where(KnowledgeChunk.id > after_id, KnowledgeChunk.is_active.is_(True))
+                    .order_by(KnowledgeChunk.id)
+                    .limit(limit)
+                )
+            ).all()
+            return [_snapshot_from_row(row) for row in rows]
+
 
 class KnowledgeWriter:
     """在持锁物理连接上执行短事务的写入器。"""
@@ -204,6 +222,13 @@ class KnowledgeWriter:
         """
         self._factory = factory
         self._lease = lease
+
+    async def assert_held(self) -> None:
+        """核锁并结束只读事务，供外部向量变更前后使用。参数：无；返回：None；异常：LeaseLost/存储异常。"""
+        await self._lease.assert_held()
+        connection = self._lease.connection
+        if connection.in_transaction():
+            await connection.commit()
 
     @asynccontextmanager
     async def _transaction(self):
@@ -266,6 +291,10 @@ class KnowledgeWriter:
                     QAExtractionStaging.status,
                     QAExtractionStaging.conflict_group,
                     QAExtractionStaging.knowledge_id,
+                    QAExtractionStaging.question,
+                    QAExtractionStaging.answer,
+                    QAExtractionStaging.category,
+                    QAExtractionStaging.evidence_refs,
                 ).order_by(QAExtractionStaging.id)
             )
         ).all()
@@ -340,6 +369,8 @@ class KnowledgeWriter:
         async with self._transaction() as session:
             if await self._token(session) != change.expected_token:
                 raise SnapshotChanged("知识库快照已变化，拒绝发布")
+            # 直接调用生命周期也必须补证，不能绕过jobs发布无来源的旧候选。
+            await self._ground_staging(session)
 
             affected_rows: list[KnowledgeChunk] = []
             affected_sources: set[str] = set(change.replace_sources)
@@ -410,6 +441,9 @@ class KnowledgeWriter:
                         row.is_active = False
                         row.vector_id = None
                         row.vectorize_status = "pending"
+                        # 先断开撤回块两侧，再为剩余有效块重建邻接。
+                        row.prev_chunk_id = None
+                        row.next_chunk_id = None
                 affected_sources.add(source_key)
 
             for identifier in change.inactive_ids:
@@ -423,6 +457,9 @@ class KnowledgeWriter:
                 row.is_active = False
                 row.vector_id = None
                 row.vectorize_status = "pending"
+                # 显式撤回也不能留下通向有效知识的旧指针。
+                row.prev_chunk_id = None
+                row.next_chunk_id = None
                 affected_sources.add(row.source_key)
                 affected_rows.append(row)
 
@@ -439,7 +476,15 @@ class KnowledgeWriter:
                 if stage_change.reason:
                     staged.reason = stage_change.reason
                 if stage_change.evidence_refs:
-                    staged.evidence_refs = list(stage_change.evidence_refs)
+                    # JSON对象按内容去重，保留首次出现顺序及所有历史原文快照。
+                    audit = []
+                    seen = set()
+                    for item in list(staged.evidence_refs or []) + list(stage_change.evidence_refs):
+                        fingerprint = json.dumps(item, ensure_ascii=False, sort_keys=True)
+                        if fingerprint not in seen:
+                            audit.append(item)
+                            seen.add(fingerprint)
+                    staged.evidence_refs = audit
                 if stage_change.knowledge_source_key:
                     related = await session.scalar(
                         select(KnowledgeChunk)
@@ -475,6 +520,30 @@ class KnowledgeWriter:
             )
             return result.rowcount == 1
 
+    async def mark_pending(self, snapshot: ChunkSnapshot) -> bool:
+        """把缺向量或指纹失配的原 done 快照条件恢复为 pending。
+
+        参数：snapshot 为对照时的 active/done 快照。返回：bool，仍为该状态才成功。
+        异常：LeaseLost、存储异常；旧快照不覆盖新原文、编码规范或发布状态。
+        """
+        if not snapshot.is_active or snapshot.vectorize_status != "done":
+            return False
+        async with self._transaction() as session:
+            result = await session.execute(
+                update(KnowledgeChunk)
+                .where(
+                    KnowledgeChunk.id == snapshot.id,
+                    KnowledgeChunk.is_active.is_(True),
+                    KnowledgeChunk.vectorize_status == "done",
+                    KnowledgeChunk.vector_id == snapshot.vector_id,
+                    KnowledgeChunk.content_hash == snapshot.content_hash,
+                    KnowledgeChunk.embedding_revision == snapshot.embedding_revision,
+                )
+                .values(vector_id=None, vectorize_status="pending")
+                .execution_options(synchronize_session=False)
+            )
+            return result.rowcount == 1
+
     def _batch_values(self, batch: ExtractionBatch) -> dict[str, Any]:
         """提取批次持久字段。参数：批次；返回：字段映射；异常：无。"""
         return {
@@ -488,6 +557,9 @@ class KnowledgeWriter:
     async def reserve_batch(self, batch: ExtractionBatch) -> ExtractionBatch:
         """幂等预留批次并拒绝同源双批次。参数：批次；返回：已预留批次；异常：并发冲突。"""
         async with self._transaction() as session:
+            loaded = await self._load_turns(session, batch.source_ids)
+            if turns_digest(loaded) != batch.input_hash or turns_digest(batch.turns) != batch.input_hash:
+                raise SnapshotChanged("预留来源指纹已变化")
             existing = await session.scalar(
                 select(QAExtractionBatch)
                 .where(QAExtractionBatch.batch_no == batch.batch_no)
@@ -498,9 +570,8 @@ class KnowledgeWriter:
                     list(existing.source_ids or []) == list(batch.source_ids)
                     and existing.snapshot_upper_id == batch.snapshot_upper_id
                     and existing.input_hash == batch.input_hash
-                    and existing.prompt_version == batch.prompt_version
                 ):
-                    return batch
+                    return await self._batch_from_row(session, existing)
                 raise ConcurrentKnowledgeWrite("批次号已被其他输入占用")
 
             assigned = {
@@ -535,12 +606,14 @@ class KnowledgeWriter:
         """从批次行重建固定轮次。参数：会话与行；返回：批次；异常：来源缺失。"""
         source_ids = [int(identifier) for identifier in (row.source_ids or [])]
         turns = await self._load_turns(session, source_ids)
+        if turns_digest(turns) != row.input_hash:
+            raise SnapshotChanged("抽取批次来源指纹已变化")
         return ExtractionBatch(
             batch_no=row.batch_no,
             source_ids=source_ids,
             snapshot_upper_id=row.snapshot_upper_id,
             input_hash=row.input_hash,
-            prompt_version=row.prompt_version,
+            prompt_version=EXTRACTION_PROMPT_VERSION if row.status == "pending" else row.prompt_version,
             turns=turns,
         )
 
@@ -594,8 +667,12 @@ class KnowledgeWriter:
             )
             if batch is None:
                 raise SnapshotChanged("抽取批次不存在")
+            # done幂等重读也必须回核固定来源；只读验证，不再次抽取或改已完成身份。
+            loaded = await self._batch_from_row(session, batch)
             if batch.status != "done":
-                for qa in qas:
+                # 校验全部候选后才写；候选、代码审计、done同短事务提交。
+                verified = [validate_grounding(qa, loaded.turns) for qa in qas]
+                for qa, audit in verified:
                     fingerprint = _qa_fingerprint(qa)
                     existing = await session.scalar(
                         select(QAExtractionStaging)
@@ -612,10 +689,13 @@ class KnowledgeWriter:
                                 answer=qa.answer,
                                 category=qa.category,
                                 status="extracted",
-                                evidence_refs=[],
+                                evidence_refs=audit,
                             )
                         )
+                    else:
+                        existing.evidence_refs = audit + [item for item in (existing.evidence_refs or []) if not isinstance(item, dict) or item.get("kind") != "source"]
                 batch.status = "done"
+                batch.prompt_version = EXTRACTION_PROMPT_VERSION
                 await session.flush()
             rows = (
                 await session.scalars(
@@ -633,56 +713,91 @@ class KnowledgeWriter:
         if limit <= 0:
             raise ValueError("limit 必须为正数")
         async with self._read_session() as session:
-            assigned = {
-                int(identifier)
-                for source_ids in (
-                    await session.scalars(select(QAExtractionBatch.source_ids))
-                ).all()
-                for identifier in (source_ids or [])
-            }
-            assistants = (
-                await session.scalars(
-                    select(Message)
-                    .where(
-                        Message.role == "assistant",
-                        Message.turn_status == "completed",
-                        Message.content.is_not(None),
-                        Message.content != "",
-                        Message.tool_calls.is_(None),
-                        Message.id > after_id,
-                        Message.id <= snapshot_upper_id,
-                    )
-                    .order_by(Message.id)
-                )
-            ).all()
+            assigned = select(QAExtractionBatch.id).where(
+                func.json_contains(QAExtractionBatch.source_ids, func.json_array(Message.id)) == 1
+            ).exists()
             turns: list[CompletedTurn] = []
-            for assistant in assistants:
-                if assistant.id in assigned:
-                    continue
-                user = await session.scalar(
-                    select(Message)
-                    .where(
-                        Message.conversation_id == assistant.conversation_id,
-                        Message.turn_id == assistant.turn_id,
-                        Message.role == "user",
+            cursor = after_id
+            while len(turns) < limit:
+                assistants = (
+                    await session.scalars(
+                        select(Message)
+                        .where(
+                            Message.role == "assistant",
+                            Message.turn_status == "completed",
+                            Message.content.is_not(None),
+                            Message.content != "",
+                            Message.tool_calls.is_(None),
+                            Message.id > cursor,
+                            Message.id <= snapshot_upper_id,
+                            ~assigned,
+                        )
+                        .order_by(Message.id)
+                        .limit(limit - len(turns))
                     )
-                    .order_by(Message.id)
-                    .limit(1)
-                )
-                if user is None or not user.content:
-                    continue
-                turns.append(
-                    CompletedTurn(
-                        message_id=assistant.id,
-                        conversation_id=assistant.conversation_id,
-                        turn_id=assistant.turn_id,
-                        question=user.content,
-                        answer=assistant.content,
-                    )
-                )
-                if len(turns) >= limit:
+                ).all()
+                if not assistants:
                     break
+                cursor = assistants[-1].id
+                for assistant in assistants:
+                    user = await session.scalar(
+                        select(Message)
+                        .where(
+                            Message.conversation_id == assistant.conversation_id,
+                            Message.turn_id == assistant.turn_id,
+                            Message.role == "user",
+                        )
+                        .order_by(Message.id)
+                        .limit(1)
+                    )
+                    if user is None or not user.content:
+                        continue
+                    turns.append(
+                        CompletedTurn(
+                            message_id=assistant.id,
+                            conversation_id=assistant.conversation_id,
+                            turn_id=assistant.turn_id,
+                            question=user.content,
+                            answer=assistant.content,
+                        )
+                    )
             return turns
+
+    async def recovery_upper_id(self) -> int:
+        """获取全部持久批次的恢复上界（含旧done半快照）。
+
+        参数：无。返回：int，无批次为0。异常：存储异常。
+        """
+        async with self._read_session() as session:
+            value = await session.scalar(select(func.max(QAExtractionBatch.snapshot_upper_id)))
+        return int(value or 0)
+
+    async def _ground_staging(self, session: AsyncSession) -> None:
+        """补证参与发布的旧暂存并保留处置审计。
+
+        参数：session为当前短事务；所有extracted/kept均须来源可回核。
+        返回：None。异常：来源缺失、指纹改变或GroundingError，事务整体回滚。
+        """
+        rows = (await session.scalars(select(QAExtractionStaging).where(
+            QAExtractionStaging.status.in_(["extracted", "kept"])
+        ).with_for_update())).all()
+        for row in rows:
+            batch = await session.scalar(select(QAExtractionBatch).where(QAExtractionBatch.batch_no == row.batch_no))
+            if batch is None:
+                turns = await self._load_turns(session, list(row.source_ids or []))
+            else:
+                turns = (await self._batch_from_row(session, batch)).turns
+            _, audit = validate_grounding(_staged_from_row(row), turns)
+            previous = [item for item in (row.evidence_refs or []) if isinstance(item, dict) and item.get("kind") == "source"]
+            if previous and previous != audit:
+                raise SnapshotChanged("暂存来源证据指纹已变化")
+            row.evidence_refs = audit + [item for item in (row.evidence_refs or [])
+                                         if not isinstance(item, dict) or item.get("kind") != "source"]
+
+    async def ensure_staging_grounded(self) -> None:
+        """在关系判定前补证旧暂存。参数：无；返回：None；异常：来源/摘要校验失败。"""
+        async with self._transaction() as session:
+            await self._ground_staging(session)
 
     async def source_upper_id(self) -> int:
         """返回完成最终回答的最大消息 ID。参数：无；返回：ID；异常：存储异常。"""

@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from app.knowledge.errors import ConcurrentKnowledgeWrite
+from app.knowledge.grounding import turns_digest
 from app.knowledge.schemas import ExtractedQA, ExtractionBatch
 from app.models.customer_service import Conversation, Message
 
@@ -92,7 +93,7 @@ def _batch(batch_no: str, turns) -> ExtractionBatch:
         batch_no=batch_no,
         source_ids=[turn.message_id for turn in turns],
         snapshot_upper_id=max(turn.message_id for turn in turns),
-        input_hash=f"input-{batch_no}",
+        input_hash=turns_digest(list(turns)),
         prompt_version="ch03-test-v1",
         turns=list(turns),
     )
@@ -122,7 +123,7 @@ async def test_scan_reserve_complete_and_recover(knowledge_store, knowledge_data
             batch_no="batch-1",
             source_ids=[turns[0].message_id],
             snapshot_upper_id=upper,
-            input_hash="input-batch-1",
+            input_hash=turns_digest([turns[0]]),
             prompt_version="ch03-test-v1",
             turns=[turns[0]],
         )
@@ -135,12 +136,13 @@ async def test_scan_reserve_complete_and_recover(knowledge_store, knowledge_data
                 ExtractedQA(
                     source_ids=[turns[0].message_id],
                     question=turns[0].question,
-                    answer="可泛化的运费知识。",
+                    answer=turns[0].answer,
                     category="物流",
                 )
             ],
         )
         assert len(staged) == 1 and staged[0].status == "extracted"
+        assert staged[0].source_evidence[0]["quote"] == turns[0].answer
         assert await writer.pending_batches() == []
         remaining = await writer.unassigned_turns(upper, 0, 10)
         assert [turn.message_id for turn in remaining] == [turns[1].message_id]
@@ -226,3 +228,78 @@ async def test_late_committed_smaller_id_is_found_without_duplicate(
         assert await writer.source_upper_id() == 9002
         second = await writer.unassigned_turns(9002, 0, 10)
     assert [turn.message_id for turn in second] == [9001]
+
+
+async def test_real_hash_change_and_atomic_qa_validation(knowledge_store, knowledge_database) -> None:
+    """真实库验证原子候选写入与预留后来源变更拒绝。参数：专用存储/库；返回：None；异常：断言失败。"""
+    from sqlalchemy import update, select
+    from app.knowledge.errors import SnapshotChanged
+    from app.knowledge.grounding import GroundingError
+    from app.models.knowledge import QAExtractionStaging, QAExtractionBatch
+    _, factory, _ = knowledge_database
+    await _create_turn(factory, session_id="hash-audit", question="运费多少", answer="运费6元。")
+    async with knowledge_store.writer() as writer:
+        turns = await writer.unassigned_turns(await writer.source_upper_id(), 0, 10)
+        batch = _batch("hash-audit", turns)
+        await writer.reserve_batch(batch)
+        valid = ExtractedQA(source_ids=batch.source_ids, question="运费多少", answer="运费6元。", category="物流")
+        with pytest.raises(GroundingError):
+            await writer.complete_batch(batch.batch_no, [valid, valid.model_copy(update={"answer": "运费600元。"})])
+        assert (await writer.frame()).staged == []
+        assert len(await writer.pending_batches()) == 1
+        rows = await writer.complete_batch(batch.batch_no, [valid])
+        assert rows[0].source_evidence[0]["message_id"] == turns[0].message_id
+        assert len(await writer.complete_batch(batch.batch_no, [valid])) == 1
+    async with factory() as session:
+        assert (await session.scalar(select(QAExtractionBatch).where(QAExtractionBatch.batch_no == batch.batch_no))).status == "done"
+        persisted = await session.scalar(select(QAExtractionStaging).where(QAExtractionStaging.batch_no == batch.batch_no))
+        assert persisted.evidence_refs[0]["quote"] == "运费6元。"
+    async with factory.begin() as session:
+        await session.execute(update(Message).where(Message.id == turns[0].message_id).values(content="运费600元。"))
+    async with knowledge_store.writer() as writer:
+        with pytest.raises(SnapshotChanged, match="指纹"):
+            await writer.ensure_staging_grounded()
+
+
+async def test_real_assigned_page_does_not_hide_later_unassigned(knowledge_store, knowledge_database) -> None:
+    """已分配200轮之后仍能扫描后续来源，恢复上界含done。参数：真实库；返回：None；异常：断言失败。"""
+    _, factory, _ = knowledge_database
+    for i in range(201):
+        await _create_turn(factory, session_id=f"page-{i}", question="你好", answer="您好。")
+    async with knowledge_store.writer() as writer:
+        upper = await writer.source_upper_id()
+        first = await writer.unassigned_turns(upper, 0, 200)
+        batch = _batch("first-page", first).model_copy(update={"snapshot_upper_id": upper})
+        await writer.reserve_batch(batch)
+        await writer.complete_batch(batch.batch_no, [])
+        assert await writer.recovery_upper_id() == upper
+        remaining = await writer.unassigned_turns(upper, 0, 200)
+        assert len(remaining) == 1 and remaining[0].message_id == upper
+
+
+async def test_real_done_idempotent_read_rechecks_source_hash(knowledge_store, knowledge_database) -> None:
+    """真实done重读核hash，源改动拒绝且保留已完成身份及证据。参数：真实库/存储；返回：None；异常：断言失败。"""
+    from sqlalchemy import update, select
+    from app.knowledge.errors import SnapshotChanged
+    from app.models.knowledge import QAExtractionBatch, QAExtractionStaging
+    _, factory, _ = knowledge_database
+    await _create_turn(factory, session_id="done-hash", question="运费多少", answer="运费6元。")
+    async with knowledge_store.writer() as writer:
+        turns = await writer.unassigned_turns(await writer.source_upper_id(), 0, 10)
+        batch = _batch("done-hash", turns)
+        await writer.reserve_batch(batch)
+        before = await writer.complete_batch(batch.batch_no, [ExtractedQA(
+            source_ids=batch.source_ids, question=turns[0].question, answer=turns[0].answer, category="物流")])
+        assert await writer.complete_batch(batch.batch_no, []) == before
+    async with factory.begin() as session:
+        await session.execute(update(Message).where(Message.id == turns[0].message_id).values(content="运费600元。"))
+    async with knowledge_store.writer() as writer:
+        with pytest.raises(SnapshotChanged, match="指纹"):
+            await writer.complete_batch(batch.batch_no, [])
+        assert (await writer.frame()).staged == before
+    async with factory() as session:
+        done = await session.scalar(select(QAExtractionBatch).where(QAExtractionBatch.batch_no == batch.batch_no))
+        assert done.status == "done" and done.input_hash == batch.input_hash
+        row = await session.scalar(select(QAExtractionStaging).where(QAExtractionStaging.batch_no == batch.batch_no))
+        assert row.answer == "运费6元。"
+        assert row.evidence_refs == before[0].source_evidence

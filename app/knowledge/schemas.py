@@ -103,6 +103,14 @@ class ExtractionBatch(BaseModel):
     turns: list[CompletedTurn] = Field(min_length=1, description="按会话边界组织的完整轮次")
 
 
+class AnswerExcerpt(BaseModel):
+    """模型提供的完整原句引用；是否可信由代码回核，不接受模型自报。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    message_id: int = Field(gt=0, description="原回答消息主键，必须属于候选source_ids")
+    quote: str = Field(min_length=1, description="完整原句，句内字符、数字、空白必须逐字一致")
+
+
 class ExtractedQA(BaseModel):
     """模型抽取出的候选知识。"""
 
@@ -112,6 +120,7 @@ class ExtractedQA(BaseModel):
     question: str = Field(min_length=1, description="来源用户的真实完整问法")
     answer: str = Field(min_length=1, description="有原文支持的可泛化答案")
     category: str = Field(min_length=1, description="知识分类")
+    answer_excerpts: list[AnswerExcerpt] = Field(default_factory=list, description="按来源顺序组合的完整原句；旧数据缺失默认空，不代表已验证")
 
 
 class StagedQA(ExtractedQA):
@@ -121,6 +130,7 @@ class StagedQA(ExtractedQA):
     status: Literal["extracted", "kept", "discarded"] = Field(description="候选知识处置状态")
     conflict_group: str | None = Field(default=None, min_length=1, description="持久冲突组身份")
     knowledge_id: int | None = Field(default=None, gt=0, description="关联的已发布知识主键")
+    source_evidence: list[dict] = Field(default_factory=list, description="代码回核的消息、原句、offset/hash与校验版本，持久于现有JSON审计列")
 
 
 class EvidenceItem(BaseModel):
@@ -158,7 +168,7 @@ class StageChange(BaseModel):
     conflict_group: str | None = Field(default=None, min_length=1, description="持久冲突组身份")
     knowledge_source_key: str | None = Field(default=None, min_length=1, description="关联知识的稳定来源键")
     reason: str = Field(min_length=1, description="处置原因")
-    evidence_refs: list[str] = Field(default_factory=list, description="处置证据引用")
+    evidence_refs: list[str | dict] = Field(default_factory=list, description="处置证据引用或带当时原文的完整文档审计快照")
 
 
 class StoreFrame(BaseModel):

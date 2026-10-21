@@ -13,6 +13,7 @@ from typing import Any, Callable
 
 import anyio
 from pydantic import ValidationError
+from app.knowledge.grounding import GroundingError, validate_grounding
 
 from app.knowledge.prompts import (
     EXTRACTION_INPUT_BUDGET,
@@ -21,6 +22,7 @@ from app.knowledge.prompts import (
     RELATION_PROMPT_VERSION,
     extraction_messages,
     relation_messages,
+    messages_size,
 )
 from app.knowledge.schemas import (
     EvidenceItem,
@@ -83,7 +85,7 @@ class KnowledgeModel:
         异常:
             KnowledgeModelError: 工具申请、空响应、超限或非法 JSON。
         """
-        input_size = sum(len(str(message.content)) for message in messages)
+        input_size = messages_size(messages)
         if input_size > EXTRACTION_INPUT_BUDGET:
             raise KnowledgeModelError("知识模型输入超过估算预算")
         model = self._client_factory(streaming=True, temperature=0.0)
@@ -129,6 +131,8 @@ class KnowledgeModel:
             KnowledgeModelError: 模型失败或输出不符合来源约束。
         """
         parsed = await self._stream_json(extraction_messages(batch))
+        if set(parsed) != {"qas"}:
+            raise KnowledgeModelError("抽取结果包含额外字段")
         raw_qas = parsed.get("qas")
         if not isinstance(raw_qas, list):
             raise KnowledgeModelError("抽取结果缺少 qas 数组")
@@ -153,7 +157,11 @@ class KnowledgeModel:
             }
             if len(conversations) != 1:
                 raise KnowledgeModelError("抽取结果跨越会话边界")
-            qas.append(qa)
+            try:
+                grounded, _ = validate_grounding(qa, batch.turns, require_excerpts=True)
+            except (GroundingError, ValidationError) as error:
+                raise KnowledgeModelError(str(error)) from error
+            qas.append(grounded)
         return qas
 
     async def relate(

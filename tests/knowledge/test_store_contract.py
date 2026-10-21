@@ -204,3 +204,55 @@ async def test_snapshot_change_is_rejected() -> None:
     store = MemoryKnowledgeStore(snapshot_changed=True)
     with pytest.raises(Exception, match="快照|snapshot|变化"):
         await _publish(store, [_draft()])
+
+
+def test_stage_change_accepts_document_snapshot_evidence() -> None:
+    """处置证据同时接受旧引用和完整文档快照。
+
+    参数：无。返回：None。异常：字段校验或断言失败。
+    """
+    document = {
+        "kind": "document",
+        "source_key": "doc:a.md",
+        "ordinal": 0,
+        "id": 1,
+        "section_path": "甲 / 退货",
+        "content_hash": "a" * 64,
+        "text": {"category": "售后", "questions": "怎么退货", "answer": "七日内可申请。"},
+        "relation": "same",
+    }
+    change = StageChange(
+        id=1,
+        status="kept",
+        reason="文档支持",
+        evidence_refs=["chunk:1", document],
+    )
+    assert change.evidence_refs == ["chunk:1", document]
+
+
+@pytest.mark.parametrize("withdrawal", ["shortened_source", "inactive_id"])
+async def test_withdrawal_clears_both_pointers_and_repairs_active_neighbors(withdrawal) -> None:
+    """两种撤回入口均断开旧块指针并接回有效邻居。
+
+    参数：withdrawal 为来源替换或显式主键撤回。返回：None。异常：断言失败。
+    """
+    store = MemoryKnowledgeStore()
+    original = await _publish(store, [_draft(ordinal=index) for index in range(3)])
+    if withdrawal == "shortened_source":
+        await _publish(
+            store,
+            [_draft(ordinal=0), _draft(ordinal=2)],
+            replace_sources=["doc:a.md"],
+        )
+    else:
+        await _publish(store, [], inactive_ids=[original[1].id])
+    async with store.writer() as writer:
+        rows = await writer.chunks_by_sources(["doc:a.md"])
+    first, withdrawn, last = sorted(rows, key=lambda row: row.ordinal)
+    assert withdrawn.is_active is False
+    assert withdrawn.prev_chunk_id is None
+    assert withdrawn.next_chunk_id is None
+    assert first.prev_chunk_id is None
+    assert first.next_chunk_id == last.id
+    assert last.prev_chunk_id == first.id
+    assert last.next_chunk_id is None

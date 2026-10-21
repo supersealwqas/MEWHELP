@@ -8,6 +8,7 @@ from app.knowledge.schemas import (
     ChunkDraft,
     ChunkSnapshot,
     KnowledgeText,
+    CompletedTurn,
     RelationDecision,
     RelationPolicy,
     StagedQA,
@@ -15,7 +16,7 @@ from app.knowledge.schemas import (
 from app.knowledge.text import content_fingerprint
 from tests.knowledge.fakes import (
     FakeEncoder,
-    MemoryKnowledgeStore,
+    source_backed_store as MemoryKnowledgeStore,
     ScriptedKnowledgeModel,
 )
 
@@ -169,6 +170,8 @@ async def test_one_sided_rerun_and_new_alias_cannot_unquarantine() -> None:
         ]
     )
     store._staged[3] = _staged(3, "偏远地区免运费吗", answer="偏远地区包邮。")
+    store._turns.append(CompletedTurn(message_id=3, conversation_id=3, turn_id="alias-3",
+                                    question="偏远地区免运费吗", answer="偏远地区包邮。"))
     model = ScriptedKnowledgeModel(
         relation_decisions=[
             _decision("staged:3", "staged:1", "same"),

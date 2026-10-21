@@ -7,11 +7,14 @@ import tempfile
 from pathlib import Path
 
 import pytest
+from argparse import Namespace
+from types import SimpleNamespace
 
 from app.knowledge.llm import KnowledgeModelError, load_relation_policy
 from app.knowledge.prompts import RELATION_PROMPT_VERSION
 from app.knowledge.schemas import ExtractedQA, RelationDecision
 from tests.eval_ch03_prompts import evaluate_prompts
+from tests import eval_ch03_prompts as evaluation
 from tests.knowledge.fakes import FakeEncoder, ScriptedKnowledgeModel
 
 _TEMP_BASE = Path(".pytest-tmp")
@@ -150,6 +153,18 @@ async def test_missing_source_or_forbidden_fact_fails(qa: ExtractedQA) -> None:
         manager.cleanup()
 
 
+async def test_fixed_evaluation_rejects_unlabelled_invented_fact() -> None:
+    """固定标注之外新增金额也必须因原句核验失败。参数：无；返回：None；异常：无。"""
+    manager, root = _cases_dir()
+    try:
+        model = ScriptedKnowledgeModel(extract_qas=[_qa(answer="未满99元收6元。偏远地区收600元。")])
+        result = await evaluate_prompts(model, FakeEncoder(), root, suite="extraction")
+        assert result["passed"] is False
+        assert any("原句" in failure or "证据" in failure for failure in result["extraction"]["failures"])
+    finally:
+        manager.cleanup()
+
+
 @pytest.mark.parametrize(
     "decisions",
     [[_decision("same")], []],
@@ -213,5 +228,26 @@ async def test_load_relation_policy_versions() -> None:
                 embedding_revision="other-revision",
                 prompt_version=RELATION_PROMPT_VERSION,
             )
+    finally:
+        manager.cleanup()
+
+
+async def test_failed_evaluation_does_not_overwrite_policy(monkeypatch) -> None:
+    """失败评估保留旧有效策略原字节。参数：替换器/临时路径；返回：None；异常：断言失败。"""
+    manager, root = _cases_dir()
+    policy = root / "policy.json"
+    policy.write_text("old-valid-policy", encoding="utf-8")
+
+    async def failed(*args, **kwargs):
+        """替代远程模型返回失败评估。参数：调用参数；返回：失败结果；异常：无。"""
+        return {"passed": False, "policy": {"min_score": .9}}
+
+    monkeypatch.setattr(evaluation, "DEFAULT_POLICY", policy)
+    monkeypatch.setattr(evaluation, "evaluate_prompts", failed)
+    monkeypatch.setattr(evaluation, "BgeM3Encoder", lambda config: FakeEncoder())
+    monkeypatch.setattr(evaluation, "Settings", lambda: SimpleNamespace(chat_model="test"))
+    try:
+        await evaluation._run(Namespace(cases="unused", suite="relation", report=str(root / "report.json")))
+        assert policy.read_text(encoding="utf-8") == "old-valid-policy"
     finally:
         manager.cleanup()

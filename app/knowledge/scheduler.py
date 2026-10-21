@@ -67,23 +67,84 @@ async def run_schedule(
     异常:
         无；任务异常被记录为恢复尝试，不向调用方传播。
     """
-    await recover()
+    if not await _recover_until_ready(recover, sleep=sleep, stop=stop):
+        return
+    last_run_date = None
     while not stop.is_set():
         target = next_run_at(clock(), hour=hour, zone=zone)
+        # 用已经触发的日期作为高水位，时钟回拨不能再次领取同一天。
+        if last_run_date is not None and target.date() <= last_run_date:
+            target = target.replace(
+                year=last_run_date.year, month=last_run_date.month, day=last_run_date.day,
+            ) + timedelta(days=1)
         while not stop.is_set() and clock() < target:
             remaining = (target - clock()).total_seconds()
-            await sleep(min(_SLEEP_CHUNK_SECONDS, max(0.0, remaining)))
+            if not await _wait_or_stop(
+                min(_SLEEP_CHUNK_SECONDS, max(0.0, remaining)), sleep=sleep, stop=stop,
+            ):
+                return
         if stop.is_set():
             break
+        # 失败任务也算已经触发；随后只恢复它，不再次领取同日新任务。
+        current = clock()
+        local_current = (
+            current.replace(tzinfo=ZoneInfo(zone)) if current.tzinfo is None
+            else current.astimezone(ZoneInfo(zone))
+        )
+        # 跨日向前跳钟时，以实际触发日记账，随后回拨也不能再触发该日。
+        last_run_date = max(target.date(), local_current.date())
         try:
             await job()
         except Exception as error:
             _LOGGER.warning("knowledge scheduled job failed: %s", type(error).__name__)
-            await sleep(_SLEEP_CHUNK_SECONDS)
-            try:
-                await recover()
-            except Exception as recovery_error:
-                _LOGGER.warning(
-                    "knowledge scheduled recovery failed: %s",
-                    type(recovery_error).__name__,
-                )
+            if not await _wait_or_stop(_SLEEP_CHUNK_SECONDS, sleep=sleep, stop=stop):
+                return
+            if not await _recover_until_ready(recover, sleep=sleep, stop=stop):
+                return
+
+
+async def _wait_or_stop(
+    seconds: float, *, sleep: Callable[[float], Awaitable[None]], stop: asyncio.Event,
+) -> bool:
+    """等待期限或停止事件，退出时清理未完成的等待。
+
+    参数：seconds 非负等待秒数；sleep 可注入异步等待；stop 停止事件。
+    返回：bool，正常等完为 True，停止为 False。
+    异常：CancelledError 外部取消；等待函数异常原样传播。
+    """
+    if stop.is_set():
+        return False
+    sleeper = asyncio.create_task(sleep(seconds))
+    stopper = asyncio.create_task(stop.wait())
+    try:
+        await asyncio.wait([sleeper, stopper], return_when=asyncio.FIRST_COMPLETED)
+        if stop.is_set():
+            return False
+        await sleeper
+        return True
+    finally:
+        for task in (sleeper, stopper):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(sleeper, stopper, return_exceptions=True)
+
+
+async def _recover_until_ready(
+    recover: Callable[[], Awaitable[object]], *,
+    sleep: Callable[[float], Awaitable[None]], stop: asyncio.Event,
+) -> bool:
+    """启动和任务故障后共用限频恢复，成功前不领取每日任务。
+
+    参数：recover 恢复函数；sleep 异步等待函数；stop 停止事件。
+    返回：bool，恢复成功为 True，停止为 False。
+    异常：CancelledError 外部取消；恢复业务异常仅记录类型并重试。
+    """
+    while not stop.is_set():
+        try:
+            await recover()
+            return not stop.is_set()
+        except Exception as error:
+            _LOGGER.warning("knowledge scheduled recovery failed: %s", type(error).__name__)
+            if not await _wait_or_stop(_SLEEP_CHUNK_SECONDS, sleep=sleep, stop=stop):
+                return False
+    return False

@@ -7,12 +7,12 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 
 from app.knowledge.chunking import chunk_markdown
-from app.knowledge.llm import KnowledgeModel
+from app.knowledge.contracts import KnowledgeModel
+from app.knowledge.grounding import turns_digest
 from app.knowledge.manifest import load_manifest
 from app.knowledge.prompts import EXTRACTION_PROMPT_VERSION
 from app.knowledge.schemas import (
@@ -31,10 +31,7 @@ _BATCH_INPUT_CHAR_BUDGET = 8000
 
 def _turns_digest(turns) -> str:
     """计算批次的稳定输入指纹。参数：轮次；返回：SHA256；异常：无。"""
-    payload = [turn.model_dump(mode="json") for turn in turns]
-    return hashlib.sha256(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    ).hexdigest()
+    return turns_digest(turns)
 
 
 def _batch_from_turns(turns, upper_id: int) -> ExtractionBatch:
@@ -171,22 +168,20 @@ class KnowledgeJobs:
             staged_ids.extend(row.id for row in staged)
         return len(batches), extracted, staged_ids
 
-    async def _process_new(self, writer) -> tuple[int, int, list[int]]:
-        """领取未分配轮次并按会话边界抽取。参数：写入器；返回：批次数/抽取数/暂存 ID；异常：模型/存储错误。"""
-        upper = await writer.source_upper_id()
-        turns = await writer.unassigned_turns(upper, 0, _TURN_SCAN_LIMIT)
-        batches = 0
-        extracted = 0
-        staged_ids: list[int] = []
-        for selected in _split_batches(turns):
-            batch = _batch_from_turns(selected, upper)
-            reserved = await writer.reserve_batch(batch)
-            qas = await self.model.extract(reserved)
-            staged = await writer.complete_batch(reserved.batch_no, qas)
-            batches += 1
-            extracted += len(qas)
-            staged_ids.extend(row.id for row in staged)
-        return batches, extracted, staged_ids
+    async def _reserve_snapshot(self, writer, upper: int) -> None:
+        """以ID游标分页预留冻结上界内所有来源，完成后才抽取。
+
+        参数：writer持锁写入器；upper固定最大消息ID，不能扩展到新消息。
+        返回：None。异常：来源变更、预算超限或存储错误，已预留批次保留恢复。
+        """
+        cursor = 0
+        while True:
+            turns = await writer.unassigned_turns(upper, cursor, _TURN_SCAN_LIMIT)
+            if not turns:
+                return
+            for selected in _split_batches(turns):
+                await writer.reserve_batch(_batch_from_turns(selected, upper))
+            cursor = turns[-1].message_id
 
     async def _finish(
         self,
@@ -197,6 +192,7 @@ class KnowledgeJobs:
         staged_ids: list[int],
     ) -> JobReport:
         """统一去重、隔离与向量同步。参数：写入器与统计；返回：报告；异常：模型/存储错误。"""
+        await writer.ensure_staging_grounded()
         await self.lifecycle.reconcile_staging(writer)
         sync = await self.synchronizer.run(writer)
         frame = await writer.frame()
@@ -217,20 +213,30 @@ class KnowledgeJobs:
         )
 
     async def mine_once(self) -> JobReport:
-        """恢复 pending 并领取一批新来源，随后去重与同步。参数：无；返回：报告；异常：模型/存储错误。"""
+        """有中断先恢复固定upper；无中断才冻结新upper并统一去重同步。
+
+        参数：无。返回：JobReport，完整快照处理统计。异常：模型/来源/存储错误。
+        """
         async with self.store.writer() as writer:
+            # 恢复先补齐旧upper，防止半快照过早统一去重；新任务仍从0补扫迟提交低ID。
+            await self._reserve_snapshot(writer, await writer.recovery_upper_id())
+            if not await writer.pending_batches():
+                await self._reserve_snapshot(writer, await writer.source_upper_id())
             pending_count, pending_extracted, pending_ids = await self._process_pending(writer)
-            new_count, new_extracted, new_ids = await self._process_new(writer)
             return await self._finish(
                 writer,
-                batch_count=pending_count + new_count,
-                extracted=pending_extracted + new_extracted,
-                staged_ids=pending_ids + new_ids,
+                batch_count=pending_count,
+                extracted=pending_extracted,
+                staged_ids=pending_ids,
             )
 
     async def recover_pending(self) -> JobReport:
-        """只恢复已预留批次，不领取新来源。参数：无；返回：报告；异常：模型/存储错误。"""
+        """补齐持久upper内未预留来源并恢复，不领取upper之后来源。
+
+        参数：无。返回：JobReport，恢复批次统计。异常：模型/来源/存储错误。
+        """
         async with self.store.writer() as writer:
+            await self._reserve_snapshot(writer, await writer.recovery_upper_id())
             count, extracted, staged_ids = await self._process_pending(writer)
             return await self._finish(
                 writer,
