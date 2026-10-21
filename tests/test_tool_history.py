@@ -30,6 +30,79 @@ def test_unpaired_and_running_history_never_leak_tool_requests():
     assert not any(getattr(m, "tool_calls", None) for m in history[0])
 
 
+@pytest.mark.parametrize("status", ["completed", "failed", "cancelled"])
+def test_multistep_history_restores_tool_groups_in_order(status):
+    """恢复不得漏掉后续物流组或改变事实顺序。参数：轮次终态；返回：None；异常：断言失败。"""
+    from app.core.memory import assemble_turns
+    turn = StoredTurn(turn_id="multi-step", turn_status=status, messages=[
+        StoredMessage(role="user", content="订单1001的物流到哪了"),
+        StoredMessage(role="assistant", content="", tool_calls=[
+            {"id": "order-call", "name": "query_order", "args": {"order_id": "1001"}}]),
+        StoredMessage(role="tool", tool_call_id="order-call",
+                      content='{"ok":true,"data":{"tracking_no":"TRACK-1001"}}'),
+        StoredMessage(role="assistant", content="", tool_calls=[
+            {"id": "logistics-call", "name": "query_logistics", "args": {"tracking_no": "TRACK-1001"}}]),
+        StoredMessage(role="tool", tool_call_id="logistics-call",
+                      content='{"ok":true,"data":{"latest_node":"配送站"}}'),
+        StoredMessage(role="assistant", content="物流已到配送站"),
+    ])
+    messages = assemble_turns([turn])[0]
+    assert [message.type for message in messages] == ["human", "ai", "tool", "ai", "tool", "ai"]
+    assert messages[1].tool_calls[0]["name"] == "query_order"
+    assert messages[3].tool_calls[0]["name"] == "query_logistics"
+    assert [messages[2].tool_call_id, messages[4].tool_call_id] == ["order-call", "logistics-call"]
+    assert "TRACK-1001" in messages[2].content and "配送站" in messages[4].content
+    assert messages[-1].content == "物流已到配送站" if status == "completed" else "未完成" in messages[-1].content
+
+
+@pytest.mark.parametrize("status", ["completed", "failed", "cancelled"])
+def test_partial_batch_history_keeps_committed_ticket_without_changing_audit(status):
+    """批次未全部完成也不能丢弃已建工单。参数：轮次终态；返回：None；异常：断言失败。"""
+    from app.core.memory import assemble_turns
+    turn = stored_turn(status)
+    turn.messages[1].tool_calls.append({"name": "query_faq", "args": {"keyword": "延误"}, "id": "pending-call"})
+    turn.messages.append(StoredMessage(role="assistant", content="工单已保存"))
+    original = turn.model_dump()
+    messages = assemble_turns([turn])[0]
+    assert [message.type for message in messages] == ["human", "ai", "tool", "ai"]
+    assert [call["id"] for call in messages[1].tool_calls] == ["call1"]
+    assert messages[2].tool_call_id == "call1" and "T-original" in messages[2].content
+    assert turn.model_dump() == original
+
+
+@pytest.mark.parametrize("result_location", ["first", "second", "both"])
+def test_reused_call_id_never_pairs_results_across_request_groups(result_location):
+    """同ID的新申请不得借用前后组的结果。参数：结果所在区段；返回：None；异常：断言失败。"""
+    from app.core.memory import assemble_turns
+    turn = stored_turn("cancelled", paired=result_location != "second")
+    turn.messages.append(StoredMessage(role="assistant", content="", tool_calls=[
+        {"name": "query_logistics", "args": {"tracking_no": "TRACK-1001"}, "id": "call1"}]))
+    if result_location != "first":
+        turn.messages.append(StoredMessage(role="tool", content='{"ok":true,"data":{"latest_node":"错误复用"}}',
+                                           tool_call_id="call1"))
+    original = turn.model_dump()
+    messages = assemble_turns([turn])[0]
+    calls = [call for message in messages if isinstance(message, AIMessage) for call in message.tool_calls]
+    facts = [message for message in messages if isinstance(message, ToolMessage)]
+    assert [call["name"] for call in calls] == ([] if result_location == "second" else ["create_ticket"])
+    assert len(facts) == (0 if result_location == "second" else 1)
+    if facts:
+        assert "T-original" in facts[0].content
+    assert turn.model_dump() == original
+
+
+@pytest.mark.parametrize("call_id", [" call1", "call1 ", "\tcall1", "call1\n"])
+def test_tool_call_id_with_surrounding_whitespace_is_rejected(call_id):
+    """空白ID不能绕过调用唯一性检查或进入历史。参数：非法ID；返回：None；异常：断言失败。"""
+    from app.core.memory import assemble_turns, valid_tool_calls
+    turn = stored_turn()
+    turn.messages[1].tool_calls[0]["id"] = call_id
+    turn.messages[2].tool_call_id = call_id
+    assert not valid_tool_calls(turn.messages[1].tool_calls)
+    messages = assemble_turns([turn])[0]
+    assert [message.type for message in messages] == ["human", "ai"]
+
+
 def test_trim_whole_turn_without_orphaning_tool_result():
     """预算不足只能丢完整旧轮，不能留下孤立工具结果。参数：无；返回：None；异常：断言失败。"""
     from app.core.memory import trim_turns

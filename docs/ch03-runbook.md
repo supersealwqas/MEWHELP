@@ -54,6 +54,8 @@ PYTHONUTF8=1 uv run --no-sync python tests/verify_ch03_live.py evaluate --test -
 
 ## 应用库初始化与启动
 
+当前聊天支持同轮连续调用工具，默认 `TOOL_MAX_CALLS_PER_TURN=4`（允许1至8）。发送“订单1001的物流到哪了”应在同一回复内依次显示订单查询和物流查询，自动取用订单中的单号；无需用户再发送物流单号。待发货订单应结束于订单查询，不编造物流轨迹。每条消息最多尝试创建一张工单，重复或失败时停止后续调用。
+
 ```bash
 uv run python -m app.db.init_db
 uv run python -m app.knowledge.cli init

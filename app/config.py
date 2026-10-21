@@ -56,6 +56,10 @@ class Settings(BaseSettings):
     tool_timeout_seconds: float = Field(default=5, gt=0, le=60, description="单次工具执行超时秒数")
     tool_max_retries: int = Field(default=1, ge=0, le=1, description="工具最大故障重试次数")
     tool_retry_delay_seconds: float = Field(default=0.2, ge=0, le=5, description="可取消的重试等待秒数")
+    tool_max_calls_per_turn: int = Field(
+        default=4, ge=1, le=8,
+        description="一条用户消息内最多执行的业务工具数，包含同批次及连续决策；执行器内部重试不重复计数",
+    )
 
     # CH03 知识库与 Dense 检索配置。模型与向量库名称是本章固定选型，不在此处提供降级开关。
     knowledge_model_path: str = Field(

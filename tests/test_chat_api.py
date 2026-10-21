@@ -94,6 +94,29 @@ def test_tool_named_event_precedes_text_and_is_not_text(client, offline_chat_run
     assert '"is_mock": true' in response.text
 
 
+def test_dependent_tools_share_one_sse_reply(client, offline_chat_runtime):
+    """同一HTTP请求传输两步工具状态，最后只发送一次完成帧。
+
+    参数：client为真实路由客户端；offline_chat_runtime为外部边界替身。
+    返回：None，通过断言核对状态顺序、工具配对与已保存回答。
+    异常：断言失败。
+    """
+    _, repository, _, model = offline_chat_runtime
+    model.decisions = [
+        AIMessage(content="", tool_calls=[{"id": "order", "name": "query_order", "args": {"order_id": "1001"}}]),
+        AIMessage(content="", tool_calls=[{"id": "logistics", "name": "query_logistics",
+                                          "args": {"tracking_no": "MOCK213502378238"}}]),
+    ]
+    response = send(client, "订单1001的物流到哪了")
+    assert response.status_code == 200
+    assert response.text.count("event: tool_status") == 4
+    assert response.text.index('"name": "query_order"') < response.text.index('"name": "query_logistics"')
+    assert response.text.count("data: [DONE]") == 1 and response.text.endswith("data: [DONE]\n\n")
+    turn = next(iter(repository.turns.values()))
+    assert [message.role for message in turn.messages] == ["user", "assistant", "tool", "assistant", "tool", "assistant"]
+    assert turn.turn_status == "completed"
+
+
 @pytest.mark.parametrize("payload", [{}, {"session_id": "s"}, {"message": "hello"},
     *[{"session_id": v, "message": "hello"} for v in ["", "   ", "\t\n", "x" * 65]],
     *[{"session_id": "s", "message": v} for v in ["", "   ", "\r\n"]],

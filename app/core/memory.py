@@ -5,6 +5,7 @@
 """
 
 import json
+from collections import Counter
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage, trim_messages
 from langchain_core.tools import BaseTool
@@ -126,11 +127,11 @@ class ContextBudgetExceeded(ValueError):
 
 
 def valid_tool_calls(calls: list[dict]) -> bool:
-    """校验可回灌的申请协议。参数：申请列表；返回：是否完整且 ID 唯一；异常：无。"""
+    """校验可回灌的申请协议。参数：申请列表；返回：是否完整且 ID 唯一、无首尾空白；异常：无。"""
     ids = []
     for call in calls:
         identifier = call.get("id")
-        if not isinstance(identifier, str) or not identifier.strip() or len(identifier) > 64:
+        if not isinstance(identifier, str) or not identifier or identifier != identifier.strip() or len(identifier) > 64:
             return False
         if not isinstance(call.get("name"), str) or not call["name"].strip() or not isinstance(call.get("args"), dict):
             return False
@@ -139,23 +140,45 @@ def valid_tool_calls(calls: list[dict]) -> bool:
 
 
 def assemble_turns(turns: list[StoredTurn]) -> list[list[BaseMessage]]:
-    """恢复完整轮及已提交事实。参数：按时间排列的存储轮；返回：逐轮消息；异常：无业务异常。"""
+    """按申请区段恢复各轮已提交事实，保留中断批次中的可信结果。
+
+    参数：turns 按时间排列的存储轮，其消息已按主键排序。
+    返回：逐轮消息列表；仅回灌唯一配对的调用与结果，不改写原始审计记录。
+    异常：无主动抛出的业务异常。
+    """
     history = []
     for turn in turns:
         if turn.turn_status == "running":
             continue
         group = []
-        for row in turn.messages:
+        seen_ids: set[str] = set()
+        for index, row in enumerate(turn.messages):
             if row.role == "user":
                 group.append(HumanMessage(content=row.content))
             elif row.role == "assistant" and row.tool_calls:
                 calls = row.tool_calls
-                results = [m for m in turn.messages if m.role == "tool" and m.tool_call_id in {c.get("id") for c in calls}]
-                # 任一结果缺失、重复或申请损坏时整组跳过，原始记录仍留数据库审计。
-                if valid_tool_calls(calls) and len(results) == len(calls) and len({m.tool_call_id for m in results}) == len(calls):
-                    group.append(AIMessage(content="", tool_calls=calls))
+                if not valid_tool_calls(calls):
+                    continue
+                call_ids = {call["id"] for call in calls}
+                reused_ids = seen_ids.intersection(call_ids)
+                seen_ids.update(call_ids)
+                # 同轮 ID 不能再次指代另一申请，即使首次申请尚无结果也不能借用后续结果。
+                if reused_ids:
+                    continue
+                results = []
+                for result_row in turn.messages[index + 1:]:
+                    # 新的助手或用户消息结束当前申请区段，禁止跨组搜索同 ID 的结果。
+                    if result_row.role != "tool":
+                        break
+                    if result_row.tool_call_id in call_ids:
+                        results.append(result_row)
+                result_counts = Counter(result.tool_call_id for result in results)
+                # 只丢弃缺失或重复结果的调用，已唯一配对的工单事实必须保留。
+                paired_calls = [call for call in calls if result_counts[call["id"]] == 1]
+                if paired_calls:
+                    group.append(AIMessage(content="", tool_calls=paired_calls))
                     by_id = {m.tool_call_id: m for m in results}
-                    group.extend(ToolMessage(content=by_id[c["id"]].content, tool_call_id=c["id"]) for c in calls)
+                    group.extend(ToolMessage(content=by_id[c["id"]].content, tool_call_id=c["id"]) for c in paired_calls)
             elif row.role == "assistant" and row.content and turn.turn_status == "completed":
                 group.append(AIMessage(content=row.content))
         if group and turn.turn_status in {"cancelled", "failed"}:

@@ -1,21 +1,10 @@
-"""单工具聊天编排的行为测试：协议、增量、故障、并发与取消。"""
+"""聊天编排的通用行为测试：协议、增量、故障、并发与取消。"""
 
 import asyncio
-from types import SimpleNamespace
 import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 from app.schemas.chat import ChatRequest
-from app.tools.registry import build_registry
-from tests.chat_fakes import FAQRepository, MemoryRepository, ScriptedModel
-
-
-def make_service(decision=None, chunks=None):
-    """建立真实服务及外部替身。参数：决策、增量；返回：服务和依赖；异常：导入错误。"""
-    from app.services.chat import ChatService
-    repo, support, model = MemoryRepository(), FAQRepository(), ScriptedModel(decision, chunks)
-    config = SimpleNamespace(token_budget=2000, request_token_budget=16000, tool_timeout_seconds=0.05,
-                             tool_max_retries=1, tool_retry_delay_seconds=0)
-    return ChatService(repo, support, model, build_registry(), config), repo, support, model
+from tests.chat_fakes import make_chat_service as make_service
 
 
 def request(session_id="s"):
@@ -35,7 +24,7 @@ async def test_one_tool_status_before_answer_and_commit_before_done():
     assert [e.event for e in events] == ["tool_status", "tool_status", "delta", "delta", "done"]
     assert [e.data["status"] for e in events[:2]] == ["running", "succeeded"]
     assert support.keywords == ["邮费"]
-    assert [step for step, _ in model.inputs] == ["decide", "answer"]
+    assert [step for step, _ in model.inputs] == ["decide", "decide", "answer"]
     messages = model.inputs[-1][1]
     results = [m for m in messages if isinstance(m, ToolMessage)]
     assert len(results) == 1 and results[0].tool_call_id == "c1"
@@ -59,14 +48,15 @@ async def test_no_tool_still_streams_and_does_not_save_planning_text():
     assert all("规划" not in m.content for m in next(iter(repo.turns.values())).messages)
 
 
-async def test_multiple_calls_execute_none_but_pair_all_results():
-    """多申请不能偷偷执行第一项。参数：无；返回：None；异常：断言失败。"""
-    service, repo, support, model = make_service(AIMessage(content="", tool_calls=[faq_call(), faq_call("c2")]))
+async def test_multiple_calls_execute_in_order_and_pair_all_results():
+    """同批独立查询依次执行且结果全部配对。参数：无；返回：None；异常：断言失败。"""
+    service, repo, support, model = make_service(AIMessage(content="", tool_calls=[
+        faq_call(args={"keyword": "邮费"}), faq_call("c2", args={"keyword": "是多少"})]))
     events = [e async for e in service.stream_turn(request())]
-    assert events[-1].event == "done" and not support.keywords
+    assert events[-1].event == "done" and support.keywords == ["邮费", "是多少"]
     results = [m for m in model.inputs[-1][1] if isinstance(m, ToolMessage)]
     assert {m.tool_call_id for m in results} == {"c1", "c2"}
-    assert all("SINGLE_TOOL_LIMIT" in m.content for m in results)
+    assert all('"ok":true' in m.content for m in results)
 
 
 @pytest.mark.parametrize("decision", [

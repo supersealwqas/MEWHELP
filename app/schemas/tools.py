@@ -26,8 +26,8 @@ class OwnedOrderArgs(BusinessArgs):
 
 
 class LogisticsArgs(BusinessArgs):
-    """物流查询的完整运行参数，物流单号来自已成功查询的订单。"""
-    tracking_no: str = Field(min_length=1, max_length=64, description="从 query_order 结果取得的物流单号，不得填写订单号或猜测")
+    """物流查询参数，单号来自用户明确提供或本会话成功的工具事实。"""
+    tracking_no: str = Field(min_length=1, max_length=64, description="用户提供、本轮或本会话历史query_order成功结果中的物流单号，不得填写订单号或猜测")
     user_id: Annotated[str, InjectedToolArg] = Field(min_length=1, description="由系统注入的当前演示用户标识")
 
 

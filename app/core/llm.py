@@ -57,7 +57,7 @@ def get_chat_model(
 
 
 class ChatModelAdapter:
-    """隔离两段模型请求：流式汇总决策，随后以无工具模型流式作答。"""
+    """隔离可重复的工具决策与最终回答：完整汇总申请，最终以无工具模型流式作答。"""
 
     async def decide(self, messages, tools) -> AIMessage:
         """汇总完整申请。参数：完整消息与工具列表；返回：AIMessage；异常：网络错误、空响应或携带审计的 InvalidToolDecision。"""

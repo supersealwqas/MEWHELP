@@ -1,4 +1,4 @@
-"""五个异步业务工具：三项可复现演示查询、FAQ 字面检索与真实工单写入。"""
+"""五个异步业务工具：三项可复现演示查询、知识库检索与真实工单写入。"""
 
 import random
 from typing import Annotated
@@ -63,9 +63,9 @@ query_product.tags = ["mock"]
 # 同上：tags 事后赋值，缺这行则该工具的演示数据会被当作真实数据播报。
 
 
-@tool(args_schema=LogisticsArgs, description="根据 query_order 返回的 tracking_no 物流单号查询当前用户的配送状态、承运方、最近物流节点及节点更新时间。只接受物流单号，不接受订单号；必须先查订单取得非空 tracking_no，待发货时不调用。")
+@tool(args_schema=LogisticsArgs, description="根据用户提供或query_order成功结果中的tracking_no物流单号查询当前用户的配送状态、承运方、最近物流节点及节点更新时间。只接受物流单号，不接受订单号；只有订单号时先查订单，再使用结果里的非空tracking_no继续查询，无需用户重复提供。待发货且没有单号时不调用。")
 async def query_logistics(
-    tracking_no: Annotated[str, Field(min_length=1, max_length=64, description="query_order 返回的非空物流单号")],
+    tracking_no: Annotated[str, Field(min_length=1, max_length=64, description="用户明确提供或query_order成功结果中的非空物流单号")],
     user_id: Annotated[str, InjectedToolArg],
 ) -> dict:
     """按物流单号校验对应订单归属后查询配送进度。

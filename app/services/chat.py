@@ -1,8 +1,10 @@
-"""单轮 Function Calling 服务，负责会话互斥、工具事实回灌和流式收敛。"""
+"""有界多工具聊天服务，负责会话互斥、顺序执行、事实回灌和最终流式回答。"""
 
 import asyncio
+import json
 import logging
 from contextlib import aclosing, suppress
+from dataclasses import dataclass
 from uuid import uuid4
 import anyio
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -25,6 +27,15 @@ MAX_ANSWER_CHARACTERS = 12000
 
 class AnswerTooLong(ValueError):
     """回答超过可展示和持久化的长度，必须关闭上游流并明确标记未完成。"""
+
+
+@dataclass
+class _ToolChainState:
+    """跨步骤保留已发生写入和固定回复，异常或取消时也不能丢失已提交事实。"""
+
+    write_started: bool = False  # 一旦尝试建单即保持为真，后续只读步骤不能重置。
+    ticket_receipt: str = ""  # 已发送的真实工单编号提示，同时作为最终落库正文前缀。
+    rejection: str | None = None  # 归属拒绝的固定答复，不交给模型改写。
 
 # 归属拒绝的固定回复：未知订单与他人订单必须逐字一致，交给模型改写会泄露订单是否存在。
 FIXED_REJECTION_REPLIES: dict[str, str] = {
@@ -109,25 +120,133 @@ class ChatService:
             raise InvalidToolDecision(tool_calls=decision.tool_calls, invalid_tool_calls=decision.invalid_tool_calls)
         return decision.tool_calls
 
-    async def _reject_batch(self, calls: list[dict], context: ToolContext, current: list) -> None:
-        """整批拒绝多工具申请，为每个合法 ID 配对安全错误。
-
-        不静默只执行第一项：那会让用户以为两项都处理了。
+    async def _skip_calls(
+        self, calls: list[dict], context: ToolContext, current: list, code: str, message: str
+    ):
+        """为未执行的合法申请保存配对结果，并明确显示跳过状态。
 
         参数:
-            calls: 模型的全部工具申请。
+            calls: 已保存申请中本次不再执行的部分，调用ID必须唯一。
             context: 本轮可信上下文。
             current: 本轮消息列表，将被追加对应的 ToolMessage。
+            code: 停止或限制的稳定错误码。
+            message: 可回灌给模型的中文停止原因。
         返回值:
-            None。
+            异步 ChatEvent 流，每个申请产生一个未执行状态。
         异常:
-            无主动抛出的业务异常；保存失败由仓储层抛出。
+            结果保存失败由仓储层抛出。
         """
         for call in calls:
             call_context = context.model_copy(update={"tool_call_id": call["id"]})
-            result = await self.chat.save_tool_result(call_context, ToolResult.failed(
-                "SINGLE_TOOL_LIMIT", "每次只能查询一项，请明确最需要处理的问题"))
+            result = await self.chat.save_tool_result(call_context, ToolResult.failed(code, message))
             current.append(ToolMessage(content=result.model_dump_json(), tool_call_id=call["id"]))
+            yield ChatEvent(event="tool_status", data={
+                "tool_call_id": call["id"], "name": call["name"][:100], "status": "failed",
+                "label": "未执行", "is_mock": False,
+            })
+
+    @staticmethod
+    def _request_key(call: dict) -> str:
+        """计算同轮请求去重标识，匹配现有业务参数去首尾空白的规则。
+
+        参数：call为经过协议校验的申请，当前五工具均使用扁平参数。
+        返回：包含工具名与规范化参数的稳定JSON字符串，不包含调用ID。
+        异常：参数包含非法JSON数值时抛出ValueError。
+        """
+        args = {key: value.strip() if isinstance(value, str) else value
+                for key, value in call["args"].items()}
+        return json.dumps([call["name"], args], sort_keys=True, ensure_ascii=False, allow_nan=False)
+
+    async def _run_tool_chain(self, history, current, context: ToolContext, state: _ToolChainState):
+        """按当前轮结果继续决策，在次数、失败和重复边界内依次执行工具。
+
+        参数：history为完整历史轮；current为不可裁剪的当前轮消息；context为可信身份；
+            state保存写入事实和固定答复，异常时由外层继续使用。
+        返回：异步ChatEvent流；结束后current包含所有已保存且配对的工具事实。
+        异常：模型、消息预算或持久化异常向外透传，取消会关闭正在执行的工具流。
+        """
+        limit = self.settings.tool_max_calls_per_turn
+        used = 0
+        seen_ids: set[str] = set()
+        seen_requests: set[str] = set()
+        tools = self.registry.all()
+        while used < limit:
+            # 每一步均重新核算完整请求，前一步结果始终保留在当前轮，不能被历史裁剪删除。
+            messages = prepare_messages(
+                history, current, self.settings.token_budget,
+                system_text=CUSTOMER_SERVICE_SYSTEM + TOOL_DECISION_SYSTEM
+                + f"\n本轮还可执行{limit - used}个工具；已完成的相同查询不要重复申请。",
+                tools=tools, request_max_tokens=self.settings.request_token_budget,
+            )
+            try:
+                calls = await self._decide(messages)
+                if any(call["id"] in seen_ids for call in calls):
+                    raise InvalidToolDecision(tool_calls=calls)
+            except InvalidToolDecision as error:
+                # 坏协议仅用于审计，不回灌原始申请；此前已经完成的事实仍然有效。
+                await self.chat.save_tool_calls(context, [error.audit_record])
+                current.append(SystemMessage(content=(
+                    "本次工具申请格式无效或调用ID重复，未执行任何工具；"
+                    "这仅指本次申请，此前已保存的工具结果仍有效。请据已有事实说明未完成部分。"
+                )))
+                return
+            if not calls:
+                return
+
+            seen_ids.update(call["id"] for call in calls)
+            await self.chat.save_tool_calls(context, calls)
+            current.append(AIMessage(content="", tool_calls=calls))
+            if len(calls) > limit - used:
+                async with aclosing(self._skip_calls(
+                    calls, context, current, "TOOL_CALL_LIMIT", "本批申请超过本轮剩余调用次数，未执行；请依据已有结果回答"
+                )) as skipped:
+                    async for event in skipped:
+                        yield event
+                return
+
+            for index, call in enumerate(calls):
+                request_key = self._request_key(call)
+                if call["name"] == "create_ticket" and state.write_started:
+                    code, reason = "WRITE_TOOL_LIMIT", "本轮已经尝试创建工单，禁止重复提交，请核实已有工单结果"
+                elif request_key in seen_requests:
+                    code, reason = "DUPLICATE_TOOL_CALL", "相同工具和参数本轮已经执行，未重复调用；请使用已有结果"
+                else:
+                    code = None
+                if code is not None:
+                    async with aclosing(self._skip_calls(calls[index:], context, current, code, reason)) as skipped:
+                        async for event in skipped:
+                            yield event
+                    return
+
+                seen_requests.add(request_key)
+                used += 1
+                state.write_started = state.write_started or call["name"] == "create_ticket"
+                call_context = context.model_copy(update={"tool_call_id": call["id"]})
+                result = None
+                async with aclosing(self._run_single(call, call_context, current)) as runner:
+                    async for item in runner:
+                        if isinstance(item, ChatEvent):
+                            yield item
+                        else:
+                            result = item
+                            state.rejection = fixed_reply(item)
+                            if call["name"] == "create_ticket" and item.ok and item.data:
+                                number = item.data.get("ticket_no")
+                                if isinstance(number, str) and number:
+                                    state.ticket_receipt = f"工单已创建，工单号：{number}，状态：待处理。\n\n"
+                                    # 先发送已提交编号；后续决策失败或用户停止也不能隐藏成功事实。
+                                    yield ChatEvent(event="delta", data={"delta": state.ticket_receipt})
+                if result is None:
+                    raise RuntimeError("工具流缺少终态结果")
+                if not result.ok:
+                    async with aclosing(self._skip_calls(
+                        calls[index + 1:], context, current, "TOOL_CHAIN_STOPPED", "前一步未完成，后续工具未执行"
+                    )) as skipped:
+                        async for event in skipped:
+                            yield event
+                    return
+
+        current.append(SystemMessage(content="本轮已达到工具调用次数上限。依据已保存结果回答，剩余未完成的部分如实说明。"))
 
     async def _run_single(self, call: dict, context: ToolContext, current: list):
         """执行单个工具申请，转发状态帧并把结果写入本轮消息。
@@ -211,7 +330,8 @@ class ChatService:
         self._active.add(key)
         context = ToolContext(session_id=key, user_id=request.user_id, turn_id=str(uuid4()), user_message=request.message)
         completed, started, terminal = False, False, "cancelled"
-        ticket_receipt, write_started, stage = "", False, "input"
+        chain = _ToolChainState()
+        stage = "input"
         try:
             current = [HumanMessage(content=request.message)]
             decision_system = CUSTOMER_SERVICE_SYSTEM + TOOL_DECISION_SYSTEM
@@ -223,45 +343,15 @@ class ChatService:
             started = True
             stage = "history"
             history = assemble_turns(await self.chat.load_turns(context.conversation_id, exclude_turn_id=context.turn_id))
-            messages = prepare_messages(history, current, self.settings.token_budget,
-                system_text=decision_system, tools=tools, request_max_tokens=self.settings.request_token_budget)
-            stage = "decision"
-            try:
-                calls = await self._decide(messages)
-            except InvalidToolDecision as error:
-                # 诊断记录先落库；回答仅获得固定失败说明，不接触原始坏参数或伪造的工具配对。
-                await self.chat.save_tool_calls(context, [error.audit_record])
-                current.append(SystemMessage(content="本轮工具申请格式无效，未执行任何工具。请说明未能完成操作，并请用户确认需求。"))
-                calls = []
-            rejection = None
-            if calls:
-                await self.chat.save_tool_calls(context, calls)
-                current.append(AIMessage(content="", tool_calls=calls))
-                if len(calls) > 1:
-                    await self._reject_batch(calls, context, current)
-                else:
-                    context = context.model_copy(update={"tool_call_id": calls[0]["id"]})
-                    stage = "tool"
-                    write_started = calls[0]["name"] == "create_ticket"
-                    # aclosing 保证取消或异常时也关闭内层生成器，工具事务才能清理完毕。
-                    async with aclosing(self._run_single(calls[0], context, current)) as runner:
-                        async for item in runner:
-                            if isinstance(item, ChatEvent):
-                                yield item
-                            else:
-                                # 工具结果已持久化，此处只判定是否需要绕过模型改写。
-                                rejection = fixed_reply(item)
-                                if write_started and item.ok and item.data:
-                                    number = item.data.get("ticket_no")
-                                    if isinstance(number, str) and number:
-                                        ticket_receipt = f"工单已创建，工单号：{number}，状态：待处理。\n\n"
-                                        # 尽早发送已保存的事实，后续模型/保存失败不再隐藏编号。
-                                        yield ChatEvent(event="delta", data={"delta": ticket_receipt})
-            if rejection is not None:
+            stage = "tool_chain"
+            async with aclosing(self._run_tool_chain(history, current, context, chain)) as runner:
+                async for event in runner:
+                    yield event
+            if chain.rejection is not None:
                 # 归属拒绝不进入模型阶段：固定回复保证未知订单与他人订单的措辞完全一致。
-                yield ChatEvent(event="delta", data={"delta": rejection})
+                yield ChatEvent(event="delta", data={"delta": chain.rejection})
                 stage = "finish"
-                await self.chat.finish_turn(context, rejection)
+                await self.chat.finish_turn(context, chain.ticket_receipt + chain.rejection)
                 completed = True
                 yield ChatEvent(event="done")
                 return
@@ -271,7 +361,7 @@ class ChatService:
                 system_text=CUSTOMER_SERVICE_SYSTEM + FINAL_ANSWER_SYSTEM,
                 request_max_tokens=self.settings.request_token_budget)
             answer = None
-            async with aclosing(self._stream_answer(messages, ticket_receipt)) as stream:
+            async with aclosing(self._stream_answer(messages, chain.ticket_receipt)) as stream:
                 async for item in stream:
                     if isinstance(item, ChatEvent):
                         yield item
@@ -286,9 +376,9 @@ class ChatService:
         except Exception as error:
             terminal = "failed"
             logger.warning("客服轮次失败 turn_id=%s stage=%s type=%s", context.turn_id, stage, type(error).__name__)
-            retry_safe = not write_started and not isinstance(error, PersistenceUncertain)
-            if ticket_receipt:
-                message = ticket_receipt.strip() + "补充回复未完成，勿重复提交工单。"
+            retry_safe = not chain.write_started and not isinstance(error, PersistenceUncertain)
+            if chain.ticket_receipt:
+                message = chain.ticket_receipt.strip() + "补充回复未完成，勿重复提交工单。"
             elif not retry_safe:
                 message = "本轮回复未完成，请先核实工单处理状态，勿重复提交工单"
             else:

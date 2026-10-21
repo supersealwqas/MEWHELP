@@ -1,6 +1,8 @@
 """聊天编排测试的外部边界替身；真实服务、工具和消息转换保持运行。"""
 
-from langchain_core.messages import AIMessage
+from types import SimpleNamespace
+
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from app.schemas.history import StoredMessage, StoredTurn
 
 
@@ -57,18 +59,29 @@ class MemoryRepository:
 class ScriptedModel:
     """提供预定决策与增量，并记录服务传给模型的真实上下文。"""
 
-    def __init__(self, decision=None, chunks=None):
-        """配置响应。参数：可选决策和增量；返回：None；异常：无。"""
+    def __init__(self, decision=None, chunks=None, *, decisions=None):
+        """配置响应。参数：单次决策、增量或显式多步决策序列；返回：None；异常：无。"""
         self.decision = decision if decision is not None else AIMessage(content="规划不展示")
+        self.decisions = list(decisions) if decisions is not None else None
+        self._decision_index = 0
         self.chunks = chunks if chunks is not None else ["已", "查到"]
         self.inputs = []
 
     async def decide(self, messages, tools):
         """记录决策调用。参数：上下文、工具；返回：AIMessage；异常：预设异常。"""
         self.inputs.append(("decide", messages))
-        if isinstance(self.decision, Exception):
-            raise self.decision
-        return self.decision
+        if self.decisions is not None:
+            decision = (self.decisions[self._decision_index]
+                        if self._decision_index < len(self.decisions) else AIMessage(content=""))
+            self._decision_index += 1
+        else:
+            # 旧用例每个用户轮只申请一次；已有当前轮结果时明确结束决策。
+            last_user = max(i for i, message in enumerate(messages) if isinstance(message, HumanMessage))
+            has_result = any(isinstance(message, ToolMessage) for message in messages[last_user + 1:])
+            decision = AIMessage(content="") if has_result else self.decision
+        if isinstance(decision, Exception):
+            raise decision
+        return decision
 
     async def stream_answer(self, messages):
         """逐块生成最终文本。参数：模型上下文；返回：异步文本流；异常：预设异常。"""
@@ -90,3 +103,21 @@ class FAQRepository:
         """模拟数据库查询边界。参数：关键词；返回：空列表；异常：无。"""
         self.keywords.append(keyword)
         return []
+
+
+def make_chat_service(decision=None, chunks=None, *, decisions=None):
+    """构造真实聊天服务并仅替换外部模型和数据库。
+
+    参数：decision为单决策；chunks为回答增量；decisions为可选多步决策序列。
+    返回：服务、会话仓库、客服仓库和模型替身。
+    异常：服务或工具注册构造错误。
+    """
+    from app.services.chat import ChatService
+    from app.tools.registry import build_registry
+
+    repository, support = MemoryRepository(), FAQRepository()
+    model = ScriptedModel(decision, chunks, decisions=decisions)
+    config = SimpleNamespace(token_budget=12000, request_token_budget=16000,
+                             tool_timeout_seconds=0.05, tool_max_retries=1,
+                             tool_retry_delay_seconds=0, tool_max_calls_per_turn=4)
+    return ChatService(repository, support, model, build_registry(), config), repository, support, model
