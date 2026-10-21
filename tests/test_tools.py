@@ -15,7 +15,7 @@ from app.tools.registry import build_registry
 
 
 # 独立解释器只导入业务工具，不初始化模型或数据库，完整结果用于重启稳定性比较。
-_MOCK_SUBPROCESS_SCRIPT = '''"""独立进程读取三个演示工具的完整结果，不连接模型或数据库。"""
+_MOCK_SUBPROCESS_SCRIPT = '''"""独立进程读取不同配送地区与三个演示工具的完整结果，不连接模型或数据库。"""
 import asyncio
 import json
 from app.tools.business import query_order, query_product, query_logistics
@@ -25,8 +25,10 @@ async def read_mock_results():
     """读取固定输入。参数：无；返回：list[dict]，完整工具结果；异常：工具调用错误。"""
     results = await asyncio.gather(
         query_order.ainvoke({"order_id": "1001", "user_id": "demo-user"}),
+        query_order.ainvoke({"order_id": "1002", "user_id": "demo-user"}),
+        query_order.ainvoke({"order_id": "1005", "user_id": "demo-user"}),
         query_product.ainvoke({"keyword": "猫粮"}),
-        query_logistics.ainvoke({"tracking_no": "MOCK213502378238", "user_id": "demo-user"}),
+        query_logistics.ainvoke({"tracking_no": "SF213502378238", "user_id": "demo-user"}),
     )
     return [result if isinstance(result, dict) else result.model_dump(mode="json") for result in results]
 
@@ -79,7 +81,7 @@ async def test_validate_args_before_execution(name, args):
 
 @pytest.mark.parametrize("name,args", [
     ("query_order", {"order_id": " 1001 ", "user_id": "demo-user"}),
-    ("query_logistics", {"tracking_no": " MOCK213502378238 ", "user_id": "demo-user"}),
+    ("query_logistics", {"tracking_no": " SF213502378238 ", "user_id": "demo-user"}),
 ])
 async def test_mock_preserves_order_identifier(name, args):
     """归属校验前清理业务字段空白并保留订单号。参数：工具名及带空白业务参数；返回：None；异常：断言失败。"""
@@ -95,8 +97,8 @@ def _serialize_result(result: dict | ToolResult) -> dict:
 @pytest.mark.parametrize("name,args,padded_args", [
     ("query_order", {"order_id": "1001", "user_id": "demo-user"}, {"order_id": " 1001 ", "user_id": "demo-user"}),
     ("query_product", {"keyword": "猫粮"}, {"keyword": " 猫粮 "}),
-    ("query_logistics", {"tracking_no": "MOCK213502378238", "user_id": "demo-user"},
-     {"tracking_no": " MOCK213502378238 ", "user_id": "demo-user"}),
+    ("query_logistics", {"tracking_no": "SF213502378238", "user_id": "demo-user"},
+     {"tracking_no": " SF213502378238 ", "user_id": "demo-user"}),
 ])
 async def test_mock_result_stable_after_interleaved_and_concurrent_calls(name, args, padded_args):
     """交错及并发查询不改变同一输入。参数：工具名、标准及带空白参数；返回：None；异常：断言失败。"""
@@ -104,7 +106,7 @@ async def test_mock_result_stable_after_interleaved_and_concurrent_calls(name, a
     tool = registry.get(name)
     expected = _serialize_result(await tool.ainvoke(args))
     if name == "query_product":
-        assert expected["name"] == "演示商品：猫粮" and expected["keyword"] == "猫粮"
+        assert expected["name"] == "猫粮" and expected["keyword"] == "猫粮"
     else:
         assert expected["order_id"] == "1001"
 
@@ -114,7 +116,7 @@ async def test_mock_result_stable_after_interleaved_and_concurrent_calls(name, a
             registry.get("query_order").ainvoke({"order_id": str(1002 + index), "user_id": "demo-user"}),
             registry.get("query_product").ainvoke({"keyword": f"猫砂-{index}"}),
             registry.get("query_logistics").ainvoke({
-                "tracking_no": ["MOCK487816333527", "MOCK973791694360", "MOCK587093061117"][index],
+                "tracking_no": ["SF487816333527", "SF973791694360", "SF587093061117"][index],
                 "user_id": "demo-user",
             }),
         )
@@ -125,7 +127,7 @@ async def test_mock_result_stable_after_interleaved_and_concurrent_calls(name, a
 @pytest.mark.parametrize("name,args", [
     ("query_order", {"order_id": "1001", "user_id": "demo-user"}),
     ("query_product", {"keyword": "猫粮"}),
-    ("query_logistics", {"tracking_no": "MOCK213502378238", "user_id": "demo-user"}),
+    ("query_logistics", {"tracking_no": "SF213502378238", "user_id": "demo-user"}),
 ])
 async def test_mock_queries_preserve_global_random_state(name, args):
     """工具不扰动其他业务的随机序列。参数：工具名及合法输入；返回：None；异常：断言失败。"""
@@ -155,6 +157,8 @@ async def test_order_and_logistics_share_shipment_facts(order_id):
     assert order["total_amount"] == round(order["quantity"] * order["unit_price"], 2)
     assert order["tracking_no"] == logistics["tracking_no"]
     assert datetime.fromisoformat(order["created_at"]) == datetime.fromisoformat(logistics["updated_at"]) - timedelta(days=2)
+    assert order["shipping_origin"] == "浙江省杭州市"
+    assert isinstance(order["shipping_destination"], str) and order["shipping_destination"]
 
     # 订单只呈现发货阶段，物流的运输中和派送中都属于已发货。
     order_status_by_logistics = {
@@ -167,25 +171,57 @@ async def test_order_and_logistics_share_shipment_facts(order_id):
         assert logistics["carrier"] is None
         assert "未发货" in logistics["latest_node"]
     else:
-        assert isinstance(logistics["tracking_no"], str) and logistics["tracking_no"]
-        assert logistics["carrier"]
+        assert logistics["tracking_no"].startswith("SF")
+        assert logistics["carrier"] == "顺丰速运"
 
 
 async def test_documented_order_1001_snapshot():
     """锁定文档中可复现的订单与物流样例。参数：无；返回：None；异常：断言失败。"""
     registry = build_registry()
     order = await registry.get("query_order").ainvoke({"order_id": "1001", "user_id": "demo-user"})
-    logistics = await registry.get("query_logistics").ainvoke({"tracking_no": "MOCK213502378238", "user_id": "demo-user"})
+    logistics = await registry.get("query_logistics").ainvoke({"tracking_no": "SF213502378238", "user_id": "demo-user"})
     assert order == {
-        "order_id": "1001", "product": "演示猫粮", "quantity": 1, "unit_price": 39.9,
-        "total_amount": 39.9, "currency": "CNY", "status": "已发货", "tracking_no": "MOCK213502378238",
+        "order_id": "1001", "product": "猫粮", "quantity": 1, "unit_price": 39.9,
+        "total_amount": 39.9, "currency": "CNY", "status": "已发货", "tracking_no": "SF213502378238",
+        "shipping_origin": "浙江省杭州市", "shipping_destination": "浙江省宁波市",
         "created_at": "2026-02-03T16:45:00+00:00",
     }
     assert logistics == {
-        "order_id": "1001", "carrier": "演示速递", "tracking_no": "MOCK213502378238",
+        "order_id": "1001", "carrier": "顺丰速运", "tracking_no": "SF213502378238",
         "status": "运输中", "latest_node": "包裹已到达杭州转运中心",
         "updated_at": "2026-02-05T16:45:00+00:00",
     }
+
+
+@pytest.mark.parametrize("order_id,destination,status,tracking_no", [
+    ("1002", "新疆维吾尔自治区乌鲁木齐市", "已发货", "SF487816333527"),
+    ("1005", "四川省成都市", "待发货", None),
+])
+async def test_order_has_destination_before_and_after_shipping(order_id, destination, status, tracking_no):
+    """偏远地区和待发货订单也有固定省市，计划地址不表示已发货。参数：订单与预期配送事实；返回：None；异常：断言失败。"""
+    order = await build_registry().get("query_order").ainvoke({"order_id": order_id, "user_id": "demo-user"})
+    assert order["shipping_origin"] == "浙江省杭州市"
+    assert order["shipping_destination"] == destination
+    assert order["status"] == status
+    assert order["tracking_no"] == tracking_no
+
+
+@pytest.mark.parametrize("tracking_digits,user_id,order_id", [
+    ("213502378238", "demo-user", "1001"),
+    ("213502378238", "demo-other-user", None),
+    ("500290570519", "demo-user", None),
+])
+async def test_legacy_tracking_number_preserves_order_ownership(tracking_digits, user_id, order_id):
+    """旧单号仍返回同一业务结果且不能绕过归属校验。参数：单号数字、用户及可访问订单；返回：None；异常：断言失败。"""
+    tool = build_registry().get("query_logistics")
+    current = await tool.ainvoke({"tracking_no": f"SF{tracking_digits}", "user_id": user_id})
+    legacy = await tool.ainvoke({"tracking_no": f"MOCK{tracking_digits}", "user_id": user_id})
+    assert legacy == current
+    if order_id is None:
+        assert legacy == {"error": "没有找到您的这笔订单", "code": "order_not_owned"}
+    else:
+        assert legacy["order_id"] == order_id
+        assert legacy["tracking_no"] == f"SF{tracking_digits}"
 
 
 def test_mock_results_stable_across_process_restarts_and_hash_seeds():

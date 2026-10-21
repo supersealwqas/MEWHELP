@@ -44,14 +44,14 @@ async def test_order_logistics_chain_uses_current_turn_result():
     """下一次决策必须收到本轮真实订单结果。参数：无；返回：None；异常：断言失败。"""
     service, repository, _, model = make_chat_service(decisions=[
         decision(call("query_order", "order", order_id="1001")),
-        decision(call("query_logistics", "shipping", tracking_no="MOCK213502378238")),
+        decision(call("query_logistics", "shipping", tracking_no="SF213502378238")),
     ])
     events = await run(service)
     assert [event.data["name"] for event in events if event.event == "tool_status"] == [
         "query_order", "query_order", "query_logistics", "query_logistics"]
     assert [phase for phase, _ in model.inputs] == ["decide", "decide", "decide", "answer"]
     previous_result = next(message for message in model.inputs[1][1] if isinstance(message, ToolMessage))
-    assert json.loads(previous_result.content)["data"]["tracking_no"] == "MOCK213502378238"
+    assert json.loads(previous_result.content)["data"]["tracking_no"] == "SF213502378238"
     results = list(repository.results.values())
     assert len(results) == 2 and results[1].data["latest_node"] == "包裹已到达杭州转运中心"
     assert events[-1].event == "done" and sum(event.event == "done" for event in events) == 1
@@ -94,7 +94,7 @@ async def test_reused_call_id_across_decisions_is_audited_without_execution():
     """后续同ID不能复用另一工具的旧结果。参数：无；返回：None；异常：断言失败。"""
     service, repository, _, _ = make_chat_service(decisions=[
         decision(call("query_order", "same", order_id="1001")),
-        decision(call("query_logistics", "same", tracking_no="MOCK213502378238")),
+        decision(call("query_logistics", "same", tracking_no="SF213502378238")),
     ])
     await run(service)
     turn = next(iter(repository.turns.values()))

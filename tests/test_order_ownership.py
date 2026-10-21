@@ -82,7 +82,7 @@ async def test_other_demo_user_can_read_own_order_and_logistics():
     registry = build_registry()
     order = await registry.get("query_order").ainvoke({"order_id": "2003", "user_id": "demo-other-user"})
     assert order["order_id"] == "2003"
-    assert order["tracking_no"] == "MOCK500290570519"
+    assert order["tracking_no"] == "SF500290570519"
     logistics = await registry.get("query_logistics").ainvoke({
         "tracking_no": order["tracking_no"], "user_id": "demo-other-user",
     })

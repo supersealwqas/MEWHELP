@@ -11,6 +11,13 @@ _ORDER_OWNERS = {
     "1004": "demo-user", "1005": "demo-user", "1006": "demo-user",
     "1007": "demo-user", "A-1001": "demo-user", "2003": "demo-other-user",
 }
+# 固定省市不消耗随机数，避免新增配送信息改变既有金额、状态或时间。
+_ORDER_DESTINATIONS = {
+    "1001": "浙江省宁波市", "1002": "新疆维吾尔自治区乌鲁木齐市",
+    "1003": "江苏省南京市", "1004": "广东省广州市", "1005": "四川省成都市",
+    "1006": "湖北省武汉市", "1007": "福建省厦门市", "A-1001": "安徽省合肥市",
+    "2003": "山东省青岛市",
+}
 
 
 def owns_order(user_id: str, order_id: str | None) -> bool:
@@ -47,15 +54,17 @@ def _mock_order_snapshot(order_id: str) -> tuple[dict, dict]:
         ("已签收", "已签收", "包裹已在收货地址签收"),
         ("待发货", "待发货", "订单尚未发货，暂无物流轨迹"),
     ])
-    # 未发货时不虚构承运方或物流单号；MOCK 前缀明确标识演示单号。
-    tracking_no = f"MOCK{rng.randint(100000000000, 999999999999)}" if order_status != "待发货" else None
+    # 未发货时不虚构承运方或物流单号；新单号使用业务格式，数据来源由工具 tags 留痕。
+    tracking_no = f"SF{rng.randint(100000000000, 999999999999)}" if order_status != "待发货" else None
     # 固定演示时间基准；保留原抽样顺序，再由节点时间推导创建时间。
     updated_at = datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(minutes=rng.randrange(90 * 24 * 60))
-    order = {"order_id": order_id, "product": "演示猫粮", "quantity": quantity,
+    order = {"order_id": order_id, "product": "猫粮", "quantity": quantity,
              "unit_price": price, "total_amount": round(quantity * price, 2),
              "currency": "CNY", "status": order_status, "tracking_no": tracking_no,
+             # 待发货时省市表示计划配送起终点，不代表已发生发货。
+             "shipping_origin": "浙江省杭州市", "shipping_destination": _ORDER_DESTINATIONS[order_id],
              "created_at": (updated_at - timedelta(days=2)).isoformat()}
-    logistics = {"order_id": order_id, "carrier": "演示速递" if tracking_no else None,
+    logistics = {"order_id": order_id, "carrier": "顺丰速运" if tracking_no else None,
                  "tracking_no": tracking_no, "status": logistics_status, "latest_node": node,
                  "updated_at": updated_at.isoformat()}
     return order, logistics
@@ -67,7 +76,8 @@ def order_snapshot(order_id: str) -> dict:
     参数:
         order_id: 有限演示数据中的订单号；调用方须先通过 owns_order 校验。
     返回值:
-        dict: 独立的订单摘要，包含商品、金额、状态、创建时间及物流单号。
+        dict: 独立的订单摘要，包含商品、金额、状态、创建时间、物流单号及配送起终点省市；
+            待发货订单的配送省市表示计划发出地与目的地。
     异常:
         KeyError: 订单号不在演示数据中；不访问网络或数据库。
     """
@@ -80,12 +90,15 @@ def order_id_for_tracking_no(tracking_no: str) -> str | None:
     """将已发货订单的物流单号映射到演示订单号。
 
     参数:
-        tracking_no: 已去除首尾空白的非空物流单号，最多 64 字符。
+        tracking_no: 已去除首尾空白的非空物流单号，最多 64 字符；兼容历史 MOCK 前缀。
     返回值:
         str | None: 匹配的演示订单号；未知单号或未发货订单没有映射。
     异常:
         无主动抛出的业务异常；不访问网络或数据库。
     """
+    # 历史会话保留的旧单号仅转换前缀，随后仍查有限订单映射并由调用方校验归属。
+    if tracking_no.startswith("MOCK"):
+        tracking_no = f"SF{tracking_no[4:]}"
     for order_id in _ORDER_OWNERS:
         order, _ = _mock_order_snapshot(order_id)
         # None 仅表示未发货，不是可以访问物流的单号。

@@ -1,6 +1,7 @@
 """聊天编排的通用行为测试：协议、增量、故障、并发与取消。"""
 
 import asyncio
+import json
 import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 from app.schemas.chat import ChatRequest
@@ -46,6 +47,51 @@ async def test_no_tool_still_streams_and_does_not_save_planning_text():
     await iterator.aclose()
     assert len(model.inputs) == 2
     assert all("规划" not in m.content for m in next(iter(repo.turns.values())).messages)
+
+
+async def test_model_inputs_hide_source_marker_for_current_and_historical_facts():
+    """当前及历史工具事实不向模型暴露来源标记，后台审计仍保留。
+
+    参数：无，运行真实聊天服务、订单工具与历史组装，仅替换模型网络和存储。
+    返回：None，断言两轮模型输入只含业务事实，原始结果未被修改。
+    异常：AssertionError 表示标记泄露、业务事实丢失或审计被改写。
+    """
+    service, repo, _, model = make_service(decisions=[
+        AIMessage(content="", tool_calls=[faq_call(name="query_order", args={"order_id": "1001"})]),
+        AIMessage(content=""), AIMessage(content=""),
+    ], chunks=["订单信息已查询。"])
+    first = [event async for event in service.stream_turn(ChatRequest(session_id="source", message="查订单1001"))]
+    original = next(iter(repo.results.values())).model_dump()
+    second_start = len(model.inputs)
+    second = [event async for event in service.stream_turn(ChatRequest(session_id="source", message="订单金额是多少"))]
+    assert first[-1].event == second[-1].event == "done"
+    assert original["is_mock"] is True
+    assert next(iter(repo.results.values())).model_dump() == original
+    assert json.loads(next(row.content for row in next(iter(repo.turns.values())).messages
+                           if row.role == "tool"))["is_mock"] is True
+    for inputs in (model.inputs[:second_start], model.inputs[second_start:]):
+        facts = [json.loads(message.content) for _, messages in inputs
+                 for message in messages if isinstance(message, ToolMessage)]
+        assert facts and all("is_mock" not in fact for fact in facts)
+        assert all(fact["ok"] and fact["data"]["order_id"] == "1001"
+                   and fact["data"]["total_amount"] == 39.9 for fact in facts)
+
+
+async def test_failed_tool_fact_keeps_error_without_source_marker():
+    """来源标记过滤不能隐藏工具失败的错误事实。
+
+    参数：无，使用真实订单参数校验触发失败。
+    返回：None，断言模型得到失败状态与错误，后台保留来源。
+    异常：AssertionError 表示错误被吞掉或来源标记泄露。
+    """
+    service, repo, _, model = make_service(AIMessage(content="", tool_calls=[
+        faq_call(name="query_order", args={"order_id": " "})]))
+    events = [event async for event in service.stream_turn(request())]
+    assert events[-1].event == "done"
+    fact = json.loads(next(message.content for message in model.inputs[-1][1] if isinstance(message, ToolMessage)))
+    assert fact == {"ok": False, "data": None,
+                    "error": next(iter(repo.results.values())).error.model_dump()}
+    assert fact["error"]["code"] == "INVALID_ARGUMENTS"
 
 
 async def test_multiple_calls_execute_in_order_and_pair_all_results():

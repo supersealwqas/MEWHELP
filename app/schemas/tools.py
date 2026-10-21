@@ -62,8 +62,8 @@ class ToolError(BaseModel):
 class ToolResult(BaseModel):
     """统一工具结果；未命中仍属于成功查询。
 
-    这是执行器与仓储层之间的事实载体；服务将完整的安全结果作为 ToolMessage 发给模型。
-    模型同时看到 ok、data、error 与 is_mock，用于区分成功、失败和演示来源。
+    这是执行器与仓储层之间的事实载体；is_mock 仅供后台审计及状态协议使用。
+    模型消息组装时移除来源标记，仅把 ok、data、error 作为业务结果交给模型。
     """
 
     ok: bool = Field(description="工具执行是否成功")

@@ -260,7 +260,7 @@ async function sendMessage(event) {
     }
     reply.tools.hidden = false;
     badge.dataset.status = status.status;
-    badge.textContent = `${toolNames[status.name] || status.name} · ${status.label}${status.is_mock ? " · 演示" : ""}`;
+    badge.textContent = `${toolNames[status.name] || status.name} · ${status.label}`;
     badge.title = `${status.name} · ${status.tool_call_id}`;
     badge.setAttribute("aria-label", `${status.name}：${badge.textContent}`);
     if (!renderer.hasText()) {

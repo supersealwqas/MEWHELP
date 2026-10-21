@@ -242,6 +242,26 @@ def _estimate_message_tokens(messages: list[BaseMessage]) -> int:
     return total
 
 
+def _model_message(message: BaseMessage) -> BaseMessage:
+    """为模型生成工具事实视图，隔离后台来源标记，不改写原消息。
+
+    参数：message 为当前或历史消息；仅处理字符串形式的工具结果。
+    返回：BaseMessage，移除结果外层 is_mock 的副本；其他消息原样返回。
+    异常：无主动抛出的业务异常；兼容历史中的非 JSON 工具正文。
+    """
+    if not isinstance(message, ToolMessage) or not isinstance(message.content, str):
+        return message
+    try:
+        payload = json.loads(message.content)
+    except (ValueError, TypeError):
+        return message
+    if not isinstance(payload, dict) or "is_mock" not in payload:
+        return message
+    # 只移除协议外层的运行元数据，业务字段、错误事实和数据库审计均保持原样。
+    payload.pop("is_mock")
+    return message.model_copy(update={"content": json.dumps(payload, ensure_ascii=False, separators=(",", ":"))})
+
+
 def prepare_messages(
     history: list[list[BaseMessage]],
     current: list[BaseMessage],
@@ -256,7 +276,7 @@ def prepare_messages(
     参数：history 按时间排列的完整旧轮；current 不可裁剪当前轮；max_tokens 对话估算预算；
         system_text 本阶段系统提示；tools 仅决策阶段传入的工具或 OpenAI 工具定义；
         request_max_tokens 包含系统、对话和工具定义的完整输入估算预算，默认 16000，不含输出。
-    返回：list[BaseMessage]，系统消息在首位，其后为裁剪后的完整对话。
+    返回：list[BaseMessage]，系统消息在首位，其后为不含后台来源标记的完整对话。
     异常：ContextBudgetExceeded 表示固定提示、工具定义与当前消息无法共同放入预算；
         TypeError、ValueError 表示工具定义或消息内容无法转换为合法 JSON 数据。
     """
@@ -266,5 +286,8 @@ def prepare_messages(
         fixed_tokens += _estimate_token_units([convert_to_openai_tool(tool) for tool in tools])
     # 固定说明只扣完整输入预算，不能挤占独立的 12000 单位对话预算。
     available = min(max_tokens, request_max_tokens - fixed_tokens)
-    messages = trim_turns(history, current, available)
+    # 两个阶段共用此出口；先投影当前及历史事实，再按模型实际可见内容核算预算。
+    model_history = [[_model_message(message) for message in turn] for turn in history]
+    model_current = [_model_message(message) for message in current]
+    messages = trim_turns(model_history, model_current, available)
     return [system, *messages]
