@@ -63,6 +63,7 @@ class VectorRecord(BaseModel):
 
     id: int = Field(gt=0, description="与 MySQL 原文一致的正整数主键")
     vector: list[float] = Field(description="1024 维 Dense 向量")
+    text: str | None = Field(default=None, min_length=1, description="与 Dense 编码输入一致的三格原文；CH04 原生 BM25 必填，旧 Dense adapter 忽略")
     content_hash: str = Field(min_length=64, max_length=64, description="用于条件回填的内容指纹")
     embedding_revision: str = Field(min_length=1, description="编码模型与推理配置标识")
 

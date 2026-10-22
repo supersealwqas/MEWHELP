@@ -9,7 +9,7 @@ from app.knowledge.errors import LeaseLost
 from app.knowledge.schemas import ChunkSnapshot, KnowledgeText, VectorRecord
 from app.knowledge.store import KnowledgeWriter
 from app.knowledge.sync import VectorSynchronizer
-from app.knowledge.text import content_fingerprint
+from app.knowledge.text import content_fingerprint, format_knowledge
 from app.knowledge.vector import VectorIndexUnavailable
 from tests.knowledge.fakes import (
     FakeEncoder,
@@ -111,6 +111,7 @@ class _Writer(MemoryKnowledgeWriter):
 def _record(snapshot: ChunkSnapshot) -> VectorRecord:
     """构造完整索引记录。参数：快照；返回：向量记录；异常：校验失败。"""
     return VectorRecord(id=snapshot.id, vector=[1.0] + [0.0] * 1023,
+                        text=format_knowledge(snapshot.text),
                         content_hash=snapshot.content_hash,
                         embedding_revision=snapshot.embedding_revision)
 

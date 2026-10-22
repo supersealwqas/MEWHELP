@@ -90,6 +90,7 @@ class VectorSynchronizer:
                 VectorRecord(
                     id=snapshot.id,
                     vector=vector,
+                    text=format_knowledge(snapshot.text),
                     content_hash=snapshot.content_hash,
                     embedding_revision=snapshot.embedding_revision,
                 )

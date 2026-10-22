@@ -82,6 +82,10 @@ class Settings(BaseSettings):
         min_length=1,
         description="本章 Milvus 集合名，初始化前必须校验所有权与 schema",
     )
+    milvus_hybrid_collection: str = Field(
+        default="knowledge_ch04", min_length=1,
+        description="CH04 原生 BM25/Dense 混合索引集合，独立于原 CH03 knowledge 集合",
+    )
     milvus_token: SecretStr = Field(
         default=SecretStr(""),
         description="Milvus 鉴权令牌；本地无鉴权时为空，日志与报告中隐藏",
