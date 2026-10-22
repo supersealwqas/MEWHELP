@@ -4,7 +4,9 @@
 集中管理上游大模型连接凭证、Token 裁剪预算以及预留的向量与重排配置。
 """
 
-from pydantic import AliasChoices, Field, SecretStr
+from typing import Literal
+
+from pydantic import AliasChoices, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -111,6 +113,18 @@ class Settings(BaseSettings):
         description="离线知识关系判定的校准策略文件路径",
     )
 
+    knowledge_retrieval_mode: Literal["hybrid", "dense"] = Field(
+        default="hybrid", description="在线检索默认原生 BM25+Dense+重排；dense 为明确 CH03 回退，不因故障自动切换",
+    )
+    knowledge_timeout_seconds: float = Field(
+        default=60, gt=0, le=300, description="FAQ/退款检索独立超时秒数，含逐子句本地推理；其他工具仍用原期限",
+    )
+    knowledge_rag_test_database: str = Field(
+        default="mewhelp_ch04_test", min_length=1, description="新混合检索专用 MySQL 测试库，不能复用旧章测试库",
+    )
+    milvus_rag_test_database: str = Field(
+        default="mewhelp_ch04_test", min_length=1, description="新混合检索专用 Milvus 测试库，与 MySQL 同时切换",
+    )
     # CH04 检索参数：每路各 50，融合后 50，默认重排返回 10；不同于 CH03 Dense 的校准分数。
     recall_top_k: int = Field(default=50, ge=1, le=50, strict=True,
                              description="Dense 与 BM25 每路初步召回数量，同时作为 RRF 融合候选上限，默认各 50")
@@ -125,6 +139,19 @@ class Settings(BaseSettings):
                                   description="本地 BAAI/bge-reranker-large 目录，请求中不下载")
     rerank_device: str = Field(default="cuda:0", min_length=1, description="显式重排设备，默认 cuda:0，不在异常时切换模型或设备")
     rerank_batch_size: int = Field(default=4, ge=1, le=32, strict=True, description="本地重排推理批次，默认 4，GPU 并发由锁串行")
+
+    @field_validator("recall_top_k", "rerank_top_k", "rerank_batch_size", mode="before")
+    @classmethod
+    def parse_retrieval_integer(cls, value: object) -> object:
+        """只将环境中的十进制整数字符串转换为严格限额。
+
+        参数：value 为环境字符串或代码显式值；bool/浮点保持原值交给严格字段拒绝。
+        返回：object，纯十进制字符串转 int，其余保持原值。
+        异常：无主动业务错误；不合法值由字段校验抛 ValidationError。
+        """
+        if isinstance(value, str) and value.strip().lstrip("+-").isascii() and value.strip().lstrip("+-").isdigit():
+            return int(value)
+        return value
 
     # 预留向量嵌入模型配置
     embed_base_url: str | None = Field(

@@ -222,7 +222,7 @@ def test_registry_mock_flags_match_tool_tags():
     """注册表内每个工具的演示语义必须与其 tags 一致。参数：无；返回：None；异常：断言失败。"""
     from app.tools.executor import is_mock_tool
     expected = {"query_order": True, "query_product": True, "query_logistics": True,
-                "query_faq": False, "create_ticket": False}
+                "query_faq": False, "create_ticket": False, "query_refund_policy": False}
     actual = {tool.name: is_mock_tool(tool) for tool in build_registry().all()}
     assert actual == expected
 

@@ -37,10 +37,10 @@ print(json.dumps(asyncio.run(read_mock_results()), ensure_ascii=False, sort_keys
 '''
 
 
-def test_five_registered_tools():
-    """仅暴露五个业务工具。参数：无；返回：None；异常：断言失败。"""
+def test_six_registered_tools():
+    """注册六个业务工具，综合退款使用独立检索入口。参数：无；返回：None；异常：断言失败。"""
     assert {tool.name for tool in build_registry().all()} == {
-        "query_order", "query_product", "query_logistics", "query_faq", "create_ticket"}
+        "query_order", "query_product", "query_logistics", "query_faq", "create_ticket", "query_refund_policy"}
 
 
 def test_runtime_context_hidden():

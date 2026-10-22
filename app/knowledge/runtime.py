@@ -9,6 +9,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import anyio
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
@@ -17,12 +18,20 @@ from app.config import Settings
 from app.core.llm import get_chat_model
 from app.db.session import create_database
 from app.knowledge.embedding import BgeM3Encoder
+from app.knowledge.hybrid_index import MilvusHybridIndex
 from app.knowledge.jobs import KnowledgeJobs
 from app.knowledge.lifecycle import KnowledgeLifecycle
 from app.knowledge.llm import KnowledgeModel, load_relation_policy
 from app.knowledge.prompts import RELATION_PROMPT_VERSION
+from app.knowledge.rerank import BgeReranker
+from app.knowledge.retrieval import HybridKnowledgeSearch
+from app.knowledge.search import KnowledgeSearch, load_retrieval_policy
+from app.knowledge.chunking import CHUNKING_VERSION as LEGACY_CHUNKING_VERSION, chunk_markdown
+from app.knowledge.documents import build_document_chunks
+from app.knowledge.schemas import ChunkSnapshot, KnowledgeText, SyncReport
 from app.knowledge.store import KnowledgeStore
 from app.knowledge.sync import VectorSynchronizer
+from app.knowledge.text import content_fingerprint
 from app.knowledge.vector import MilvusVectorIndex, VectorIndexUnavailable
 from app.models.knowledge import (
     KnowledgeBase,
@@ -43,36 +52,128 @@ async def knowledge_runtime(config: Settings):
     异常:
         VectorIndexUnavailable、KnowledgeModelError、数据库/模型错误。
     """
-    engine = lease_engine = encoder = index = None
+    encoder = index = None
     try:
-        engine, factory = create_database(config)
-        lease_engine = create_async_engine(
-            engine.url,
-            poolclass=NullPool,
-            connect_args={"connect_timeout": 5},
-        )
-        store = KnowledgeStore(factory, lease_engine)
-        encoder = BgeM3Encoder(config)
-        index = MilvusVectorIndex(config)
-        await index.ensure_ready(create=False)
-        model = KnowledgeModel(get_chat_model)
-        policy = load_relation_policy(
-            Path(config.knowledge_relation_policy_path),
-            embedding_revision=encoder.revision,
-            prompt_version=RELATION_PROMPT_VERSION,
-        )
-        lifecycle = KnowledgeLifecycle(encoder, model, policy)
-        synchronizer = VectorSynchronizer(store, encoder, index)
-        yield KnowledgeJobs(store, encoder, index, model, lifecycle, synchronizer)
+        async with knowledge_storage(config) as store:
+            encoder = BgeM3Encoder(config)
+            index = (MilvusHybridIndex(config) if config.knowledge_retrieval_mode == "hybrid"
+                     else MilvusVectorIndex(config))
+            await index.ensure_ready(create=False)
+            model = KnowledgeModel(get_chat_model)
+            policy = load_relation_policy(
+                Path(config.knowledge_relation_policy_path),
+                embedding_revision=encoder.revision,
+                prompt_version=RELATION_PROMPT_VERSION,
+            )
+            lifecycle = KnowledgeLifecycle(encoder, model, policy)
+            synchronizer = VectorSynchronizer(store, encoder, index)
+            chunker = build_document_chunks if config.knowledge_retrieval_mode == "hybrid" else chunk_markdown
+            yield KnowledgeJobs(store, encoder, index, model, lifecycle, synchronizer, document_chunker=chunker)
     finally:
-        if encoder is not None:
-            await encoder.aclose()
-        if index is not None:
-            await index.aclose()
-        if lease_engine is not None:
-            await lease_engine.dispose()
-        if engine is not None:
-            await engine.dispose()
+        with anyio.CancelScope(shield=True):
+            try:
+                if encoder is not None:
+                    await encoder.aclose()
+            finally:
+                if index is not None:
+                    await index.aclose()
+
+
+@asynccontextmanager
+async def knowledge_storage(config: Settings):
+    """建立独立权威原文与写锁连接，业务退出或取消时保证资源关闭。
+
+    参数：config 为已确定 MySQL 目标库的配置。
+    返回：AsyncContextManager[KnowledgeStore]，不启动模型或向量连接。
+    异常：数据库连接/关闭错误，取消在屏蔽清理完成后传播。
+    """
+    engine, factory = create_database(config)
+    lease_engine = None
+    try:
+        lease_engine = create_async_engine(engine.url, poolclass=NullPool, connect_args={"connect_timeout": 5})
+        yield KnowledgeStore(factory, lease_engine)
+    finally:
+        with anyio.CancelScope(shield=True):
+            try:
+                if lease_engine is not None:
+                    await lease_engine.dispose()
+            finally:
+                await engine.dispose()
+
+
+@asynccontextmanager
+async def online_search_runtime(config: Settings, store: KnowledgeStore):
+    """组装显式混合或旧 Dense 在线路径并预热，不在故障时改变模式。
+
+    参数：config 决定模式、模型和新旧集合；store 为当前 MySQL 权威读取器。
+    返回：AsyncContextManager[HybridKnowledgeSearch | KnowledgeSearch]。
+    异常：索引/模型/策略错误阻止启动；取消清理模型/客户端后传播。
+    """
+    encoder = index = reranker = None
+    try:
+        encoder = BgeM3Encoder(config)
+        if config.knowledge_retrieval_mode == "hybrid":
+            index = MilvusHybridIndex(config)
+            await index.ensure_ready(create=False)
+            reranker = BgeReranker(config)
+            await encoder.encode(["知识库启动预热"])
+            text = KnowledgeText(category="运行检查", questions="预热", answer="仅检查模型可用，不是知识库事实。")
+            warmup = ChunkSnapshot(id=1, source_key="runtime:warmup", ordinal=0, text=text,
+                                    content_type="runtime", content_hash=content_fingerprint(text),
+                                    embedding_revision=encoder.revision)
+            await reranker.rank("模型启动检查", [warmup])
+            yield HybridKnowledgeSearch(store, encoder, index, reranker, config)
+        else:
+            index = MilvusVectorIndex(config)
+            await index.ensure_ready(create=False)
+            policy = load_retrieval_policy(
+                Path(config.knowledge_policy_path), embedding_revision=encoder.revision,
+                chunking_version=LEGACY_CHUNKING_VERSION,
+            )
+            await encoder.encode(["知识库启动预热"])
+            yield KnowledgeSearch(store, encoder, index, policy)
+    finally:
+        # 清理三个独立资源，关闭某一个失败也必须继续释放其余资源。
+        with anyio.CancelScope(shield=True):
+            try:
+                if reranker is not None:
+                    await reranker.aclose()
+            finally:
+                try:
+                    if encoder is not None:
+                        await encoder.aclose()
+                finally:
+                    if index is not None:
+                        await index.aclose()
+
+
+async def prepare_hybrid_index(config: Settings, *, confirmed_database: str | None = None) -> SyncReport:
+    """在现有知识写锁内创建/补齐独立新混合集合，保留原 Dense 集合。
+
+    参数：config 为应用或显式 CH04 测试配置；confirmed_database 为操作人确认的空库名，不自动推断。
+    返回：SyncReport，现有 MySQL 权威记录同步到新集合的结果。
+    异常：ValueError/VectorIndexUnavailable，非法确认、缺权威库/模型、外来资源；存储/租约错误。
+    """
+    if confirmed_database is not None and confirmed_database != config.milvus_database:
+        raise VectorIndexUnavailable("Milvus 归属确认必须匹配目标数据库")
+    encoder = index = None
+    try:
+        async with knowledge_storage(config) as store:
+            async with store.writer() as writer:
+                await writer.assert_held()
+                encoder = BgeM3Encoder(config)
+                index = MilvusHybridIndex(config)
+                await index.ensure_ready(create=True, confirmed_database=confirmed_database)
+                await writer.assert_held()
+                return await VectorSynchronizer(store, encoder, index).run(writer)
+    finally:
+        with anyio.CancelScope(shield=True):
+            try:
+                if encoder is not None:
+                    await encoder.aclose()
+            finally:
+                if index is not None:
+                    await index.aclose()
 
 
 async def initialize_knowledge(

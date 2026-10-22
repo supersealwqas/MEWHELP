@@ -17,6 +17,7 @@ from app.config import Settings
 from app.knowledge.runtime import (
     initialize_knowledge,
     knowledge_runtime,
+    prepare_hybrid_index,
     read_knowledge_status,
 )
 from app.knowledge.scheduler import run_schedule
@@ -49,16 +50,45 @@ def _config(test: bool) -> Settings:
     return config
 
 
+def _hybrid_config(test: bool, *, config: Settings | None = None) -> Settings:
+    """同时选择 CH04 两类专用测试资源，不改旧 --test 的默认语义。
+
+    参数：test 是否测试模式；config 可选已加载配置，None 时从环境加载。
+    返回：Settings，显式 hybrid 模式，测试时 MySQL/Milvus 都为 mewhelp_ch04_test。
+    异常：SystemExit，任一测试库不匹配；配置校验错误。
+    """
+    config = config if config is not None else Settings()
+    updates = {"knowledge_retrieval_mode": "hybrid"}
+    if test:
+        if (config.knowledge_rag_test_database != "mewhelp_ch04_test"
+                or config.milvus_rag_test_database != "mewhelp_ch04_test"):
+            raise SystemExit("CH04 两类测试库必须同时为 mewhelp_ch04_test")
+        updates.update(mysql_database=config.knowledge_rag_test_database, milvus_database=config.milvus_rag_test_database)
+    return config.model_copy(update=updates)
+
+
 def _add_command(subparsers, name: str, help_text: str):
     """添加带 --test 的子命令。参数：解析器/名称/帮助；返回：子解析器；异常：无。"""
     parser = subparsers.add_parser(name, help=help_text)
-    parser.add_argument("--test", action="store_true", help="只使用 CH03 专用测试库")
+    parser.add_argument("--test", action="store_true", help="只使用 CH03 专用测试库；prepare-hybrid 使用 CH04 专用库")
+    parser.add_argument("--mode", choices=["dense", "hybrid"], help="显式选择任务索引模式，未指定时使用配置；init 仍只创建旧 CH03 集合")
     return parser
 
 
 async def _run(args: argparse.Namespace) -> None:
     """执行一次 CLI 命令。参数：解析结果；返回：None；异常：任务/配置错误。"""
-    config = _config(args.test)
+    if args.command == "prepare-hybrid":
+        config = _hybrid_config(args.test)
+        report = await prepare_hybrid_index(config, confirmed_database=args.confirm_milvus_database)
+        print(report.model_dump_json(indent=2))
+        return
+    if args.mode == "hybrid":
+        config = _hybrid_config(args.test)
+    else:
+        config = _config(args.test)
+        # 旧 --test 默认保持 CH03 路径；新测试需显式 --mode hybrid，避免误写旧测试库。
+        if args.test or args.mode == "dense":
+            config = config.model_copy(update={"knowledge_retrieval_mode": "dense"})
     if args.command == "init":
         await initialize_knowledge(config, confirmed_database=args.confirm_milvus_database)
         print("knowledge init completed")
@@ -101,6 +131,8 @@ def main() -> None:
         "--confirm-milvus-database", metavar="数据库名",
         help="明确确认该既存空 Milvus 库归本项目所有；必须与目标库名完全一致",
     )
+    prepare = _add_command(subparsers, "prepare-hybrid", "持写锁准备独立混合集合并同步现有权威原文，保留旧集合")
+    prepare.add_argument("--confirm-milvus-database", metavar="数据库名", help="仅对明确归本项目的既存空库具名确认")
     import_docs = _add_command(subparsers, "import-docs", "导入 data/kb 清单")
     import_docs.add_argument("--manifest", default="data/kb/manifest.json")
     _add_command(subparsers, "sync", "补齐 pending 向量并清理失效向量")

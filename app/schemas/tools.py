@@ -36,6 +36,11 @@ class KeywordArgs(BusinessArgs):
     keyword: str = Field(min_length=1, max_length=100, description="用户原话中用于检索的关键词")
 
 
+class RefundPolicyArgs(BusinessArgs):
+    """退款政策查询参数，原话身份仍由可信运行上下文提供。"""
+    query: str = Field(min_length=1, max_length=2000, description="当前用户完整退款问题，不得新增型号、否定条件或承诺")
+
+
 class TicketArgs(BusinessArgs):
     """人工工单业务参数，不包含会话身份。"""
     description: str = Field(min_length=1, max_length=2000, description="用户明确要求提交处理的问题描述")

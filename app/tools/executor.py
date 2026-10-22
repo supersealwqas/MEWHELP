@@ -88,7 +88,7 @@ class ToolExecutor:
     """执行一次决策选中的工具，并保证成功事实优先于异常表象。"""
 
     def __init__(self, registry, chat_repository, support_repository, timeout_seconds=5,
-                 max_retries=1, retry_delay_seconds=0.2):
+                 max_retries=1, retry_delay_seconds=0.2, *, knowledge_timeout_seconds=None):
         """注入依赖及执行限制。
 
         参数:
@@ -98,15 +98,18 @@ class ToolExecutor:
             timeout_seconds: 单次尝试超时秒数，必须为正。
             max_retries: 允许的重试次数，只支持 0 或 1。
             retry_delay_seconds: 重试前的退避秒数，不得为负。
+            knowledge_timeout_seconds: FAQ/退款独立期限；None 保持调用方原期限，生产配置默认 60 秒。
         返回值:
             None。
         异常:
             ValueError: 执行限制参数非法。
         """
-        if timeout_seconds <= 0 or max_retries not in {0, 1} or retry_delay_seconds < 0:
+        if (timeout_seconds <= 0 or max_retries not in {0, 1} or retry_delay_seconds < 0
+                or (knowledge_timeout_seconds is not None and knowledge_timeout_seconds <= 0)):
             raise ValueError("非法工具执行限制")
         self.registry, self.chat, self.support = registry, chat_repository, support_repository
         self.timeout, self.retries, self.delay = timeout_seconds, max_retries, retry_delay_seconds
+        self.knowledge_timeout = knowledge_timeout_seconds
 
     async def execute(self, call: dict, context: ToolContext,
                       on_status: Callable[[dict], Awaitable[None]]) -> ToolResult:
@@ -255,9 +258,11 @@ class ToolExecutor:
         """
         config = {"configurable": {"context": context, "support_repository": self.support}}
         is_write = _is_write_tool(tool)
+        timeout = (self.knowledge_timeout if tool.name in {"query_faq", "query_refund_policy"}
+                   and self.knowledge_timeout is not None else self.timeout)
         for attempt in range(self.retries + 1):
             try:
-                async with asyncio.timeout(self.timeout):
+                async with asyncio.timeout(timeout):
                     payload = await tool.ainvoke(arguments, config=config)
                 return self._normalize(payload, mock)
             except PersistenceUncertain:

@@ -7,6 +7,7 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import anyio
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -21,11 +22,9 @@ from app.core.logging import setup_logging
 from app.config import settings
 from app.core.llm import ChatModelAdapter
 from app.db.session import create_database
-from app.knowledge.chunking import CHUNKING_VERSION
-from app.knowledge.embedding import BgeM3Encoder
-from app.knowledge.search import KnowledgeSearch, load_retrieval_policy
+from app.knowledge.runtime import online_search_runtime
+from app.api.kb import router as kb_router
 from app.knowledge.store import KnowledgeStore
-from app.knowledge.vector import MilvusVectorIndex
 from app.repositories.chat import ChatRepository
 from app.repositories.support import SupportRepository
 from app.services.chat import ChatService
@@ -103,8 +102,6 @@ async def database_runtime():
     """
     engine, factory = create_database()
     lease_engine = None
-    encoder = None
-    index = None
     try:
         repository = ChatRepository(factory)
         await repository.recover_interrupted_turns()
@@ -114,32 +111,21 @@ async def database_runtime():
             connect_args={"connect_timeout": 5},
         )
         store = KnowledgeStore(factory, lease_engine)
-        encoder = BgeM3Encoder(settings)
-        index = MilvusVectorIndex(settings)
-        await index.ensure_ready(create=False)
-        policy = load_retrieval_policy(
-            Path(settings.knowledge_policy_path),
-            embedding_revision=encoder.revision,
-            chunking_version=CHUNKING_VERSION,
-        )
-        # 模型与客户端在 lifespan 内共享；启动即验证本地权重可用，避免首问才失败。
-        await encoder.encode(["知识库启动预热"])
-        search = KnowledgeSearch(store, encoder, index, policy)
-        yield ChatService(
-            repository,
-            SupportRepository(factory, search),
-            ChatModelAdapter(),
-            build_registry(),
-            settings,
-        )
+        async with online_search_runtime(settings, store) as search:
+            yield ChatService(
+                repository,
+                SupportRepository(factory, search),
+                ChatModelAdapter(),
+                build_registry(include_refund_policy=settings.knowledge_retrieval_mode == "hybrid"),
+                settings,
+            )
     finally:
-        if encoder is not None:
-            await encoder.aclose()
-        if index is not None:
-            await index.aclose()
-        if lease_engine is not None:
-            await lease_engine.dispose()
-        await engine.dispose()
+        with anyio.CancelScope(shield=True):
+            try:
+                if lease_engine is not None:
+                    await lease_engine.dispose()
+            finally:
+                await engine.dispose()
 
 
 # 运行时工厂可在测试边界替换，生产默认始终连接 MySQL，不提供内存后备。
@@ -163,6 +149,7 @@ def create_app(runtime_factory=None) -> FastAPI:
     application.add_middleware(SecurityHeadersMiddleware)
     application.include_router(extract_router)
     application.include_router(chat_router)
+    application.include_router(kb_router)
     application.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     application.add_api_route("/", chat_page, response_class=FileResponse, include_in_schema=False)
     return application

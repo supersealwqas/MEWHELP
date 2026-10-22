@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from typing import Callable
+
 from app.knowledge.documents import build_document_chunks
 from app.knowledge.contracts import KnowledgeModel
 from app.knowledge.grounding import turns_digest
@@ -107,6 +109,8 @@ class KnowledgeJobs:
         model: KnowledgeModel,
         lifecycle,
         synchronizer: VectorSynchronizer,
+        *,
+        document_chunker: Callable | None = None,
     ) -> None:
         """保存任务依赖。
 
@@ -117,6 +121,7 @@ class KnowledgeJobs:
             model: 抽取/关系模型。
             lifecycle: 文档权威与去重生命周期。
             synchronizer: 向量同步器。
+            document_chunker: 显式版本切分入口，None 使用 CH04 字符默认；旧 Dense 运行时注入 CH03 版本。
         返回值:
             None
         异常:
@@ -128,6 +133,7 @@ class KnowledgeJobs:
         self.model = model
         self.lifecycle = lifecycle
         self.synchronizer = synchronizer
+        self.document_chunker = document_chunker or build_document_chunks
 
     async def import_documents(self, manifest_path: Path) -> JobReport:
         """导入清单内全部文档并同步向量。参数：清单路径；返回：报告；异常：切分/模型/存储错误。"""
@@ -139,7 +145,7 @@ class KnowledgeJobs:
         for spec in specs:
             source = spec.path.read_text(encoding="utf-8")
             prepared_drafts.extend(
-                build_document_chunks(source, spec, self.encoder.count_tokens)
+                self.document_chunker(source, spec, self.encoder.count_tokens)
             )
             source_keys.append(spec.source_key)
         async with self.store.writer() as writer:

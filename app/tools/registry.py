@@ -1,7 +1,7 @@
 """集中注册可供模型选择的异步业务工具，拒绝重名和未知名称。"""
 
 from langchain_core.tools import BaseTool
-from app.tools.business import create_ticket, query_faq, query_logistics, query_order, query_product
+from app.tools.business import create_ticket, query_faq, query_logistics, query_order, query_product, query_refund_policy
 
 
 class ToolRegistry:
@@ -25,9 +25,12 @@ class ToolRegistry:
         return list(self._tools.values())
 
 
-def build_registry() -> ToolRegistry:
-    """注册本章五工具。参数：无；返回：注册表；异常：注册冲突。"""
+def build_registry(*, include_refund_policy: bool = True) -> ToolRegistry:
+    """注册业务工具。参数：include_refund_policy 是否提供混合退款入口；返回：注册表；异常：注册冲突。"""
     registry = ToolRegistry()
-    for business_tool in [query_order, query_product, query_logistics, query_faq, create_ticket]:
+    tools = [query_order, query_product, query_logistics, query_faq, create_ticket]
+    if include_refund_policy:
+        tools.append(query_refund_policy)
+    for business_tool in tools:
         registry.register(business_tool)
     return registry

@@ -65,7 +65,8 @@ class ChatService:
         """注入业务依赖。参数：存储、模型、注册表和配置；返回：None；异常：执行器配置错误。"""
         self.chat, self.model, self.registry, self.settings = chat_repository, model_adapter, registry, settings
         self.executor = ToolExecutor(registry, chat_repository, support_repository, settings.tool_timeout_seconds,
-                                     settings.tool_max_retries, settings.tool_retry_delay_seconds)
+                                     settings.tool_max_retries, settings.tool_retry_delay_seconds,
+                                     knowledge_timeout_seconds=getattr(settings, "knowledge_timeout_seconds", None))
         self._active: set[str] = set()
 
     async def _execute(self, call, context):
@@ -230,6 +231,9 @@ class ChatService:
                         else:
                             result = item
                             state.rejection = fixed_reply(item)
+                            if call["name"] == "query_refund_policy" and item.ok:
+                                # 一次三查询已覆盖完整退款问题，不让模型再申请同问题 FAQ 重复重排。
+                                current.append(SystemMessage(content="本轮已完成退款政策三查询并保留全部证据，同一退款问题不要再查询 FAQ。"))
                             if call["name"] == "create_ticket" and item.ok and item.data:
                                 number = item.data.get("ticket_no")
                                 if isinstance(number, str) and number:

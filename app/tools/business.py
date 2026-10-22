@@ -1,11 +1,11 @@
-"""五个异步业务工具：三项可复现演示查询、知识库检索与真实工单写入。"""
+"""异步业务工具：演示查询、普通/退款知识检索与真实工单写入。"""
 
 import random
 from typing import Annotated
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import InjectedToolArg, tool
 from pydantic import Field
-from app.schemas.tools import CODE_FIELD, ERROR_FIELD, KeywordArgs, LogisticsArgs, OwnedOrderArgs, TicketArgs
+from app.schemas.tools import CODE_FIELD, ERROR_FIELD, KeywordArgs, LogisticsArgs, OwnedOrderArgs, RefundPolicyArgs, TicketArgs
 from app.tools.mock_data import NOT_OWNED, logistics_snapshot, order_id_for_tracking_no, order_snapshot, owns_order
 
 # 写操作标记。写操作会改变外部状态，不能像只读查询那样重试；
@@ -90,7 +90,7 @@ query_logistics.tags = ["mock"]
 # 同上：tags 事后赋值，保留演示数据的内部来源标记供后台审计。
 
 
-@tool(args_schema=KeywordArgs, description="按当前用户原话中的关键词查询知识库，覆盖退换货、配送、发票、商品规格/使用、会员权益和售后流程，返回最多三条相关问答。关键词必须取自当前用户原话的连续片段，不能改成同义词；例如邮费不能改成运费。无匹配时 hits 为空列表。")
+@tool(args_schema=KeywordArgs, description="查询商城政策、商品规格/使用、配送与会员知识。keyword 提交当前原话中的核心片段并保留时限/型号/否定；混合检索使用服务端本轮完整原话按子句独立召回重排，默认最多10条。无匹配时 hits 为空。综合退款申请优先 query_refund_policy，该工具不办理退款。")
 async def query_faq(keyword: str, config: RunnableConfig) -> dict:
     """查询商城政策和常见问答。
 
@@ -105,10 +105,28 @@ async def query_faq(keyword: str, config: RunnableConfig) -> dict:
         KnowledgeUnavailable: 知识检索依赖不可用。
     """
     resources = config["configurable"]
-    # 原话取词由提示词约束，查询词原样进入检索，避免正常追问被字面校验拦截。
-    rows = await resources["support_repository"].query_faq(keyword)
+    support = resources["support_repository"]
+    # 新混合路径必须保留当前全部子句；旧显式 Dense 路径继续使用原关键词。
+    query = resources["context"].user_message if getattr(support, "uses_full_knowledge_query", False) else keyword
+    rows = await support.query_faq(query)
     if not rows:
-        return {"hits": [], "message": f"未找到与「{keyword}」相关的常见问题"}
+        return {"hits": [], "message": f"未找到与「{query}」相关的常见问题"}
+    return {"hits": rows}
+
+
+@tool(args_schema=RefundPolicyArgs, description="检索当前用户的综合退款/退货申请政策，扩展3个检索角度，每条最多10个块，按chunk id去重后全部返回，默认最多30条，不再截为10。仅查询申请条件、流程、处理时限和运费规则，不执行退款、不承诺到账或人工已经接入。")
+async def query_refund_policy(query: str, config: RunnableConfig) -> dict:
+    """通过可信本轮原话检索三组退款政策证据。
+
+    参数：query 模型提交的当前诉求说明，只作工具参数校验；config 注入本轮原话与仓储身份。
+    返回：dict，hits 为去重后的全部权威证据，默认最多 30；空时附安全未命中说明。
+    异常：ValueError，输入非法；KnowledgeUnavailable，混合检索未配置或依赖错误。
+    """
+    resources = config["configurable"]
+    raw = resources["context"].user_message
+    rows = await resources["support_repository"].query_refund_policy(raw)
+    if not rows:
+        return {"hits": [], "message": "未找到与当前退款问题相关的政策证据"}
     return {"hits": rows}
 
 
