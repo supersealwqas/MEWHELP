@@ -230,7 +230,10 @@ async def test_import_documents_is_atomic_on_chunk_failure() -> None:
     with tempfile.TemporaryDirectory(prefix="ch03-atomic-", dir=_TEMP_BASE) as temp:
         root = Path(temp)
         (root / "good.md").write_text("# 甲\n\n## 乙\n\n正常知识。\n", encoding="utf-8")
-        (root / "bad.md").write_text("# 甲\n\n## 乙\n\n" + "长" * 1601 + "\n", encoding="utf-8")
+        # 新字符切分可将长正文逐字拆分；用不可拆的超限表格行检验原子发布保护。
+        (root / "bad.md").write_text(
+            "# 甲\n\n## 乙\n\n| 条件 |\n| --- |\n| " + "长" * 1601 + " |\n", encoding="utf-8"
+        )
         (root / "manifest.json").write_text(
             json.dumps(
                 {

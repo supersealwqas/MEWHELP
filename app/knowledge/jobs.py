@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from app.knowledge.chunking import chunk_markdown
+from app.knowledge.documents import build_document_chunks
 from app.knowledge.contracts import KnowledgeModel
 from app.knowledge.grounding import turns_digest
 from app.knowledge.manifest import load_manifest
@@ -139,7 +139,7 @@ class KnowledgeJobs:
         for spec in specs:
             source = spec.path.read_text(encoding="utf-8")
             prepared_drafts.extend(
-                chunk_markdown(source, spec, self.encoder.count_tokens)
+                build_document_chunks(source, spec, self.encoder.count_tokens)
             )
             source_keys.append(spec.source_key)
         async with self.store.writer() as writer:

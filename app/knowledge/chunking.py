@@ -54,12 +54,16 @@ class _Context:
     is_key_clause: bool
 
 
-def split_sections(markdown: str) -> list[Document]:
+def split_sections(
+    markdown: str, *, headers: list[tuple[str, str]] | None = None,
+) -> list[Document]:
     """由 LangChain 维护标题树，同时从原文恢复完整正文。
 
-    参数：markdown 为原文；返回：含 h1–h6 和 line_start 的 Document。
+    参数：markdown 为原文；headers 为需要识别的标题列表，None 沿用 CH03 的 h1–h6。
+    返回：含指定标题层级和 line_start 的 Document。
     异常：ValueError，依赖输出无法回映原文时明确拒绝。
     """
+    selected_headers = HEADERS if headers is None else headers
     lines = markdown.replace("\r\n", "\n").replace("\r", "\n").splitlines(keepends=True)
     normalized = ["".join(filter(str.isprintable, line.strip())) for line in lines]
     prefix = "MEWHELP_SOURCE_LINE_"
@@ -84,7 +88,7 @@ def split_sections(markdown: str) -> list[Document]:
                 normalized[index] = f"{prefix}{index}"
             index += 1
 
-    splitter = MarkdownHeaderTextSplitter(headers_to_split_on=HEADERS, strip_headers=True,
+    splitter = MarkdownHeaderTextSplitter(headers_to_split_on=selected_headers, strip_headers=True,
                                           return_each_line=True)
     sections: list[Document] = []
     cursor = 0
@@ -100,7 +104,7 @@ def split_sections(markdown: str) -> list[Document]:
             cursor += 1
         start, end = positions[0], positions[-1] + 1
         # 同标题的相邻段落恢复中间空行；遇到真实标题则不能跨章节合并/重叠。
-        if (sections and {key: sections[-1].metadata[key] for _, key in HEADERS
+        if (sections and {key: sections[-1].metadata[key] for _, key in selected_headers
                           if key in sections[-1].metadata} == part.metadata
                 and not "".join(lines[previous_end:start]).strip()):
             sections[-1].page_content += "".join(lines[previous_end:end])
