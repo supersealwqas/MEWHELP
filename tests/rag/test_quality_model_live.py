@@ -35,3 +35,7 @@ async def test_real_model_useful_true_and_false_use_only_current_evidence(monkey
         HumanMessage(content="本轮证据hits:[]\n当前问题：型号MH-UNKNOWN-999在零下50度能稳定工作多久？")])
     assert missing.useful is False
     assert decide_answer(missing, [])[1].source == "self_check"
+    from app.evaluation.faithfulness import FaithfulnessJudge
+    judgment = await FaithfulnessJudge(model_name=config.chat_model).judge(
+        "退款多久能到账", "保证2个工作日到账[1]", [citation])
+    assert any(not fact.supported for fact in judgment.facts)

@@ -68,6 +68,48 @@ async def test_refusal_and_pool_commit_idempotently_and_failure_rolls_back(monke
 
 
 @pytest.mark.skipif(os.getenv("MEWHELP_RUN_QUALITY_MYSQL") != "1", reason="需要显式 MEWHELP_RUN_QUALITY_MYSQL=1")
+async def test_faith_case_concurrent_recurrence_updates_latest_snapshot_without_losing_history() -> None:
+    """真实台账同题并发累计、人工解决后复发，完整快照更新而首次/处置时间保持。参数：无；返回：None；异常：SQL/断言错误。"""
+    from app.knowledge.answering import EvidenceCitation
+    from app.repositories.faith_cases import FaithCaseDraft, FaithCaseRepository
+
+    config = Settings(_env_file=os.getenv("MEWHELP_TEST_ENV_FILE", ".env")).model_copy(update={"mysql_database": "mewhelp_ch04_test"})
+    engine, factory = create_database(config)
+    eval_id = "T" + uuid4().hex[:15]
+    try:
+        await migrate_quality_tables(config)
+        repository = FaithCaseRepository(factory)
+        citations = [EvidenceCitation(n=index, chunk_id=index, section_path="售后 / 政策", question=f"问{index}", answer=f"原文{index}")
+                     for index in range(1, 11)]
+        draft = FaithCaseDraft(eval_id=eval_id, bucket="A_policy", query="退款到账几天", strategy="hybrid_rerank",
+                               answer="保证两天到账[1]", reason="证据没有到账时限", citations=citations, judge_model="judge-test")
+        await repository.record(draft)
+        async with factory() as session:
+            first = await session.scalar(select(FaithCase).where(FaithCase.eval_id == eval_id))
+            first_time = first.first_seen_at
+            first_id = first.id
+        await repository.resolve(eval_id, "已解决", "已补充证据与拒绝到账承诺")
+        async with factory() as session:
+            solved = await session.scalar(select(FaithCase).where(FaithCase.eval_id == eval_id))
+            resolved = solved.resolved_at
+        latest = draft.model_copy(update={"answer": "保证三天到账[2]", "reason": "又编造到账天数"})
+        await asyncio.gather(*(repository.record(latest) for _ in range(3)))
+        async with factory() as session:
+            rows = (await session.scalars(select(FaithCase).where(FaithCase.eval_id == eval_id))).all()
+            assert len(rows) == 1
+            row = rows[0]
+            assert row.id == first_id and row.seen_count == 4
+            assert row.first_seen_at == first_time and row.resolved_at == resolved
+            assert row.status == "未解决" and row.resolution is None
+            assert row.answer == "保证三天到账[2]" and row.reason == "又编造到账天数"
+            assert len(row.citations) == 10 and row.citations[-1]["answer"] == "原文10"
+    finally:
+        async with factory.begin() as session:
+            await session.execute(delete(FaithCase).where(FaithCase.eval_id == eval_id))
+        await engine.dispose()
+
+
+@pytest.mark.skipif(os.getenv("MEWHELP_RUN_QUALITY_MYSQL") != "1", reason="需要显式 MEWHELP_RUN_QUALITY_MYSQL=1")
 async def test_quality_migration_is_repeatable_and_retains_existing_utf8_rows() -> None:
     """真实 MySQL 迁移保持旧记录与中文枚举，不重建已有表。参数：无；返回：None；异常：SQL/断言错误。"""
     config = Settings(_env_file=os.getenv("MEWHELP_TEST_ENV_FILE", ".env"))
