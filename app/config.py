@@ -70,7 +70,7 @@ class Settings(BaseSettings):
     milvus_uri: str = Field(
         default="http://127.0.0.1:19530",
         min_length=1,
-        description="已有 Milvus 2.4.x 实例连接地址，不升级或清理原项目资源",
+        description="Milvus 实例连接地址；运行基线见部署手册，不自动升级或清理原项目资源",
     )
     milvus_database: str = Field(
         default="mewhelp_ch03",

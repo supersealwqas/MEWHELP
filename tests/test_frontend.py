@@ -127,6 +127,8 @@ async def test_security_headers_preserve_incremental_stream_and_cancellation() -
         ("styles.css", "text/css"),
         ("chat.js", "javascript"),
         ("chat-api.mjs", "javascript"),
+        ("markdown.mjs", "javascript"),
+        ("vendor/markdown-it.mjs", "javascript"),
         ("mew.svg", "image/svg+xml"),
     ],
 )

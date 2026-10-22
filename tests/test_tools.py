@@ -240,19 +240,35 @@ def test_mock_results_stable_across_process_restarts_and_hash_seeds():
     assert snapshots[0] == snapshots[1]
 
 
-async def test_faq_context_is_injected_and_keyword_is_literal():
-    """关键词不能被模型替换同义词。参数：无；返回：None；异常：断言失败。"""
+@pytest.mark.parametrize("question,keyword", [
+    ("邮费是多少", "邮费"),
+    ("邮费是多少", "运费"),
+    ("那如果没有满99元的话，我需要付什么费用？是多少", "运费"),
+    ("那如果没有满99元的话，我需要付什么费用？是多少", "包邮"),
+])
+async def test_faq_passes_keyword_to_search_without_literal_rejection(question, keyword):
+    """有效查询词即使不在当前原句中也应进入检索，不被硬校验拒绝。
+
+    参数：question 为当前用户原话，keyword 为模型提交的有效查询词。
+    返回：None，断言真实工具将查询词原样交给检索并返回正常空命中。
+    异常：AssertionError 表示查询被拦截、被程序改词或结果协议异常。
+    """
     class Support:
-        """只替换外部数据库读取，记录传入的字面词。"""
+        """只替换外部数据库读取，核对工具传入的查询词。"""
+        def __init__(self):
+            """初始化查询记录。参数：无；返回：None；异常：无。"""
+            self.keywords = []
+
         async def query_faq(self, keyword):
-            """返回受控数据库结果。参数：原文词；返回：空列表；异常：断言失败。"""
-            assert keyword == "邮费"
+            """返回受控数据库结果。参数：查询词；返回：空列表；异常：无。"""
+            self.keywords.append(keyword)
             return []
 
-    context = ToolContext(session_id="s", user_id="u", turn_id="t", user_message="邮费是多少")
-    config = {"configurable": {"context": context, "support_repository": Support()}}
+    context = ToolContext(session_id="s", user_id="u", turn_id="t", user_message=question)
+    support = Support()
+    config = {"configurable": {"context": context, "support_repository": support}}
     tool = build_registry().get("query_faq")
-    result = await tool.ainvoke({"keyword": "邮费"}, config=config)
+    result = await tool.ainvoke({"keyword": keyword}, config=config)
     assert result["hits"] == [] and "未找到" in result["message"]
-    with pytest.raises(ValueError):
-        await tool.ainvoke({"keyword": "运费"}, config=config)
+    assert f"「{keyword}」" in result["message"]
+    assert support.keywords == [keyword]

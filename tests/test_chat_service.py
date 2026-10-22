@@ -239,12 +239,31 @@ async def test_unknown_and_foreign_orders_produce_identical_reply():
 
 async def test_faq_error_still_uses_model_answer():
     """非归属错误不能被固定回复劫持。参数：无；返回：None；异常：断言失败。"""
-    service, _, _, model = make_service(AIMessage(content="", tool_calls=[faq_call(args={"keyword": "运费"})]))
+    service, _, _, model = make_service(AIMessage(content="", tool_calls=[faq_call(args={"keyword": " "})]))
     events = [e async for e in service.stream_turn(request())]
-    # query_faq 关键词不在原话中会得到 INVALID_ARGUMENTS，仍应走回答阶段。
+    # 空关键词仍会得到 INVALID_ARGUMENTS，非归属错误应交给回答阶段。
     assert [step for step, _ in model.inputs] == ["decide", "answer"]
     assert events[-1].event == "done"
     assert all(e.data.get("delta") != "没有找到您的这笔订单，请确认订单号或物流单号后重试。" for e in events)
+
+
+async def test_faq_followup_accepts_keyword_absent_from_current_message():
+    """包邮追问的查询词不在原句中时，真实编排仍应执行查询并保存成功事实。
+
+    参数：无，使用原问题和模型曾提交的“运费”，仅替换外部模型与数据库。
+    返回：None，断言工具成功、查询词传递正确且当前轮保存正常空命中。
+    异常：AssertionError 表示原句硬校验再次拦截查询或破坏工具结果持久化。
+    """
+    service, repo, support, model = make_service(AIMessage(content="", tool_calls=[
+        faq_call(args={"keyword": "运费"})]))
+    events = [event async for event in service.stream_turn(ChatRequest(
+        session_id="faq-followup", message="那如果没有满99元的话，我需要付什么费用？是多少"))]
+    statuses = [event.data["status"] for event in events if event.event == "tool_status"]
+    assert statuses == ["running", "succeeded"] and events[-1].event == "done"
+    assert support.keywords == ["运费"]
+    result = next(iter(repo.results.values()))
+    assert result.ok and result.data["hits"] == [] and result.error is None
+    assert [step for step, _ in model.inputs] == ["decide", "decide", "answer"]
 
 
 def ticket_service(chunks):
@@ -328,11 +347,123 @@ async def test_answer_stage_checks_its_own_complete_request_budget(monkeypatch):
     """回答阶段也必须核算系统提示，不能只检查决策。参数：替换器；返回：None；异常：断言失败。"""
     import app.services.chat as chat_module
     service, repo, _, model = make_service()
-    monkeypatch.setattr(chat_module, "FINAL_ANSWER_SYSTEM", "答" * 9000)
+    # 回答阶段的 system 已独立为 ANSWER_SYSTEM；改它才能单独撑大回答请求。
+    monkeypatch.setattr(chat_module, "ANSWER_SYSTEM", "答" * 9000)
     events = [event async for event in service.stream_turn(request())]
     assert events[-1].event == "error"
     assert [step for step, _ in model.inputs] == ["decide"]
     assert next(iter(repo.turns.values())).turn_status == "failed"
+
+
+@pytest.mark.parametrize("budget_kind,spare", [("request", 0), ("dialogue", 0), ("request", 100)])
+async def test_answer_retry_respects_both_input_budgets(monkeypatch, budget_kind, spare):
+    """纠正重试必须预留预算，不能在检查后向上游发送超限请求。
+
+    参数:
+        monkeypatch: 仅替换模型网络边界与回答提示。
+        budget_kind: 本用例贴近完整请求预算或对话预算。
+        spare: 初次输入之外的可用余量；0 无法容纳纠正，100 足够。
+    返回值:
+        None: 断言超限时零网络调用，余量足够时两次请求均符合预算。
+    异常:
+        AssertionError: 超限仍发送请求、正常重试失败或修改用户原话。
+    """
+    from langchain_core.messages import AIMessageChunk, HumanMessage, SystemMessage
+    from app.core import llm
+    from app.core.memory import _estimate_message_tokens
+    from app.services import chat as chat_module
+
+    # 放大回答提示，使完整请求预算先约束回答阶段，决策阶段仍可正常完成。
+    answer_system = "答" * 7000
+    monkeypatch.setattr(chat_module, "ANSWER_SYSTEM", answer_system)
+    service, repo, _, _ = make_service()
+    original = request("retry-budget")
+    user = HumanMessage(content=original.message)
+    if budget_kind == "request":
+        service.settings.request_token_budget = _estimate_message_tokens([
+            SystemMessage(content=answer_system), user,
+        ]) + spare
+    else:
+        service.settings.token_budget = _estimate_message_tokens([user])
+    seen = []
+
+    class NetworkModel:
+        """只记录实际网络输入；首轮空正文，重试返回正文。"""
+
+        async def astream(self, messages):
+            """模拟网络流。参数：真实请求消息；返回：模型分片；异常：无。"""
+            seen.append(list(messages))
+            yield AIMessageChunk(content="" if len(seen) == 1 else "重试回答")
+
+    monkeypatch.setattr(llm, "get_chat_model", lambda **kwargs: NetworkModel())
+    service.model.stream_answer = llm.ChatModelAdapter().stream_answer
+    events = [event async for event in service.stream_turn(original)]
+    for messages in seen:
+        assert _estimate_message_tokens(messages) <= service.settings.request_token_budget
+        assert _estimate_message_tokens(messages[1:]) <= service.settings.token_budget
+        assert messages[1].content == original.message
+    if spare == 0:
+        assert seen == [] and events[-1].event == "error"
+        assert next(iter(repo.turns.values())).turn_status == "failed"
+    else:
+        assert len(seen) == 2 and events[-1].event == "done"
+        assert events[-2].data["delta"] == "重试回答"
+
+
+async def test_answer_retry_reservation_trims_history_as_a_whole(monkeypatch):
+    """为纠正预留预算时整轮裁旧历史，首轮与重试均保留当前问题且不超限。
+
+    参数:
+        monkeypatch: 替换回答提示及模型网络边界。
+    返回值:
+        None: 断言旧问答整轮裁掉，两次实际请求均符合预算，存储未改变。
+    异常:
+        AssertionError: 重试超限、历史只裁半轮或当前事实被纠正消息改写。
+    """
+    from langchain_core.messages import AIMessageChunk, HumanMessage, SystemMessage
+    from app.core import llm
+    from app.core.memory import _estimate_message_tokens
+    from app.schemas.history import StoredMessage, StoredTurn
+    from app.services import chat as chat_module
+
+    answer_system = "答" * 7000
+    monkeypatch.setattr(chat_module, "ANSWER_SYSTEM", answer_system)
+    service, repo, _, _ = make_service()
+    old_question, old_answer = "旧问题" * 30, "旧回答" * 30
+    old = StoredTurn(turn_id="old", turn_status="completed", messages=[
+        StoredMessage(role="user", content=old_question),
+        StoredMessage(role="assistant", content=old_answer),
+    ])
+    repo.turns["old"] = old
+    original = request("retry-history")
+    # 此预算可刚好容纳旧轮及原请求，但无法再容纳纠正；必须裁掉完整旧轮。
+    service.settings.request_token_budget = _estimate_message_tokens([
+        SystemMessage(content=answer_system), HumanMessage(content=old_question),
+        AIMessage(content=old_answer), HumanMessage(content=original.message),
+    ])
+    seen = []
+
+    class NetworkModel:
+        """首轮空响应、下一轮正文，记录真正送往网络的消息。"""
+
+        async def astream(self, messages):
+            """模拟网络分片。参数：请求；返回：分片流；异常：无。"""
+            seen.append(list(messages))
+            yield AIMessageChunk(content="" if len(seen) == 1 else "重试回答")
+
+    monkeypatch.setattr(llm, "get_chat_model", lambda **kwargs: NetworkModel())
+    service.model.stream_answer = llm.ChatModelAdapter().stream_answer
+    events = [event async for event in service.stream_turn(original)]
+    assert len(seen) == 2 and events[-1].event == "done"
+    assert len(seen[0]) == 2 and len(seen[1]) == 3
+    for messages in seen:
+        assert _estimate_message_tokens(messages) <= service.settings.request_token_budget
+        assert messages[1].content == original.message
+        assert all(message.content not in {old_question, old_answer} for message in messages)
+    assert repo.turns["old"] == old
+    current = next(turn for key, turn in repo.turns.items() if key != "old")
+    assert current.messages[0].content == original.message
+    assert all(message.content != llm.ChatModelAdapter.ANSWER_NUDGE for message in current.messages)
 
 
 async def test_cancel_after_ticket_receipt_preserves_fact_without_answer_call():

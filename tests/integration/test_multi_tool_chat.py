@@ -4,6 +4,7 @@
 每例只创建并清理自己的唯一会话，不建表、不清库，也不恢复其他会话。
 """
 
+import json
 from pathlib import Path
 from uuid import uuid4
 
@@ -123,7 +124,8 @@ async def test_mysql_order_logistics_persist_and_restore_in_order(isolated_multi
     factory, session_id, build_service = isolated_multi_tool_mysql
     service, chat, model = build_service([
         _decision({"id": "order", "name": "query_order", "args": {"order_id": "1001"}}),
-        _decision({"id": "shipping", "name": "query_logistics", "args": {"tracking_no": "MOCK213502378238"}}),
+        # 本例模拟取用订单工具返回的当前单号；历史 MOCK 前缀兼容在专门用例中验证。
+        _decision({"id": "shipping", "name": "query_logistics", "args": {"tracking_no": "SF213502378238"}}),
     ])
     events = [event async for event in service.stream_turn(
         ChatRequest(session_id=session_id, message="订单1001的物流到哪了")
@@ -141,8 +143,14 @@ async def test_mysql_order_logistics_persist_and_restore_in_order(isolated_multi
     assert order.data["tracking_no"] == rows[3].tool_calls[0]["args"]["tracking_no"]
     assert shipping.data["latest_node"] == "包裹已到达杭州转运中心"
     assert rows[-1].content == "".join(event.data.get("delta", "") for event in events)
-    assert any(isinstance(message, ToolMessage) and message.content == rows[2].content
-               for message in model.inputs[1][1])
+    # 审计载荷保留来源标记；模型输入仅去掉标记，全部订单业务事实必须完整保留。
+    order_messages = [message for message in model.inputs[1][1]
+                      if isinstance(message, ToolMessage) and message.tool_call_id == "order"]
+    assert len(order_messages) == 1
+    model_order = json.loads(order_messages[0].content)
+    assert set(model_order) == {"ok", "data", "error"}
+    assert model_order["ok"] is True and model_order["error"] is None
+    assert model_order["data"] == order.data and order.is_mock
     turns = await chat.load_turns(conversation.id)
     assert len(turns) == 1 and turns[0].turn_status == "completed"
     history = assemble_turns(turns)[0]

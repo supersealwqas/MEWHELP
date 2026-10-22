@@ -3,6 +3,7 @@
  * 刷新或新建会话会换用新标识；页面不读取密钥、不保存本地聊天记录。
  */
 import { failurePresentation, streamChat } from "./chat-api.mjs";
+import { renderMarkdown } from "./markdown.mjs";
 
 const ui = {
   form: document.querySelector("#chat-form"),
@@ -65,10 +66,10 @@ function onConversationScroll() {
 }
 
 /**
- * 创建安全的纯文本消息气泡。
+ * 创建消息气泡；用户输入保持纯文本，客服正文预留 Markdown 容器。
  * @param {"user"|"assistant"} role 消息的发送者。
  * @param {string} text 初始内容，不会被解析为 HTML。
- * @returns {{article: HTMLElement, bubble: HTMLElement, note: HTMLElement}} 消息节点集合。
+ * @returns {{article: HTMLElement, bubble: HTMLElement, tools: HTMLElement, note: HTMLElement}} 消息节点集合。
  * @throws {Error} 无主动抛出的业务异常。
  */
 function appendMessage(role, text) {
@@ -88,9 +89,10 @@ function appendMessage(role, text) {
   const tools = document.createElement("div");
   tools.className = "tool-trail";
   tools.hidden = true;
+  tools.setAttribute("aria-label", "本轮工具调用");
   tools.setAttribute("aria-live", "polite");
-  const content = document.createElement("p");
-  content.className = "message-content";
+  const content = document.createElement("div");
+  content.className = role === "assistant" ? "message-content markdown-content" : "message-content";
   content.textContent = text;
   bubble.append(tools, content);
   const note = document.createElement("p");
@@ -125,7 +127,8 @@ function createTextRenderer(node) {
     frame = null;
     const count = reducedMotion.matches ? pending.length : Math.max(1, Math.ceil(pending.length / 60));
     text += pending.splice(0, count).join("");
-    node.textContent = text;
+    // 只写入禁用原始 HTML 的 Markdown 解析结果，避免将模型文本直接当网页执行。
+    node.innerHTML = renderMarkdown(text);
     scrollToLatest();
     if (pending.length) frame = requestAnimationFrame(paint);
     else if (resolveFinish) { resolveFinish(); resolveFinish = null; }
@@ -154,7 +157,7 @@ function createTextRenderer(node) {
     if (pending.length) text += pending.join("");
     pending = [];
     frame = null;
-    if (text) node.textContent = text;
+    if (text) node.innerHTML = renderMarkdown(text);
     if (resolveFinish) { resolveFinish(); resolveFinish = null; }
     scrollToLatest();
   }
@@ -207,6 +210,38 @@ function setBusy(busy) {
 }
 
 /**
+ * 更新具体工具名和调用状态，图标与文本分别创建，不把服务端字段解析为 HTML。
+ * @param {HTMLElement} badge 本次调用的标签节点，按 tool_call_id 复用。
+ * @param {object} tool 服务端工具状态，或页面停止接收后的 interrupted 状态。
+ * @returns {void} 更新标签内容、样式及无障碍说明。
+ * @throws {Error} 无主动抛出的业务异常。
+ */
+function updateToolBadge(badge, tool) {
+  const prefixes = { running: "正在调用", retrying: "正在重试", succeeded: "调用了",
+    failed: "调用失败", interrupted: "调用中断" };
+  // 被服务端跳过的调用也使用 failed；明确标为未执行，不能当作已经调用失败。
+  const prefix = tool.status === "failed" && tool.label === "未执行"
+    ? "未执行" : prefixes[tool.status];
+  const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  icon.setAttribute("viewBox", "0 0 24 24");
+  icon.setAttribute("aria-hidden", "true");
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.setAttribute("d", "M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0L21.5 5.5a6 6 0 0 1-7.9 7.9l-7.1 7.1a2.1 2.1 0 0 1-3-3l7.1-7.1a6 6 0 0 1 7.9-7.9z");
+  icon.append(path);
+  const label = document.createElement("span");
+  label.textContent = `${prefix} `;
+  const name = document.createElement("code");
+  name.className = "tool-badge-name";
+  name.textContent = tool.name;
+  label.append(name);
+  if (tool.status === "interrupted") label.append(" · 结果待核实");
+  badge.replaceChildren(icon, label);
+  badge.dataset.status = tool.status;
+  badge.title = `${tool.name} · ${tool.label}`;
+  badge.setAttribute("aria-label", badge.textContent);
+}
+
+/**
  * 提交消息并将流式结果写入同一个客服气泡。
  * @param {SubmitEvent} event 表单提交事件。
  * @returns {Promise<void>} 本轮成功、失败或取消后恢复操作。
@@ -233,7 +268,7 @@ async function sendMessage(event) {
   /**
    * 将接口文本交给逐字队列，首块到达时退出等待状态。
    * @param {string} delta 模型文本增量。
-   * @returns {void} 更新展示状态，不拼接或执行 HTML。
+   * @returns {void} 更新展示状态，将文本交给安全 Markdown 渲染器。
    * @throws {Error} 无主动抛出的业务异常。
    */
   function onDelta(delta) {
@@ -245,10 +280,13 @@ async function sendMessage(event) {
 
   const badges = new Map();
   const toolStatuses = new Map();
-  const toolNames = { query_order: "订单查询", query_product: "商品查询", query_logistics: "物流查询",
-    query_faq: "常见问题查询", create_ticket: "人工工单" };
 
-  /** 更新同一个调用的徽章；所有文字均作为纯文本展示。 */
+  /**
+   * 按调用标识更新标签，同一工具的不同调用分别保留。
+   * @param {object} status 已经通过接口客户端校验的工具状态。
+   * @returns {void} 更新标签及正文尚未到达时的等待提示。
+   * @throws {Error} 无主动抛出的业务异常。
+   */
   function onToolStatus(status) {
     toolStatuses.set(status.tool_call_id, status);
     let badge = badges.get(status.tool_call_id);
@@ -259,10 +297,7 @@ async function sendMessage(event) {
       reply.tools.append(badge);
     }
     reply.tools.hidden = false;
-    badge.dataset.status = status.status;
-    badge.textContent = `${toolNames[status.name] || status.name} · ${status.label}`;
-    badge.title = `${status.name} · ${status.tool_call_id}`;
-    badge.setAttribute("aria-label", `${status.name}：${badge.textContent}`);
+    updateToolBadge(badge, status);
     if (!renderer.hasText()) {
       reply.bubble.textContent = ["running", "retrying"].includes(status.status)
         ? `${status.label}…` : "小喵正在整理结果…";
@@ -279,10 +314,9 @@ async function sendMessage(event) {
     renderer.flush();
     const stopped = controller.signal.aborted;
     const presentation = failurePresentation({ error, stopped, toolStatuses: toolStatuses.values() });
-    for (const badge of badges.values()) {
+    for (const [callId, badge] of badges) {
       if (["running", "retrying"].includes(badge.dataset.status)) {
-        badge.dataset.status = "interrupted";
-        badge.textContent += " · 已中断，结果待核实";
+        updateToolBadge(badge, { ...toolStatuses.get(callId), status: "interrupted", label: "结果待核实" });
       }
     }
     if (!renderer.hasText()) reply.bubble.textContent = presentation.status;

@@ -23,7 +23,7 @@ from app.knowledge.llm import KnowledgeModel, load_relation_policy
 from app.knowledge.prompts import RELATION_PROMPT_VERSION
 from app.knowledge.store import KnowledgeStore
 from app.knowledge.sync import VectorSynchronizer
-from app.knowledge.vector import MilvusVectorIndex
+from app.knowledge.vector import MilvusVectorIndex, VectorIndexUnavailable
 from app.models.knowledge import (
     KnowledgeBase,
     KnowledgeChunk,
@@ -75,16 +75,22 @@ async def knowledge_runtime(config: Settings):
             await engine.dispose()
 
 
-async def initialize_knowledge(config: Settings) -> None:
+async def initialize_knowledge(
+    config: Settings, *, confirmed_database: str | None = None,
+) -> None:
     """显式创建缺失的 MySQL 知识表和独立 Milvus 集合。
 
     参数:
         config: 应用或测试配置。
+        confirmed_database: 操作人确认归本项目的既存空 Milvus 库名；None 时不接管未知库。
     返回值:
         None
     异常:
+        VectorIndexUnavailable: 确认库名不匹配或 Milvus 归属未知。
         数据库/向量初始化错误。
     """
+    if confirmed_database is not None and confirmed_database != config.milvus_database:
+        raise VectorIndexUnavailable("Milvus 归属确认必须匹配初始化的目标数据库")
     engine, _ = create_database(config)
     try:
         async with engine.begin() as connection:
@@ -93,7 +99,7 @@ async def initialize_knowledge(config: Settings) -> None:
         await engine.dispose()
     index = MilvusVectorIndex(config)
     try:
-        await index.ensure_ready(create=True)
+        await index.ensure_ready(create=True, confirmed_database=confirmed_database)
     finally:
         await index.aclose()
 

@@ -59,14 +59,69 @@ async def test_invalid_arguments_preserve_raw_audit(monkeypatch, raw):
     assert failure.value.audit_record["tool_call_chunks"][0]["args"] == raw
 
 
-async def test_final_model_unbound_filters_reasoning_and_rejects_tool_calls(monkeypatch):
-    """回答阶段不能继续选工具，也不能展示推理块。参数：替换器；返回：None；异常：断言失败。"""
+async def test_final_model_unbound_filters_reasoning_and_ignores_tool_calls(monkeypatch):
+    """回答阶段不展示推理块；模型违规申请工具时丢弃该分片并继续等正文。
+
+    参数：替换器；返回：None；异常：断言失败。
+    背景：真实上游在“历史缺工具轮 + 本轮工具失败”时会在无工具绑定的回答请求里
+    继续输出 tool_call 分片，旧实现直接抛 ValueError，用户看到“本轮暂时未能完成”。
+    """
     from app.core import llm
     model = ChunkModel([AIMessageChunk(content=[{"type": "text", "text": "你好"}, {"type": "reasoning", "text": "SECRET"}])])
     monkeypatch.setattr(llm, "get_chat_model", lambda **kwargs: model)
     assert [v async for v in llm.ChatModelAdapter().stream_answer([])] == ["你好"]
     assert not model.binds
-    model.chunks = [AIMessageChunk(content="", tool_call_chunks=[{"name": "query_order", "id": "c", "args": "{}", "index": 0}])]
+    # 工具申请分片被丢弃，同一条流里的正常正文仍要送出，不能因违规分片整体失败。
+    model.chunks = [
+        AIMessageChunk(content="", tool_call_chunks=[{"name": "query_order", "id": "c", "args": "{}", "index": 0}]),
+        AIMessageChunk(content="订单 1005 待发货"),
+    ]
+    assert [v async for v in llm.ChatModelAdapter().stream_answer([])] == ["订单 1005 待发货"]
+
+
+async def test_answer_stream_retries_once_when_model_returns_no_text(monkeypatch):
+    """模型整轮只返回工具申请或空正文时，重试一次而不是直接判失败。
+
+    参数：替换器；返回：None；异常：断言失败。
+    背景：上游偶发把回答阶段的分片全部用在 tool_call 上，正文为空；
+    单次失败会让用户看到“本轮暂时未能完成”，重试一次可显著降低误报。
+    """
+    from app.core import llm
+
+    class RecordingModel(ChunkModel):
+        """记录每次收到的消息，用于确认重试确实改变了输入。"""
+        def __init__(self, chunks):
+            """初始化并创建输入记录。参数：分片；返回：None；异常：无。"""
+            super().__init__(chunks)
+            self.seen = []
+
+        async def astream(self, messages):
+            """记录输入后转发分片。参数：消息；返回：异步分片流；异常：无。"""
+            self.seen.append(list(messages))
+            for chunk in self.chunks:
+                yield chunk
+
+    first = RecordingModel([AIMessageChunk(content="", tool_call_chunks=[
+        {"name": "query_faq", "id": "c1", "args": '{"keyword":"运费"}', "index": 0}])])
+    second = RecordingModel([AIMessageChunk(content="重试后的正文")])
+    models = [first, second]
+    monkeypatch.setattr(llm, "get_chat_model", lambda **kwargs: models.pop(0))
+    assert [v async for v in llm.ChatModelAdapter().stream_answer([HumanMessage(content="问")])] == ["重试后的正文"]
+    # 首次请求不带纠正指令，重试时追加，保证正常路径的输入不被改变。
+    assert len(first.seen[0]) == 1
+    assert second.seen[0][-1].content == llm.ChatModelAdapter.ANSWER_NUDGE
+    assert len(second.seen[0]) == 2
+
+
+async def test_answer_stream_reports_error_when_both_attempts_have_no_text(monkeypatch):
+    """两次尝试都没有正文时必须显式失败，不能返回空回答。
+
+    参数：替换器；返回：None；异常：断言失败。
+    """
+    from app.core import llm
+    empty = AIMessageChunk(content="", tool_call_chunks=[
+        {"name": "query_faq", "id": "c1", "args": '{"keyword":"运费"}', "index": 0}])
+    monkeypatch.setattr(llm, "get_chat_model", lambda **kwargs: ChunkModel([empty]))
     with pytest.raises(ValueError):
         [v async for v in llm.ChatModelAdapter().stream_answer([])]
 

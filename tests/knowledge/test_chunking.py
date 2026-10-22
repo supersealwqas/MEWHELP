@@ -169,6 +169,217 @@ def test_table_headers_repeated_without_lost_rows() -> None:
     assert unique_ids == list(range(1, row_count + 1))
 
 
+@pytest.mark.parametrize(
+    "header,separator,row_template",
+    [
+        ("| 条件 |", "| --- |", "| 条件{index}：必须验货并保留凭证 |"),
+        ("| 条件 |", "---", "| 条件{index}：必须验货并保留凭证 |"),
+        ("| 条件 |", "| - |", "| 条件{index}：必须验货并保留凭证 |"),
+        ("| 条件 |", "| -- |", "| 条件{index}：必须验货并保留凭证 |"),
+        ("| 条件 |", "| --- |", "条件{index}：必须验货并保留凭证"),
+        ("| 条件 |", "---", "条件{index}：必须验货并保留凭证"),
+        ("条件 |", "---: |", "条件{index}：必须验货并保留凭证 |"),
+        ("| 条件", "| :---", "| 条件{index}：必须验货并保留凭证"),
+        ("条件 | 处理", ":--- | ---:", "条件{index}：必须验货并保留凭证 | 受理退货"),
+    ],
+)
+def test_long_single_and_double_column_tables_keep_every_row(
+    header: str, separator: str, row_template: str,
+) -> None:
+    """单列和双列长表都逐行切分，并完整重复本表表头。
+
+    参数：header 表头；separator 分隔行；row_template 带 index 占位符的数据行。
+    返回：None。异常：无。
+    """
+    rows = [row_template.format(index=index) for index in range(120)]
+    table = "\n".join([header, separator, *rows])
+    assert len(table) > 1600
+    chunks = _chunk("# 甲\n## 乙\n" + table, target_tokens=120, overlap_tokens=0)
+    assert len(chunks) > 1
+    restored_rows: list[str] = []
+    for chunk in chunks:
+        lines = chunk.text.answer.splitlines()
+        assert lines[:2] == [header, separator]
+        assert chunk.section_path == "甲 / 乙"
+        assert len(chunk.text.category + chunk.text.questions + chunk.text.answer) <= 1600
+        assert len(format_knowledge(chunk.text)) <= 2048
+        restored_rows.extend(lines[2:])
+    assert restored_rows == rows
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        "| 退货 | 7天 | 必须验货 |",
+        "| 退货 |",
+        "退货 | 7天 | 必须验货",
+        "退货 |",
+        "| 退货 | `7天|必须验货 |",
+        "| 退货 | `7天|必须验货` |",
+        "| 退货 | ``7天`|必须验货`` |",
+        r"正文 a\|b。",
+        "必须验货",
+    ],
+)
+def test_table_rejects_extra_or_missing_cells_with_source_location(row: str) -> None:
+    """列数错误整表拒绝，避免额外条件在展示时被丢弃。
+
+    参数：row 相对两列表头多列或少列的数据行。
+    返回：None。异常：无。
+    """
+    with pytest.raises(ChunkingError, match="列数") as failure:
+        _chunk("# 甲\n## 乙\n| 项 | 值 |\n| --- | --- |\n" + row)
+    assert failure.value.path == Path("sample.md")
+    assert failure.value.section_path == "甲 / 乙"
+    assert (failure.value.line_start, failure.value.line_end) == (4, 5)
+
+
+@pytest.mark.parametrize(
+    "table",
+    [
+        "| 项 | 值 |\n| --- |\n| 商品 |",
+        "| 项 |\n| --- | --- |\n| 商品 | 必须验货 |",
+    ],
+)
+def test_table_rejects_header_and_separator_width_mismatch(table: str) -> None:
+    """表头与分隔行列数必须一致。
+
+    参数：table 含不一致表头和分隔行的 Markdown 表格。
+    返回：None。异常：无。
+    """
+    with pytest.raises(ChunkingError, match="列数") as failure:
+        _chunk("# 甲\n## 乙\n" + table)
+    assert (failure.value.line_start, failure.value.line_end) == (2, 4)
+
+
+@pytest.mark.parametrize("separator", ["| - | - |", "| -- | -- |"])
+def test_short_table_separators_cannot_bypass_extra_cell_validation(separator: str) -> None:
+    """页面接受的短分隔行也必须拒绝含额外条件的第三列。
+
+    参数：separator 每列含一或两个连字符的两列表格分隔行。
+    返回：None。异常：无。
+    """
+    source = "# 甲\n## 乙\n| 项 | 值 |\n" + separator + "\n| 退货 | 7天 | 必须验货 |"
+    with pytest.raises(ChunkingError, match="列数") as failure:
+        _chunk(source)
+    assert (failure.value.line_start, failure.value.line_end) == (4, 5)
+
+
+def test_horizontal_rule_without_pipe_header_stays_prose() -> None:
+    """没有竖线表头的正文分隔线不能被当作单列表格。
+
+    参数：无。返回：None。异常：无。
+    """
+    body = "退货条件\n---\n必须验货"
+    assert [chunk.text.answer for chunk in _chunk("# 甲\n## 乙\n" + body)] == [body]
+
+
+@pytest.mark.parametrize("marker", ["---", "***", "___", "- - -"])
+def test_single_column_table_before_horizontal_rule_keeps_its_data_row(marker: str) -> None:
+    """表后水平线不能让最后一行数据被误认成新表头。
+
+    参数：marker 为页面接受的水平线标记。返回：None。异常：无。
+    """
+    table = "| 条件 |\n| --- |\n| 必须验货 |"
+    following = marker + "\n后续说明。"
+    chunks = _chunk("# 甲\n## 乙\n" + table + "\n" + following, overlap_tokens=0)
+    assert [chunk.text.answer for chunk in chunks] == [table, following]
+
+
+def test_adjacent_tables_with_explicit_separators_keep_their_own_headers() -> None:
+    """相邻表格带明确分隔行时，仍各自复制表头并保留数据。
+
+    参数：无。返回：None。异常：无。
+    """
+    first = "| 凭证 |\n| --- |\n| 原包装 |"
+    second = "| 条件 |\n| --- |\n| 必须验货 |"
+    chunks = _chunk("# 甲\n## 乙\n" + first + "\n" + second, overlap_tokens=0)
+    assert [chunk.text.answer for chunk in chunks] == [first, second]
+
+
+@pytest.mark.parametrize("row", [
+    r"| a\|b | `c\|d` |", r"| a\\|b | `c\|d` |",
+    r"| a\\\|b | `c\|d` |", r"| a | ``c`\|d`` |",
+])
+def test_table_width_ignores_escaped_pipes_in_text_and_code(row: str) -> None:
+    """与页面渲染一致，竖线前紧邻反斜杠时不制造额外列。
+
+    参数：row 含转义竖线或不同长度反引号的数据行。
+    返回：None。异常：无。
+    """
+    table = "| 名\\|称 | 值 |\n| --- | --- |\n" + row
+    assert [chunk.text.answer for chunk in _chunk("# 甲\n## 乙\n" + table)] == [table]
+
+
+@pytest.mark.parametrize("gap,following", [
+    ("\n", "后续必须保留凭证。"), ("", "- 先核对 a|b。"), ("", "```text\n| 表外代码 |\n```"),
+])
+def test_table_does_not_consume_following_prose_list_or_fence(gap: str, following: str) -> None:
+    """表外正文、列表与围栏不能误作待校验的数据行。
+
+    参数：gap 分隔空行；following 表后正文、列表或代码围栏；正文须由空行结束表格。
+    返回：None。异常：无。
+    """
+    table = "| 项 | 值 |\n| --- | --- |\n| 退货 | 必须验货 |"
+    chunks = _chunk("# 甲\n## 乙\n" + table + "\n" + gap + following, overlap_tokens=0)
+    assert [chunk.text.answer for chunk in chunks] == [table, following]
+
+
+def test_single_column_table_keeps_plain_following_line_as_data_without_blank() -> None:
+    """无空行时单列普通文字仍是一行表格数据，并复制表头。
+
+    参数：无。返回：None。异常：无。
+    """
+    header = "| 条件 |\n| --- |\n"
+    chunks = _chunk("# 甲\n## 乙\n" + header + "必须验货\n请保留凭证。", target_tokens=20)
+    assert [chunk.text.answer for chunk in chunks] == [header + "必须验货", header + "请保留凭证。"]
+
+
+def test_single_column_table_ends_before_plain_following_line_after_blank() -> None:
+    """空行结束无外框单列数据，表后普通说明不复制表头。
+
+    参数：无。返回：None。异常：无。
+    """
+    table = "| 条件 |\n| --- |\n必须验货"
+    chunks = _chunk("# 甲\n## 乙\n" + table + "\n\n请保留凭证。", overlap_tokens=0)
+    assert [chunk.text.answer for chunk in chunks] == [table, "请保留凭证。"]
+
+
+def test_single_column_table_ends_at_following_heading_without_blank() -> None:
+    """无空行的新标题仍结束单列表格，后续正文沿用新章节。
+
+    参数：无。返回：None。异常：无。
+    """
+    table = "| 条件 |\n| --- |\n必须验货"
+    chunks = _chunk("# 甲\n## 乙\n" + table + "\n### 凭证\n请保留凭证。", overlap_tokens=0)
+    assert [chunk.text.answer for chunk in chunks] == [table, "请保留凭证。"]
+    assert [chunk.section_path for chunk in chunks] == ["甲 / 乙", "甲 / 乙 / 凭证"]
+
+
+@pytest.mark.parametrize("following,expected_body", [("> 说明", "> 说明"), ("    缩进说明", "缩进说明")])
+def test_single_column_table_does_not_consume_quote_or_indented_block(
+    following: str, expected_body: str,
+) -> None:
+    """表后的引用或缩进内容仍交给原有正文流程，不能成为表格数据。
+
+    参数：following 紧跟表格的块级内容；expected_body 现有正文流程输出的答案。
+    返回：None。异常：无。
+    """
+    table = "| 条件 |\n| --- |\n必须验货"
+    chunks = _chunk("# 甲\n## 乙\n" + table + "\n" + following, overlap_tokens=0)
+    assert [chunk.text.answer for chunk in chunks] == [table, expected_body]
+
+
+def test_single_column_table_header_can_contain_only_an_escaped_pipe() -> None:
+    """单列表头中的竖线可作为转义内容，仍完整复制表头。
+
+    参数：无。返回：None。异常：无。
+    """
+    header = "退货\\|退款\n| --- |\n"
+    chunks = _chunk("# 甲\n## 乙\n" + header + "| 必须验货 |\n| 保留凭证 |", target_tokens=20)
+    assert [chunk.text.answer for chunk in chunks] == [header + "| 必须验货 |", header + "| 保留凭证 |"]
+
+
 def test_code_fence_heading_is_not_section() -> None:
     """代码围栏内的 # 行不产生新章节，代码内容完整保留。
 
@@ -186,8 +397,8 @@ def test_code_fence_heading_is_not_section() -> None:
     assert any("print('x')" in chunk.text.answer for chunk in chunks)
 
 
-def test_inline_code_pipe_and_escaped_pipe() -> None:
-    """表格行中的转义竖线与行内代码竖线不被当成列分隔。
+def test_escaped_pipe_inside_inline_code_is_preserved() -> None:
+    """表格行内代码的竖线正确转义后，不会被页面误分列或丢弃。
 
     参数:
         无
@@ -200,12 +411,12 @@ def test_inline_code_pipe_and_escaped_pipe() -> None:
         "# 表\n\n## 数据\n\n"
         "| 名称 | 值 |\n"
         "| --- | --- |\n"
-        "| a\\|b | `c|d` |\n"
+        "| a\\|b | `c\\|d` |\n"
         "| e | f |\n"
     )
     chunks = _chunk(source)
     answer = "\n".join(chunk.text.answer for chunk in chunks)
-    assert "| a\\|b | `c|d` |" in answer
+    assert "| a\\|b | `c\\|d` |" in answer
     assert "| e | f |" in answer
     assert chunks[0].section_path == "表 / 数据"
 

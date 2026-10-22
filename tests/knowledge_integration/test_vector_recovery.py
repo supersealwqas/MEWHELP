@@ -238,7 +238,9 @@ async def test_late_rpc_real_databases_recover_current_facts(
         calibration_digest="test",
     ))
     if operation == "delete":
-        assert await search.query_faq("退款多久到账？") == []
+        # 旧删除使向量消失，但当前原文仍有效，必须明确报告同步故障而非正常零命中。
+        with pytest.raises(KnowledgeSearchUnavailable, match="索引为空.*有效原文"):
+            await search.query_faq("退款多久到账？")
     else:
         with pytest.raises(KnowledgeSearchUnavailable):
             await search.query_faq("退款多久到账？")

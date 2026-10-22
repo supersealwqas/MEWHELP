@@ -9,7 +9,7 @@ from uuid import uuid4
 import anyio
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from app.core.memory import ContextBudgetExceeded, assemble_turns, prepare_messages, valid_tool_calls
-from app.core.prompts import CUSTOMER_SERVICE_SYSTEM, FINAL_ANSWER_SYSTEM, TOOL_DECISION_SYSTEM
+from app.core.prompts import ANSWER_NUDGE, ANSWER_SYSTEM, CUSTOMER_SERVICE_SYSTEM, TOOL_DECISION_SYSTEM
 from app.repositories.chat import PersistenceUncertain
 from app.schemas.chat import ChatEvent, ChatRequest, InvalidToolDecision
 from app.schemas.tools import ToolContext, ToolResult
@@ -356,10 +356,13 @@ class ChatService:
                 yield ChatEvent(event="done")
                 return
             stage = "answer"
-            # 回答阶段没有工具定义，但必须重新核算新增工具事实和回答专用提示。
-            messages = prepare_messages(history, current, self.settings.token_budget,
-                system_text=CUSTOMER_SERVICE_SYSTEM + FINAL_ANSWER_SYSTEM,
-                request_max_tokens=self.settings.request_token_budget)
+            # 回答阶段没有工具定义，必须改用不含决策指令的 ANSWER_SYSTEM；
+            # 继续使用 CUSTOMER_SERVICE_SYSTEM 会命令模型再调工具，导致本轮整轮失败。
+            # 同时为可能的空正文纠正预留两层预算，仍按整轮裁历史，不修改当前事实。
+            messages = prepare_messages(history, [*current, HumanMessage(content=ANSWER_NUDGE)],
+                self.settings.token_budget,
+                system_text=ANSWER_SYSTEM,
+                request_max_tokens=self.settings.request_token_budget)[:-1]
             answer = None
             async with aclosing(self._stream_answer(messages, chain.ticket_receipt)) as stream:
                 async for item in stream:

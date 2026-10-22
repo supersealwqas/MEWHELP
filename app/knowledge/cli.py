@@ -60,7 +60,7 @@ async def _run(args: argparse.Namespace) -> None:
     """执行一次 CLI 命令。参数：解析结果；返回：None；异常：任务/配置错误。"""
     config = _config(args.test)
     if args.command == "init":
-        await initialize_knowledge(config)
+        await initialize_knowledge(config, confirmed_database=args.confirm_milvus_database)
         print("knowledge init completed")
         return
     if args.command == "status":
@@ -96,7 +96,11 @@ def main() -> None:
     """命令行入口。参数：无；返回：None；异常：参数/任务错误。"""
     parser = argparse.ArgumentParser(description="CH03 知识库运维命令")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    _add_command(subparsers, "init", "创建缺失的知识表与 Milvus 集合")
+    initialize = _add_command(subparsers, "init", "创建缺失的知识表与 Milvus 集合")
+    initialize.add_argument(
+        "--confirm-milvus-database", metavar="数据库名",
+        help="明确确认该既存空 Milvus 库归本项目所有；必须与目标库名完全一致",
+    )
     import_docs = _add_command(subparsers, "import-docs", "导入 data/kb 清单")
     import_docs.add_argument("--manifest", default="data/kb/manifest.json")
     _add_command(subparsers, "sync", "补齐 pending 向量并清理失效向量")

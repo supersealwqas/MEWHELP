@@ -95,17 +95,17 @@ async def query_faq(keyword: str, config: RunnableConfig) -> dict:
     """查询商城政策和常见问答。
 
     参数:
-        keyword: 原文关键词，必须取自当前用户原话。
+        keyword: 模型提交的查询词，提示词要求取自当前原话；代码不校验原句包含关系。
         config: 当前请求身份与查询资源的可信运行配置。
     返回值:
         dict: 命中时包含 hits 列表；未命中时 hits 为空列表并附带 message 说明。
             使用 hits 而非泛化的 data 键，避免与执行器兼容分支的字段名撞车。
     异常:
-        ValueError: 关键词不在当前用户原话中或参数不合法。
+        ValueError: 关键词为空、长度超限或检索参数不合法。
+        KnowledgeUnavailable: 知识检索依赖不可用。
     """
     resources = config["configurable"]
-    if keyword not in resources["context"].user_message:
-        raise ValueError("FAQ 关键词必须来自当前用户原话")
+    # 原话取词由提示词约束，查询词原样进入检索，避免正常追问被字面校验拦截。
     rows = await resources["support_repository"].query_faq(keyword)
     if not rows:
         return {"hits": [], "message": f"未找到与「{keyword}」相关的常见问题"}

@@ -1,4 +1,4 @@
-"""真实 Milvus 2.4.10 集合的写入、检索、分页与所有权测试。"""
+"""真实 Milvus 集合的写入、检索、分页与所有权测试；部署基线见 CH03 运行手册。"""
 
 from __future__ import annotations
 

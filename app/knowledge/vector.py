@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from functools import partial
 from typing import Any, Callable
 
@@ -103,59 +104,107 @@ class MilvusVectorIndex:
         self._bootstrap_factory = bootstrap_factory or _create_bootstrap_client
         self._client: Any | None = None
         self._ready = False
+        self._closed = False
+        self._initializing: asyncio.Task[Exception | None] | None = None
+        self._closing: asyncio.Task[None] | None = None
         self._lock = anyio.Lock()
 
-    async def ensure_ready(self, create: bool = False) -> None:
+    async def ensure_ready(
+        self, create: bool = False, *, confirmed_database: str | None = None,
+    ) -> None:
         """检查或显式创建索引资源。
 
         参数:
             create: 是否允许创建缺失的独立数据库/集合；运行时必须为 False。
+            confirmed_database: 操作人已确认归本项目的既存空库准确名称；仅初始化时使用。
         返回值:
             None
         异常:
-            VectorIndexUnavailable: 数据库/集合缺失、归属不明或 schema 不兼容。
+            VectorIndexUnavailable: 已关闭、等待超时、数据库/集合缺失或结构不兼容。
+            asyncio.CancelledError: 调用方取消等待；后台任务仍由索引持有，关闭时排空。
         """
-        async with self._lock:
-            if self._ready and self._client is not None:
-                return
-            try:
-                client = await anyio.to_thread.run_sync(self._prepare, create)
-            except VectorIndexUnavailable:
-                raise
-            except Exception as error:
-                raise VectorIndexUnavailable("Milvus 索引初始化失败") from error
-            self._client = client
-            self._ready = True
+        if confirmed_database is not None and (
+            not create or confirmed_database != self._config.milvus_database
+        ):
+            raise VectorIndexUnavailable("Milvus 归属确认必须匹配初始化的目标数据库")
+        if self._closed:
+            raise VectorIndexUnavailable("Milvus 索引已关闭")
+        try:
+            # SDK 自身期限之外，等待锁及整个初始化也有统一上限。
+            with anyio.fail_after(_RPC_TIMEOUT_SECONDS):
+                async with self._lock:
+                    if self._closed:
+                        raise VectorIndexUnavailable("Milvus 索引已关闭")
+                    if self._ready and self._client is not None:
+                        return
+                    if self._initializing is None:
+                        self._initializing = asyncio.create_task(
+                            self._initialize(create, confirmed_database)
+                        )
+                    # 超时或原生/AnyIO 取消只结束等待，不能取消持有客户端的任务。
+                    error = await asyncio.shield(self._initializing)
+                    if isinstance(error, VectorIndexUnavailable):
+                        raise error
+                    if error is not None:
+                        raise VectorIndexUnavailable("Milvus 索引初始化失败") from error
+        except TimeoutError as error:
+            raise VectorIndexUnavailable("Milvus 索引初始化等待超时") from error
 
-    def _prepare(self, create: bool) -> Any:
+    async def _initialize(self, create: bool, confirmed_database: str | None) -> Exception | None:
+        """持有同步初始化结果，确保调用方不再等待时客户端仍有归属。
+
+        参数：create 为是否创建缺失资源，confirmed_database 为已确认归属的库名或 None。
+        返回：None 表示成功；Exception 表示同步初始化失败，供等待方转换业务异常。
+        异常：无；SDK 异常作为结果保存，避免调用方超时后出现无人读取的任务异常。
+        """
+        try:
+            self._client = await anyio.to_thread.run_sync(self._prepare, create, confirmed_database)
+            self._ready = not self._closed
+        except Exception as error:
+            return error
+        finally:
+            # 保存客户端或完成失败清理之后才移除任务，关闭始终能找到未结束的工作。
+            self._initializing = None
+        return None
+
+    def _prepare(self, create: bool, confirmed_database: str | None = None) -> Any:
         """同步检查数据库、集合与索引并返回客户端。
 
         参数:
             create: 是否允许创建缺失资源。
+            confirmed_database: 明确确认归属的既存空库名；None 不允许自动接管。
         返回值:
             MilvusClient: 已就绪客户端。
         异常:
             VectorIndexUnavailable: 资源缺失或归属/结构不匹配。
         """
         target_database = self._config.milvus_database
+        created_database = False
         bootstrap = self._bootstrap_factory(self._config)
         try:
-            databases = bootstrap.list_databases()
+            databases = bootstrap.list_databases(timeout=_RPC_TIMEOUT_SECONDS)
             if target_database not in databases:
                 if not create:
                     raise VectorIndexUnavailable("Milvus 目标数据库不存在")
-                bootstrap.create_database(target_database)
+                bootstrap.create_database(target_database, timeout=_RPC_TIMEOUT_SECONDS)
+                # 只有本次成功新建才有归属依据；同名既存空库不能凭名称接管。
+                created_database = True
         finally:
             bootstrap.close()
 
         client = self._client_factory(self._config)
         try:
-            collections = client.list_collections()
+            collections = client.list_collections(timeout=_RPC_TIMEOUT_SECONDS)
             if self._config.milvus_collection not in collections:
                 if not create:
                     raise VectorIndexUnavailable("Milvus 目标集合不存在")
                 if collections:
                     raise VectorIndexUnavailable("Milvus 隔离数据库已有其他集合，拒绝自动初始化")
+                if not created_database and confirmed_database != target_database:
+                    raise VectorIndexUnavailable(
+                        "Milvus 已有空数据库归属不明，请先确认归本项目，"
+                        "再使用 init --confirm-milvus-database <目标数据库名> 重试"
+                    )
                 self._create_collection(client)
             self._validate(client)
             client.load_collection(
@@ -224,7 +273,7 @@ class MilvusVectorIndex:
 
         name = self._config.milvus_collection
         try:
-            description = client.describe_collection(name)
+            description = client.describe_collection(name, timeout=_RPC_TIMEOUT_SECONDS)
         except Exception as error:
             raise VectorIndexUnavailable("Milvus 集合结构读取失败") from error
 
@@ -266,10 +315,10 @@ class MilvusVectorIndex:
             raise VectorIndexUnavailable("Milvus 集合一致性级别不是 Strong")
 
         try:
-            indexes = client.list_indexes(name, field_name="vector")
+            indexes = client.list_indexes(name, field_name="vector", timeout=_RPC_TIMEOUT_SECONDS)
             if not indexes:
                 raise VectorIndexUnavailable("Milvus 集合缺少向量索引")
-            index_info = client.describe_index(name, indexes[0])
+            index_info = client.describe_index(name, indexes[0], timeout=_RPC_TIMEOUT_SECONDS)
         except VectorIndexUnavailable:
             raise
         except Exception as error:
@@ -448,11 +497,29 @@ class MilvusVectorIndex:
             raise VectorIndexUnavailable("Milvus 向量删除失败") from error
 
     async def aclose(self) -> None:
-        """关闭客户端。参数：无；返回：None；异常：无。"""
-        client, self._client = self._client, None
+        """停止接收初始化并等待后台工作后关闭客户端。
+
+        参数：无；返回：None。
+        异常：asyncio.CancelledError 表示调用方取消等待；清理任务保留，重试关闭可继续等待。
+        """
+        self._closed = True
         self._ready = False
-        if client is not None:
-            try:
-                await anyio.to_thread.run_sync(client.close)
-            except Exception:
-                pass
+        if self._closing is None:
+            # 清理本身也必须有独立归属，重复取消 aclose 不能打断或重复释放客户端。
+            self._closing = asyncio.create_task(self._close())
+        await asyncio.shield(self._closing)
+
+    async def _close(self) -> None:
+        """在初始化真正结束后完成唯一一次客户端释放。
+
+        参数：无；返回：None；异常：客户端关闭失败被抑制，不覆盖调用方原始错误。
+        """
+        async with self._lock:
+            if self._initializing is not None:
+                await asyncio.shield(self._initializing)
+            client, self._client = self._client, None
+            if client is not None:
+                try:
+                    await anyio.to_thread.run_sync(client.close)
+                except Exception:
+                    pass

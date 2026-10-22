@@ -77,7 +77,8 @@ class TestCustomerServicePrompt:
         异常:
             AssertionError: 提示词缺少处理时限与到账时效的分离约束。
         """
-        from app.core.prompts import CUSTOMER_SERVICE_SYSTEM, FINAL_ANSWER_SYSTEM
+        from app.core.prompts import (CUSTOMER_SERVICE_SYSTEM, FINAL_ANSWER_SYSTEM,
+                                       TOOL_DECISION_RULES)
 
         assert "处理时限" in CUSTOMER_SERVICE_SYSTEM
         assert "到账时间" in CUSTOMER_SERVICE_SYSTEM
@@ -85,6 +86,33 @@ class TestCustomerServicePrompt:
         assert "不能截成" in CUSTOMER_SERVICE_SYSTEM
         assert "处理/审核时限" in FINAL_ANSWER_SYSTEM
         assert "不能因为不承诺到账就否认知识库给出的处理时限" in FINAL_ANSWER_SYSTEM
+
+    def test_answer_system_does_not_command_tool_use(self) -> None:
+        """回答阶段提示不能携带决策期指令。
+
+        参数：无；返回：None；异常：AssertionError。
+        背景：回答阶段不绑定工具，但旧实现把含“必须先用 query_faq”的
+        CUSTOMER_SERVICE_SYSTEM 直接拼进回答请求，模型会继续输出 tool_call，
+        被适配层判为非法而整轮失败（用户看到“本轮暂时未能完成”）。
+        """
+        from app.core.prompts import (ANSWER_SYSTEM, CUSTOMER_SERVICE_PERSONA,
+                                       CUSTOMER_SERVICE_SYSTEM, FINAL_ANSWER_SYSTEM,
+                                       TOOL_DECISION_RULES)
+
+        # 回答阶段只能包含人设/通用守则与回答规则，不能包含“选择/调用工具”的指令。
+        assert ANSWER_SYSTEM == CUSTOMER_SERVICE_PERSONA + FINAL_ANSWER_SYSTEM
+        for decision_marker in ["必须先用 query_faq", "按需连续调用工具",
+                                 "才用 create_ticket", "先调用query_order",
+                                 "结束工具决策"]:
+            assert decision_marker not in ANSWER_SYSTEM
+        # 人设与关键业务约束必须保留，不能因为剥离决策指令而丢失。
+        assert "喵购商城" in ANSWER_SYSTEM
+        assert "严禁编造订单、物流、价格、库存、商城政策或工单号" in ANSWER_SYSTEM
+        # 决策阶段仍必须保留强制查询约束，不能被一并删除。
+        assert "必须先用 query_faq" in CUSTOMER_SERVICE_SYSTEM
+        assert "才用 create_ticket" in CUSTOMER_SERVICE_SYSTEM
+        # 旧入口保持不变：决策提示仍可直接拼接使用。
+        assert CUSTOMER_SERVICE_SYSTEM == CUSTOMER_SERVICE_PERSONA + TOOL_DECISION_RULES
 
     def test_customer_service_system_prompt_content(self) -> None:
         """测试客服 System Prompt 文本包含官方人设、严禁臆造虚假单号、礼貌引导等核心业务约束。

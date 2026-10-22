@@ -132,11 +132,11 @@ async def test_validation_and_not_found_not_retried():
             self.count += 1
             return []
     support = Support()
-    for args, expected in [({"keyword": "邮费"}, True), ({"keyword": "运费"}, False), ({"keyword": " "}, False)]:
+    for args, expected in [({"keyword": "邮费"}, True), ({"keyword": "运费"}, True), ({"keyword": " "}, False)]:
         store = ResultStore()
         result = await ToolExecutor(build_registry(), store, support).execute(call("query_faq", args), context(), ignore_status)
         assert result.ok is expected and store.writes == 1
-    assert support.count == 1
+    assert support.count == 2
 
 
 async def test_cancel_during_backoff():

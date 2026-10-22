@@ -16,7 +16,9 @@ SENTENCE_END = r"[。！？!?…]+[”’\"'）)\]】》」』]*[ \t\n]*"
 _FENCE = re.compile(r"^[ \t]*(`{3,}|~{3,})(.*)$")
 _LIST = re.compile(r"^( *)(?:[-+*]|\d+[.)])[ \t]+")
 _ATX_HEADER = re.compile(r"^[ \t]*#{1,6}(?:[ \t]|$)")
-_TABLE_SEPARATOR = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$")
+_TABLE_SEPARATOR_CELL = re.compile(r":?-+:?")
+_HORIZONTAL_RULE = re.compile(r"^ {0,3}(?:(?:-[ \t]*){3,}|(?:\*[ \t]*){3,}|(?:_[ \t]*){3,})$")
+_BLOCK_QUOTE = re.compile(r"^ {0,3}>")
 
 
 @dataclass(frozen=True)
@@ -54,13 +56,54 @@ def fence_end(lines: list[str], start: int) -> int | None:
     raise AtomError("代码围栏未闭合，无法保持完整代码块", start, len(lines))
 
 
+def _table_cells(line: str) -> list[str] | None:
+    """按有效竖线识别单元格，仅供结构校验，不改写原文。
+
+    参数：line 为单行 Markdown，可带行尾空白与换行。
+    返回：list[str] 为去除外侧边框后的单元格；原行没有竖线时返回 None。
+    异常：无。
+    """
+    text = line.strip()
+    if "|" not in text:
+        return None
+    # 与聊天端 markdown-it 一致：先拆表格列，再解析行内代码，反引号不会保护竖线。
+    # 表格规则只检查竖线紧前方的反斜杠，不按正文转义规则计算反斜杠奇偶数。
+    boundaries = [index for index, char in enumerate(text)
+                  if char == "|" and (index == 0 or text[index - 1] != "\\")]
+    if not boundaries:
+        return [text]
+    starts = [0, *(boundary + 1 for boundary in boundaries)]
+    ends = [*boundaries, len(text)]
+    cells = [text[start:end].strip() for start, end in zip(starts, ends)]
+    # 首尾竖线是可选边框，中间的空单元格仍须计入列数。
+    if boundaries[-1] == len(text) - 1:
+        cells.pop()
+    if boundaries[0] == 0:
+        cells.pop(0)
+    return cells
+
+
 def _table_start(lines: list[str], index: int) -> bool:
-    """识别本表表头与分隔行。参数：原始行/索引；返回：bool；异常：无。"""
-    return (
-        index + 1 < len(lines)
-        and "|" in lines[index]
-        and bool(_TABLE_SEPARATOR.fullmatch(lines[index + 1].rstrip("\r\n")))
-    )
+    """识别本表表头与分隔行，并校验二者列数。
+
+    参数：lines 为原始行；index 为待识别的表头行索引。
+    返回：bool，是否为含至少一列的表格起点。
+    异常：AtomError，表头与合法分隔行的列数不一致。
+    """
+    if index + 1 >= len(lines):
+        return False
+    header = _table_cells(lines[index])
+    separator = _table_cells(lines[index + 1])
+    # markdown-it 接受单列无边框分隔行；仍要求上一行有竖线，避免误收普通水平线。
+    if separator is None:
+        separator = [lines[index + 1].strip()]
+    if not header or not separator or not all(_TABLE_SEPARATOR_CELL.fullmatch(cell) for cell in separator):
+        return False
+    if len(header) != len(separator):
+        raise AtomError(
+            f"表格列数不一致：表头 {len(header)} 列，分隔行 {len(separator)} 列", index, index + 2,
+        )
+    return True
 
 
 def list_item_end(lines: list[str], start: int) -> int | None:
@@ -106,7 +149,7 @@ def parse_atoms(content: str) -> list[Atom]:
     """按原序识别结构，再递归拆分正文完整句。
 
     参数：content 为保留缩进和空白的章节原文。
-    返回：有行范围的 Atom 列表；异常：AtomError，未闭合围栏或无数据表格。
+    返回：有行范围的 Atom 列表；异常：AtomError，未闭合围栏、无数据表格或表格列数不一致。
     """
     lines = content.splitlines(keepends=True)
     atoms: list[Atom] = []
@@ -125,11 +168,26 @@ def parse_atoms(content: str) -> list[Atom]:
             atoms.append(Atom("".join(lines[index:end]), "code", index, end))
         elif _table_start(lines, index):
             header = "".join(lines[index:index + 2]).rstrip("\n") + "\n"
+            columns = len(_table_cells(lines[index]) or [])
             end = index + 2
-            while end < len(lines) and lines[end].strip() and "|" in lines[end] and not _table_start(lines, end):
-                # 表格遇到围栏/列表即结束，不能把其后的正文归为数据行。
-                if _FENCE.match(lines[end]) or _LIST.match(lines[end]):
+            while end < len(lines) and lines[end].strip():
+                # 与页面一致，块级结构结束当前表格；普通无竖线行仍属于表内数据。
+                if (_FENCE.match(lines[end]) or _LIST.match(lines[end]) or _ATX_HEADER.match(lines[end])
+                        or _HORIZONTAL_RULE.fullmatch(lines[end].rstrip("\r\n"))
+                        or _BLOCK_QUOTE.match(lines[end]) or lines[end].expandtabs(4).startswith("    ")):
                     break
+                # 表内裸分隔线属于表后的水平线，不能把前一数据行改认成新表头。
+                if end + 1 < len(lines) and "|" in lines[end + 1] and _table_start(lines, end):
+                    break
+                cells = _table_cells(lines[end])
+                if cells is None:
+                    # 无外框单列行保留原文；多列表则在下方明确报告缺列。
+                    cells = [lines[end].strip()]
+                # 不补齐或丢弃单元格，避免表格展示时静默丢失业务条件。
+                if len(cells) != columns:
+                    raise AtomError(
+                        f"表格列数不一致：表头 {columns} 列，数据行 {len(cells)} 列", end, end + 1,
+                    )
                 atoms.append(Atom(lines[end], "table", end, end + 1, header, index))
                 end += 1
             if end == index + 2:
