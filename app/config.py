@@ -111,6 +111,21 @@ class Settings(BaseSettings):
         description="离线知识关系判定的校准策略文件路径",
     )
 
+    # CH04 检索参数：每路各 50，融合后 50，默认重排返回 10；不同于 CH03 Dense 的校准分数。
+    recall_top_k: int = Field(default=50, ge=1, le=50, strict=True,
+                             description="Dense 与 BM25 每路初步召回数量，同时作为 RRF 融合候选上限，默认各 50")
+    rerank_top_k: int = Field(default=10, ge=1, le=50, strict=True,
+                             description="普通检索重排后进入上下文的最大条数，默认 10，显式查询可覆盖")
+    subquery_split: bool = Field(default=True, description="按中文逗号句号分号问号拆子句，每句分别完整召回并重排")
+    rerank_min_score: float = Field(default=0.3, ge=0, le=1, allow_inf_nan=False,
+                                   description="最高归一化重排分低于此值时 FAQ 返回空；不是 COSINE/RRF 阈值或正确概率")
+    evidence_confidence_threshold: float = Field(default=0.26, ge=0, le=1, allow_inf_nan=False,
+        description="参考 CH09 四信号闸默认值；当前未定义四信号/权重且未接入，不代表本项目已校准")
+    rerank_model_path: str = Field(default="models/bge-reranker-large", min_length=1,
+                                  description="本地 BAAI/bge-reranker-large 目录，请求中不下载")
+    rerank_device: str = Field(default="cuda:0", min_length=1, description="显式重排设备，默认 cuda:0，不在异常时切换模型或设备")
+    rerank_batch_size: int = Field(default=4, ge=1, le=32, strict=True, description="本地重排推理批次，默认 4，GPU 并发由锁串行")
+
     # 预留向量嵌入模型配置
     embed_base_url: str | None = Field(
         default=None,
