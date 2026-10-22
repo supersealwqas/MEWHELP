@@ -112,6 +112,17 @@ def _migrate(connection) -> list[str]:
     return created
 
 
+async def check_quality_tables(config: Settings) -> None:
+    """只读检查目标库已完成质量表迁移。参数：config 明确目标；返回：None；异常：结构/数据库错误。"""
+    engine, _ = create_database(config)
+    try:
+        async with engine.connect() as connection:
+            await connection.run_sync(lambda sync: validate_quality_schema(inspect(sync)))
+    finally:
+        with anyio.CancelScope(shield=True):
+            await engine.dispose()
+
+
 async def migrate_quality_tables(config: Settings) -> list[str]:
     """显式迁移两张质量表，UTF-8 会话解析中文枚举，退出保证关闭。
 

@@ -211,6 +211,11 @@ async def test_cancelled_hybrid_warmup_closes_all_resources(monkeypatch) -> None
     monkeypatch.setattr(runtime, "MilvusHybridIndex", lambda config: index)
     monkeypatch.setattr(runtime, "BgeReranker", lambda config: ranking)
 
+    async def check(config):
+        """替代已验证的质量表外部依赖。参数：配置；返回：None；异常：无。"""
+
+    monkeypatch.setattr(runtime, "check_quality_tables", check)
+
     async def start():
         """进入实际运行时。参数：无；返回：None；异常：原启动取消。"""
         async with runtime.online_search_runtime(make_settings(), MemoryKnowledgeStore()):

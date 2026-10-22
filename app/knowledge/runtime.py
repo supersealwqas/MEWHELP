@@ -16,6 +16,7 @@ from sqlalchemy.pool import NullPool
 
 from app.config import Settings
 from app.core.llm import get_chat_model
+from app.db.migrate_rag_quality import check_quality_tables
 from app.db.session import create_database
 from app.knowledge.embedding import BgeM3Encoder
 from app.knowledge.hybrid_index import MilvusHybridIndex
@@ -115,6 +116,8 @@ async def online_search_runtime(config: Settings, store: KnowledgeStore):
         if config.knowledge_retrieval_mode == "hybrid":
             index = MilvusHybridIndex(config)
             await index.ensure_ready(create=False)
+            # 质量表必须由显式迁移准备；普通启动仅核验，缺表阻止接收会话。
+            await check_quality_tables(config)
             reranker = BgeReranker(config)
             await encoder.encode(["知识库启动预热"])
             text = KnowledgeText(category="运行检查", questions="预热", answer="仅检查模型可用，不是知识库事实。")

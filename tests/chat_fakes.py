@@ -1,5 +1,6 @@
 """聊天编排测试的外部边界替身；真实服务、工具和消息转换保持运行。"""
 
+import json
 from types import SimpleNamespace
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
@@ -13,6 +14,7 @@ class MemoryRepository:
         """初始化记录。参数：无；返回：None；异常：无。"""
         self.turns, self.results, self.contexts = {}, {}, []
         self.fail_finish = False
+        self.low_confidence = []
 
     async def start_turn(self, context, message):
         """保存用户轮次。参数：上下文、原文；返回：带数字 ID 的上下文；异常：无。"""
@@ -43,11 +45,16 @@ class MemoryRepository:
                 content=result.model_dump_json(), tool_call_id=context.tool_call_id))
         return self.results[key]
 
-    async def finish_turn(self, context, content):
-        """模拟完成提交。参数：上下文、回答；返回：None；异常：ConnectionError。"""
+    async def finish_turn(self, context, content, *, low_confidence=None):
+        """模拟原子完成/入池。参数：上下文、回答、自评失败；返回：None；异常：ConnectionError。"""
         if self.fail_finish:
             raise ConnectionError("SECRET")
+        if self.turns[context.turn_id].turn_status == "completed":
+            return
         self.turns[context.turn_id].messages.append(StoredMessage(role="assistant", content=content))
+        if low_confidence is not None:
+            self.low_confidence.append({"raw_question": context.user_message, "source": low_confidence.source,
+                                        "reason": low_confidence.reason, "conversation_id": context.conversation_id})
         self.turns[context.turn_id].turn_status = "completed"
 
     async def mark_turn(self, context, status):
@@ -82,6 +89,34 @@ class ScriptedModel:
         if isinstance(decision, Exception):
             raise decision
         return decision
+
+    async def answer_knowledge(self, messages):
+        """提供旧聊天测试的显式生成边界，真实JSON解析另有定向测试。
+
+        参数：messages 为实际知识自评输入；返回：KnowledgeAnswer；异常：预设模型错误。
+        """
+        from app.knowledge.answering import KnowledgeAnswer
+        self.inputs.append(("answer", messages))
+        text = []
+        for chunk in self.chunks:
+            if isinstance(chunk, Exception):
+                raise chunk
+            text.append(chunk)
+        answer = "".join(text)
+        if len(answer) > 12000:
+            from app.services.chat import AnswerTooLong
+            raise AnswerTooLong("回答过长")
+        if not answer.strip():
+            raise ValueError("模型未返回有效文本")
+        hits = []
+        for message in messages:
+            if isinstance(message, ToolMessage):
+                data = json.loads(message.content).get("data")
+                if isinstance(data, dict):
+                    hits.extend(data.get("hits", []))
+        if not hits:
+            return KnowledgeAnswer(useful=False, reason="当前证据不足", answer="", citation_numbers=[])
+        return KnowledgeAnswer(useful=True, reason="", answer=answer + "[1]", citation_numbers=[1])
 
     async def stream_answer(self, messages):
         """逐块生成最终文本。参数：模型上下文；返回：异步文本流；异常：预设异常。"""

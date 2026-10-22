@@ -16,6 +16,7 @@ from pydantic import ValidationError
 
 from app.config import settings
 from app.core.prompts import ANSWER_NUDGE
+from app.knowledge.answering import KnowledgeAnswer, KnowledgeAnswerError
 from app.schemas.chat import InvalidToolDecision
 
 
@@ -98,6 +99,54 @@ class ChatModelAdapter:
                 raise InvalidToolDecision(tool_call_chunks=gathered.tool_call_chunks) from error
         return AIMessage(content=gathered.content, tool_calls=gathered.tool_calls,
                          invalid_tool_calls=gathered.invalid_tool_calls)
+
+    async def answer_knowledge(self, messages) -> KnowledgeAnswer:
+        """有界聚合知识答案 JSON，严格校验 useful，不依赖网关 json_schema 支持。
+
+        参数：messages 为完整本轮证据、稳定 n 及自评规则，不能携带未编号新证据。
+        返回：KnowledgeAnswer，尚需服务端回核编号再发布。
+        异常：KnowledgeAnswerError，空/超长/重复键/非法 JSON 或工具申请；网络错误原样传播；取消关闭流。
+        """
+        model = get_chat_model(streaming=True, temperature=0.0, max_tokens=4096)
+        parts = []
+        size = 0
+        stream = model.astream(messages)
+        try:
+            async for chunk in stream:
+                if chunk.tool_calls or chunk.invalid_tool_calls or getattr(chunk, "tool_call_chunks", None):
+                    raise KnowledgeAnswerError("知识自评不能输出工具申请")
+                if isinstance(chunk.content, str):
+                    content = chunk.content
+                else:
+                    content = "".join(block if isinstance(block, str) else block["text"]
+                        for block in chunk.content if isinstance(block, str) or
+                        (isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str)))
+                size += len(content)
+                if size > 20000:
+                    raise KnowledgeAnswerError("知识自评输出超过长度上限")
+                parts.append(content)
+        finally:
+            with anyio.CancelScope(shield=True):
+                await stream.aclose()
+
+        def unique_object(pairs):
+            """拒绝JSON重复字段。参数：字段列表；返回：字典；异常：ValueError，重复键。"""
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("JSON重复键")
+                result[key] = value
+            return result
+
+        def reject_number(value):
+            """拒绝NaN/Infinity。参数：异常数值文本；返回：不返回；异常：ValueError。"""
+            raise ValueError("JSON非有限数值")
+
+        try:
+            payload = json.loads("".join(parts), object_pairs_hook=unique_object, parse_constant=reject_number)
+            return KnowledgeAnswer.model_validate(payload)
+        except (ValueError, TypeError, ValidationError) as error:
+            raise KnowledgeAnswerError("知识自评返回不合法JSON或字段") from error
 
     async def stream_answer(self, messages):
         """生成最终文本。

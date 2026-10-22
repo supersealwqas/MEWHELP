@@ -52,7 +52,8 @@ def expand_policy_queries(query: str) -> list[str]:
 def faq_rows(ranked: list[RankedChunk]) -> list[dict]:
     """映射模型可读权威结果。参数：ranked 为已校验排名；返回：原 FAQ 四字段列表；异常：无。"""
     return [{"id": item.chunk.id, "question": item.chunk.text.questions,
-             "answer": item.chunk.text.answer, "category": item.chunk.text.category} for item in ranked]
+             "answer": item.chunk.text.answer, "category": item.chunk.text.category,
+             "section_path": item.chunk.section_path} for item in ranked]
 
 
 class HybridKnowledgeSearch:

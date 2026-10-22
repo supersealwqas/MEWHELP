@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from uuid import uuid4
 
@@ -15,8 +16,55 @@ from sqlalchemy import delete, inspect, select
 from app.config import Settings
 from app.db.migrate_rag_quality import migrate_quality_tables, validate_quality_schema
 from app.db.session import create_database
-from app.models.customer_service import Base, Conversation
+from app.models.customer_service import Base, Conversation, Message
 from app.models.rag_quality import FaithCase, LowConfidenceQuestion
+
+
+@pytest.mark.skipif(os.getenv("MEWHELP_RUN_QUALITY_MYSQL") != "1", reason="需要显式 MEWHELP_RUN_QUALITY_MYSQL=1")
+async def test_refusal_and_pool_commit_idempotently_and_failure_rolls_back(monkeypatch) -> None:
+    """真实 MySQL 验证同轮并发拒答只入池一次，异常时两者均回滚。参数：替换器；返回：None；异常：SQL/断言错误。"""
+    from app.repositories import chat as module
+    from app.knowledge.answering import FIXED_KNOWLEDGE_REFUSAL, SelfCheckFailure
+    from app.schemas.tools import ToolContext
+
+    config = Settings(_env_file=os.getenv("MEWHELP_TEST_ENV_FILE", ".env")).model_copy(update={"mysql_database": "mewhelp_ch04_test"})
+    engine, factory = create_database(config)
+    context = None
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(lambda sync: Message.__table__.create(sync, checkfirst=True))
+        await migrate_quality_tables(config)
+        repository = module.ChatRepository(factory)
+        raw = "  烦死了，这个到底怎么退啊？！  "
+        context = await repository.start_turn(ToolContext(session_id="pool-" + uuid4().hex, user_id="quality-test",
+                                                        turn_id=str(uuid4()), user_message=raw), raw)
+        failure = SelfCheckFailure(reason="当前证据不够")
+        await asyncio.gather(*(repository.finish_turn(context, FIXED_KNOWLEDGE_REFUSAL, low_confidence=failure) for _ in range(3)))
+        async with factory() as session:
+            questions = (await session.scalars(select(LowConfidenceQuestion).where(LowConfidenceQuestion.conversation_id == context.conversation_id))).all()
+            replies = (await session.scalars(select(Message).where(Message.conversation_id == context.conversation_id, Message.role == "assistant"))).all()
+            assert len(questions) == len(replies) == 1 and questions[0].raw_question == raw
+            assert questions[0].source == "self_check" and replies[0].turn_status == "completed"
+        second = await repository.start_turn(context.model_copy(update={"turn_id": str(uuid4())}), raw)
+
+        def fail_pool(**kwargs):
+            """注入池写入构造故障。参数：数据库字段；返回：不返回；异常：RuntimeError。"""
+            raise RuntimeError("pool unavailable")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(module, "LowConfidenceQuestion", fail_pool)
+            with pytest.raises(RuntimeError):
+                await repository.finish_turn(second, FIXED_KNOWLEDGE_REFUSAL, low_confidence=failure)
+        async with factory() as session:
+            rows = (await session.scalars(select(Message).where(Message.turn_id == second.turn_id))).all()
+            assert len(rows) == 1 and rows[0].role == "user" and rows[0].turn_status == "running"
+    finally:
+        if context is not None:
+            async with factory.begin() as session:
+                await session.execute(delete(LowConfidenceQuestion).where(LowConfidenceQuestion.conversation_id == context.conversation_id))
+                await session.execute(delete(Message).where(Message.conversation_id == context.conversation_id))
+                await session.execute(delete(Conversation).where(Conversation.id == context.conversation_id))
+        await engine.dispose()
 
 
 @pytest.mark.skipif(os.getenv("MEWHELP_RUN_QUALITY_MYSQL") != "1", reason="需要显式 MEWHELP_RUN_QUALITY_MYSQL=1")

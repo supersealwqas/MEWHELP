@@ -2,6 +2,8 @@
 
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
+from app.knowledge.answering import SelfCheckFailure
+from app.models.rag_quality import LowConfidenceQuestion
 from app.models.customer_service import Conversation, Message
 from app.schemas.history import StoredMessage, StoredTurn
 from app.schemas.tools import ToolContext, ToolResult
@@ -85,14 +87,39 @@ class ChatRepository:
             return existing_result
         return result
 
-    async def finish_turn(self, context: ToolContext, content: str) -> None:
-        """原子保存最终回复与完成状态。参数：上下文及完整回复；返回：None；异常：正文过长 ValueError 或数据库错误。"""
-        # MySQL TEXT 上限按字节计算，不能用中文字符数代替；在打开事务前拒绝溢出。
+    async def finish_turn(self, context: ToolContext, content: str, *, low_confidence: SelfCheckFailure | None = None) -> None:
+        """原子保存最终回复、完成状态及可选 useful=false 问题池记录。
+
+        参数：context 可信会话/轮次/原话；content 完整回复；low_confidence 只有自评不足可传。
+        返回：None，同轮一致结果重试幂等，不重复原话入池。
+        异常：ValueError，正文过长/身份或原话不符；PersistenceUncertain，已完成结果不同；数据库错误。
+        """
         if len(content.encode("utf-8")) > 65535:
             raise ValueError("回答正文过长，无法保存")
         async with self.factory.begin() as session:
+            # 锁定同一轮最早用户消息，使并发完成互斥，无须给用户DDL增加turn_id字段。
+            user = await session.scalar(select(Message).where(
+                Message.conversation_id == context.conversation_id, Message.turn_id == context.turn_id,
+                Message.role == "user").order_by(Message.id).limit(1).with_for_update())
+            if user is None or user.content != context.user_message:
+                raise ValueError("轮次原话与可信上下文不匹配")
+            conversation = await session.get(Conversation, context.conversation_id)
+            if conversation is None or conversation.user_id != context.user_id:
+                raise ValueError("完成轮次会话身份不匹配")
+            if user.turn_status == "completed":
+                existing = await session.scalar(select(Message).where(
+                    Message.conversation_id == context.conversation_id, Message.turn_id == context.turn_id,
+                    Message.role == "assistant", Message.tool_calls.is_(None)).order_by(Message.id.desc()).limit(1))
+                if existing is None or existing.content != content:
+                    raise PersistenceUncertain("轮次已完成但结果不同，需核查")
+                return
+            if user.turn_status != "running":
+                raise PersistenceUncertain("轮次已结束，不能重新提交回复")
             session.add(Message(conversation_id=context.conversation_id, turn_id=context.turn_id,
                                 role="assistant", content=content, turn_status="completed"))
+            if low_confidence is not None:
+                session.add(LowConfidenceQuestion(conversation_id=context.conversation_id,
+                    raw_question=context.user_message, source=low_confidence.source, reason=low_confidence.reason))
             await session.execute(update(Message).where(Message.conversation_id == context.conversation_id,
                                                         Message.turn_id == context.turn_id).values(turn_status="completed"))
 
