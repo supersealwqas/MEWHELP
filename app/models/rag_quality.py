@@ -1,20 +1,24 @@
 """用户 CH04 DDL 的低置信问题池与忠实度编造个案 ORM。
 
 问题池只记录原话和入池理由，不保存 useful 或新增轮次字段；编造台账一题一行，
-保留当轮证据全集、累计次数、首次/最近时间与人工处置/复发时间。共享业务 Base
-仅为解析 conversations 外键，迁移必须显式限定本模块两张表。
+保留当轮证据全集、累计次数、首次/最近时间与人工处置/复发时间。使用独立元数据，
+避免旧业务初始化及测试库重置误处理质量表；会话外键直接引用既有列。
 """
 
 from datetime import datetime
 
 from sqlalchemy import Enum, ForeignKey, Index, JSON, String, Text, UniqueConstraint, text
 from sqlalchemy.dialects.mysql import BIGINT, DATETIME, INTEGER
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-from app.models.customer_service import Base, TABLE_OPTIONS
+from app.models.customer_service import Conversation, TABLE_OPTIONS
 
 
-class LowConfidenceQuestion(Base):
+class QualityBase(DeclarativeBase):
+    """仅管理两张质量表；建表和结构核验由专用迁移入口负责。"""
+
+
+class LowConfidenceQuestion(QualityBase):
     """生成自评知识不足时的原话问题池，为后续数据归并保留真实诉求。"""
 
     __tablename__ = "low_confidence_questions"
@@ -23,7 +27,8 @@ class LowConfidenceQuestion(Base):
 
     id: Mapped[int] = mapped_column(BIGINT(unsigned=True), primary_key=True, autoincrement=True, comment="主键")
     conversation_id: Mapped[int | None] = mapped_column(
-        BIGINT(unsigned=True), ForeignKey("conversations.id", name="fk_lcq_conversation"), nullable=True, comment="来源会话")
+        # 直接引用既有列，使外键可跨元数据解析，同时不复制或注册业务表。
+        BIGINT(unsigned=True), ForeignKey(Conversation.__table__.c.id, name="fk_lcq_conversation"), nullable=True, comment="来源会话")
     raw_question: Mapped[str] = mapped_column(Text, nullable=False, comment="用户原话,带情绪口语")
     source: Mapped[str] = mapped_column(Enum("retrieval_low_conf", "self_check", "user_feedback"), nullable=False,
         comment="入池入口:检索证据低 / 生成自评不足 / 用户反馈未解决")
@@ -31,7 +36,7 @@ class LowConfidenceQuestion(Base):
     created_at: Mapped[datetime] = mapped_column(DATETIME, nullable=False, server_default=text("CURRENT_TIMESTAMP"), comment="入池时间")
 
 
-class FaithCase(Base):
+class FaithCase(QualityBase):
     """忠实度裁判判出的编造台账，eval_id 唯一并支持人工处置后复发。"""
 
     __tablename__ = "faith_cases"
