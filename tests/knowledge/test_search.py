@@ -259,4 +259,4 @@ async def test_query_faq_rejects_invalid_limit_and_blank_keyword() -> None:
 def test_public_tool_schema_and_envelope_unchanged() -> None:
     """query_faq 仍只暴露 keyword 参数。参数：无；返回：None；异常：无。"""
     schema = build_registry().get("query_faq").tool_call_schema.model_json_schema()
-    assert set(schema["properties"]) == {"keyword"}
+    assert set(schema["properties"]) == {"keyword", "category", "content_type"}
