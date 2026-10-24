@@ -106,11 +106,11 @@ async def query_faq(keyword: str, config: RunnableConfig) -> dict:
     """
     resources = config["configurable"]
     support = resources["support_repository"]
-    # 新混合路径必须保留当前全部子句；旧显式 Dense 路径继续使用原关键词。
-    query = resources["context"].user_message if getattr(support, "uses_full_knowledge_query", False) else keyword
-    rows = await support.query_faq(query)
+    # 检索词一律采用模型提交的 keyword：模型会按需换成「会员运费权益」这类能命中的说法，
+    # 改回本轮原话会让换词失效，零命中后反复重试直至失败。
+    rows = await support.query_faq(keyword)
     if not rows:
-        return {"hits": [], "message": f"未找到与「{query}」相关的常见问题"}
+        return {"hits": [], "message": f"未找到与「{keyword}」相关的常见问题"}
     return {"hits": rows}
 
 

@@ -68,14 +68,22 @@ async def test_refund_tool_sends_thirty_authoritative_hits_to_answer_model() -> 
     assert [hit["id"] for hit in facts[0]] == [*range(1, 31, 2), *range(30, 1, -2)]
 
 
-async def test_hybrid_faq_tool_uses_trusted_full_current_query_for_clause_split() -> None:
-    """模型抽取片段不能让默认子句拆分失效，混合路径用当前原话。参数：无；返回：None；异常：断言失败。"""
+async def test_hybrid_faq_tool_uses_model_keyword_for_clause_split() -> None:
+    """混合路径用模型提交的检索词，并在该词内部继续做子句拆分。
+
+    参数：无。
+    返回：None。
+    异常：AssertionError，检索词被改回本轮原话或子句拆分失效。
+    """
     search, _, index, reranker = _search([_chunk(1)])
-    decision = AIMessage(content="", tool_calls=[{"id": "faq", "name": "query_faq", "args": {"keyword": "退货条件"}}])
+    decision = AIMessage(content="", tool_calls=[{"id": "faq", "name": "query_faq",
+                                                  "args": {"keyword": "退货申请条件，退款处理时限"}}])
     service, _, _, _ = make_chat_service(decision)
     service.executor.support = SupportRepository(None, search)
-    events = [event async for event in service.stream_turn(ChatRequest(session_id="full-query", message="退货申请条件，退款处理时限"))]
+    events = [event async for event in service.stream_turn(
+        ChatRequest(session_id="model-keyword", message="会员权益怎么算"))]
     assert events[-1].event == "done"
+    # 检索词来自模型 keyword，不是本轮原话；子句拆分在 keyword 内部照常生效。
     assert [call[0] for call in index.calls] == ["退货申请条件", "退款处理时限"]
     assert len(reranker.calls) == 2
 

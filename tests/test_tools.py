@@ -272,3 +272,33 @@ async def test_faq_passes_keyword_to_search_without_literal_rejection(question, 
     assert result["hits"] == [] and "未找到" in result["message"]
     assert f"「{keyword}」" in result["message"]
     assert support.keywords == [keyword]
+
+
+async def test_hybrid_query_faq_uses_model_keyword_not_raw_message() -> None:
+    """混合检索路径也必须使用模型提交的检索词，不能改回本轮原话。
+
+    参数：无。
+    返回：None，断言检索收到的是 keyword 而非 user_message。
+    异常：AssertionError 表示检索词被替换成本轮原话。
+    """
+    class HybridSupport:
+        """模拟混合检索仓储，记录实际收到的检索词。"""
+
+        uses_full_knowledge_query = True
+
+        def __init__(self):
+            """初始化记录。参数：无；返回：None；异常：无。"""
+            self.keywords = []
+
+        async def query_faq(self, keyword):
+            """记录并返回空结果。参数：检索词；返回：空列表；异常：无。"""
+            self.keywords.append(keyword)
+            return []
+
+    context = ToolContext(session_id="s", user_id="u", turn_id="t", user_message="如果我是会员呢")
+    support = HybridSupport()
+    config = {"configurable": {"context": context, "support_repository": support}}
+    tool = build_registry().get("query_faq")
+    result = await tool.ainvoke({"keyword": "会员运费权益"}, config=config)
+    assert support.keywords == ["会员运费权益"], f"应使用模型检索词，实际收到 {support.keywords}"
+    assert "会员运费权益" in result["message"]
