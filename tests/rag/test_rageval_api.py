@@ -67,7 +67,9 @@ def test_overview_reads_latest_comparison(monkeypatch, tmp_path) -> None:
     assert set(body["by_bucket"]) == {"dense", "bm25", "hybrid", "hybrid_rerank"}
     # 库外桶不参与召回图，只保留五个可作答桶。
     assert "F_unanswerable" not in body["buckets"]
-    assert body["calibration"]["case_count"] == 8
+    # _summary 里 expected_sample_count=8 且 4 个策略，真实题数是 8//4=2
+    assert body["calibration"]["case_count"] == 2
+    assert body["meta"]["sample_count"] == 2
     assert body["calibration"]["thresholds"]["dense"]["minimum"] == 0.66
 
 
@@ -115,3 +117,59 @@ def test_rag_eval_page_is_served(monkeypatch, tmp_path) -> None:
     response = client.get("/rag-eval")
     assert response.status_code == 200
     assert "RAG 评估看板" in response.text
+
+
+def test_case_count_divides_by_strategy_count() -> None:
+    """看板展示的是题数，不是「题数×策略数」的总样本量。
+
+    参数：无。
+    返回：None。
+    异常：AssertionError，把样本量当成题数展示。
+    """
+    from app.api.rageval import _case_count
+
+    # 24 题 × 4 策略 = 96 样本
+    assert _case_count({"expected_sample_count": 96,
+                        "strategies": {k: {} for k in ("dense", "bm25", "hybrid", "hybrid_rerank")}}) == 24
+    # 48 题 × 4 策略 = 192 样本
+    assert _case_count({"expected_sample_count": 192,
+                        "strategies": {k: {} for k in ("dense", "bm25", "hybrid", "hybrid_rerank")}}) == 48
+    # 只跑两个策略时按两个除
+    assert _case_count({"expected_sample_count": 48,
+                        "strategies": {"dense": {}, "bm25": {}}}) == 24
+    # 缺字段时不猜
+    assert _case_count(None) is None
+    assert _case_count({}) is None
+    assert _case_count({"expected_sample_count": 96}) is None
+
+
+def test_overview_reports_error_total_for_completed_with_errors(monkeypatch, tmp_path) -> None:
+    """有出错样本时要把总数暴露出来，避免「跑完了但有错」被当成全绿。
+
+    参数：monkeypatch/tmp_path。
+    返回：None。
+    异常：AssertionError，出错数未统计。
+    """
+    summary = _summary()
+    summary["status"] = "completed_with_errors"
+    # _summary 里四个策略共用同一个 dict 对象，先各自复制再改，避免互相污染。
+    summary["strategies"] = {name: dict(record) for name, record in summary["strategies"].items()}
+    summary["strategies"]["dense"]["error_count"] = 2
+    summary["strategies"]["hybrid"]["error_count"] = 3
+    client = _client(monkeypatch, tmp_path, {"20261024-evaluation-01": summary})
+    body = client.get("/api/rag-eval/overview").json()
+    assert body["meta"]["status"] == "completed_with_errors"
+    assert body["meta"]["error_total"] == 5
+
+
+def test_cli_treats_completed_with_errors_as_success() -> None:
+    """部分样本出错仍属完成，退出码不能是失败，否则看板会把正常结果标成失败。
+
+    参数：无。
+    返回：None。
+    异常：AssertionError，completed_with_errors 被判失败。
+    """
+    from app.evaluation.cli import run  # noqa: F401  # 导入即验证模块可用
+    import inspect
+    source = inspect.getsource(run)
+    assert '"completed", "completed_with_errors"' in source

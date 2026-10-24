@@ -12,11 +12,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
-import subprocess
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,11 +24,14 @@ from fastapi import APIRouter, HTTPException, Query
 router = APIRouter(prefix="/api/rag-eval", tags=["rag-eval"])
 
 # 评估产物根目录与任务状态文件；与 CLI 的默认输出位置保持一致。
-REPORTS_ROOT = Path(__file__).resolve().parents[2] / "reports" / "ch04"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+REPORTS_ROOT = REPO_ROOT / "reports" / "ch04"
 JOB_STATE = REPORTS_ROOT / "rageval-job.json"
 JOB_LOG = REPORTS_ROOT / "rageval-job.log"
 # 单次评估最多跑多久，超时由子进程自身终止，避免僵尸进程长期占用 GPU。
 JOB_TIMEOUT_SECONDS = 3600
+# 当前进程内持有的任务对象，用于停止与去重；服务重启后自然清空。
+_RUNS: dict[str, dict] = {}
 
 STRATEGIES = ("dense", "bm25", "hybrid", "hybrid_rerank")
 STRATEGY_LABELS = {
@@ -118,6 +120,25 @@ def _read_policy(directory: Path) -> dict:
         return {}
     thresholds = policy.get("thresholds")
     return thresholds if isinstance(thresholds, dict) else {}
+
+
+def _case_count(summary: dict | None) -> int | None:
+    """从运行汇总反推真实题数。
+
+    `expected_sample_count` 是「题数 × 策略数」的总样本量，不是题数；
+    看板要展示的是题数，因此除以本次实际运行的策略数。
+
+    参数：summary 运行汇总，可为 None。
+    返回：int 题数；无法推断时为 None。
+    异常：无。
+    """
+    if not summary:
+        return None
+    total = summary.get("expected_sample_count")
+    strategies = summary.get("strategies")
+    if not isinstance(total, int) or not isinstance(strategies, dict) or not strategies:
+        return None
+    return total // len(strategies) if len(strategies) else None
 
 
 def _best_strategy(summary: dict) -> dict:
@@ -238,11 +259,14 @@ async def overview() -> dict:
             "source_revision": (metadata.get("source_revision") or "")[:8],
             "elapsed_seconds": comparison.get("elapsed_seconds"),
             "status": comparison.get("status"),
-            "sample_count": comparison.get("expected_sample_count"),
+            # 出错样本数单独统计，让「跑完了但有错」不被当成全绿。
+            "error_total": sum((r.get("error_count") or 0)
+                               for r in (comparison.get("strategies") or {}).values()),
+            "sample_count": _case_count(comparison),
         },
         "calibration": {
             "present": calibration is not None,
-            "case_count": (calibration or {}).get("expected_sample_count"),
+            "case_count": _case_count(calibration),
             "thresholds": ((calibration or {}).get("thresholds") or {}),
         },        "strategies": list(STRATEGIES),
         "strategy_labels": STRATEGY_LABELS,
@@ -310,36 +334,99 @@ async def rerun(
     calibration_dir = REPORTS_ROOT / f"{stamp[:8]}-calibration-{stamp[-6:]}"
     comparison_dir = REPORTS_ROOT / f"{stamp[:8]}-evaluation-{stamp[-6:]}"
 
-    # 两段串行执行：先校准出 policy.json，再用它跑固定集比较。
-    script = (
-        "set -e\n"
-        f'python -m app.evaluation.cli calibrate --split calibration --dataset "{dataset_path}" '
-        f'--strategies {" ".join(chosen)} --output-dir "{calibration_dir}"\n'
-        f'python -m app.evaluation.cli compare --split evaluation --dataset "{dataset_path}" '
-        f'--strategies {" ".join(chosen)} --policy "{calibration_dir / "policy.json"}" '
-        f'--output-dir "{comparison_dir}"\n'
-    )
-    JOB_LOG.write_text("", encoding="utf-8")
-    log_handle = open(JOB_LOG, "a", encoding="utf-8", buffering=1)
-    try:
-        process = subprocess.Popen(
-            ["bash", "-lc", script], cwd=str(Path(__file__).resolve().parents[2]),
-            stdout=log_handle, stderr=subprocess.STDOUT, start_new_session=True,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
-        )
-    except OSError as error:
-        log_handle.close()
-        raise HTTPException(status_code=500, detail=f"无法启动评估进程：{error}") from error
-
     state = {
         "status": "running",
-        "pid": process.pid,
+        "pid": None,
         "started_at": datetime.now(timezone.utc).isoformat(),
-        "dataset": str(dataset_path.name),
+        "finished_at": None,
+        "returncode": None,
+        "dataset": dataset_path.name,
         "strategies": chosen,
         "calibration_dir": calibration_dir.name,
         "comparison_dir": comparison_dir.name,
         "message": "正在校准并比较四策略，完成后刷新页面查看",
     }
-    JOB_STATE.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+    JOB_LOG.write_text("", encoding="utf-8")
+    log_handle = open(JOB_LOG, "a", encoding="utf-8", buffering=1)
+    state["pid"] = None
+    _write_state(state)
+    # 两段串行：先校准出 policy.json，再用它跑固定集比较。
+    asyncio.create_task(_run_job(dataset_path, chosen, calibration_dir, comparison_dir, log_handle, state))
     return {"started": True, **state}
+
+
+def _cli_argv(*args: str) -> list[str]:
+    """组装一条 CLI 命令的 argv。
+
+    参数：args 子命令与选项。
+    返回：list[str]，交给 create_subprocess_exec，不经过 shell。
+    异常：无。
+    """
+    # 用 uv run 保证子进程使用项目 venv，而不是宿主 PATH 上的其它 Python。
+    return ["uv", "run", "python", "-m", "app.evaluation.cli", *args]
+
+
+async def _run_job(dataset: Path, strategies: list[str], calibration: Path,
+                   comparison: Path, log_handle, state: dict) -> None:
+    """依次执行校准与比较，把进度和终态写进日志与状态文件。
+
+    参数：dataset 题集；strategies 策略列表；calibration/comparison 输出目录；
+        log_handle 追加写日志；state 可变状态字典。
+    返回：None。
+    异常：无；启动或子进程失败都转成 failed 状态，不让任务静默消失。
+    """
+    try:
+        stages = [
+            _cli_argv("calibrate", "--split", "calibration", "--dataset", str(dataset),
+                      "--strategies", *strategies, "--output-dir", str(calibration)),
+            _cli_argv("compare", "--split", "evaluation", "--dataset", str(dataset),
+                      "--strategies", *strategies,
+                      "--policy", str(calibration / "policy.json"),
+                      "--output-dir", str(comparison)),
+        ]
+        for index, argv in enumerate(stages, start=1):
+            log_handle.write(chr(10) + "$ " + " ".join(argv) + chr(10))
+            log_handle.flush()
+            process = await asyncio.create_subprocess_exec(
+                *argv, cwd=str(REPO_ROOT), stdout=log_handle,
+                stderr=asyncio.subprocess.STDOUT,
+                env={**os.environ, "PYTHONUNBUFFERED": "1"}, start_new_session=True,
+            )
+            state["pid"] = process.pid
+            _write_state(state)
+            returncode = await process.wait()
+            if returncode != 0:
+                state.update({"status": "failed", "returncode": returncode,
+                              "finished_at": datetime.now(timezone.utc).isoformat(),
+                              "message": f"第 {index} 阶段失败，退出码 {returncode}，见日志"})
+                _write_state(state)
+                return
+        state.update({"status": "done", "returncode": 0,
+                      "finished_at": datetime.now(timezone.utc).isoformat(),
+                      "message": "评估完成，刷新页面查看最新结果"})
+        _write_state(state)
+    except Exception as error:
+        # 任务协程里任何异常都要落成 failed，否则页面会一直显示运行中。
+        log_handle.write(chr(10) + "启动失败：" + type(error).__name__ + ": " + str(error) + chr(10))
+        state.update({"status": "failed", "returncode": None,
+                      "finished_at": datetime.now(timezone.utc).isoformat(),
+                      "message": f"无法启动评估进程：{error}"})
+        _write_state(state)
+    finally:
+        try:
+            log_handle.close()
+        except OSError:
+            pass
+
+
+def _write_state(state: dict) -> None:
+    """把任务状态写入状态文件，供跨请求与重启后读取。
+
+    参数：state 状态字典。
+    返回：None。
+    异常：无；写盘失败静默忽略，不让接口因为状态文件报错。
+    """
+    try:
+        JOB_STATE.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+    except OSError:
+        pass

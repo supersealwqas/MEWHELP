@@ -140,7 +140,9 @@ async def run(args: argparse.Namespace) -> int:
                                          for strategy in args.strategies}}
                 atomic_json(output / "policy.json", policy)
             print(json.dumps({"status": result["status"], "output_dir": str(output.resolve())}, ensure_ascii=False))
-            return int(result["status"] != "completed")
+            # completed_with_errors 是“跑完了但部分样本出错”，结果可用，不算任务失败；
+            # 错误样本已逐条记在 results.jsonl，由报告与看板展示，不用退出码代替。
+            return int(result["status"] not in {"completed", "completed_with_errors"})
     except Exception as error:
         if not output.exists():
             output.mkdir(parents=True, exist_ok=False)
