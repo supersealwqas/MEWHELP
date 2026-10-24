@@ -159,3 +159,30 @@ def test_published_dataset_resolves_against_real_character_chunks() -> None:
     cases = load_dataset(path)
     assert len(cases) == 72
     assert {case.split for case in cases} == {"calibration", "evaluation"}
+
+
+def test_loader_accepts_variable_size_corpus_when_expected_size_is_none(tmp_path: Path) -> None:
+    """扩展题集题量不固定，expected_size=None 时只要求每桶两种 split 都有题。
+
+    参数：临时目录。
+    返回：None。
+    异常：AssertionError，变长题集被固定 72 题契约拒绝。
+    """
+    from app.evaluation.dataset import load_dataset
+
+    payload = _balanced_payload()
+    # 每桶再复制一题进校准集，凑成每桶 4 校准 + 8 固定以外的分布。
+    extra = []
+    for case in payload[:6]:
+        clone = copy.deepcopy(case)
+        clone["id"] = case["id"] + "-extra"
+        clone["fact_group"] = case["fact_group"] + "-extra"
+        clone["split"] = "calibration"
+        extra.append(clone)
+    variable = payload + extra
+
+    cases = load_dataset(_write(tmp_path / "var.json", variable), chunks=_corpus(), expected_size=None)
+    assert len(cases) == 78
+    # 默认仍按 72 题契约校验，变长题集必须显式放开。
+    with pytest.raises(Exception):
+        load_dataset(_write(tmp_path / "var2.json", variable), chunks=_corpus())

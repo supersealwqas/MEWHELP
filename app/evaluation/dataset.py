@@ -135,12 +135,14 @@ def _source_chunks() -> list[ChunkSnapshot]:
     return chunks
 
 
-def load_dataset(path: Path, *, chunks: list[ChunkSnapshot] | None = None) -> list[EvalCase]:
-    """加载72题发布集并检查计数、事实隔离与全部证据。
+def load_dataset(path: Path, *, chunks: list[ChunkSnapshot] | None = None,
+                 expected_size: int | None = 72) -> list[EvalCase]:
+    """加载发布题集并检查计数、事实隔离与全部证据。
 
     参数：path 为UTF-8 JSON文件，根节点必须是题目数组；chunks 可传冻结语料，
-        默认读取仓库六份资料并执行真实字符切分，便于离线验证。
-    返回：24条校准题和48条固定题，每桶分别4条和8条，保持文件顺序。
+        默认读取仓库六份资料并执行真实字符切分，便于离线验证；
+        expected_size 为题量上限校验，None 表示只要求每桶非空且两种 split 都有题。
+    返回：题目列表，保持文件顺序。
     异常：DatasetError，文件/JSON错误、题目字段错误、计数错误、跨集合事实泄漏或证据错误。
     """
     try:
@@ -150,14 +152,24 @@ def load_dataset(path: Path, *, chunks: list[ChunkSnapshot] | None = None) -> li
         cases = [EvalCase.model_validate(item) for item in payload]
     except (OSError, json.JSONDecodeError, ValidationError) as error:
         raise DatasetError(f"题集不可读或字段不合法：{path}；{error}") from error
-    if len(cases) != 72:
-        raise DatasetError("发布题集必须恰好72题")
+    if expected_size is not None and len(cases) != expected_size:
+        raise DatasetError(f"发布题集必须恰好{expected_size}题")
+    if not cases:
+        raise DatasetError("题集不能为空")
     if len({case.id for case in cases}) != len(cases):
         raise DatasetError("题号重复")
     counts = Counter((case.split, case.bucket) for case in cases)
-    for split, expected in (("calibration", 4), ("evaluation", 8)):
-        if any(counts[(split, bucket)] != expected for bucket in BUCKETS):
-            raise DatasetError(f"{split} 每桶必须恰好{expected}题")
+    if expected_size is not None:
+        # 固定题量时沿用每桶精确配比，保持既有 72 题契约不变。
+        for split, expected in (("calibration", 4), ("evaluation", 8)):
+            if any(counts[(split, bucket)] != expected for bucket in BUCKETS):
+                raise DatasetError(f"{split} 每桶必须恰好{expected}题")
+    else:
+        # 变长题集只要求每桶在两种 split 下都有题，允许各桶题量不同。
+        for bucket in BUCKETS:
+            for split in ("calibration", "evaluation"):
+                if counts[(split, bucket)] < 1:
+                    raise DatasetError(f"{split} 的 {bucket} 至少需要1题")
     fact_splits: dict[str, str] = {}
     for case in cases:
         if fact_splits.setdefault(case.fact_group, case.split) != case.split:
