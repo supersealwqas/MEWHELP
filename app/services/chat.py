@@ -12,7 +12,7 @@ from app.core.memory import ContextBudgetExceeded, assemble_turns, prepare_messa
 from app.core.prompts import ANSWER_NUDGE, ANSWER_SYSTEM, CUSTOMER_SERVICE_SYSTEM, TOOL_DECISION_SYSTEM
 from app.knowledge.answering import (
     KNOWLEDGE_ANSWER_RULES, business_facts_summary, collect_citations, decide_answer, has_knowledge_call,
-    has_successful_knowledge_result, knowledge_answer_handoff, number_knowledge_results,
+    has_failed_knowledge_result, KnowledgeAnswerError, knowledge_answer_handoff, number_knowledge_results,
 )
 from app.repositories.chat import PersistenceUncertain
 from app.schemas.chat import ChatEvent, ChatRequest, InvalidToolDecision
@@ -365,8 +365,11 @@ class ChatService:
                 yield ChatEvent(event="done")
                 return
             stage = "answer"
-            if (has_knowledge_call(current) and has_successful_knowledge_result(current)
+            if (has_knowledge_call(current)
                     and getattr(self.executor.support, "uses_full_knowledge_query", False)):
+                if has_failed_knowledge_result(current):
+                    # 故障不得绕过严格知识生成，也不能制造useful=false污染问题池。
+                    raise KnowledgeAnswerError("本轮知识查询未成功完成")
                 citations = collect_citations(current)
                 numbered = number_knowledge_results(current, citations)
                 # 最后显式交接为生成任务，阻止网关沿工具尾帧继续申请不存在的工具；原问不改写。

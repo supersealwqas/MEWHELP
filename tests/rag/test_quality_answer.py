@@ -333,7 +333,38 @@ async def test_backend_failed_knowledge_call_does_not_run_self_check_or_pool() -
     events = [event async for event in service.stream_turn(ChatRequest(session_id="backend-fail", message="政策条件"))]
     assert not calls and not repository.low_confidence
     assert next(iter(repository.results.values())).ok is False
-    assert events[-1].event == "done"
+    assert events[-1].event == "error"
+
+
+@pytest.mark.parametrize("ticket", [False, True])
+async def test_knowledge_backend_failure_is_not_completed_or_pooled(ticket):
+    """知识故障禁止普通生成成功，已提交工单仍保留。参数：ticket 先建工单；返回：None；异常：断言失败。"""
+    from app.knowledge.vector import VectorIndexUnavailable
+    from tests.test_multi_tool_chat import call, decision, install_ticket_store
+
+    decisions = [decision(call("create_ticket", "ticket", description="请人工处理", ticket_type="售后"))] if ticket else []
+    decisions.append(decision(call("query_faq", "faq", keyword="政策")))
+    service, repository, _, model = make_chat_service(decisions=decisions, chunks=["我编造的政策答案"])
+    search, _, index, _ = _search([_chunk(1)])
+
+    async def unavailable(*args, **kwargs):
+        """模拟真实索引依赖异常。参数：请求；返回：不返回；异常：VectorIndexUnavailable。"""
+        raise VectorIndexUnavailable("broken")
+
+    index.hybrid_search = unavailable
+    service.executor.support = SupportRepository(None, search)
+    writes = install_ticket_store(repository, service.executor.support)
+    events = [event async for event in service.stream_turn(ChatRequest(session_id="dependency-failure", message="请创建售后工单并查询政策"))]
+    assert events[-1].event == "error" and not any(event.event == "done" for event in events)
+    assert not repository.low_confidence
+    assert next(iter(repository.turns.values())).turn_status == "failed"
+    assert not any(phase == "answer" for phase, _ in model.inputs)
+    if ticket:
+        assert len(writes) == 1 and "T-1" in events[-1].data["error"]
+        assert "T-1" in "".join(event.data["delta"] for event in events if event.event == "delta")
+        assert events[-1].data["retry_safe"] is False
+    else:
+        assert not writes and not any(event.event == "delta" for event in events)
 
 
 async def test_ticket_receipt_is_preserved_when_later_knowledge_self_check_refuses() -> None:

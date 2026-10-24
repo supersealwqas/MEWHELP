@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import json
 import re
+from html.parser import HTMLParser
 from typing import Annotated, Literal
 
 from langchain_core.messages import AIMessage, ToolMessage
+from markdown_it import MarkdownIt
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.knowledge.schemas import KnowledgeUnavailable
@@ -90,6 +92,19 @@ def _knowledge_results(current: list) -> list[tuple[ToolMessage, dict]]:
 def has_successful_knowledge_result(current: list) -> bool:
     """判断本轮是否有成功知识查询（允许零命中）。参数：current 本轮消息；返回：bool；异常：KnowledgeAnswerError，协议非法。"""
     return bool(_knowledge_results(current))
+
+
+def has_failed_knowledge_result(current: list) -> bool:
+    """检查本轮是否有未成功完成的知识申请，避免部分成功掩盖故障。
+
+    参数：current 当前轮配对消息，不读取历史。
+    返回：bool，存在失败或缺失结果时为True。
+    异常：KnowledgeAnswerError，成功结果协议非法。
+    """
+    calls = {call["id"] for message in current if isinstance(message, AIMessage)
+             for call in message.tool_calls if call.get("name") in _KNOWLEDGE_TOOLS}
+    successful = {message.tool_call_id for message, _ in _knowledge_results(current)}
+    return bool(calls - successful)
 
 
 def collect_citations(current: list) -> list[EvidenceCitation]:
@@ -190,6 +205,29 @@ def number_knowledge_results(current: list, citations: list[EvidenceCitation]) -
 
 # 方括号内允许一个或多个编号：单写 [1]、合并写 [1, 4]、中文逗号 [1，4] 都是模型常见的合法写法。
 _INLINE_CITATION = re.compile(r"\[\s*([1-9]\d*(?:\s*[,，]\s*[1-9]\d*)*)\s*\]")
+_MARKDOWN = MarkdownIt("commonmark")
+
+
+class _InlineHtmlScope(HTMLParser):
+    """仅跟踪解析器已识别的行内HTML范围，不把标签内文本当正文引用。"""
+
+    def __init__(self) -> None:
+        """初始化HTML标签栈。参数：无；返回：None；异常：无。"""
+        super().__init__()
+        self.tags: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list) -> None:
+        """进入非空HTML元素。参数：tag 标签、attrs 属性；返回：None；异常：无。"""
+        if tag not in {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}:
+            self.tags.append(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        """退出匹配范围。参数：tag 闭合标签；返回：None；异常：无。"""
+        if tag in self.tags:
+            self.tags = self.tags[:len(self.tags) - 1 - self.tags[::-1].index(tag)]
+
+    def handle_startendtag(self, tag: str, attrs: list) -> None:
+        """自闭合元素不扩大范围。参数：tag/attrs；返回：None；异常：无。"""
 
 
 def _inline_citation_numbers(answer: str) -> set[int]:
@@ -197,13 +235,24 @@ def _inline_citation_numbers(answer: str) -> set[int]:
 
     参数：answer 为模型正文，允许单编号、逗号合并及中文逗号合并写法。
     返回：set[int]，正文中出现的编号集合；无角标为空集。
-    异常：无主动业务异常；非数字或零开头的方括号内容不视为角标。
+    异常：解析器错误；非数字或零开头的方括号内容不视为角标。
     """
     numbers: set[int] = set()
-    for group in _INLINE_CITATION.finditer(answer):
-        # 一个方括号内可能并列多个编号，逐个拆开计入同一集合。
-        for part in re.split(r"\s*[,，]\s*", group.group(1)):
-            numbers.add(int(part))
+    for block in _MARKDOWN.parse(answer):
+        if block.type != "inline" or not block.children:
+            continue
+        link_depth, html = 0, _InlineHtmlScope()
+        for token in block.children:
+            if token.type == "link_open":
+                link_depth += 1
+            elif token.type == "link_close":
+                link_depth -= 1
+            elif token.type == "html_inline":
+                html.feed(token.content)
+            elif token.type == "text" and not link_depth and not html.tags:
+                # 只在Markdown确认的正文文本上识别编号；代码、图片、链接与HTML不参与。
+                for group in _INLINE_CITATION.finditer(token.content):
+                    numbers.update(int(part) for part in re.split(r"\s*[,，]\s*", group.group(1)))
     return numbers
 
 
@@ -225,6 +274,8 @@ def decide_answer(result: KnowledgeAnswer, citations: list[EvidenceCitation]) ->
         raise KnowledgeAnswerError("知识答案正文为空")
     if not numbers or not cited:
         raise KnowledgeAnswerError("知识答案缺少有效本轮引用")
+    if not inline:
+        raise KnowledgeAnswerError("知识答案缺少可展示的正文角标")
     if not cited.issubset(numbers):
         raise KnowledgeAnswerError(
             f"知识答案引用了不存在的编号 {sorted(cited - numbers)}，本轮证据编号为 1-{max(numbers)}")
