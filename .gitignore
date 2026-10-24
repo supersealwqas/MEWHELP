@@ -16,6 +16,17 @@ htmlcov/
 dist/
 build/
 
+# pytest 临时根目录；除固定 /.pytest-tmp/ 外，验证过程会产生带后缀的变体
+# （如 .pytest-tmp-verify、.pytest-tmp-citations-red），一律不入库
+.pytest-tmp*/
+
+# 代理与验证过程的临时工作目录（日志、探针、一次性 diff），9MB 级且可重建
+/.tmp/
+
+# 评估/真实运行产物目录（reports/ 下逐次运行的 cases.jsonl、summary 等）
+# 只保留生成规则与文档；结果按运行时间戳产生，不入库
+/reports/
+
 # 本地学习文档、示例与 Notebook；开发文档 docs/、dev-notes/ 仍正常跟踪
 /mydemo/
 /learning-guide/
