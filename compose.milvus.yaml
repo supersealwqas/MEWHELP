@@ -1,8 +1,8 @@
 # Milvus 2.6.22 Standalone 本地编排（CH03 知识库 RAG 链路依赖）。
-# 客户端锁定 pymilvus 2.4.15；版本核对与真实组合验证见 docs/ch03-runbook.md。
+# CH04 客户端锁定 pymilvus 2.6.17，以支持原生 BM25；旧 CH03 验证记录见 docs/ch03-runbook.md。
 #
 # 项目主 compose.yaml 只定义 MySQL；但 app/main.py 启动时即执行
-# `MilvusVectorIndex.ensure_ready(create=False)`，要求 MILVUS_URI 可达，
+# 在线检索的 ensure_ready(create=False)，要求 MILVUS_URI 可达且目标集合已准备，
 # 因此把 Milvus 及其依赖（etcd 元数据、minio 对象存储）拆到本文件，
 # 用同一 compose 项目名并入同一网络，避免与主 compose 互相干扰。
 #

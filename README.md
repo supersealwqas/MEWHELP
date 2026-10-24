@@ -1,6 +1,6 @@
 # MewHelp
 
-喵购商城客服演示项目：在同一个聊天页面完成“模型选工具 → 执行 → 按结果流式回答”。后端使用 FastAPI、SQLAlchemy 和 Docker MySQL，工具使用 LangChain `@tool`；CH03 起 `query_faq` 使用 BGE-M3 + Milvus 的 Dense 语义检索，MySQL 保存权威原文与发布状态。
+喵购商城客服演示项目：在同一个聊天页面完成“模型选工具 → 执行 → 按结果回答”。后端使用 FastAPI、SQLAlchemy 和 Docker MySQL，工具使用 LangChain `@tool`。CH04 默认使用 BGE-M3 向量与 Milvus 原生 BM25 混合检索，再由本地 `bge-reranker-large` 重排；MySQL 保存权威原文、发布状态与回答引用快照。
 
 ## 启动与演示
 
@@ -8,24 +8,29 @@
 
 ```bash
 uv sync
-docker compose up -d --wait mysql
+docker compose -f compose.yaml -f compose.milvus.yaml up -d --wait
 uv run python -m app.db.init_db
-# CH03 知识库初始化、六份资料导入与向量同步（应用库/应用 Milvus 库）
+# 显式补齐质量表和消息引用列；自定义库名时相应替换 mewhelp。
+uv run python -m app.db.migrate_rag_quality
+uv run python -m app.db.migrate_citations --database mewhelp
+# 新环境先建知识表/旧集合，再准备独立 CH04 集合并导入六份资料。
 uv run python -m app.knowledge.cli init
-uv run python -m app.knowledge.cli import-docs --manifest data/kb/manifest.json
+uv run python -m app.knowledge.cli prepare-hybrid
+uv run python -m app.knowledge.cli import-docs --mode hybrid --manifest data/kb/manifest.json
+uv run python -m app.knowledge.cli sync --mode hybrid
 uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
 浏览器访问 [客服聊天页](http://127.0.0.1:8000/)。页面与 API 同源，不需要 npm 或单独启动前端。普通初始化只创建缺失表、补缺失种子，不清空已有聊天。
 
-CH03 起 `query_faq` 的在线数据来自 `data/kb` 六份权威文档构建的 Dense 知识库，不再使用 FAQ LIKE；FAQ 表保留为旧数据。启动服务前必须有版本匹配的 `data/knowledge/retrieval-policy.json`，生成/校准、测试库和恢复命令见 [CH03 runbook](docs/ch03-runbook.md)。已有数据库中的旧答案不会被普通初始化覆盖；仅修改种子代码不会自动刷新已保存的数据。手动 SQL 的用途与执行顺序见 [sql/README.md](sql/README.md)。
+在线知识来自 `data/kb` 六份权威文档，不再使用 FAQ LIKE；FAQ 表保留为旧数据。已有 CH03 数据升级时先阅读 [CH04 运行手册](docs/ch04-runbook.md)，明确重新切分与旧索引的关系。显式旧 `dense` 模式仍需版本匹配的 `data/knowledge/retrieval-policy.json`，历史操作见 [CH03 runbook](docs/ch03-runbook.md)。已有聊天不会被普通初始化覆盖；修改种子代码不会自动刷新已保存的数据。手动 SQL 的用途与执行顺序见 [sql/README.md](sql/README.md)。
 
 依次发送：
 
 1. `订单 1001 的物流到哪了`：同一条消息依次执行 `query_order` 和 `query_logistics`，自动使用订单结果里的物流单号，直接回答物流轨迹；页面依次显示订单与物流两个徽章。
 2. `物流单号 SF213502378238 到哪了`：出现“调用了 query_logistics”徽章，回答引用返回的承运方和物流节点。
-3. `退货政策是什么`：`query_faq` 走向量知识库，命中退货政策。
-4. `邮费是多少`：原词“邮费”经 Dense 检索命中 6 元基础运费、满 99 元包邮，并保留偏远地区 12 元附加费不参与包邮的例外；不再要求“邮费零命中”。
+3. `退货政策是什么`：查询退货政策，完整证据通过生成自评后回答并显示可点击的引用编号。
+4. `邮费是多少`：经混合检索查询 6 元基础运费、满 99 元包邮，并保留偏远地区 12 元附加费不参与包邮的例外；不再要求“邮费零命中”。
 5. 对照 `运费是多少`：同样命中知识库，不再使用 10 元旧口径。
 6. `请帮我创建人工工单，订单 1001 一直未送达`：在 MySQL 写入待处理工单，回答给出真实保存的工单号。
 7. `帮我查订单 2003`：该单属于另一个演示用户，工具返回 `order_not_owned`，页面直接回固定文本“没有找到您的这笔订单，请确认订单号或物流单号后重试。”，不经过模型改写。
@@ -48,17 +53,22 @@ CH03 起 `query_faq` 的在线数据来自 `data/kb` 六份权威文档构建的
 
 - Enter 发送，Shift+Enter 换行；保留中文输入法选字行为。
 - 工具执行中、重试、成功、失败或未执行显示在当前客服气泡顶部的标签中，直接展示具体工具名（如“调用了 query_faq”）；多个调用分别显示，同一次调用更新原标签。
-- 回答按上游到达的增量显示，并实时排版 Markdown 标题、列表、加粗、引用、代码和表格；用户输入保留原文。Markdown 库随本地静态资源提供，无需浏览器连接外部 CDN；原始 HTML 不执行，图片显示替代文字。首字前可能有多次工具决策及查询，等待取决于模型与网关。
+- 普通业务回答按上游增量显示；知识回答先完成自评、引用校验及保存，再输出正文。页面排版 Markdown 标题、列表、加粗、引用、代码和表格；用户输入保留原文。Markdown 库随本地静态资源提供，无需外部 CDN；原始 HTML 不执行，图片显示替代文字。
+- 已完成知识回答的合法 `[n]` 可打开证据面板和登记原文；旧快照保留，当前文档改变时明确提示版本差异。代码、已有链接及未知编号不会转成引用按钮。
+- 已完成回答可选择一次赞或踩，仅保存在本浏览器 localStorage；反馈尚未上传到服务器，不参与问题池或评估计分。
 - 停止回复会关闭本轮网络流并等待工具事务清理；已经提交的工单不会撤销，状态未知时请先核实，避免重复提交。
 - 工单成功后，服务端先发送已保存的工单号，再生成补充回答；模型或回答保存失败仍保留已收到的编号和文字。断流、取消或写入状态未知时不自动回填原话、不鼓励重复建单；连接已断开时无法保证新提示送达。
 - 新会话和刷新页面生成新的 session_id；旧记录保留在数据库。此版本没有历史会话列表。
 - `POST /api/chat` 仍接收 `session_id` 和 `message`，可选 `user_id` 默认 `demo-user`；标识上限 64 字符，问题上限 4000 字符。最终回答上限 12000 字符，超限停止生成并明确标为未完成。
-- SSE 保留 `data: {"delta":"…"}`、`data: [DONE]` 和 `event: error`，增加 `event: tool_status`；完成记录提交后才发送 DONE。错误载荷中的可选 `retry_safe=false` 表示应先核实提交结果，不能直接重发原话。
+- SSE 保留文本增量、`[DONE]`、错误和工具状态事件；完成事务提交后发送 `event: answer_metadata`（会话、轮次、状态及引用全集），再发送 DONE。错误载荷中的可选 `retry_safe=false` 表示应先核实提交结果，不能直接重发原话。
+- `GET /api/chat/{session_id}/turns/{turn_id}/citations/{n}` 返回本轮证据快照；追加 `/source` 读取登记来源。两者沿用演示 `user_id` 归属检查，不是新增登录认证。
 - `POST /api/extract` 保持原有结构化提取功能；可在 [接口文档](http://127.0.0.1:8000/docs) 查看。
 
-工具决策在次数上限内循环，前一步结果回传后再决定下一步；每次都重新核算消息预算，最终回答阶段不携带工具。CH03 起 `query_faq` 只做 BGE-M3 Dense 单路检索：提示词仍要求关键词取用户原话、不做同义词改写；暂不在代码中校验查询词是否出现在当前原句里，模型提交的有效查询词原样进入检索，非空、1–100 字符及类型校验继续保留。命中按 MySQL active/done/指纹回读，低分是正常空结果，索引失配或后端异常是工具错误，不伪装为空命中。
+工具决策在次数上限内循环，前一步结果回传后再决定下一步；每次重新核算预算，最终回答阶段不携带工具。CH04 用可信的当前用户原话检索，每个子句的 Dense/BM25 各50条、RRF合并50条、独立重排后普通最多10条；退款政策三路去重最多30条。最高重排分低于0.3返回空知识，仍经生成自评；仅 `useful=false` 保存原话到问题池。命中按 MySQL active/done/指纹回读，索引失配或后端异常是工具错误，不伪装成知识不足。
 
 ## 测试
+
+CH04 提供72题（24校准、48固定验收）、四策略命令与独立 `mewhelp_ch04_eval` 资源。题集依据、筛选含义见 [评估题集说明](docs/ch04-evaluation-set.md)；真实准备、校准、比较及专用测试见 [CH04 运行手册](docs/ch04-runbook.md)。评估不写应用问题池或编造台账。
 
 对话使用两层近似预算：`TOKEN_BUDGET=12000` 限制历史消息、当前问题及工具事实；`REQUEST_TOKEN_BUDGET=16000` 另限制包含系统提示和本阶段工具定义的完整输入。ASCII 每四字符约一单位，非 ASCII 每字符约两单位，协议字段同样计入，JSON 保留真实 Unicode。它们不是模型实际分词数或上下文窗口；16000 也不含模型输出，需结合实际网关限制留出输出空间。历史只能按整轮裁剪；当前问题或工具结果仍超限时明确失败，不丢掉事实继续回答。较长的 FAQ 结果可能触及对话预算，应缩小问题范围或按模型容量同时调整两层配置。
 
@@ -66,7 +76,7 @@ CH03 起 `query_faq` 的在线数据来自 `data/kb` 六份权威文档构建的
 
 ```bash
 # 离线回归，不请求真实模型、不连接 MySQL。
-uv run --offline --locked pytest -q
+CHAT_BASE_URL=http://test.invalid/v1 CHAT_MODEL=test-model CHAT_API_KEY=test-key uv run --offline --locked pytest -q
 node --test tests/frontend/*.test.mjs
 
 # 真实 MySQL：CH02 mewhelp_test
@@ -94,13 +104,14 @@ uv run python tests/verify_ch03_live.py recovery --test --report dev-notes/ch03-
 - `app/models/`、`app/db/`：客服与知识库表模型、连接及显式初始化。
 - `app/repositories/`：会话与工单存储，以及调用知识检索的客服入口。
 - `app/knowledge/`：集中处理知识库业务。`jobs.py` 编排导入和挖掘，`lifecycle.py` 决定发布/合并/隔离，`store.py` 负责原文与审计事务，`sync.py` 对照并同步向量，`search.py` 执行在线检索；编码与 Milvus 访问分别在 `embedding.py`、`vector.py`。
-- `app/tools/`：五工具、注册、参数校验、5 秒默认超时和最多 1 次重试。
+- `app/tools/`：工具注册、参数校验、业务工具5秒默认超时、知识查询独立60秒超时和最多1次重试。
 - `app/services/chat.py`：有界多工具聊天编排、同会话互斥、取消与持久化。
 - `app/core/`：模型工厂与适配、完整轮次历史裁剪、提示词。
 - `app/static/`：纯文本安全渲染与工具轨迹，无外部 CDN。
 - `tests/knowledge/`、`tests/knowledge_integration/`：离线知识规则测试与真实存储集成测试，共享替身集中在 `tests/knowledge/fakes.py`。
 - [CH02 开发记录](dev-notes/ch02.md)、[CH02 历史评估](dev-notes/ch02-evaluation.md)。
 - [CH03 开发记录](dev-notes/ch03.md)、[CH03 校准](dev-notes/ch03-calibration.md)、[CH03 验收](dev-notes/ch03-evaluation.md)、[CH03 运行手册](docs/ch03-runbook.md)。
+- [CH04 开发记录](dev-notes/ch04.md)、[CH04 运行手册](docs/ch04-runbook.md)、[CH04 题集](docs/ch04-evaluation-set.md)。
 
 当前 embedding 使用本地 BGE-M3。`EMBED_BASE_URL`、`EMBED_MODEL`、`EMBED_API_KEY` 仍是预留配置，填写它们不会切换编码器；云端接入与配置切换后续单独实现。
 
