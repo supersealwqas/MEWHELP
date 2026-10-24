@@ -110,7 +110,8 @@ def generation_input(query: str, selected: list, *, evidence_budget: int, reques
     dropped = []
     while True:
         ordered = edge_order(citations)
-        payload = [item.model_dump() for item in ordered]
+        # 与线上一致：chunk_id 只留服务端，模型只看 n，避免拿主键当角标。
+        payload = [item.model_dump(exclude={"chunk_id"}) for item in ordered]
         messages = [SystemMessage(content=KNOWLEDGE_ANSWER_RULES),
                     HumanMessage(content=json.dumps({**knowledge_answer_handoff(query), "hits": payload}, ensure_ascii=False))]
         if _estimate_token_units(payload) <= evidence_budget and _estimate_message_tokens(messages) <= request_budget:

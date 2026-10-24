@@ -172,11 +172,15 @@ def test_numbered_knowledge_groups_keep_citation_ids_and_saved_facts_unchanged()
     citations = collect_citations(current)
     numbered = number_knowledge_results(current, citations)
     groups = [json.loads(message.content)["data"]["hits"] for message in numbered if isinstance(message, ToolMessage)]
-    assert [hit["id"] for hit in groups[0]] == [1, 3, 5, 7, 9, 10, 8, 6, 4, 2]
-    assert [hit["id"] for hit in groups[1]] == [11, 13, 12]
-    assert all(hit["n"] == hit["id"] and hit["answer"] == f"完整原文{hit['id']}" for group in groups for hit in group)
+    # 模型输入只带 n；首尾排列按 n 校验，主键 id 不再暴露给模型。
+    assert [hit["n"] for hit in groups[0]] == [1, 3, 5, 7, 9, 10, 8, 6, 4, 2]
+    assert [hit["n"] for hit in groups[1]] == [11, 13, 12]
+    assert all("id" not in hit for group in groups for hit in group)
+    assert all(hit["answer"] == f"完整原文{hit['n']}" for group in groups for hit in group)
     assert [item.n for item in citations] == list(range(1, 14))
+    # 持久化的工具事实（原消息）仍保留主键，不被模型输入裁剪影响。
     assert [message.model_dump() for message in current] == original
+    assert [hit["id"] for hit in hits] == list(range(1, 14))
 
 
 class SelfCheckModel:
@@ -473,3 +477,44 @@ def test_inline_outside_declared_is_still_rejected(answer: str, declared: list[i
     citations = [EvidenceCitation(n=n, chunk_id=n, question="问", answer="答") for n in declared]
     with pytest.raises(KnowledgeAnswerError):
         decide_answer(KnowledgeAnswer(useful=True, reason="", answer=answer, citation_numbers=declared), citations)
+
+
+def test_model_evidence_hides_database_id_from_model_input() -> None:
+    """模型输入只能看到引用编号 n，不能看到数据库主键 id，否则模型会误把主键当角标。
+
+    参数：无。
+    返回：None。
+    异常：AssertionError，模型输入里仍暴露 id 字段。
+    """
+    from langchain_core.messages import AIMessage, ToolMessage
+    from app.knowledge.answering import EvidenceCitation, number_knowledge_results
+
+    hit = {"id": 16, "question": "退货政策是什么", "answer": "支持 7 天无理由退货", "category": "FAQ"}
+    current = [
+        AIMessage(content="", tool_calls=[{"id": "faq", "name": "query_faq", "args": {"keyword": "退货"}}]),
+        ToolMessage(content=json.dumps({"ok": True, "data": {"hits": [hit]}}), tool_call_id="faq"),
+    ]
+    citations = [EvidenceCitation(n=1, chunk_id=16, question=hit["question"], answer=hit["answer"])]
+    numbered = number_knowledge_results(current, citations)
+    payload = json.loads(numbered[1].content)["data"]["hits"][0]
+    assert payload["n"] == 1, "模型必须看到引用编号 n"
+    assert "id" not in payload, f"模型输入不应出现数据库主键：{payload}"
+
+
+def test_collect_citations_still_reads_database_id_from_tool_result() -> None:
+    """隐藏模型输入里的 id 不能破坏服务端从工具事实读取主键。
+
+    参数：无。
+    返回：None。
+    异常：AssertionError，服务端拿不到 chunk_id。
+    """
+    from langchain_core.messages import AIMessage, ToolMessage
+    from app.knowledge.answering import collect_citations
+
+    hit = {"id": 16, "question": "退货政策是什么", "answer": "支持 7 天无理由退货", "category": "FAQ"}
+    current = [
+        AIMessage(content="", tool_calls=[{"id": "faq", "name": "query_faq", "args": {"keyword": "退货"}}]),
+        ToolMessage(content=json.dumps({"ok": True, "data": {"hits": [hit]}}), tool_call_id="faq"),
+    ]
+    citations = collect_citations(current)
+    assert citations[0].chunk_id == 16 and citations[0].n == 1

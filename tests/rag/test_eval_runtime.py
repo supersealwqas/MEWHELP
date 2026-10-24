@@ -34,7 +34,9 @@ def test_evidence_budget_drops_whole_chunks_and_matches_messages() -> None:
     assert [item.chunk_id for item in citations] == [1]
     assert dropped == [2]
     payload = json.loads(messages[-1].content)
-    assert payload["hits"] == [citation.model_dump() for citation in citations]
+    # 模型只看 n 与正文；chunk_id 是服务端内部主键，不进模型上下文。
+    assert payload["hits"] == [citation.model_dump(exclude={"chunk_id"}) for citation in citations]
+    assert all("chunk_id" not in hit for hit in payload["hits"])
     assert _estimate_message_tokens(messages) <= 3000
 
 
@@ -55,7 +57,7 @@ def test_evaluation_handoff_keeps_original_query_and_budgeted_evidence() -> None
     payload = json.loads(messages[-1].content)
     assert payload["query"] == raw
     assert isinstance(payload.get("instruction"), str) and payload["instruction"]
-    assert payload["hits"] == [item.model_dump() for item in citations]
+    assert payload["hits"] == [item.model_dump(exclude={"chunk_id"}) for item in citations]
     assert _estimate_message_tokens(messages) <= 16000 and dropped == []
 
 
@@ -121,7 +123,7 @@ def test_evidence_order_after_budget_preserves_stable_numbers() -> None:
     candidates = [RetrievalCandidate(chunk=_chunk(index), score=0.5) for index in range(1, 11)]
     messages, citations, dropped = generation_input("问题", candidates, evidence_budget=8000, request_budget=16000)
     assert [item.n for item in citations] == [1, 3, 5, 7, 9, 10, 8, 6, 4, 2]
-    assert json.loads(messages[-1].content)["hits"] == [item.model_dump() for item in citations]
+    assert json.loads(messages[-1].content)["hits"] == [item.model_dump(exclude={"chunk_id"}) for item in citations]
     assert dropped == []
 
 

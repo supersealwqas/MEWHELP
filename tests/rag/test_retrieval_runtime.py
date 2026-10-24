@@ -62,10 +62,16 @@ async def test_refund_tool_sends_thirty_authoritative_hits_to_answer_model() -> 
     answer_input = next(messages for phase, messages in model.inputs if phase == "answer")
     facts = [json.loads(message.content)["data"]["hits"] for message in answer_input if isinstance(message, ToolMessage)]
     assert len(facts[0]) == 30
-    assert {hit["id"]: hit["answer"] for hit in facts[0]} == {
+    # 持久化的工具事实保留主键；模型输入只保留 n，避免模型把主键当角标。
+    assert {hit["id"]: hit["answer"] for hit in result.data["hits"]} == {
         identifier: f"权威答案{identifier}。" for identifier in range(1, 31)
     }
-    assert [hit["id"] for hit in facts[0]] == [*range(1, 31, 2), *range(30, 1, -2)]
+    assert all("id" not in hit for hit in facts[0])
+    assert {hit["n"]: hit["answer"] for hit in facts[0]} == {
+        identifier: f"权威答案{identifier}。" for identifier in range(1, 31)
+    }
+    # 首尾排列按 n 校验：原排名 1,3,5,...,10,8,...,2
+    assert [hit["n"] for hit in facts[0]] == [*range(1, 31, 2), *range(30, 1, -2)]
 
 
 async def test_hybrid_faq_tool_uses_model_keyword_for_clause_split() -> None:
