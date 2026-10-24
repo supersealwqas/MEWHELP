@@ -1,6 +1,6 @@
 # CH04 原始范围收尾验收
 
-日期：2026-10-25。最终产品候选：`85f1b1af91ebd1946e5bfb9a925bfe77d9e1e16b`。四项原定验收已有证据，唯一独审问题已TDD修复；最终同版本评估完成，待本地合并后回归。
+日期：2026-10-25。最终产品候选：`85f1b1af91ebd1946e5bfb9a925bfe77d9e1e16b`。四项原定验收完成，唯一独审问题已TDD修复，已快进并入本地main；main回归1033通过、前端59通过，原文件及源码摘要核对通过。
 
 ## 范围与实现
 
@@ -17,8 +17,9 @@
 
 | 检查 | 实际结果 | 证据 |
 |---|---|---|
-| 最终候选离线 Python | 1030通过、47跳过、25排除，23.10秒 | `execution/review-full.log` |
-| 前端回归 | 59通过，0失败 | `execution/final-node.log` |
+| 收尾工作树离线 Python | 1030通过、47跳过、25排除，23.10秒 | `execution/review-full.log` |
+| main合并后完整 Python | 1033通过、44跳过、25排除，30.62秒 | `execution/task-4-tests.log` |
+| 前端回归 | main合并后59通过，0失败 | `execution/main-node.log` |
 | 真实质量MySQL、BM25/RRF、large重排、模型自评与裁判专项 | 6通过，26.29秒 | `live-special.log` |
 | 预先标注的单轮语义样例 | 最终Prompt 6/6；初次失败和定向复验保留 | `semantic-final.jsonl`、`semantic-samples*.jsonl` |
 | 真实聊天：问候、MH-W20、MH-W99、物流、工单 | 5/5；MH-W20为2L且引用可读，MH-W99明确拒答并以原话单次入池 | `../20261025-scope-live-02/` |
@@ -60,6 +61,10 @@
 唯一一次fresh只读后端审查覆盖 `e62a538..f54a687`，结论为1项Important、无Critical/Minor；看板错配门槛问题由主Agent一次TDD修复，完整回归1030通过。[独审记录](superpowers/reviews/2026-10-25-ch04-scope-closeout-review.md)明确其原始范围、所有排除项及处理，没有冒称再次独审。最终85f1b1a的全源码绑定通过补跑验证。
 
 合并前逐字节核对main的59个原文件和优化工作树的7个文件，包括两份 `.env`。本地main从 `e62a538` 快进；不触碰 `codex/ch04-completion` 的HEAD及其未提交内容。合并后的原文件哈希、源码摘要、Git树和测试证据记录在 `preservation-after.json` 与 `execution/task-4-tests.log`；保留收尾工作树及报告副本，不删除用户分支或文件。
+
+main比收尾工作树多通过3项，是根目录存在本地BGE-M3 tokenizer，`tests/knowledge/test_chunking_tokenizer.py` 的3项实际切分检查可以运行；没有开启真实网关/数据库开关。合并检查发现9个文件仅LF/CRLF不同，先核对Git树及规范化内容相同，再对齐已评估候选的物理字节；全源码摘要恢复精确一致，记录见 `main-line-ending-alignment.json`，没有逻辑修改。
+
+最后一次提交只收尾文档与计划状态；运行代码仍是85f1b1a对应的源码摘要，不因文档提交重复模型评估。完整执行台账、红绿日志和审查包先逐文件校验归档，再移除本计划的临时目录；原优化工作树及其他计划目录保持。
 
 ## 本机复现命令与资源
 
