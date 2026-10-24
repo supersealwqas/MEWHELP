@@ -21,6 +21,8 @@ from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query
 
+from app.evaluation.policy import digest_json
+
 router = APIRouter(prefix="/api/rag-eval", tags=["rag-eval"])
 
 # 评估产物根目录与任务状态文件；与 CLI 的默认输出位置保持一致。
@@ -82,44 +84,55 @@ def _read_summary(directory: Path) -> dict | None:
 
 
 def _pick_pair() -> tuple[dict | None, dict | None, str | None]:
-    """挑出最近一次校准与比较运行，供看板展示。
+    """选择最近比较及其实际绑定的校准，避免跨轮次拼接成绩。
 
     参数：无。
     返回：tuple(校准 summary, 比较 summary, 比较运行目录名)，缺失时为 None。
     异常：无。
     """
-    calibration = comparison = None
+    directories = _run_dirs()
+    comparison = None
     comparison_name = None
-    for directory in _run_dirs():
-        summary = _read_summary(directory)
-        if summary is None:
+    for directory in directories:
+        if "evaluation" not in directory.name:
             continue
-        if "calibration" in directory.name and calibration is None:
-            # 阈值不在 summary 里，而是同目录 policy.json 的产物。
-            summary = {**summary, "thresholds": _read_policy(directory)}
-            calibration = summary
-        elif "evaluation" in directory.name and comparison is None:
+        summary = _read_summary(directory)
+        if summary is not None:
             comparison, comparison_name = summary, directory.name
-        if calibration is not None and comparison is not None:
             break
     if comparison is None:
-        return calibration, None, "还没有固定集的四策略比较结果，先跑一次评估。"
-    return calibration, comparison, comparison_name
+        return None, None, "还没有固定集的四策略比较结果，先跑一次评估。"
+
+    policy_digest = (comparison.get("metadata") or {}).get("policy_digest")
+    # 旧报告缺少绑定时保留成绩，但不能猜测它使用了哪个门槛。
+    if not isinstance(policy_digest, str) or not policy_digest:
+        return None, comparison, comparison_name
+    for directory in directories:
+        if "calibration" not in directory.name:
+            continue
+        policy = _read_policy(directory)
+        try:
+            matched = bool(policy) and digest_json(policy) == policy_digest
+        except ValueError:
+            # 损坏产物中的非有限数字不是有效JSON策略，不能拖垮已有成绩展示。
+            continue
+        if matched and (summary := _read_summary(directory)) is not None:
+            return {**summary, "thresholds": policy["thresholds"]}, comparison, comparison_name
+    return None, comparison, comparison_name
 
 
 def _read_policy(directory: Path) -> dict:
-    """读取校准目录下的 policy.json 中的 thresholds 字段。
+    """读取完整校准策略，供摘要匹配后展示其中的门槛。
 
     参数：directory 校准运行目录。
-    返回：dict，策略到阈值记录；文件缺失或损坏时为空字典。
+    返回：dict，完整策略记录；文件缺失或门槛结构损坏时为空字典。
     异常：无。
     """
     try:
         policy = json.loads((directory / "policy.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
-    thresholds = policy.get("thresholds")
-    return thresholds if isinstance(thresholds, dict) else {}
+    return policy if isinstance(policy, dict) and isinstance(policy.get("thresholds"), dict) else {}
 
 
 def _case_count(summary: dict | None) -> int | None:

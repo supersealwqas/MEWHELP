@@ -8,6 +8,8 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from app.evaluation.policy import digest_json
+
 
 def _summary(mrr: float = 0.88) -> dict:
     """构造最小可用的比较运行汇总。参数：mrr 目标值；返回：dict；异常：无。"""
@@ -24,7 +26,8 @@ def _summary(mrr: float = 0.88) -> dict:
     return {
         "status": "completed", "expected_sample_count": 8, "elapsed_seconds": 12.0,
         "metadata": {"corpus_digest": "c" * 64, "chunk_count": 52, "model": "m",
-                     "judge_model": "j", "dataset_digest": "d" * 64, "source_revision": "abc123"},
+                     "judge_model": "j", "dataset_digest": "d" * 64, "source_revision": "abc123",
+                     "policy_digest": digest_json({"thresholds": {"dense": {"minimum": 0.66}}})},
         "strategies": {"dense": strategy, "bm25": strategy, "hybrid": strategy,
                        "hybrid_rerank": {**strategy, "mrr@10": metric(mrr)}},
         "buckets": {name: {"A_policy": strategy} for name in
@@ -79,6 +82,48 @@ def test_overview_without_artifacts_degrades(monkeypatch, tmp_path) -> None:
     body = client.get("/api/rag-eval/overview").json()
     assert body["present"] is False
     assert "先跑一次评估" in body["hint"]
+
+
+def test_overview_pairs_comparison_with_its_actual_policy(monkeypatch, tmp_path) -> None:
+    """新校准尚未完成比较时，旧成绩只能显示旧校准门槛。
+
+    参数：monkeypatch 隔离接口目录；tmp_path 本例独占报告目录。
+    返回：None。
+    异常：AssertionError，接口把不同运行的门槛与成绩混用。
+    """
+    client = _client(monkeypatch, tmp_path, {
+        "20261024-calibration-01": _summary(),
+        "20261024-evaluation-01": _summary(),
+        "20261025-calibration-01": {**_summary(), "expected_sample_count": 416},
+    })
+    (tmp_path / "ch04/20261025-calibration-01/policy.json").write_text(
+        json.dumps({"thresholds": {"dense": {"minimum": 0.99}}}), encoding="utf-8")
+    body = client.get("/api/rag-eval/overview").json()
+    assert body["calibration"]["thresholds"]["dense"]["minimum"] == 0.66
+    assert body["calibration"]["case_count"] == 2
+
+
+@pytest.mark.parametrize("missing_binding", [True, False])
+def test_overview_does_not_guess_unmatched_calibration(monkeypatch, tmp_path, missing_binding) -> None:
+    """没有绑定摘要或摘要不匹配时，保留成绩而不猜校准门槛。
+
+    参数：monkeypatch/tmp_path 隔离报告；missing_binding 是否缺失绑定。
+    返回：None。
+    异常：AssertionError，接口为无法证明匹配的成绩展示门槛。
+    """
+    comparison = _summary()
+    if missing_binding:
+        comparison["metadata"].pop("policy_digest")
+    else:
+        comparison["metadata"]["policy_digest"] = "0" * 64
+    client = _client(monkeypatch, tmp_path, {
+        "20261024-calibration-01": _summary(),
+        "20261024-evaluation-01": comparison,
+    })
+    body = client.get("/api/rag-eval/overview").json()
+    assert body["present"] is True
+    assert body["calibration"]["thresholds"] == {}
+    assert body["calibration"]["case_count"] is None
 
 
 def test_overview_without_comparison_still_reports_hint(monkeypatch, tmp_path) -> None:
