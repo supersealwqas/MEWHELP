@@ -32,13 +32,22 @@ class LogisticsArgs(BusinessArgs):
 
 
 class KeywordArgs(BusinessArgs):
-    """商品或 FAQ 的单个关键词。"""
+    """商品的单个关键词。"""
     keyword: str = Field(min_length=1, max_length=100, description="用户原话中用于检索的关键词")
+
+
+class KnowledgeQueryArgs(BusinessArgs):
+    """知识关键词及可选元数据，不包含身份或运行配置。"""
+    keyword: str = Field(min_length=1, max_length=100, description="当前问题中的检索关键词，保留型号和条件")
+    category: str | None = Field(default=None, min_length=1, max_length=200, description="知识品类精确筛选，不得猜测")
+    content_type: str | None = Field(default=None, min_length=1, max_length=64, description="知识内容类型精确筛选")
 
 
 class RefundPolicyArgs(BusinessArgs):
     """退款政策查询参数，原话身份仍由可信运行上下文提供。"""
     query: str = Field(min_length=1, max_length=2000, description="当前用户完整退款问题，不得新增型号、否定条件或承诺")
+    category: str | None = Field(default=None, min_length=1, max_length=200, description="知识品类精确筛选，不得猜测")
+    content_type: str | None = Field(default=None, min_length=1, max_length=64, description="知识内容类型精确筛选")
 
 
 class TicketArgs(BusinessArgs):

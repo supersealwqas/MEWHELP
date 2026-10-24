@@ -34,8 +34,13 @@ def split_clauses(query: str) -> list[str]:
     """
     if not query.strip():
         raise ValueError("检索 query 不能为空")
-    clauses = [part.strip() for part in re.split(r"[，。；？]+", query) if len(part.strip()) >= _MIN_CLAUSE]
-    return clauses if len(clauses) > 1 else [query.strip()]
+    parts = [part.strip() for part in re.split(r"[，。；？]+", query) if part.strip()]
+    clauses = [part for part in parts if len(part) >= _MIN_CLAUSE]
+    if len(clauses) <= 1:
+        return [query.strip()]
+    # 短条件不单独召回，但必须随每个子句进入编码、BM25和重排。
+    conditions = "，".join(part for part in parts if len(part) < _MIN_CLAUSE)
+    return [f"{conditions}，{clause}" if conditions else clause for clause in clauses]
 
 
 def expand_policy_queries(query: str) -> list[str]:
@@ -71,22 +76,34 @@ class HybridKnowledgeSearch:
         if not isinstance(query, str) or not query.strip() or len(query) > _MAX_QUERY_CHARACTERS:
             raise ValueError("检索 query 必须为 1–2000 字符的非空文本，请拆分超长问题")
 
-    async def _retrieve_one(self, query: str, top_k: int) -> list[RankedChunk]:
+    async def _filter_scope(self, filters: dict) -> dict[int, ChunkSnapshot]:
+        """分页取得权威白名单。参数：filters 已验证元数据；返回：主键快照；异常：存储故障。"""
+        scope, after_id = {}, 0
+        while rows := await self.store.active_page(after_id=after_id, limit=500):
+            scope.update({row.id: row for row in rows if matches_filters(row, filters)})
+            after_id = rows[-1].id
+        return scope
+
+    async def _retrieve_one(self, query: str, top_k: int,
+                            scope: dict[int, ChunkSnapshot] | None = None) -> list[RankedChunk]:
         """执行一次完整混合召回、权威回读、原 chunk 重排。
 
-        参数：query 为完整子句；top_k 为已校验结果上限。
+        参数：query 为完整子句；top_k 为已校验结果上限；scope 为可选权威筛选快照。
         返回：list[RankedChunk]，最多 top_k 权威块；候选默认最多 50。
         异常：KnowledgeSearchUnavailable，空索引或权威状态失配；编码/索引/重排依赖异常。
         """
+        if scope is not None and not scope:
+            return []
         vectors = await self.encoder.encode([query])
         if len(vectors) != 1 or not valid_dense_vector(vectors[0]):
             raise KnowledgeSearchUnavailable("查询编码结果不合法")
         recall = self.config.recall_top_k
+        options = {"filter_ids": sorted(scope)} if scope is not None else {}
         hits = await self.index.hybrid_search(vectors[0], query, dense_limit=recall,
-                                              sparse_limit=recall, limit=recall)
+                                              sparse_limit=recall, limit=recall, **options)
         if not hits:
             # 真空库允许零结果；仍有有效原文却没有 Dense 候选属于同步故障。
-            if await self.store.active_page(after_id=0, limit=1):
+            if scope or await self.store.active_page(after_id=0, limit=1):
                 raise KnowledgeSearchUnavailable("知识混合索引为空，但仍有有效原文，需显式同步")
             return []
         if len(hits) > recall or len({hit.id for hit in hits}) != len(hits):
@@ -96,9 +113,14 @@ class HybridKnowledgeSearch:
         chunks: list[ChunkSnapshot] = []
         for hit in hits:
             row = by_id.get(hit.id)
+            # 筛选后复核整份权威快照，拒绝任一路忽略filter或查询中途元数据变化。
+            if scope is not None and (hit.id not in scope or row != scope[hit.id]):
+                raise KnowledgeSearchUnavailable("索引返回过滤范围外候选或权威范围已变化")
             if (row is None or not row.is_active or row.vectorize_status != "done"
                     or row.vector_id != str(row.id) or row.content_hash != hit.content_hash
                     or row.embedding_revision != hit.embedding_revision):
+                if scope is not None:
+                    raise KnowledgeSearchUnavailable("过滤范围内索引与权威状态失配")
                 continue
             chunks.append(row)
         if not chunks:
@@ -113,11 +135,11 @@ class HybridKnowledgeSearch:
         return ranked
 
     async def retrieve(self, query: str, *, top_k: int | None = None,
-                       subquery_split: bool | None = None) -> list[RankedChunk]:
+                       subquery_split: bool | None = None, filters: dict | None = None) -> list[RankedChunk]:
         """逐子句跑完整链路，轮转合并去重后最终截到 Top-K。
 
         参数：query 当前原话；top_k None 使用 config.rerank_top_k=10，显式值 1–recall_top_k；
-            subquery_split None 使用配置默认 True，False 只检索完整原话。
+            subquery_split None 使用配置默认 True，False 只检索完整原话；filters 为权威元数据筛选。
         返回：list[RankedChunk]，普通路径最多 Top-K；N 个子句会分别调用 N 次重排。
         异常：ValueError，参数非法；检索/模型/权威存储异常；取消直接传播。
         """
@@ -129,7 +151,9 @@ class HybridKnowledgeSearch:
         if type(split) is not bool:
             raise ValueError("subquery_split 必须为布尔值")
         queries = split_clauses(query) if split else [query.strip()]
-        results = [await self._retrieve_one(clause, selected) for clause in queries]
+        normalized = _validated_filters(filters)
+        scope = await self._filter_scope(normalized) if normalized else None
+        results = [await self._retrieve_one(clause, selected, scope) for clause in queries]
         # 保持首次轮转位置，但同一证据跨子句相关度不同，门槛使用其最高有效分。
         strongest: dict[int, RankedChunk] = {}
         for group in results:
@@ -149,29 +173,29 @@ class HybridKnowledgeSearch:
                         return merged
         return merged
 
-    async def query_faq(self, keyword: str, limit: int | None = None) -> list[dict]:
+    async def query_faq(self, keyword: str, limit: int | None = None, *, filters: dict | None = None) -> list[dict]:
         """普通 FAQ 在重排完成后以最高分闸判断是否可用，不把 RRF 分数当阈值。
 
-        参数：keyword 当前查询；limit None 使用默认 10，显式值覆盖。
+        参数：keyword 当前查询；limit None 使用默认 10，显式值覆盖；filters 可选元数据筛选。
         返回：list[dict]，最高重排分低于 0.3 时空，否则返回全部最多 limit 条。
         异常：ValueError，参数不合法；检索/模型/存储依赖错误。
         """
-        ranked = await self.retrieve(keyword, top_k=limit)
+        ranked = await self.retrieve(keyword, top_k=limit, filters=filters)
         if not ranked or max(item.score for item in ranked) < self.config.rerank_min_score:
             return []
         return faq_rows(ranked)
 
-    async def retrieve_policy(self, query: str) -> list[RankedChunk]:
+    async def retrieve_policy(self, query: str, *, filters: dict | None = None) -> list[RankedChunk]:
         """退款政策三查询分别检索并按 chunk id 去重，合并后不再截为十条。
 
-        参数：query 当前退款问题，原话保留到三条扩展中。
+        参数：query 当前退款问题，原话保留到三条扩展中；filters 可选元数据筛选。
         返回：list[RankedChunk]，默认最多 30 个原 chunk，保留查询顺序。
         异常：ValueError，参数/输入限制；检索、模型或存储异常。
         """
         self._validate_query(query)
         merged: dict[int, RankedChunk] = {}
         for expanded in expand_policy_queries(query):
-            for item in await self.retrieve(expanded):
+            for item in await self.retrieve(expanded, filters=filters):
                 merged.setdefault(item.chunk.id, item)
         return list(merged.values())
 

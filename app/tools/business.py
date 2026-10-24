@@ -5,7 +5,7 @@ from typing import Annotated
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import InjectedToolArg, tool
 from pydantic import Field
-from app.schemas.tools import CODE_FIELD, ERROR_FIELD, KeywordArgs, LogisticsArgs, OwnedOrderArgs, RefundPolicyArgs, TicketArgs
+from app.schemas.tools import CODE_FIELD, ERROR_FIELD, KeywordArgs, KnowledgeQueryArgs, LogisticsArgs, OwnedOrderArgs, RefundPolicyArgs, TicketArgs
 from app.tools.mock_data import NOT_OWNED, logistics_snapshot, order_id_for_tracking_no, order_snapshot, owns_order
 
 # 写操作标记。写操作会改变外部状态，不能像只读查询那样重试；
@@ -90,13 +90,15 @@ query_logistics.tags = ["mock"]
 # 同上：tags 事后赋值，保留演示数据的内部来源标记供后台审计。
 
 
-@tool(args_schema=KeywordArgs, description="查询商城政策、商品规格/使用、配送与会员知识。keyword 提交当前原话中的核心片段并保留时限/型号/否定；混合检索使用服务端本轮完整原话按子句独立召回重排，默认最多10条。无匹配时 hits 为空。综合退款申请优先 query_refund_policy，该工具不办理退款。")
-async def query_faq(keyword: str, config: RunnableConfig) -> dict:
+@tool(args_schema=KnowledgeQueryArgs, description="查询商城政策、商品规格/使用、配送与会员知识。keyword 提交当前问题的核心检索词并保留时限/型号/否定；按子句独立召回重排，默认最多10条。category/content_type可选精确预过滤，不得猜测。无匹配时 hits 为空。综合退款申请优先 query_refund_policy，该工具不办理退款。")
+async def query_faq(keyword: str, config: RunnableConfig, category: str | None = None,
+                    content_type: str | None = None) -> dict:
     """查询商城政策和常见问答。
 
     参数:
         keyword: 模型提交的查询词，提示词要求取自当前原话；代码不校验原句包含关系。
         config: 当前请求身份与查询资源的可信运行配置。
+        category/content_type: 可选权威元数据筛选，不放宽无命中范围。
     返回值:
         dict: 命中时包含 hits 列表；未命中时 hits 为空列表并附带 message 说明。
             使用 hits 而非泛化的 data 键，避免与执行器兼容分支的字段名撞车。
@@ -108,23 +110,28 @@ async def query_faq(keyword: str, config: RunnableConfig) -> dict:
     support = resources["support_repository"]
     # 检索词一律采用模型提交的 keyword：模型会按需换成「会员运费权益」这类能命中的说法，
     # 改回本轮原话会让换词失效，零命中后反复重试直至失败。
-    rows = await support.query_faq(keyword)
+    filters = {key: value for key, value in {"category": category, "content_type": content_type}.items()
+               if value is not None}
+    rows = await support.query_faq(keyword, **({"filters": filters} if filters else {}))
     if not rows:
         return {"hits": [], "message": f"未找到与「{keyword}」相关的常见问题"}
     return {"hits": rows}
 
 
 @tool(args_schema=RefundPolicyArgs, description="检索当前用户的综合退款/退货申请政策，扩展3个检索角度，每条最多10个块，按chunk id去重后全部返回，默认最多30条，不再截为10。仅查询申请条件、流程、处理时限和运费规则，不执行退款、不承诺到账或人工已经接入。")
-async def query_refund_policy(query: str, config: RunnableConfig) -> dict:
+async def query_refund_policy(query: str, config: RunnableConfig, category: str | None = None,
+                              content_type: str | None = None) -> dict:
     """通过可信本轮原话检索三组退款政策证据。
 
-    参数：query 模型提交的当前诉求说明，只作工具参数校验；config 注入本轮原话与仓储身份。
+    参数：query 模型提交的当前诉求说明；config 注入本轮原话与仓储身份；category/content_type 可选筛选。
     返回：dict，hits 为去重后的全部权威证据，默认最多 30；空时附安全未命中说明。
     异常：ValueError，输入非法；KnowledgeUnavailable，混合检索未配置或依赖错误。
     """
     resources = config["configurable"]
     raw = resources["context"].user_message
-    rows = await resources["support_repository"].query_refund_policy(raw)
+    filters = {key: value for key, value in {"category": category, "content_type": content_type}.items()
+               if value is not None}
+    rows = await resources["support_repository"].query_refund_policy(raw, **({"filters": filters} if filters else {}))
     if not rows:
         return {"hits": [], "message": "未找到与当前退款问题相关的政策证据"}
     return {"hits": rows}

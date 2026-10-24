@@ -113,7 +113,7 @@ async def test_subqueries_deduplicate_chunk_ids_and_keep_other_evidence() -> Non
     ("退货，退款？", ["退货，退款？"]),
     ("退款条件，啊", ["退款条件，啊"]),
     ("退货条件,退款时限", ["退货条件,退款时限"]),
-    ("甲；退货条件；退款时限", ["退货条件", "退款时限"]),
+    ("甲；退货条件；退款时限", ["甲，退货条件", "甲，退款时限"]),
 ])
 def test_clause_split_uses_four_character_minimum(query: str, expected: list[str]) -> None:
     """不足四字不发独立调用，不能形成多个子句时原句保留。参数：查询/预期；返回：None；异常：断言失败。"""

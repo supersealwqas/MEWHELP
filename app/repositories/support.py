@@ -39,11 +39,11 @@ class SupportRepository:
         """判断新混合路径是否使用当前完整原话。参数：无；返回：bool；异常：无。"""
         return isinstance(self.knowledge_search, HybridKnowledgeSearch)
 
-    async def query_faq(self, keyword: str, limit: int | None = None) -> list[dict]:
+    async def query_faq(self, keyword: str, limit: int | None = None, *, filters: dict | None = None) -> list[dict]:
         """通过注入检索服务查询 FAQ，不以旧 3 条覆盖混合默认 10。
 
         参数：keyword 混合路径为 1–2000 字符原话，旧 Dense 路径为 1–100 关键词；
-            limit None 保留检索服务默认值，显式正整数上限由对应服务校验。
+            limit None 保留检索服务默认值，显式正整数上限由对应服务校验；filters 为白名单元数据。
         返回：list[dict]，最多对应默认或 limit 条 id/question/answer/category。
         异常：ValueError，参数不合法；KnowledgeUnavailable，未配置或依赖故障，不回退 LIKE。
         """
@@ -51,20 +51,23 @@ class SupportRepository:
             raise ValueError("FAQ 关键词或条数不合法")
         if self.knowledge_search is None:
             raise KnowledgeUnavailable("知识检索未配置")
+        if filters and not isinstance(self.knowledge_search, HybridKnowledgeSearch):
+            raise KnowledgeUnavailable("元数据筛选需要混合检索服务")
+        options = {"filters": filters} if filters else {}
         if limit is None:
-            return await self.knowledge_search.query_faq(keyword)
-        return await self.knowledge_search.query_faq(keyword, limit)
+            return await self.knowledge_search.query_faq(keyword, **options)
+        return await self.knowledge_search.query_faq(keyword, limit, **options)
 
-    async def query_refund_policy(self, query: str) -> list[dict]:
+    async def query_refund_policy(self, query: str, *, filters: dict | None = None) -> list[dict]:
         """独立退款证据入口，不截断去重后的三查询结果。
 
-        参数：query 当前用户退款原话。
+        参数：query 当前用户退款原话；filters 可选白名单元数据。
         返回：list[dict]，混合路径默认最多 30；不办理退款。
         异常：KnowledgeUnavailable，未配置混合检索；ValueError，输入非法；模型/存储错误。
         """
         if not isinstance(self.knowledge_search, HybridKnowledgeSearch):
             raise KnowledgeUnavailable("退款政策扩展检索需要已准备的混合索引")
-        return faq_rows(await self.knowledge_search.retrieve_policy(query))
+        return faq_rows(await self.knowledge_search.retrieve_policy(query, filters=filters))
 
     async def create_ticket(self, context: ToolContext, description: str, ticket_type: str) -> ToolResult:
         """幂等创建工单并保存成功事实。参数：可信上下文、描述、售后/投诉/咨询；返回：原工单结果；异常：数据库或一致性错误。"""
