@@ -76,6 +76,10 @@ markdown.renderer.rules.th_open = renderTableCell;
 markdown.renderer.rules.td_open = renderTableCell;
 
 // 只改行内普通文本；代码、图片和已有链接中的数字保持原样。
+// 方括号内允许一个或多个编号：单写 [1]、合并写 [1, 4]、中文逗号 [1，4] 都要支持，
+// 与后端 decide_answer 的角标识别保持一致，避免模型换一种写法就渲染不出按钮。
+const INLINE_CITATION = /\[\s*([1-9]\d*(?:\s*[,，]\s*[1-9]\d*)*)\s*\]/g;
+
 markdown.core.ruler.after("inline", "answer_citations", function citationTokens(state) {
   const allowed = new Set(state.env.citations?.map((item) => item.n) || []);
   if (!allowed.size) return;
@@ -88,15 +92,25 @@ markdown.core.ruler.after("inline", "answer_citations", function citationTokens(
       if (token.type === "link_close") linkDepth -= 1;
       if (token.type !== "text" || linkDepth) { output.push(token); continue; }
       let start = 0;
-      for (const match of token.content.matchAll(/\[([1-9]\d*)\]/g)) {
-        const number = Number(match[1]);
-        if (!Number.isSafeInteger(number) || !allowed.has(number)) continue;
+      INLINE_CITATION.lastIndex = 0;
+      for (const match of token.content.matchAll(INLINE_CITATION)) {
+        // 一个方括号内可能并列多个编号，逐个拆成独立按钮，分隔符原样保留。
+        const parts = match[1].split(/\s*[,，]\s*/);
+        const numbers = parts.map(Number);
+        if (!numbers.every((number) => Number.isSafeInteger(number) && allowed.has(number))) continue;
         const prefix = new state.Token("text", "", 0);
         prefix.content = token.content.slice(start, match.index);
         output.push(prefix);
-        const citation = new state.Token("citation_ref", "button", 0);
-        citation.content = String(number);
-        output.push(citation);
+        numbers.forEach((number, index) => {
+          if (index > 0) {
+            const separator = new state.Token("text", "", 0);
+            separator.content = ", ";
+            output.push(separator);
+          }
+          const citation = new state.Token("citation_ref", "button", 0);
+          citation.content = String(number);
+          output.push(citation);
+        });
         start = match.index + match[0].length;
       }
       const suffix = new state.Token("text", "", 0);

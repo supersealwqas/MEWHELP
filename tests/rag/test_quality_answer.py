@@ -373,3 +373,103 @@ async def test_self_check_network_failure_and_commit_failure_never_pool_or_publi
     events = [event async for event in service.stream_turn(ChatRequest(session_id="pool-fail", message="政策条件"))]
     assert events[-1].event == "error" and not repository.low_confidence
     assert not any(event.event == "delta" for event in events)
+
+
+async def test_merged_citation_brackets_are_accepted_not_system_error() -> None:
+    """模型把多个编号合并在一个方括号内（[1, 4, 6]）是合法引用写法，不能被当成系统错误。
+
+    参数：无。
+    返回：None，完成回答并保留引用。
+    异常：AssertionError，合并写法被判失败。
+    """
+    from app.knowledge.answering import KnowledgeAnswer
+
+    # 夹具只提供 n=1 的权威证据，因此合并写法引用同一组已存在的编号。
+    service, repository, _ = _service(KnowledgeAnswer(
+        useful=True, reason="",
+        answer="支持无理由退货[1]。运费由平台承担[1, 1]。",
+        citation_numbers=[1],
+    ))
+    events = [event async for event in service.stream_turn(ChatRequest(session_id="merged", message="退货政策"))]
+    assert not any(event.event == "error" for event in events), "合并角标不应被判系统错误"
+    metadata = next(event.data for event in events if event.event == "answer_metadata")
+    assert [item["n"] for item in metadata["citations"]] == [1]
+
+
+@pytest.mark.parametrize("answer,declared", [
+    ("答案[1][4]", [1, 4]),
+    ("答案[1, 4]", [1, 4]),
+    ("答案[1，4]", [1, 4]),
+    ("答案[1,4,6]", [1, 4, 6]),
+    ("答案[1, 4]和[10]", [1, 4, 10]),
+])
+def test_inline_citation_formats_are_equivalent(answer: str, declared: list[int]) -> None:
+    """单编号、逗号合并、中文逗号、混合写法都代表同一组引用，校验必须一致通过。
+
+    参数：answer 模型正文；declared 模型声明的引用编号。
+    返回：None。
+    异常：AssertionError，任一合法写法被拒。
+    """
+    from app.knowledge.answering import EvidenceCitation, decide_answer, KnowledgeAnswer
+
+    citations = [EvidenceCitation(n=n, chunk_id=n, question="问", answer="答") for n in declared]
+    text, failure = decide_answer(
+        KnowledgeAnswer(useful=True, reason="", answer=answer, citation_numbers=declared), citations)
+    assert failure is None and text == answer
+
+
+@pytest.mark.parametrize("answer,declared", [
+    ("答案[1, 99]", [1, 99]),
+    ("答案[1, 2]", [1]),
+])
+def test_merged_citation_still_rejects_unknown_or_mismatched_numbers(answer: str, declared: list[int]) -> None:
+    """放宽合并写法不能放过越界或声明缺失的编号。
+
+    参数：answer 模型正文；declared 模型声明编号。
+    返回：None。
+    异常：AssertionError，非法引用被放行。
+    """
+    from app.knowledge.answering import EvidenceCitation, KnowledgeAnswer, KnowledgeAnswerError, decide_answer
+
+    citations = [EvidenceCitation(n=1, chunk_id=1, question="问", answer="答")]
+    with pytest.raises(KnowledgeAnswerError):
+        decide_answer(KnowledgeAnswer(useful=True, reason="", answer=answer, citation_numbers=declared), citations)
+
+
+@pytest.mark.parametrize("answer,declared", [
+    ("答案[1, 2, 3]", [1, 2, 3, 4, 5, 6]),
+    ("答案[1]", [1, 2, 3]),
+    ("答案[1][2]", [1, 2, 3, 4]),
+])
+def test_declared_superset_of_inline_is_accepted(answer: str, declared: list[int]) -> None:
+    """模型在 citation_numbers 多列参考过的证据是常见行为，正文角标是声明的子集应放行。
+
+    参数：answer 模型正文；declared 模型声明编号（宽于正文）。
+    返回：None。
+    异常：AssertionError，合理行为被判系统错误。
+    """
+    from app.knowledge.answering import EvidenceCitation, KnowledgeAnswer, decide_answer
+
+    citations = [EvidenceCitation(n=n, chunk_id=n, question="问", answer="答") for n in declared]
+    text, failure = decide_answer(
+        KnowledgeAnswer(useful=True, reason="", answer=answer, citation_numbers=declared), citations)
+    assert failure is None and text == answer
+
+
+@pytest.mark.parametrize("answer,declared", [
+    ("答案[1, 9]", [1, 2]),
+    ("答案[9]", [1, 2]),
+    ("答案[1][7][8]", [1, 2, 3]),
+])
+def test_inline_outside_declared_is_still_rejected(answer: str, declared: list[int]) -> None:
+    """正文出现声明之外的编号仍属伪造引用，必须拒绝。
+
+    参数：answer 模型正文；declared 模型声明编号。
+    返回：None。
+    异常：AssertionError，越界角标被放行。
+    """
+    from app.knowledge.answering import EvidenceCitation, KnowledgeAnswer, KnowledgeAnswerError, decide_answer
+
+    citations = [EvidenceCitation(n=n, chunk_id=n, question="问", answer="答") for n in declared]
+    with pytest.raises(KnowledgeAnswerError):
+        decide_answer(KnowledgeAnswer(useful=True, reason="", answer=answer, citation_numbers=declared), citations)

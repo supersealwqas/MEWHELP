@@ -117,3 +117,43 @@ test("流式返回的未闭合 Markdown 片段可以逐次安全重绘", functio
 test("空回复不生成正文", function emptyInput() {
   assert.equal(renderMarkdown(""), "");
 });
+
+/** 无参数；返回 void；单编号角标未渲染成可点击按钮时断言失败。 */
+test("单编号角标渲染为引用按钮", function singleCitation() {
+  const html = renderMarkdown("支持 7 天无理由退货[1]。", [{ n: 1 }]);
+  assert.match(html, /data-citation="1"/);
+  assert.match(html, /class="citation-ref"/);
+});
+
+/** 无参数；返回 void；合并写法 [1, 4] 未被拆成独立按钮时断言失败。 */
+test("合并角标 [1, 4] 拆成多个引用按钮", function mergedCitations() {
+  const html = renderMarkdown("商品需保持完好[1, 4]。", [{ n: 1 }, { n: 4 }]);
+  assert.match(html, /data-citation="1"/);
+  assert.match(html, /data-citation="4"/);
+  assert.equal((html.match(/citation-ref/g) || []).length, 2);
+});
+
+/** 无参数；返回 void；中文逗号合并没有同样处理时断言失败。 */
+test("中文逗号合并角标 [1，4] 同样拆成按钮", function mergedCitationsFullWidth() {
+  const html = renderMarkdown("商品需保持完好[1，4]。", [{ n: 1 }, { n: 4 }]);
+  assert.equal((html.match(/citation-ref/g) || []).length, 2);
+});
+
+/** 无参数；返回 void；未登记编号被渲染成按钮时断言失败。 */
+test("不在引用清单中的编号保持原文不生成按钮", function unknownCitation() {
+  const html = renderMarkdown("答案[9]。", [{ n: 1 }]);
+  assert.doesNotMatch(html, /data-citation="9"/);
+  assert.match(html, /\[9\]/);
+});
+
+/** 无参数；返回 void；代码块内角标被转换时断言失败。 */
+test("代码块中的角标保持原样不生成按钮", function citationInCode() {
+  const html = renderMarkdown("```\n数组索引 arr[1]\n```", [{ n: 1 }]);
+  assert.doesNotMatch(html, /citation-ref/);
+});
+
+/** 无参数；返回 void；混合单写与合并写法未被同时处理时断言失败。 */
+test("单写与合并混用同时生效", function mixedCitationStyles() {
+  const html = renderMarkdown("第一点[1][4]，第二点[10, 12]。", [{ n: 1 }, { n: 4 }, { n: 10 }, { n: 12 }]);
+  assert.equal((html.match(/citation-ref/g) || []).length, 4);
+});
