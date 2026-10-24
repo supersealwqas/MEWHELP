@@ -35,6 +35,10 @@ class Settings(BaseSettings):
         min_length=1,
         description="上游对话模型调用的 API 鉴权密钥",
     )
+    judge_model: str | None = Field(
+        default=None,
+        description="忠实度裁判模型名；留空时沿用 chat_model，显式指定可用不同模型避免同模型自评偏差",
+    )
     token_budget: int = Field(
         default=12000,
         gt=0,

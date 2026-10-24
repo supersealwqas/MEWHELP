@@ -150,7 +150,7 @@ def runtime_metadata(config: Settings, chunks: list[ChunkSnapshot], *, evidence_
     sources = sorted((root / "app").rglob("*.py")) + [root / "uv.lock"]
     revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, text=True, capture_output=True, check=False)
     return {"corpus_digest": corpus_digest(chunks), "chunk_count": len(chunks),
-            "model": config.chat_model, "judge_model": config.chat_model,
+            "model": config.chat_model, "judge_model": config.judge_model or config.chat_model,
             "model_endpoint_digest": hashlib.sha256(config.chat_base_url.encode()).hexdigest(),
             "embedding_revision": EMBEDDING_REVISION, "reranker_revision": RERANKER_REVISION,
             "embedding_artifacts_digest": model_digest(Path(config.knowledge_model_path)),
@@ -343,7 +343,9 @@ class EvaluationRuntime:
         """保存冻结依赖。参数：search/chunks/config/evidence_budget/metadata；返回：None；异常：无。"""
         self.search, self.chunks, self.config = search, chunks, config
         self.evidence_budget, self.metadata = evidence_budget, metadata
-        self.answer_model, self.judge_model = ChatModelAdapter(), FaithfulnessJudge(model_name=config.chat_model)
+        self.answer_model = ChatModelAdapter()
+        # 裁判可显式换用其它模型，避免生成与评判同一模型带来的自评偏差。
+        self.judge_model = FaithfulnessJudge(model_name=config.judge_model or config.chat_model)
 
     async def retrieve(self, prepared, strategy, filters):
         """读取门禁前排名。参数：本题缓存/策略/过滤；返回：检索结果；异常：检索或模型错误。"""

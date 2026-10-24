@@ -150,3 +150,59 @@ async def test_prepare_repairs_missing_indexes_on_existing_table() -> None:
                                "idx_chunks_source_key": ["source_key"], "idx_chunks_ordinal": ["source_key", "ordinal"]}
     finally:
         engine.dispose()
+
+
+def test_judge_model_falls_back_to_chat_model_when_unset(monkeypatch) -> None:
+    """未配置 JUDGE_MODEL 时裁判沿用对话模型，保持既有行为不变。
+
+    参数：monkeypatch 清掉主机环境里的 JUDGE_MODEL。
+    返回：None。
+    异常：AssertionError，默认值不再是对话模型。
+    """
+    from app.config import Settings
+
+    monkeypatch.delenv("JUDGE_MODEL", raising=False)
+    s = Settings(_env_file=None, chat_base_url="http://test.invalid/v1",
+                 chat_model="answer-model", chat_api_key="k")
+    assert s.judge_model is None
+    assert (s.judge_model or s.chat_model) == "answer-model"
+
+
+def test_judge_model_can_differ_from_chat_model() -> None:
+    """显式配置 JUDGE_MODEL 时裁判使用独立模型，避免同模型自评偏差。
+
+    参数：无。
+    返回：None。
+    异常：AssertionError，裁判模型未按配置切换。
+    """
+    from app.config import Settings
+
+    s = Settings(_env_file=None, chat_base_url="http://test.invalid/v1",
+                 chat_model="answer-model", chat_api_key="k", judge_model="judge-model")
+    assert (s.judge_model or s.chat_model) == "judge-model"
+
+
+async def test_evaluation_runtime_passes_configured_judge_model(monkeypatch) -> None:
+    """评估运行时必须把配置的裁判模型名传给 FaithfulnessJudge。
+
+    参数：monkeypatch 替换裁判构造。
+    返回：None。
+    异常：AssertionError，运行时仍用对话模型当裁判。
+    """
+    import app.evaluation.runtime as runtime_module
+    from app.config import Settings
+
+    observed = {}
+
+    class Recorder:
+        """记录构造时收到的模型名。"""
+
+        def __init__(self, *, model_name=None):
+            """保存模型名。参数：model_name 裁判模型；返回：None；异常：无。"""
+            observed["judge"] = model_name
+
+    monkeypatch.setattr(runtime_module, "FaithfulnessJudge", Recorder)
+    config = Settings(_env_file=None, chat_base_url="http://test.invalid/v1",
+                      chat_model="answer-model", chat_api_key="k", judge_model="judge-model")
+    runtime_module.EvaluationRuntime(None, [], config, evidence_budget=100, metadata={})
+    assert observed["judge"] == "judge-model"
