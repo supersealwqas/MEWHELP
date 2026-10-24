@@ -27,7 +27,31 @@ if str(ROOT) not in sys.path:
 TEST_DATABASE = "mewhelp_ch04_test"
 TEST_COLLECTION = "knowledge_ch04_live"
 MANIFEST = ROOT / "data/kb/manifest.json"
-EVIDENCE_FIELDS = ("n", "chunk_id", "question", "answer", "section_path")
+EVIDENCE_FIELDS = ("n", "question", "answer", "section_path")
+
+
+def collect_model_evidence(messages: list) -> list[dict]:
+    """记录模型真正看到的编号与完整正文，不补造已隐藏的数据库主键。
+
+    参数：messages 实际发送到自评模型的消息。
+    返回：按首次出现编号去重的证据；同编号正文冲突时不允许继续验证。
+    异常：ValueError，编号或证据冲突；JSON解析错误。
+    """
+    evidence = {}
+    for message in messages:
+        if getattr(message, "type", None) != "tool":
+            continue
+        payload = json.loads(message.content)
+        for hit in (payload.get("data") or {}).get("hits", []):
+            if "n" not in hit:
+                continue
+            if type(hit["n"]) is not int or hit["n"] < 1:
+                raise ValueError("实际模型证据编号非法")
+            item = {key: hit.get(key) for key in EVIDENCE_FIELDS}
+            if hit["n"] in evidence and evidence[hit["n"]] != item:
+                raise ValueError("实际模型同编号证据冲突")
+            evidence.setdefault(hit["n"], item)
+    return list(evidence.values())
 
 
 def inspect_exchange(case: dict, observed: dict) -> dict:
@@ -120,6 +144,7 @@ def inspect_exchange(case: dict, observed: dict) -> dict:
                 or any(type(number) is not int for number in numbers)
                 or len(set(numbers)) != len(actual)
                 or any(any(expected.get(key) != saved.get(key) for key in EVIDENCE_FIELDS)
+                       or ("chunk_id" in expected and expected["chunk_id"] != saved.get("chunk_id"))
                        for expected, saved in zip(sorted(actual, key=lambda item: item["n"]), citations))):
             failures.append("model_evidence_mismatch")
     elif citations:
@@ -424,16 +449,7 @@ async def live_runtime(config):
 
         async def answer_knowledge(self, messages):
             """记录实际请求中的编号知识，随后调用原模型。参数：messages 完整真实输入；返回：KnowledgeAnswer；异常：原模型错误。"""
-            evidence = {}
-            for message in messages:
-                if getattr(message, "type", None) != "tool":
-                    continue
-                payload = json.loads(message.content)
-                for hit in (payload.get("data") or {}).get("hits", []):
-                    if "n" in hit:
-                        evidence.setdefault(hit["id"], {"n": hit["n"], "chunk_id": hit["id"], "question": hit["question"],
-                            "answer": hit["answer"], "section_path": hit.get("section_path"), "source_key": hit.get("source_key")})
-            record = {"evidence": list(evidence.values()), "decision": None}
+            record = {"evidence": collect_model_evidence(messages), "decision": None}
             self.checks.append(record)
             decision = await super().answer_knowledge(messages)
             record["decision"] = decision.model_dump(mode="json")

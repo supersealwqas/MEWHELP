@@ -68,6 +68,25 @@ def test_completed_turn_requires_metadata_even_when_body_and_done_exist() -> Non
     assert "missing_or_misordered_metadata" in inspect_exchange(case, observed)["failures"]
 
 
+def test_current_model_evidence_has_number_but_no_database_id():
+    """基线模型已隐藏数据库id，观察器不能要求模型携带该字段。参数：无；返回：None；异常：断言失败。"""
+    case, observed = _knowledge_observation()
+    for evidence in observed["model_checks"][0]["evidence"]:
+        evidence.pop("chunk_id")
+    assert inspect_exchange(case, observed)["failures"] == []
+
+
+def test_recording_collects_actual_numbered_model_text_without_id():
+    """真实生成输入只带n，不能因观察器KeyError使付费请求失败。参数：无；返回：None；异常：断言失败。"""
+    import json
+    from langchain_core.messages import ToolMessage
+    from tests.verify_ch04_live import collect_model_evidence
+
+    hits = [{"n": 1, "question": "保修", "answer": "保修一年。", "section_path": "手册 / 保修"}]
+    messages = [ToolMessage(content=json.dumps({"ok": True, "data": {"hits": hits}}), tool_call_id="faq")]
+    assert collect_model_evidence(messages) == hits
+
+
 @pytest.mark.parametrize("field,replacement,expected", [
     ("content", "另一份回答", "persisted_answer_mismatch"),
     ("rag_metadata", {"status": "completed", "citations": []}, "persisted_metadata_mismatch"),
