@@ -19,6 +19,12 @@ class RuntimeBoundary:
         self.refuse, self.judge_error, self.inputs = refuse, judge_error, []
         self.metadata = {"corpus_digest": "fixture", "model": "test", "prompt_digest": "fixture"}
 
+    async def prepare(self, query):
+        """替换外部改写模型，保留确定准备。参数：原问；返回：准备查询；异常：ValueError。"""
+        from app.knowledge.retrieval import prepare_query
+
+        return prepare_query(query, policy=any(term in query for term in ("退款", "退货", "退换")))
+
     async def retrieve(self, prepared, strategy, filters):
         """返回门禁前低分命中。参数：查询/策略/过滤；返回：结果；异常：无。"""
         item = RetrievalCandidate(chunk=self.chunks[0], score=0.01)
@@ -39,6 +45,53 @@ class RuntimeBoundary:
         if self.judge_error:
             raise RuntimeError("upstream failure")
         return FaithfulnessDecision(facts=[])
+
+
+async def test_one_rewrite_is_shared_by_four_strategies(tmp_path):
+    """逐策略重做prepare会增加费用并污染比较。参数：临时目录；返回：None；异常：断言失败。"""
+    from app.evaluation.runner import evaluate_dataset
+    from app.knowledge.retrieval import prepare_query
+
+    runtime = RuntimeBoundary()
+    calls, prepared_objects = [], []
+    retrieve = runtime.retrieve
+
+    async def prepare(query):
+        """记录唯一模型准备入口。参数：原问；返回：准备结果；异常：无。"""
+        calls.append(query)
+        return prepare_query(query)
+
+    async def record(prepared, strategy, filters):
+        """记录传给召回的实际准备对象。参数：查询/策略/过滤；返回：候选；异常：无。"""
+        prepared_objects.append(prepared)
+        return await retrieve(prepared, strategy, filters)
+
+    runtime.prepare, runtime.retrieve = prepare, record
+    directory = tmp_path / "shared"
+    await evaluate_dataset([case()], runtime, directory, retrieval_only=True,
+                           evidence_resolver=lambda case, chunks: [{1}])
+    assert calls == ["退货申请条件"]
+    assert len(prepared_objects) == 4 and all(item is prepared_objects[0] for item in prepared_objects)
+    rows = [json.loads(line) for line in (directory / "results.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert all(row["prepared_bm25_queries"] == rows[0]["prepared_bm25_queries"] for row in rows)
+
+
+async def test_failed_rewrite_is_not_retried_for_each_strategy(tmp_path):
+    """改写失败仍保留四个异常分母，但不能重复发模型请求。参数：临时目录；返回：None；异常：断言失败。"""
+    from app.evaluation.runner import evaluate_dataset
+
+    runtime, calls = RuntimeBoundary(), []
+
+    async def fail(query):
+        """模拟网络准备失败。参数：原问；返回：不返回；异常：RuntimeError。"""
+        calls.append(query)
+        raise RuntimeError("rewrite failed")
+
+    runtime.prepare = fail
+    report = await evaluate_dataset([case()], runtime, tmp_path / "failed", retrieval_only=True,
+                                     evidence_resolver=lambda case, chunks: [{1}])
+    assert calls == ["退货申请条件"]
+    assert all(value["error_count"] == 1 for value in report["strategies"].values())
 
 
 def case():

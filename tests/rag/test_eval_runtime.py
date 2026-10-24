@@ -7,6 +7,21 @@ from tests.knowledge.fakes import make_settings
 from tests.rag.test_retrieval import _chunk
 
 
+async def test_runtime_prepare_passes_only_current_question_to_model():
+    """正式评估准备接入真实改写解析，不读取标注。参数：无；返回：None；异常：断言失败。"""
+    import json
+    from app.evaluation.runtime import EvaluationRuntime
+    from tests.rag.test_query_rewrite import RewriteModel
+
+    runtime = EvaluationRuntime(None, [], make_settings(), evidence_budget=8000, metadata={})
+    model = RewriteModel()
+    runtime.query_rewriter.model_factory = model.factory
+    prepared = await runtime.prepare("饮水机脏了咋洗")
+    assert prepared.raw == "饮水机脏了咋洗" and len(model.inputs) == 1
+    assert json.loads(model.inputs[0][-1].content) == {"query": "饮水机脏了咋洗", "keyword": None}
+    assert prepared.groups == [["饮水机怎么清洗"]]
+
+
 def test_only_named_eval_resources_are_allowed() -> None:
     """任何半边应用资源配置必须被拒绝。参数：无；返回：None；异常：断言失败。"""
     from app.evaluation.runtime import eval_config, validate_resources

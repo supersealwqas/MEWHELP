@@ -14,7 +14,6 @@ from app.evaluation.faithfulness import FaithfulnessError
 from app.evaluation.metrics import aggregate_results, retrieval_metrics
 from app.evaluation.policy import STRATEGIES
 from app.knowledge.answering import FIXED_KNOWLEDGE_REFUSAL, decide_answer
-from app.knowledge.retrieval import prepare_query
 
 
 def atomic_json(path: Path, value: object) -> None:
@@ -108,6 +107,7 @@ async def evaluate_dataset(cases: list, runtime, output_dir: Path, *,
             for case in cases:
                 # 规则只读取原问，不能以标注bucket/answerable改变检索路径。
                 prepared = None
+                preparation_attempted, preparation_error = False, None
                 for strategy in strategies:
                     begin, stage = time.perf_counter(), "dataset"
                     row = {"id": case.id, "split": case.split, "bucket": case.bucket, "difficulty": case.difficulty,
@@ -117,13 +117,22 @@ async def evaluate_dataset(cases: list, runtime, output_dir: Path, *,
                            "retrieval": None, "ranked_ids": [], "top_score": None, "citations": [],
                            "citation_valid": None, "timings": {}}
                     try:
-                        if prepared is None:
-                            stage = "query"
-                            prepared = prepare_query(case.query, policy=any(term in case.query for term in ("退款", "退货", "退换")))
+                        stage = "query"
+                        if not preparation_attempted:
+                            preparation_attempted = True
+                            try:
+                                prepared = await runtime.prepare(case.query)
+                            except Exception as error:
+                                # 失败也共用同一准备结果，不能每策略重新调用模型改变比较条件。
+                                preparation_error = error
+                        if preparation_error is not None:
+                            raise preparation_error
                         stage = "dataset"
                         groups = evidence_resolver(case, runtime.chunks)
                         row["evidence_groups"] = [sorted(group) for group in groups]
                         row["prepared_queries"] = prepared.groups
+                        row["prepared_bm25_queries"] = prepared.bm25_queries
+                        row["prepared_rerank_queries"] = prepared.rerank_queries
                         stage, tick = "retrieval", time.perf_counter()
                         result = await runtime.retrieve(prepared, strategy, case.filters)
                         row["timings"]["retrieval_seconds"] = time.perf_counter() - tick

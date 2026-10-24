@@ -108,11 +108,13 @@ async def query_faq(keyword: str, config: RunnableConfig, category: str | None =
     """
     resources = config["configurable"]
     support = resources["support_repository"]
-    # 检索词一律采用模型提交的 keyword：模型会按需换成「会员运费权益」这类能命中的说法，
-    # 改回本轮原话会让换词失效，零命中后反复重试直至失败。
+    # keyword和可信原问分别传入：允许检索同义词，但不能丢失原问型号和条件。
     filters = {key: value for key, value in {"category": category, "content_type": content_type}.items()
                if value is not None}
-    rows = await support.query_faq(keyword, **({"filters": filters} if filters else {}))
+    options = {"filters": filters} if filters else {}
+    if getattr(support, "uses_full_knowledge_query", False):
+        options["source_query"] = resources["context"].user_message
+    rows = await support.query_faq(keyword, **options)
     if not rows:
         return {"hits": [], "message": f"未找到与「{keyword}」相关的常见问题"}
     return {"hits": rows}

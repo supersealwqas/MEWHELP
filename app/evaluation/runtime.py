@@ -31,7 +31,8 @@ from app.knowledge.documents import CHUNKING_VERSION
 from app.knowledge.embedding import BgeM3Encoder, EMBEDDING_REVISION
 from app.knowledge.hybrid_index import MilvusHybridIndex
 from app.knowledge.rerank import BgeReranker, RERANKER_REVISION
-from app.knowledge.retrieval import EvaluationSearch
+from app.knowledge.query_rewrite import QueryRewriter, QUERY_REWRITE_RULES
+from app.knowledge.retrieval import EvaluationSearch, PreparedQuery, prepare_query
 from app.knowledge.runtime import knowledge_storage
 from app.knowledge.schemas import ChunkSnapshot
 from app.knowledge.store import _snapshot_from_row
@@ -41,7 +42,7 @@ from app.models.knowledge import KnowledgeChunk
 EVAL_DATABASE = "mewhelp_ch04_eval"
 EVAL_COLLECTION = "knowledge_ch04_eval"
 EVAL_MARKER = "mewhelp:ch04:evaluation:v1"
-QUERY_RULES_VERSION = "raw:clauses4:policy3:50-50-50:per-clause10:v1"
+QUERY_RULES_VERSION = "single-turn:rewrite1:synonyms4:clauses4:policy3:50-50-50:per-clause10:v2"
 _IDENTITY_TABLE = "ch04_eval_identity"
 _LOCK_NAME = "mewhelp:ch04:evaluation:exclusive"
 
@@ -157,7 +158,7 @@ def runtime_metadata(config: Settings, chunks: list[ChunkSnapshot], *, evidence_
             "embedding_artifacts_digest": model_digest(Path(config.knowledge_model_path)),
             "reranker_artifacts_digest": model_digest(Path(config.rerank_model_path)),
             "prompt_digest": digest_json({"generation": KNOWLEDGE_ANSWER_RULES, "handoff": KNOWLEDGE_ANSWER_HANDOFF,
-                                          "judge": _JUDGE_SYSTEM}),
+                                          "judge": _JUDGE_SYSTEM, "query_rewrite": QUERY_REWRITE_RULES}),
             "source_revision": revision.stdout.strip() if revision.returncode == 0 else None,
             "source_digest": digest_json({path.relative_to(root).as_posix(): file_digest(path) for path in sources}),
             "chunking_version": CHUNKING_VERSION, "query_rules_version": QUERY_RULES_VERSION,
@@ -345,8 +346,15 @@ class EvaluationRuntime:
         self.search, self.chunks, self.config = search, chunks, config
         self.evidence_budget, self.metadata = evidence_budget, metadata
         self.answer_model = ChatModelAdapter()
+        self.query_rewriter = QueryRewriter(request_budget=config.request_token_budget)
         # 裁判可显式换用其它模型，避免生成与评判同一模型带来的自评偏差。
         self.judge_model = FaithfulnessJudge(model_name=config.judge_model or config.chat_model)
+
+    async def prepare(self, query: str) -> PreparedQuery:
+        """只按原问准备一次，不接收题集答案。参数：query 当前原问；返回：四策略共用结果；异常：改写/预算错误。"""
+        rewrite = await self.query_rewriter.rewrite(query)
+        return prepare_query(query, policy=any(term in query for term in ("退款", "退货", "退换")),
+                             subquery_split=self.config.subquery_split, rewrite=rewrite)
 
     async def retrieve(self, prepared, strategy, filters):
         """读取门禁前排名。参数：本题缓存/策略/过滤；返回：检索结果；异常：检索或模型错误。"""

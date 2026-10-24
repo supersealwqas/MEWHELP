@@ -25,6 +25,7 @@ from app.knowledge.lifecycle import KnowledgeLifecycle
 from app.knowledge.llm import KnowledgeModel, load_relation_policy
 from app.knowledge.prompts import RELATION_PROMPT_VERSION
 from app.knowledge.rerank import BgeReranker
+from app.knowledge.query_rewrite import QueryRewriter
 from app.knowledge.retrieval import HybridKnowledgeSearch
 from app.knowledge.search import KnowledgeSearch, load_retrieval_policy
 from app.knowledge.chunking import CHUNKING_VERSION as LEGACY_CHUNKING_VERSION, chunk_markdown
@@ -125,7 +126,8 @@ async def online_search_runtime(config: Settings, store: KnowledgeStore):
                                     content_type="runtime", content_hash=content_fingerprint(text),
                                     embedding_revision=encoder.revision)
             await reranker.rank("模型启动检查", [warmup])
-            yield HybridKnowledgeSearch(store, encoder, index, reranker, config)
+            yield HybridKnowledgeSearch(store, encoder, index, reranker, config,
+                                        query_rewriter=QueryRewriter(request_budget=config.request_token_budget))
         else:
             index = MilvusVectorIndex(config)
             await index.ensure_ready(create=False)

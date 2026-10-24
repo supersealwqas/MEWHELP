@@ -1,0 +1,11 @@
+{
+  "description": "2026-10-25运行前冻结的六个单轮语义样例；期望来自原问条件和现有知识原文，不由模型答卷反推。",
+  "cases": [
+    {"id":"scope-q1","query":"MH-W20那个饮水的桶能装多少水？","keyword":"MH-W20水箱容量","must_preserve":["MH-W20"],"intent":"询问MH-W20水箱容量，不更换型号","sources":["data/kb/product-specs.md#自动饮水机"]},
+    {"id":"scope-q2","query":"饮水机脏了咋洗？","keyword":"饮水机清洗","must_preserve":[],"intent":"询问饮水机清洗，不凭空指定型号","sources":["data/kb/product-specs.md"]},
+    {"id":"scope-q3","query":"新疆呢，金卡会员买2件能免邮吗？","keyword":"新疆金卡会员2件免邮","must_preserve":["新疆","金卡","2"],"intent":"查询新疆地区金卡会员运费权益，保留购买数量","sources":["data/kb/billing-shipping.md","data/kb/member-benefits.md"]},
+    {"id":"scope-q4","query":"我不退款，只想知道签收7天后还能换货吗？","keyword":"不退款签收7天后换货","must_preserve":["不退款","签收","7","后"],"intent":"查询换货时限，保留不退款与签收7天后条件","sources":["data/kb/returns-policy.md#换货"]},
+    {"id":"scope-q5","query":"MH-W99装得下多少水，不要换成MH-W20。","keyword":"MH-W99容量不要换成MH-W20","must_preserve":["MH-W99","不要","MH-W20"],"intent":"未知型号容量，不用已知相邻型号替代；提及MH-W20仅是否定条件","sources":["data/kb/product-specs.md（不存在MH-W99）"]},
+    {"id":"scope-q6","query":"MH-LP100和MH-LP200家里两只猫怎么选？","keyword":"MH-LP100 MH-LP200两只猫选型","must_preserve":["MH-LP100","MH-LP200","两"],"intent":"比较两个明确型号在两只猫家庭的适用性，不新增型号","sources":["data/kb/product-specs.md#智能猫砂盆"]}
+  ]
+}

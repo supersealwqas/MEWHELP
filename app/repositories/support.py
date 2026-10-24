@@ -39,11 +39,12 @@ class SupportRepository:
         """判断新混合路径是否使用当前完整原话。参数：无；返回：bool；异常：无。"""
         return isinstance(self.knowledge_search, HybridKnowledgeSearch)
 
-    async def query_faq(self, keyword: str, limit: int | None = None, *, filters: dict | None = None) -> list[dict]:
+    async def query_faq(self, keyword: str, limit: int | None = None, *, filters: dict | None = None,
+                        source_query: str | None = None) -> list[dict]:
         """通过注入检索服务查询 FAQ，不以旧 3 条覆盖混合默认 10。
 
         参数：keyword 混合路径为 1–2000 字符原话，旧 Dense 路径为 1–100 关键词；
-            limit None 保留检索服务默认值，显式正整数上限由对应服务校验；filters 为白名单元数据。
+            limit None 保留默认上限；filters 为白名单元数据；source_query 为可信本轮原问，旧Dense忽略此上下文。
         返回：list[dict]，最多对应默认或 limit 条 id/question/answer/category。
         异常：ValueError，参数不合法；KnowledgeUnavailable，未配置或依赖故障，不回退 LIKE。
         """
@@ -54,6 +55,8 @@ class SupportRepository:
         if filters and not isinstance(self.knowledge_search, HybridKnowledgeSearch):
             raise KnowledgeUnavailable("元数据筛选需要混合检索服务")
         options = {"filters": filters} if filters else {}
+        if source_query is not None and self.uses_full_knowledge_query:
+            options["source_query"] = source_query
         if limit is None:
             return await self.knowledge_search.query_faq(keyword, **options)
         return await self.knowledge_search.query_faq(keyword, limit, **options)

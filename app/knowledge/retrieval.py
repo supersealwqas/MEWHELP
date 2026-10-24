@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.config import Settings
 from app.knowledge.contracts import KnowledgeEncoder
 from app.knowledge.limits import valid_dense_vector
+from app.knowledge.query_rewrite import QueryRewrite, QueryRewriter, validate_rewrite
 from app.knowledge.rerank import RankedChunk, RerankUnavailable
 from app.knowledge.schemas import ChunkSnapshot
 from app.knowledge.search import KnowledgeSearchUnavailable
@@ -67,9 +68,20 @@ class HybridKnowledgeSearch:
     """无共享单轮状态的混合检索编排，逐子句调用但最终普通结果仍只取 Top-K。"""
 
     def __init__(self, store: KnowledgeStore, encoder: KnowledgeEncoder, index: Any,
-                 reranker: Any, config: Settings) -> None:
-        """保存外部依赖。参数：store 权威库、encoder 编码器、index 混合索引、reranker 相关度模型、config K/N；返回：None；异常：无。"""
+                 reranker: Any, config: Settings, *, query_rewriter: QueryRewriter | None = None) -> None:
+        """参数：store/encoder/index/reranker/config 检索依赖；query_rewriter 正式运行时改写器；返回：None；异常：无。"""
         self.store, self.encoder, self.index, self.reranker, self.config = store, encoder, index, reranker, config
+        self.query_rewriter = query_rewriter
+
+    async def _prepare(self, query: str, *, policy: bool = False, subquery_split: bool = True,
+                       source_query: str | None = None) -> PreparedQuery:
+        """一次准备整次查询。参数：query 关键词或原问、policy 退款、subquery_split 拆句、source_query 原问；返回：准备结果；异常：改写/校验错误。"""
+        raw = source_query if source_query is not None else query
+        if self.query_rewriter is None:
+            # 未注入只供底层兼容；正式运行时在装配处强制提供改写器。
+            return prepare_query(query, policy=policy, subquery_split=subquery_split)
+        rewrite = await self.query_rewriter.rewrite(raw, keyword=query if source_query is not None else None)
+        return prepare_query(raw, policy=policy, subquery_split=subquery_split, rewrite=rewrite)
 
     def _validate_query(self, query: str) -> None:
         """校验单轮查询字符限制。参数：query 为 1–2000 非空字符；返回：None；异常：ValueError。"""
@@ -85,10 +97,11 @@ class HybridKnowledgeSearch:
         return scope
 
     async def _retrieve_one(self, query: str, top_k: int,
-                            scope: dict[int, ChunkSnapshot] | None = None) -> list[RankedChunk]:
+                            scope: dict[int, ChunkSnapshot] | None = None, *,
+                            bm25_query: str | None = None, rerank_query: str | None = None) -> list[RankedChunk]:
         """执行一次完整混合召回、权威回读、原 chunk 重排。
 
-        参数：query 为完整子句；top_k 为已校验结果上限；scope 为可选权威筛选快照。
+        参数：query 标准子句；top_k 结果上限；scope 权威筛选快照；bm25_query/rerank_query 各阶段完整文本。
         返回：list[RankedChunk]，最多 top_k 权威块；候选默认最多 50。
         异常：KnowledgeSearchUnavailable，空索引或权威状态失配；编码/索引/重排依赖异常。
         """
@@ -99,7 +112,7 @@ class HybridKnowledgeSearch:
             raise KnowledgeSearchUnavailable("查询编码结果不合法")
         recall = self.config.recall_top_k
         options = {"filter_ids": sorted(scope)} if scope is not None else {}
-        hits = await self.index.hybrid_search(vectors[0], query, dense_limit=recall,
+        hits = await self.index.hybrid_search(vectors[0], bm25_query if bm25_query is not None else query, dense_limit=recall,
                                               sparse_limit=recall, limit=recall, **options)
         if not hits:
             # 真空库允许零结果；仍有有效原文却没有 Dense 候选属于同步故障。
@@ -125,7 +138,7 @@ class HybridKnowledgeSearch:
             chunks.append(row)
         if not chunks:
             raise KnowledgeSearchUnavailable("知识混合索引与 MySQL 权威状态不一致")
-        ranked = await self.reranker.rank(query, chunks, top_n=top_k)
+        ranked = await self.reranker.rank(rerank_query if rerank_query is not None else query, chunks, top_n=top_k)
         expected = {row.id: row for row in chunks}
         ids = [item.chunk.id for item in ranked]
         # 即使注入模型返回类型正确，未知主键或替换正文也不能进入上下文。
@@ -135,11 +148,12 @@ class HybridKnowledgeSearch:
         return ranked
 
     async def retrieve(self, query: str, *, top_k: int | None = None,
-                       subquery_split: bool | None = None, filters: dict | None = None) -> list[RankedChunk]:
+                       subquery_split: bool | None = None, filters: dict | None = None,
+                       source_query: str | None = None) -> list[RankedChunk]:
         """逐子句跑完整链路，轮转合并去重后最终截到 Top-K。
 
         参数：query 当前原话；top_k None 使用 config.rerank_top_k=10，显式值 1–recall_top_k；
-            subquery_split None 使用配置默认 True，False 只检索完整原话；filters 为权威元数据筛选。
+            subquery_split None 使用配置默认 True，False 只检索完整原话；filters 为权威元数据筛选；source_query 为可信原问。
         返回：list[RankedChunk]，普通路径最多 Top-K；N 个子句会分别调用 N 次重排。
         异常：ValueError，参数非法；检索/模型/权威存储异常；取消直接传播。
         """
@@ -150,10 +164,17 @@ class HybridKnowledgeSearch:
         split = self.config.subquery_split if subquery_split is None else subquery_split
         if type(split) is not bool:
             raise ValueError("subquery_split 必须为布尔值")
-        queries = split_clauses(query) if split else [query.strip()]
+        prepared = await self._prepare(query, subquery_split=split, source_query=source_query)
         normalized = _validated_filters(filters)
         scope = await self._filter_scope(normalized) if normalized else None
-        results = [await self._retrieve_one(clause, selected, scope) for clause in queries]
+        return await self._retrieve_group(prepared.groups[0], prepared, selected, scope)
+
+    async def _retrieve_group(self, queries: list[str], prepared: PreparedQuery, selected: int,
+                              scope: dict[int, ChunkSnapshot] | None) -> list[RankedChunk]:
+        """合并一组子句的排名。参数：queries 子句、prepared 共用文本、selected 上限、scope 权威范围；返回：排名；异常：检索依赖错误。"""
+        results = [await self._retrieve_one(clause, selected, scope,
+                    bm25_query=prepared.bm25_queries.get(clause, clause),
+                    rerank_query=prepared.rerank_queries.get(clause, clause)) for clause in queries]
         # 保持首次轮转位置，但同一证据跨子句相关度不同，门槛使用其最高有效分。
         strongest: dict[int, RankedChunk] = {}
         for group in results:
@@ -173,14 +194,15 @@ class HybridKnowledgeSearch:
                         return merged
         return merged
 
-    async def query_faq(self, keyword: str, limit: int | None = None, *, filters: dict | None = None) -> list[dict]:
+    async def query_faq(self, keyword: str, limit: int | None = None, *, filters: dict | None = None,
+                        source_query: str | None = None) -> list[dict]:
         """普通 FAQ 在重排完成后以最高分闸判断是否可用，不把 RRF 分数当阈值。
 
-        参数：keyword 当前查询；limit None 使用默认 10，显式值覆盖；filters 可选元数据筛选。
+        参数：keyword 当前查询；limit None 使用默认10；filters 元数据筛选；source_query 可信本轮原问。
         返回：list[dict]，最高重排分低于 0.3 时空，否则返回全部最多 limit 条。
         异常：ValueError，参数不合法；检索/模型/存储依赖错误。
         """
-        ranked = await self.retrieve(keyword, top_k=limit, filters=filters)
+        ranked = await self.retrieve(keyword, top_k=limit, filters=filters, source_query=source_query)
         if not ranked or max(item.score for item in ranked) < self.config.rerank_min_score:
             return []
         return faq_rows(ranked)
@@ -193,9 +215,12 @@ class HybridKnowledgeSearch:
         异常：ValueError，参数/输入限制；检索、模型或存储异常。
         """
         self._validate_query(query)
+        prepared = await self._prepare(query, policy=True, subquery_split=self.config.subquery_split)
+        normalized = _validated_filters(filters)
+        scope = await self._filter_scope(normalized) if normalized else None
         merged: dict[int, RankedChunk] = {}
-        for expanded in expand_policy_queries(query):
-            for item in await self.retrieve(expanded, filters=filters):
+        for group in prepared.groups:
+            for item in await self._retrieve_group(group, prepared, self.config.rerank_top_k, scope):
                 merged.setdefault(item.chunk.id, item)
         return list(merged.values())
 
@@ -216,6 +241,8 @@ class PreparedQuery(BaseModel):
     groups: list[list[str]] = Field(description="普通问题一组，退款三组；每组为有效子句")
     policy: bool = Field(description="是否使用一致的三角度退款扩展")
     vectors: dict[str, list[float]] = Field(default_factory=dict, description="本题实际查询编码缓存；纯BM25不填充")
+    bm25_queries: dict[str, str] = Field(default_factory=dict, description="标准子句对应的完整原问、标准问法及同义检索文本")
+    rerank_queries: dict[str, str] = Field(default_factory=dict, description="标准子句对应的本轮原意重排文本，不含检索同义词")
 
 
 class EvaluationRetrieval(BaseModel):
@@ -226,10 +253,11 @@ class EvaluationRetrieval(BaseModel):
     selected: list[RetrievalCandidate] = Field(description="普通最多10、退款最多30的生成候选")
 
 
-def prepare_query(raw: str, *, policy: bool = False, subquery_split: bool = True) -> PreparedQuery:
+def prepare_query(raw: str, *, policy: bool = False, subquery_split: bool = True,
+                  rewrite: QueryRewrite | None = None) -> PreparedQuery:
     """确定性准备一次原问，四策略使用相同子句与退款扩展。
 
-    参数：raw 1–2000字符非空问题；policy 是否退款；subquery_split 是否拆子句。
+    参数：raw 1–2000字符非空问题；policy 是否退款；subquery_split 是否拆子句；rewrite 可选本轮严格改写。
     返回：PreparedQuery，本题私有缓存，不读取答案、历史或其他题。
     异常：ValueError，输入或布尔参数非法。
     """
@@ -237,9 +265,19 @@ def prepare_query(raw: str, *, policy: bool = False, subquery_split: bool = True
         raise ValueError("评估问题必须为1–2000字符")
     if type(policy) is not bool or type(subquery_split) is not bool:
         raise ValueError("查询规则必须为布尔值")
-    expanded = expand_policy_queries(raw) if policy else [raw.strip()]
-    return PreparedQuery(raw=raw, policy=policy,
-                         groups=[split_clauses(query) if subquery_split else [query] for query in expanded])
+    if rewrite is not None:
+        validate_rewrite(raw, rewrite)
+    standard = rewrite.standard_query if rewrite is not None else raw.strip()
+    expanded = expand_policy_queries(standard) if policy else [standard]
+    groups = [split_clauses(query) if subquery_split else [query] for query in expanded]
+    bm25_queries, rerank_queries = {}, {}
+    for group in groups:
+        for query in group:
+            # 同义词不进入Dense或重排；原问原样保留，不能被标准问法取代。
+            bm25_queries[query] = "\n".join([raw, query, *rewrite.synonyms]) if rewrite is not None else query
+            rerank_queries[query] = "\n".join([raw, query]) if rewrite is not None else query
+    return PreparedQuery(raw=raw, policy=policy, groups=groups,
+                         bm25_queries=bm25_queries, rerank_queries=rerank_queries)
 
 
 def _validated_filters(filters: dict | None) -> dict:
@@ -314,11 +352,11 @@ class EvaluationSearch:
                 raise KnowledgeSearchUnavailable("查询编码结果不合法")
             prepared.vectors[query] = vectors[0]
         if strategy == "bm25":
-            hits = await self.index.search_bm25(query, 50, **options)
+            hits = await self.index.search_bm25(prepared.bm25_queries.get(query, query), 50, **options)
         elif strategy == "dense":
             hits = await self.index.search(prepared.vectors[query], 50, **options)
         else:
-            hits = await self.index.hybrid_search(prepared.vectors[query], query,
+            hits = await self.index.hybrid_search(prepared.vectors[query], prepared.bm25_queries.get(query, query),
                                                   dense_limit=50, sparse_limit=50, limit=50, **options)
         if not hits:
             if strategy != "bm25":
@@ -339,7 +377,7 @@ class EvaluationSearch:
             candidates.append(RetrievalCandidate(chunk=row, score=hit.score))
         if strategy != "hybrid_rerank":
             return candidates
-        ranked = await self.reranker.rank(query, [item.chunk for item in candidates], top_n=10)
+        ranked = await self.reranker.rank(prepared.rerank_queries.get(query, query), [item.chunk for item in candidates], top_n=10)
         expected = {item.chunk.id: item.chunk for item in candidates}
         if (len(ranked) != min(10, len(candidates)) or len({item.chunk.id for item in ranked}) != len(ranked)
                 or any(item.chunk != expected.get(item.chunk.id) for item in ranked)):

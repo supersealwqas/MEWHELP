@@ -290,8 +290,9 @@ async def test_hybrid_query_faq_uses_model_keyword_not_raw_message() -> None:
             """初始化记录。参数：无；返回：None；异常：无。"""
             self.keywords = []
 
-        async def query_faq(self, keyword):
-            """记录并返回空结果。参数：检索词；返回：空列表；异常：无。"""
+        async def query_faq(self, keyword, *, source_query=None):
+            """记录并返回空结果。参数：检索词和独立原问；返回：空列表；异常：断言失败。"""
+            assert source_query == "如果我是会员呢"
             self.keywords.append(keyword)
             return []
 
