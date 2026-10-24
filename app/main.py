@@ -19,6 +19,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from app.api.chat import router as chat_router
 from app.api.citations import router as citations_router
 from app.api.extract import router as extract_router
+from app.api.rageval import router as rageval_router
 from app.core.logging import setup_logging
 from app.config import settings
 from app.core.llm import ChatModelAdapter
@@ -90,6 +91,20 @@ async def chat_page() -> FileResponse:
     )
 
 
+async def rag_eval_page() -> FileResponse:
+    """返回四策略评估看板页面。
+
+    参数：无；页面与评估 API 同源，不接外部图表库。
+    返回：FileResponse，UTF-8 HTML；数据由 /api/rag-eval/overview 提供。
+    异常：RuntimeError，部署时缺失 rag-eval.html。
+    """
+    return FileResponse(
+        STATIC_DIR / "rag-eval.html",
+        media_type="text/html",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
 @asynccontextmanager
 async def database_runtime():
     """建立单 worker 运行时、恢复中断轮并加载知识检索。
@@ -152,8 +167,10 @@ def create_app(runtime_factory=None) -> FastAPI:
     application.include_router(chat_router)
     application.include_router(citations_router)
     application.include_router(kb_router)
+    application.include_router(rageval_router)
     application.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     application.add_api_route("/", chat_page, response_class=FileResponse, include_in_schema=False)
+    application.add_api_route("/rag-eval", rag_eval_page, response_class=FileResponse, include_in_schema=False)
     return application
 
 

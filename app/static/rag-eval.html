@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RAG 评估 · 小喵客服</title>
+<style>
+  /* 与聊天页共用一套配色变量，避免两个页面像两个产品。 */
+  :root {
+    --page: #f3f5f1;
+    --surface: #fff;
+    --ink: #243b31;
+    --muted: #627269;
+    --primary: #285b49;
+    --primary-hover: #1d4838;
+    --soft: #eaf0e8;
+    --border: #dce4da;
+    --error: #a43529;
+    --warn: #b4762a;
+    --radius: 18px;
+    /* 四策略固定配色，图例与柱状图必须一致。 */
+    --s-dense: #7fb3d5;
+    --s-bm25: #6cc28a;
+    --s-hybrid: #f08a9b;
+    --s-rerank: #ef9a54;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px;
+    background: var(--page); color: var(--ink);
+    font: 14px/1.6 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  }
+  .wrap { max-width: 1240px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 20px; margin-bottom: 16px;
+  }
+  .meta-row { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }
+  .meta-item {
+    flex: 1 1 150px; background: var(--soft); border-radius: 12px;
+    padding: 10px 14px; min-width: 130px;
+  }
+  .meta-item .k { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  .meta-item .v { font-size: 15px; font-weight: 600; word-break: break-all; }
+  .kpi-row { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }
+  .kpi {
+    flex: 1 1 200px; background: var(--surface); border: 1px solid var(--border);
+    border-radius: 14px; padding: 14px 18px;
+  }
+  .kpi .k { font-size: 12px; color: var(--muted); }
+  .kpi .v { font-size: 28px; font-weight: 700; line-height: 1.2; }
+  .kpi .n { font-size: 12px; color: var(--muted); }
+  h2 { font-size: 15px; margin: 0 0 4px; }
+  .hint { color: var(--muted); font-size: 12px; margin-bottom: 14px; }
+  .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  .seg button {
+    border: 0; background: var(--surface); padding: 7px 14px; cursor: pointer;
+    font: inherit; color: var(--muted); border-right: 1px solid var(--border);
+  }
+  .seg button:last-child { border-right: 0; }
+  .seg button[aria-pressed="true"] { background: var(--primary); color: #fff; font-weight: 600; }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 16px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 16px; font-size: 12px; color: var(--muted); }
+  .legend i { display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+  /* 柱状图用纯 CSS 实现，避免引入图表库；每根柱子高度按百分比算。 */
+  .chart { display: flex; align-items: flex-end; gap: 24px; height: 300px; padding: 16px 8px 0; border-bottom: 2px solid var(--border); }
+  .group { flex: 1; display: flex; flex-direction: column; align-items: center; height: 100%; }
+  .bars { display: flex; align-items: flex-end; gap: 6px; width: 100%; height: 100%; justify-content: center; }
+  .bar-wrap { flex: 1; max-width: 44px; display: flex; flex-direction: column; justify-content: flex-end; height: 100%; }
+  .bar-val { font-size: 11px; text-align: center; color: var(--ink); margin-bottom: 3px; font-variant-numeric: tabular-nums; }
+  .bar { border-radius: 4px 4px 0 0; min-height: 2px; transition: height .3s; }
+  .group-label { margin-top: 8px; text-align: center; font-size: 13px; font-weight: 600; }
+  .group-label small { display: block; font-weight: 400; color: var(--muted); font-size: 11px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { padding: 8px 10px; text-align: right; border-bottom: 1px solid var(--border); }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  tbody tr:hover { background: var(--soft); }
+  .num { font-variant-numeric: tabular-nums; }
+  .good { color: var(--primary); font-weight: 600; }
+  .bad { color: var(--error); font-weight: 600; }
+  .actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  button.act {
+    background: var(--primary); color: #fff; border: 0; border-radius: 10px;
+    padding: 9px 18px; font: inherit; cursor: pointer;
+  }
+  button.act:hover:not([disabled]) { background: var(--primary-hover); }
+  button.act[disabled] { opacity: .45; cursor: default; }
+  button.ghost { background: var(--surface); color: var(--primary); border: 1px solid var(--border); }
+  pre.log {
+    background: #1d2a24; color: #d7e4dc; border-radius: 12px; padding: 14px;
+    font-size: 12px; line-height: 1.5; overflow: auto; max-height: 260px; margin: 0;
+  }
+  .empty { text-align: center; padding: 40px; color: var(--muted); }
+  .pill { display: inline-block; padding: 2px 9px; border-radius: 20px; font-size: 11px; font-weight: 600; }
+  .pill.running { background: #fff3d6; color: var(--warn); }
+  .pill.done { background: var(--soft); color: var(--primary); }
+  .pill.failed { background: #ffe8e2; color: var(--error); }
+  .note { font-size: 12px; color: var(--muted); margin-top: 10px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>RAG 评估看板</h1>
+  <div class="sub">四策略检索对照 · 证据覆盖 · 端到端答案质量 · 可重跑</div>
+
+  <div id="metaRow" class="meta-row"></div>
+  <div id="kpiRow" class="kpi-row"></div>
+
+  <div class="card">
+    <h2>检索质量（确定性，不依赖大模型）</h2>
+    <div class="hint">
+      MRR 看排名够不够靠前；Recall@k 看必需证据在不在前 k 条里；证据覆盖度看召回证据里覆盖了多少必需事实。
+      三项都由冻结语料机械算出，可复现。
+    </div>
+    <div class="toolbar">
+      <div class="seg" id="metricSeg">
+        <button data-metric="mrr@10" aria-pressed="true">MRR@10</button>
+        <button data-metric="recall@10" aria-pressed="false">Recall@10</button>
+        <button data-metric="all_evidence@10" aria-pressed="false">完整证据@10</button>
+        <button data-metric="coverage" aria-pressed="false">证据覆盖度</button>
+      </div>
+      <div class="legend" id="legend"></div>
+    </div>
+    <div id="retrievalChart"></div>
+  </div>
+
+  <div class="card">
+    <h2>生成质量（端到端，LLM 裁判）</h2>
+    <div class="hint">
+      四策略各自把召回的证据交给同一模型生成答案，再由独立裁判统计事实支持情况。
+      拒答不算满分；库外问题单独看正确拒答率。
+    </div>
+    <div class="toolbar">
+      <div class="seg" id="genSeg">
+        <button data-metric="faithfulness_macro" aria-pressed="true">忠实度</button>
+        <button data-metric="citation_validity" aria-pressed="false">引用有效率</button>
+        <button data-metric="false_refusal_rate" aria-pressed="false">误拒率</button>
+      </div>
+    </div>
+    <div id="genChart"></div>
+  </div>
+
+  <div class="card">
+    <h2>总体指标</h2>
+    <div class="hint">数值为单次真实运行结果，不是上线保证。失败样本保留在 results.jsonl。</div>
+    <div style="overflow:auto"><table id="overallTable"></table></div>
+  </div>
+
+  <div class="card">
+    <h2>分难度</h2>
+    <div class="hint">按题目标注难度拆分，便于看哪一档最弱。</div>
+    <div style="overflow:auto"><table id="difficultyTable"></table></div>
+  </div>
+
+  <div class="card">
+    <h2>重跑评估</h2>
+    <div class="hint">
+      后台执行「校准 → 固定集比较」，需要本地模型与 Milvus 可用，分钟级。
+      跑完后本页数据会自动切换到最新一次运行。
+    </div>
+    <div class="actions">
+      <button class="act" id="rerunBtn">重跑四策略评估</button>
+      <button class="act ghost" id="refreshBtn">刷新数据</button>
+      <span id="jobPill" class="pill"></span>
+      <span id="jobMsg" class="note"></span>
+    </div>
+    <div id="logBox" style="margin-top:14px; display:none">
+      <pre class="log" id="jobLog"></pre>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+/** 评估看板：只负责取数与绘图，所有指标都由后端算好，前端不重算。 */
+const $ = (id) => document.getElementById(id);
+const COLORS = { dense: "#7fb3d5", bm25: "#6cc28a", hybrid: "#f08a9b", hybrid_rerank: "#ef9a54" };
+const STRATEGY_ORDER = ["dense", "bm25", "hybrid", "hybrid_rerank"];
+
+let state = null;
+let retrievalMetric = "mrr@10";
+let genMetric = "faithfulness_macro";
+
+/** 取数值，兼容 {value: x} 与裸数字两种结构。 */
+function val(record, key) {
+  if (!record) return null;
+  const v = record[key];
+  if (v && typeof v === "object") return typeof v.value === "number" ? v.value : null;
+  return typeof v === "number" ? v : null;
+}
+
+/** 百分比或三位小数展示；null 显示为 —。 */
+function fmt(x, digits = 3) {
+  return x === null || x === undefined ? "—" : Number(x).toFixed(digits);
+}
+
+/** 创建元素。 */
+function el(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+async function api(path, options) {
+  const response = await fetch(path, options);
+  if (!response.ok) {
+    let detail = response.statusText;
+    try { detail = (await response.json()).detail || detail; } catch { /* 非 JSON 错误体按状态文本处理 */ }
+    throw new Error(detail);
+  }
+  return response.json();
+}
+
+/** 画一组分组柱状图。rows: [{label, sub, values: {strategy: number|null}}] */
+function drawChart(container, rows, strategies, labels) {
+  container.textContent = "";
+  const chart = el("div", "chart");
+  for (const row of rows) {
+    const group = el("div", "group");
+    const bars = el("div", "bars");
+    for (const s of strategies) {
+      const wrap = el("div", "bar-wrap");
+      const value = row.values[s];
+      wrap.appendChild(el("div", "bar-val", value === null ? "—" : fmt(value, 2)));
+      const bar = el("div", "bar");
+      // 空值用极小高度占位，避免整组塌陷。
+      bar.style.height = `${Math.max((value ?? 0) * 100, 1.5)}%`;
+      bar.style.background = COLORS[s] || "#999";
+      bar.title = `${labels[s] || s}: ${value === null ? "无数据" : fmt(value, 4)}`;
+      wrap.appendChild(bar);
+      bars.appendChild(wrap);
+    }
+    group.appendChild(bars);
+    const gl = el("div", "group-label", row.label);
+    if (row.sub) gl.appendChild(el("small", null, row.sub));
+    group.appendChild(gl);
+    chart.appendChild(group);
+  }
+  container.appendChild(chart);
+}
+
+function renderLegend(labels, strategies) {
+  const box = $("legend");
+  box.textContent = "";
+  for (const s of strategies) {
+    const item = el("span");
+    const dot = el("i");
+    dot.style.background = COLORS[s];
+    item.appendChild(dot);
+    item.appendChild(document.createTextNode(labels[s] || s));
+    box.appendChild(item);
+  }
+}
+
+function renderMeta(data) {
+  const row = $("metaRow");
+  row.textContent = "";
+  const meta = data.meta || {};
+  const items = [
+    ["运行目录", meta.run || "—"],
+    ["题集", `${meta.sample_count ?? "—"} 样本`],
+    ["语料", `${meta.chunk_count ?? "—"} 块`],
+    ["生成模型", meta.model || "—"],
+    ["裁判模型", meta.judge_model || "—"],
+    ["耗时", meta.elapsed_seconds ? `${Math.round(meta.elapsed_seconds)} s` : "—"],
+    ["源码版本", meta.source_revision || "—"],
+  ];
+  for (const [k, v] of items) {
+    const box = el("div", "meta-item");
+    box.appendChild(el("div", "k", k));
+    box.appendChild(el("div", "v", String(v)));
+    row.appendChild(box);
+  }
+}
+
+function renderKpi(data) {
+  const row = $("kpiRow");
+  row.textContent = "";
+  const best = data.best || {};
+  const overall = data.overall || {};
+
+  // 最佳策略 MRR
+  const k1 = el("div", "kpi");
+  k1.appendChild(el("div", "k", "最佳整体 MRR@10"));
+  k1.appendChild(el("div", "v", fmt(best.mrr, 3)));
+  k1.appendChild(el("div", "n", best.label ? `${best.label} · 四策略最高` : "无数据"));
+  row.appendChild(k1);
+
+  // 各策略 Recall@10 都高说明召回不是瓶颈
+  const recalls = STRATEGY_ORDER.map((s) => val(overall[s], "recall@10")).filter((x) => x !== null);
+  const k2 = el("div", "kpi");
+  k2.appendChild(el("div", "k", "最低 Recall@10"));
+  k2.appendChild(el("div", "v", recalls.length ? fmt(Math.min(...recalls), 3) : "—"));
+  k2.appendChild(el("div", "n", "四策略召回下限，接近 1 说明召回不是瓶颈"));
+  row.appendChild(k2);
+
+  // 库外问题正确拒答
+  const un = STRATEGY_ORDER.map((s) => val(overall[s], "unanswerable_correct_refusal")).filter((x) => x !== null);
+  const k3 = el("div", "kpi");
+  k3.appendChild(el("div", "k", "库外问题正确拒答"));
+  k3.appendChild(el("div", "v", un.length ? `${fmt(Math.min(...un) * 100, 0)}%` : "—"));
+  k3.appendChild(el("div", "n", "取四策略最低值"));
+  row.appendChild(k3);
+
+  // 校准阈值
+  const cal = data.calibration || {};
+  const k4 = el("div", "kpi");
+  k4.appendChild(el("div", "k", "校准题数"));
+  k4.appendChild(el("div", "v", String(cal.case_count ?? "—")));
+  const mins = Object.entries(cal.thresholds || {})
+    .map(([s, r]) => `${s}=${r.minimum === null ? "null" : fmt(r.minimum, 2)}`);
+  k4.appendChild(el("div", "n", mins.length ? mins.join(" · ") : "无校准记录"));
+  row.appendChild(k4);
+}
+
+function renderRetrieval(data) {
+  renderLegend(data.strategy_labels || {}, data.strategies);
+  const buckets = data.buckets || [];
+  const labels = data.bucket_labels || {};
+  const rows = buckets.map((b) => {
+    const values = {};
+    for (const s of data.strategies) {
+      values[s] = val((data.by_bucket[s] || {})[b], retrievalMetric);
+    }
+    return { label: labels[b] || b, sub: b, values };
+  });
+  // 总体列单独一组，与分桶区分开。
+  const overallValues = {};
+  for (const s of data.strategies) overallValues[s] = val((data.overall || {})[s], retrievalMetric);
+  rows.push({ label: "总体", sub: "overall", values: overallValues });
+  drawChart($("retrievalChart"), rows, data.strategies, data.strategy_labels || {});
+}
+
+function renderGen(data) {
+  const buckets = data.buckets || [];
+  const labels = data.bucket_labels || {};
+  const rows = buckets.map((b) => {
+    const values = {};
+    for (const s of data.strategies) values[s] = val((data.by_bucket[s] || {})[b], genMetric);
+    return { label: labels[b] || b, sub: b, values };
+  });
+  const overallValues = {};
+  for (const s of data.strategies) overallValues[s] = val((data.overall || {})[s], genMetric);
+  rows.push({ label: "总体", sub: "overall", values: overallValues });
+  drawChart($("genChart"), rows, data.strategies, data.strategy_labels || {});
+}
+
+function renderOverallTable(data) {
+  const table = $("overallTable");
+  table.textContent = "";
+  const head = el("thead");
+  const hr = el("tr");
+  for (const title of ["策略", "MRR@10", "Recall@10", "完整证据@10", "覆盖率", "误拒率", "库外正确拒答", "忠实度", "错误"]) {
+    hr.appendChild(el("th", null, title));
+  }
+  head.appendChild(hr);
+  table.appendChild(head);
+
+  const body = el("tbody");
+  for (const s of data.strategies) {
+    const r = (data.overall || {})[s] || {};
+    const tr = el("tr");
+    tr.appendChild(el("td", null, data.strategy_labels[s] || s));
+    const cells = [
+      ["mrr@10", 3], ["recall@10", 3], ["all_evidence@10", 3],
+      ["coverage", 3], ["false_refusal_rate", 3], ["unanswerable_correct_refusal", 3],
+      ["faithfulness_macro", 3],
+    ];
+    for (const [key, digits] of cells) {
+      const v = val(r, key);
+      const td = el("td", "num", fmt(v, digits));
+      // 误拒率越低越好，其余越高越好，用颜色点出方向。
+      if (v !== null) {
+        const good = key === "false_refusal_rate" ? v <= 0.15 : v >= 0.8;
+        if (good) td.classList.add("good");
+        else if (key === "false_refusal_rate" && v >= 0.4) td.classList.add("bad");
+      }
+      tr.appendChild(td);
+    }
+    tr.appendChild(el("td", "num", String(r.error_count ?? 0)));
+    body.appendChild(tr);
+  }
+  table.appendChild(body);
+}
+
+function renderDifficultyTable(data) {
+  const table = $("difficultyTable");
+  table.textContent = "";
+  const head = el("thead");
+  const hr = el("tr");
+  for (const title of ["策略", "难度", "样本", "MRR@10", "Recall@10", "覆盖率"]) hr.appendChild(el("th", null, title));
+  head.appendChild(hr);
+  table.appendChild(head);
+
+  const body = el("tbody");
+  for (const s of data.strategies) {
+    const block = (data.by_difficulty || {})[s] || {};
+    for (const level of ["easy", "medium", "hard"]) {
+      const r = block[level];
+      if (!r) continue;
+      const tr = el("tr");
+      tr.appendChild(el("td", null, data.strategy_labels[s] || s));
+      tr.appendChild(el("td", null, { easy: "易", medium: "中", hard: "难" }[level] || level));
+      tr.appendChild(el("td", "num", String(r.sample_count ?? "—")));
+      tr.appendChild(el("td", "num", fmt(val(r, "mrr@10"), 3)));
+      tr.appendChild(el("td", "num", fmt(val(r, "recall@10"), 3)));
+      tr.appendChild(el("td", "num", fmt(val(r, "coverage"), 3)));
+      body.appendChild(tr);
+    }
+  }
+  table.appendChild(body);
+}
+
+function renderJob(job) {
+  const pill = $("jobPill");
+  const msg = $("jobMsg");
+  const status = job.status || "idle";
+  pill.className = `pill ${status === "running" ? "running" : status === "failed" ? "failed" : "done"}`;
+  pill.textContent = { idle: "未运行", running: "运行中", done: "已完成", failed: "失败", interrupted: "已中断" }[status] || status;
+  msg.textContent = job.message || "";
+  $("rerunBtn").disabled = status === "running";
+  const logBox = $("logBox");
+  if (job.log) {
+    logBox.style.display = "";
+    $("jobLog").textContent = job.log;
+  } else {
+    logBox.style.display = "none";
+  }
+}
+
+function renderEmpty(data) {
+  const box = document.createElement("div");
+  box.className = "card empty";
+  box.textContent = data.hint || "还没有可展示的评估结果。";
+  $("retrievalChart").textContent = "";
+  $("retrievalChart").appendChild(box);
+  renderJob(data.job || {});
+}
+
+async function load() {
+  try {
+    state = await api("/api/rag-eval/overview");
+  } catch (error) {
+    $("retrievalChart").textContent = `取数失败：${error.message}`;
+    return;
+  }
+  if (!state.present) {
+    renderEmpty(state);
+    return;
+  }
+  renderMeta(state);
+  renderKpi(state);
+  renderRetrieval(state);
+  renderGen(state);
+  renderOverallTable(state);
+  renderDifficultyTable(state);
+  renderJob(state.job || {});
+}
+
+/** 重跑期间轮询任务状态与日志，结束后自动刷新数据。 */
+async function pollJob() {
+  try {
+    const job = await api("/api/rag-eval/job");
+    renderJob(job);
+    if (job.status === "running") {
+      setTimeout(pollJob, 3000);
+    } else {
+      await load();
+    }
+  } catch {
+    setTimeout(pollJob, 5000);
+  }
+}
+
+for (const button of document.querySelectorAll("#metricSeg button")) {
+  button.addEventListener("click", () => {
+    retrievalMetric = button.dataset.metric;
+    for (const other of document.querySelectorAll("#metricSeg button")) {
+      other.setAttribute("aria-pressed", String(other === button));
+    }
+    if (state?.present) renderRetrieval(state);
+  });
+}
+
+for (const button of document.querySelectorAll("#genSeg button")) {
+  button.addEventListener("click", () => {
+    genMetric = button.dataset.metric;
+    for (const other of document.querySelectorAll("#genSeg button")) {
+      other.setAttribute("aria-pressed", String(other === button));
+    }
+    if (state?.present) renderGen(state);
+  });
+}
+
+$("refreshBtn").addEventListener("click", load);
+$("rerunBtn").addEventListener("click", async () => {
+  $("rerunBtn").disabled = true;
+  try {
+    await api("/api/rag-eval/rerun", { method: "POST" });
+    pollJob();
+  } catch (error) {
+    $("jobMsg").textContent = `启动失败：${error.message}`;
+    $("rerunBtn").disabled = false;
+  }
+});
+
+load();
+if (state?.job?.status === "running") pollJob();
+</script>
+</body>
+</html>
