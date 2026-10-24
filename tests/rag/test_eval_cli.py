@@ -79,3 +79,35 @@ def test_validate_runs_without_chat_credentials_or_env_file(tmp_path) -> None:
                             env=environment, capture_output=True, text=True, encoding="utf-8", timeout=30)
     assert result.returncode == 0, result.stderr
     assert '"case_count": 72' in result.stdout
+
+
+def test_policy_accepts_any_calibration_count_when_unspecified() -> None:
+    """不再写死 24 题：不传题数时不校验数量，只校验版本与绑定。
+
+    参数：无。
+    返回：None。
+    异常：AssertionError，非 24 题的 policy 仍被拒绝。
+    """
+    from app.evaluation.policy import POLICY_BINDINGS, POLICY_VERSION, validate_policy
+
+    metadata = {key: "same" for key in POLICY_BINDINGS}
+    policy = {"version": POLICY_VERSION, "metadata": metadata,
+              "calibration_case_count": 104, "thresholds": {"bm25": {"minimum": None}}}
+    assert validate_policy(policy, metadata, ["bm25"]) == {"bm25": None}
+
+
+def test_policy_rejects_count_that_differs_from_current_dataset() -> None:
+    """显式给出本次题数时必须一致，避免把 24 题的校准套到 104 题的题集上。
+
+    参数：无。
+    返回：None。
+    异常：AssertionError，题数不一致未报错。
+    """
+    from app.evaluation.policy import POLICY_BINDINGS, POLICY_VERSION, validate_policy
+
+    metadata = {key: "same" for key in POLICY_BINDINGS}
+    policy = {"version": POLICY_VERSION, "metadata": metadata,
+              "calibration_case_count": 24, "thresholds": {"bm25": {"minimum": None}}}
+    assert validate_policy(policy, metadata, ["bm25"], calibration_case_count=24) == {"bm25": None}
+    with pytest.raises(ValueError):
+        validate_policy(policy, metadata, ["bm25"], calibration_case_count=104)

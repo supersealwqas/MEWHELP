@@ -94,15 +94,22 @@ def calibrate_threshold(rows: list[dict], *, strategy: str) -> dict:
             "reason": "校准集平衡准确率最优；同分优先减少错误放行，再选择更严格分界"}
 
 
-def validate_policy(policy: dict, metadata: dict, strategies: list[str]) -> dict[str, float | None]:
+def validate_policy(policy: dict, metadata: dict, strategies: list[str],
+                    calibration_case_count: int | None = None) -> dict[str, float | None]:
     """核验题集、语料、模型、Prompt、源码和预算绑定，禁止错用策略分数。
 
-    参数：policy 校准JSON；metadata 当前运行版本；strategies 需比较的策略。
+    参数：policy 校准JSON；metadata 当前运行版本；strategies 需比较的策略；
+        calibration_case_count 本次数据集实际校准题数，None 表示不校验题数
+        （题量由数据集决定，不再写死 24）。
     返回：dict，策略到门槛，null保持为不启用分数门禁。
     异常：ValueError，版本/数量/绑定缺失或不匹配、门槛非法。
     """
-    if policy.get("version") != POLICY_VERSION or policy.get("calibration_case_count") != 24:
-        raise ValueError("校准策略版本或24题数量不合法")
+    if policy.get("version") != POLICY_VERSION:
+        raise ValueError("校准策略版本不合法")
+    if (calibration_case_count is not None
+            and policy.get("calibration_case_count") != calibration_case_count):
+        raise ValueError(f"校准策略的题数 {policy.get('calibration_case_count')} "
+                         f"与本次数据集 {calibration_case_count} 不一致")
     saved = policy.get("metadata", {})
     if any(key not in metadata or key not in saved or metadata[key] != saved[key] for key in POLICY_BINDINGS):
         raise ValueError("校准策略的题集、语料、模型、Prompt、源码或预算已变化")

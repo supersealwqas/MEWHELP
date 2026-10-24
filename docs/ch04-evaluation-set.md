@@ -112,3 +112,13 @@ uv run pytest tests/rag/test_eval_dataset.py
 - `difficulty` 分布偏易：easy 193 / medium 112 / hard 15。hard 集中在 12 道 E_multi 多证据题，与主集 easy 22 / medium 32 / hard 18 的分布不同，两集难度不可直接比较。
 - 事实组按组名哈希分配 split 后校正，保证无跨集合泄漏（校验器已确认 0 泄漏），但 `D_filter` 校准题只有 1 道，该桶的阈值校准样本不足。
 - 扩展集尚未用于正式校准与四策略比较；在跑出真实数字前，不得引用其任何成绩。
+
+### 题量不再写死
+
+校准与比较的题数一律取自数据集本身，不再硬编码 24/48/72：
+
+- `validate` 与真实运行都用 `load_dataset(..., expected_size=None)`，只要求每桶在两种 split 都有题。
+- `policy.json` 的 `calibration_case_count` 记录当次实际校准题数。
+- `validate_policy` 在 `compare` 时用当前数据集的校准题数核对 policy，题数不一致直接报错，避免把主集 24 题的校准套到扩展集上。
+
+主集仍保持 24 校准 / 48 固定，摘要 `f91e0e43…` 不变；扩展集为 104 校准 / 216 固定，摘要 `85561aaa…`。

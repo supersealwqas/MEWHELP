@@ -1,4 +1,4 @@
-"""CH04题集验证、专用资源准备、24题校准与48题固定比较命令行入口。
+"""CH04题集验证、专用资源准备、校准与固定集比较命令行入口。题量由数据集决定。
 
 CLI先解析显式环境文件再加载应用依赖，--help无需模型或数据库。
 每次准备/运行使用新目录，失败留下状态文件并返回非零码。
@@ -40,7 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
                                  default=["dense", "bm25", "hybrid", "hybrid_rerank"])
             command.add_argument("--evidence-budget", type=int, default=8000)
         if name == "compare":
-            command.add_argument("--policy", type=Path, required=True, help="24题真实校准运行产生的policy.json")
+            command.add_argument("--policy", type=Path, required=True, help="真实校准运行产生的policy.json（校准题数须与当前数据集一致）")
     return parser
 
 
@@ -74,7 +74,8 @@ async def run(args: argparse.Namespace) -> int:
 
     if args.command == "validate":
         chunks = build_corpus(args.manifest, embedding_revision="offline-validation-only")
-        cases = load_dataset(args.dataset, chunks=chunks)
+        # 题量由数据集决定：validate 不限定题数，只校验每桶两种 split 都有题。
+        cases = load_dataset(args.dataset, chunks=chunks, expected_size=None)
         for case in cases:
             resolve_evidence(case, chunks)
         print(json.dumps({"valid": True, "case_count": len(cases), "chunk_count": len(chunks),
@@ -115,23 +116,26 @@ async def run(args: argparse.Namespace) -> int:
             print(json.dumps({**result, "output_dir": str(output.resolve())}, ensure_ascii=False, indent=2))
             return 0
         async with evaluation_runtime(config, manifest_path=args.manifest, evidence_budget=args.evidence_budget) as runtime:
-            cases = load_dataset(args.dataset, chunks=runtime.chunks)
+            cases = load_dataset(args.dataset, chunks=runtime.chunks, expected_size=None)
             runtime.metadata["dataset_digest"] = digest_json([case.model_dump(mode="json") for case in cases])
             selected = [case for case in cases if case.split == args.split]
-            expected_count = 24 if args.command == "calibrate" else 48
-            if len(selected) != expected_count:
-                raise ValueError("分割题数不符合24校准/48固定要求")
+            # 题量由数据集决定，不写死 24/48；只要求本次要跑的 split 有题。
+            if not selected:
+                raise ValueError(f"数据集没有 split={args.split} 的题目")
             thresholds = None
             if args.command == "compare":
                 policy = json.loads(args.policy.read_text(encoding="utf-8"))
-                thresholds = validate_policy(policy, runtime.metadata, args.strategies)
+                # 校准题数取自数据集本身，保证 policy 与当前题集是同一次校准的产物。
+                calibration_count = sum(1 for case in cases if case.split == "calibration")
+                thresholds = validate_policy(policy, runtime.metadata, args.strategies,
+                                             calibration_case_count=calibration_count)
                 runtime.metadata["policy_digest"] = digest_json(policy)
             result = await evaluate_dataset(selected, runtime, output, strategies=args.strategies,
                                               thresholds=thresholds, retrieval_only=args.command == "calibrate", progress=_progress)
             owns_output = True
             if args.command == "calibrate":
                 rows = [json.loads(line) for line in (output / "results.jsonl").read_text(encoding="utf-8").splitlines()]
-                policy = {"version": POLICY_VERSION, "calibration_case_count": 24, "metadata": runtime.metadata,
+                policy = {"version": POLICY_VERSION, "calibration_case_count": len(selected), "metadata": runtime.metadata,
                           "thresholds": {strategy: calibrate_threshold([row for row in rows if row["strategy"] == strategy], strategy=strategy)
                                          for strategy in args.strategies}}
                 atomic_json(output / "policy.json", policy)
