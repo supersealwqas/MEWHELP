@@ -17,6 +17,7 @@ from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.api.chat import router as chat_router
+from app.api.citations import router as citations_router
 from app.api.extract import router as extract_router
 from app.core.logging import setup_logging
 from app.config import settings
@@ -149,6 +150,7 @@ def create_app(runtime_factory=None) -> FastAPI:
     application.add_middleware(SecurityHeadersMiddleware)
     application.include_router(extract_router)
     application.include_router(chat_router)
+    application.include_router(citations_router)
     application.include_router(kb_router)
     application.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     application.add_api_route("/", chat_page, response_class=FileResponse, include_in_schema=False)

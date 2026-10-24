@@ -15,6 +15,7 @@ class MemoryRepository:
         self.turns, self.results, self.contexts = {}, {}, []
         self.fail_finish = False
         self.low_confidence = []
+        self.metadata = {}
 
     async def start_turn(self, context, message):
         """保存用户轮次。参数：上下文、原文；返回：带数字 ID 的上下文；异常：无。"""
@@ -45,17 +46,20 @@ class MemoryRepository:
                 content=result.model_dump_json(), tool_call_id=context.tool_call_id))
         return self.results[key]
 
-    async def finish_turn(self, context, content, *, low_confidence=None):
-        """模拟原子完成/入池。参数：上下文、回答、自评失败；返回：None；异常：ConnectionError。"""
+    async def finish_turn(self, context, content, *, low_confidence=None, citations=None):
+        """模拟原子完成/入池。参数：上下文、回答、自评失败、全部引用；返回：元数据；异常：ConnectionError。"""
+        from app.knowledge.sources import answer_metadata
         if self.fail_finish:
             raise ConnectionError("SECRET")
         if self.turns[context.turn_id].turn_status == "completed":
-            return
+            return self.metadata[context.turn_id]
         self.turns[context.turn_id].messages.append(StoredMessage(role="assistant", content=content))
         if low_confidence is not None:
             self.low_confidence.append({"raw_question": context.user_message, "source": low_confidence.source,
                                         "reason": low_confidence.reason, "conversation_id": context.conversation_id})
         self.turns[context.turn_id].turn_status = "completed"
+        self.metadata[context.turn_id] = answer_metadata(context, citations or [])
+        return self.metadata[context.turn_id]
 
     async def mark_turn(self, context, status):
         """记录失败/取消。参数：上下文、状态；返回：None；异常：无。"""

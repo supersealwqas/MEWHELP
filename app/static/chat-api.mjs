@@ -108,7 +108,7 @@ export async function streamChat(options, fetcher = globalThis.fetch) {
  * @returns {Promise<string>} 收到完成帧后的完整回答。
  * @throws {Error} HTTP、网络或协议错误；取消时抛出 AbortError。
  */
-async function receiveChatStream({ sessionId, message, signal, onDelta, onToolStatus }, fetcher) {
+async function receiveChatStream({ sessionId, message, signal, onDelta, onToolStatus, onAnswerMetadata }, fetcher) {
   // EventSource 不支持此处需要的 POST JSON，因此使用 fetch 的可读响应流。
   const response = await fetcher("/api/chat", {
     method: "POST",
@@ -130,6 +130,7 @@ async function receiveChatStream({ sessionId, message, signal, onDelta, onToolSt
   const decoder = new TextDecoder("utf-8", { fatal: true });
   let buffer = "";
   let answer = "";
+  let metadata = null;
   try {
     while (true) {
       const { value, done } = await reader.read();
@@ -140,9 +141,11 @@ async function receiveChatStream({ sessionId, message, signal, onDelta, onToolSt
         const frame = buffer.slice(0, boundary.index);
         buffer = buffer.slice(boundary.index + boundary[0].length);
         const event = parseEvent(frame);
-        if (!event.data || !["message", "error", "tool_status"].includes(event.event)) continue;
+        if (!event.data || !["message", "error", "tool_status", "answer_metadata"].includes(event.event)) continue;
         if (event.event === "message" && event.data === "[DONE]") {
           if (!answer.trim()) throw new Error("模型没有返回有效回复，请重新提问。");
+          // 兼容旧服务的DONE；仅含新完成元数据的回答提供引用和反馈入口。
+          if (metadata) onAnswerMetadata?.(metadata);
           return answer;
         }
 
@@ -156,6 +159,17 @@ async function receiveChatStream({ sessionId, message, signal, onDelta, onToolSt
           const error = new Error(typeof payload?.error === "string" ? payload.error : "模型暂时不可用，请稍后重试。");
           if (typeof payload?.retry_safe === "boolean") error.retry_safe = payload.retry_safe;
           throw error;
+        }
+        if (event.event === "answer_metadata") {
+          if (metadata || payload?.session_id !== sessionId || typeof payload?.turn_id !== "string" ||
+              !payload.turn_id || payload.status !== "completed" || !Array.isArray(payload.citations) ||
+              payload.citations.some((item) => !Number.isSafeInteger(item?.n) || item.n < 1 ||
+                typeof item.answer !== "string" || typeof item.question !== "string") ||
+              new Set(payload.citations.map((item) => item.n)).size !== payload.citations.length) {
+            throw new Error("回答完成信息不完整，请保留本页文字并稍后核实。");
+          }
+          metadata = payload;
+          continue;
         }
         if (event.event === "tool_status") {
           if (typeof payload?.tool_call_id !== "string" || typeof payload?.name !== "string" ||

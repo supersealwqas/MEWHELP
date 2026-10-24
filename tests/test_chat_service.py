@@ -22,7 +22,7 @@ async def test_one_tool_status_before_answer_and_commit_before_done():
     """缺少工具配对或提前 done 都应失败。参数：无；返回：None；异常：断言失败。"""
     service, repo, support, model = make_service(AIMessage(content="", tool_calls=[faq_call()]))
     events = [e async for e in service.stream_turn(request())]
-    assert [e.event for e in events] == ["tool_status", "tool_status", "delta", "delta", "done"]
+    assert [e.event for e in events] == ["tool_status", "tool_status", "delta", "delta", "answer_metadata", "done"]
     assert [e.data["status"] for e in events[:2]] == ["running", "succeeded"]
     assert support.keywords == ["邮费"]
     assert [step for step, _ in model.inputs] == ["decide", "decide", "answer"]
@@ -42,6 +42,7 @@ async def test_no_tool_still_streams_and_does_not_save_planning_text():
     assert (await anext(iterator)).data == {"delta": "已"}
     assert next(iter(repo.turns.values())).turn_status == "running"
     assert (await anext(iterator)).data == {"delta": "查到"}
+    assert (await anext(iterator)).event == "answer_metadata"
     assert (await anext(iterator)).event == "done"
     assert next(iter(repo.turns.values())).turn_status == "completed"
     await iterator.aclose()
@@ -215,7 +216,7 @@ async def test_order_not_owned_bypasses_model_and_uses_fixed_reply():
     service, repo, _, model = make_service(AIMessage(content="", tool_calls=[owned_call()]))
     events = [e async for e in service.stream_turn(request())]
     # 仍保留 running/succeeded 之外的失败状态徽章，随后是固定回复与完成帧。
-    assert [e.event for e in events] == ["tool_status", "tool_status", "delta", "done"]
+    assert [e.event for e in events] == ["tool_status", "tool_status", "delta", "answer_metadata", "done"]
     assert events[1].data["status"] == "failed"
     assert events[2].data["delta"] == "没有找到您的这笔订单，请确认订单号或物流单号后重试。"
     # 只发生决策阶段调用，回答阶段被完全跳过。
@@ -407,7 +408,7 @@ async def test_answer_retry_respects_both_input_budgets(monkeypatch, budget_kind
         assert next(iter(repo.turns.values())).turn_status == "failed"
     else:
         assert len(seen) == 2 and events[-1].event == "done"
-        assert events[-2].data["delta"] == "重试回答"
+        assert events[-3].data["delta"] == "重试回答"
 
 
 async def test_answer_retry_reservation_trims_history_as_a_whole(monkeypatch):

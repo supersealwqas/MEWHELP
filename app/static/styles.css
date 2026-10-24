@@ -197,3 +197,27 @@ kbd { font: inherit; }
 .markdown-content .markdown-align-center { text-align: center; }
 .markdown-content .markdown-align-right { text-align: right; }
 .markdown-content hr { margin: 1em 0; border: 0; border-top: 1px solid var(--border); }
+/* 完成回答引用与一次性本地反馈，沿用页面柔和边框和按钮语言。 */
+.citation-ref { border: 0; border-radius: 5px; padding: 0 3px; margin: 0 2px; background: #e4f1ea; color: #23563d; font: inherit; font-size: .8em; vertical-align: super; cursor: pointer; }
+.citation-ref:hover { background: #cce4d6; }
+.citation-ref:focus-visible, .feedback-choice:focus-visible { outline: 2px solid #3c7758; outline-offset: 3px; }
+.answer-feedback { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.feedback-choice { border: 1px solid #d9e1da; border-radius: 8px; background: #fff; color: #566257; padding: 5px 9px; cursor: pointer; font: inherit; font-size: 12px; }
+.feedback-choice[aria-pressed="true"] { background: #e4f1ea; color: #23563d; border-color: #81a98e; }
+.feedback-choice:disabled { cursor: default; }
+.feedback-note { font-size: 11px; color: #69776e; }
+.citation-dialog { width: min(760px, calc(100vw - 32px)); max-height: 88vh; padding: 0; border: 1px solid #d9e1da; border-radius: 18px; box-shadow: 0 20px 70px #182b2733; color: #27382e; background: #fffefa; }
+.citation-dialog[open] { display: flex; flex-direction: column; }
+.citation-dialog::backdrop { background: #1a282966; }
+.citation-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 24px; border-bottom: 1px solid #e7e9e2; }
+.citation-header h2 { font-size: 18px; margin: 0; }
+.citation-close { flex: none; }
+.citation-body { overflow-y: auto; overscroll-behavior: contain; padding: 20px 24px; line-height: 1.8; }
+.citation-section { font-weight: 600; margin-top: 0; overflow-wrap: anywhere; }
+.citation-snapshot { overflow-wrap: anywhere; }
+.citation-note { font-size: 12px; color: #69776e; }
+.citation-version { padding: 12px; border-radius: 10px; background: #fff3d9; font-size: 13px; }
+.citation-full { margin-top: 8px; }
+.citation-document { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; font-size: 13px; margin: 0; }
+.citation-target { background: #e4f1ea; outline: 2px solid #81a98e; border-radius: 3px; }
+@media (max-width: 540px) { .citation-header, .citation-body { padding: 16px; } .citation-dialog { max-height: 90dvh; } }

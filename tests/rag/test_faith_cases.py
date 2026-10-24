@@ -57,6 +57,18 @@ def _draft():
                            answer="保证两天到账[1]", reason="证据没有两天到账承诺", citations=[_citation(1), _citation(2)], judge_model="judge-test")
 
 
+async def test_false_self_check_cannot_create_pool_record_with_non_refusal_content() -> None:
+    """有入池草案也必须与固定拒答相配，不能让普通成功答案因错误调用污染池。参数：无；返回：None；异常：断言失败。"""
+    from app.repositories.chat import ChatRepository
+    from app.knowledge.answering import SelfCheckFailure
+    from app.schemas.tools import ToolContext
+
+    repository = ChatRepository(None)
+    with pytest.raises(ValueError, match="拒答"):
+        await repository.finish_turn(ToolContext(session_id="s", user_id="u", turn_id="t", user_message="问"),
+                                     "保证两天退款到账", low_confidence=SelfCheckFailure(reason="不足"))
+
+
 async def test_record_emits_atomic_unique_eval_upsert_and_preserves_recurrence_fields() -> None:
     """SQL 必须按 eval_id 原子累计，不覆盖 first_seen_at/resolved_at，并重置处置。参数：无；返回：None；异常：断言失败。"""
     from app.repositories.faith_cases import FaithCaseRepository

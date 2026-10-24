@@ -75,12 +75,48 @@ function renderTableCell(tokens, index, options, env, renderer) {
 markdown.renderer.rules.th_open = renderTableCell;
 markdown.renderer.rules.td_open = renderTableCell;
 
+// 只改行内普通文本；代码、图片和已有链接中的数字保持原样。
+markdown.core.ruler.after("inline", "answer_citations", function citationTokens(state) {
+  const allowed = new Set(state.env.citations?.map((item) => item.n) || []);
+  if (!allowed.size) return;
+  for (const block of state.tokens) {
+    if (block.type !== "inline" || !block.children) continue;
+    const output = [];
+    let linkDepth = 0;
+    for (const token of block.children) {
+      if (token.type === "link_open") linkDepth += 1;
+      if (token.type === "link_close") linkDepth -= 1;
+      if (token.type !== "text" || linkDepth) { output.push(token); continue; }
+      let start = 0;
+      for (const match of token.content.matchAll(/\[([1-9]\d*)\]/g)) {
+        const number = Number(match[1]);
+        if (!Number.isSafeInteger(number) || !allowed.has(number)) continue;
+        const prefix = new state.Token("text", "", 0);
+        prefix.content = token.content.slice(start, match.index);
+        output.push(prefix);
+        const citation = new state.Token("citation_ref", "button", 0);
+        citation.content = String(number);
+        output.push(citation);
+        start = match.index + match[0].length;
+      }
+      const suffix = new state.Token("text", "", 0);
+      suffix.content = token.content.slice(start);
+      output.push(suffix);
+    }
+    block.children = output;
+  }
+});
+markdown.renderer.rules.citation_ref = function renderCitation(tokens, index) {
+  const number = tokens[index].content;
+  return `<button type="button" class="citation-ref" data-citation="${number}" aria-label="查看引用 ${number}">[${number}]</button>`;
+};
+
 /**
  * 将聊天原文转换为显示用 HTML。
  * @param {string} text 当前累计的聊天原文，可为空或未闭合的流式片段。
  * @returns {string} 禁止原始 HTML 和危险协议的显示用 HTML；空输入返回空字符串。
  * @throws {TypeError} text 不是字符串时由 Markdown 解析器抛出。
  */
-export function renderMarkdown(text) {
-  return markdown.render(text);
+export function renderMarkdown(text, citations = []) {
+  return markdown.render(text, { citations });
 }

@@ -11,8 +11,8 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from app.core.memory import ContextBudgetExceeded, assemble_turns, prepare_messages, valid_tool_calls
 from app.core.prompts import ANSWER_NUDGE, ANSWER_SYSTEM, CUSTOMER_SERVICE_SYSTEM, TOOL_DECISION_SYSTEM
 from app.knowledge.answering import (
-    KNOWLEDGE_ANSWER_RULES, collect_citations, decide_answer, has_knowledge_call,
-    has_successful_knowledge_result, number_knowledge_results,
+    KNOWLEDGE_ANSWER_RULES, business_facts_summary, collect_citations, decide_answer, has_knowledge_call,
+    has_successful_knowledge_result, knowledge_answer_handoff, number_knowledge_results,
 )
 from app.repositories.chat import PersistenceUncertain
 from app.schemas.chat import ChatEvent, ChatRequest, InvalidToolDecision
@@ -359,8 +359,9 @@ class ChatService:
                 # 归属拒绝不进入模型阶段：固定回复保证未知订单与他人订单的措辞完全一致。
                 yield ChatEvent(event="delta", data={"delta": chain.rejection})
                 stage = "finish"
-                await self.chat.finish_turn(context, chain.ticket_receipt + chain.rejection)
+                metadata = await self.chat.finish_turn(context, chain.ticket_receipt + chain.rejection)
                 completed = True
+                yield ChatEvent(event="answer_metadata", data=metadata)
                 yield ChatEvent(event="done")
                 return
             stage = "answer"
@@ -368,18 +369,26 @@ class ChatService:
                     and getattr(self.executor.support, "uses_full_knowledge_query", False)):
                 citations = collect_citations(current)
                 numbered = number_knowledge_results(current, citations)
-                messages = prepare_messages(history, numbered, self.settings.token_budget,
+                # 最后显式交接为生成任务，阻止网关沿工具尾帧继续申请不存在的工具；原问不改写。
+                handoff = HumanMessage(content=json.dumps(knowledge_answer_handoff(context.user_message), ensure_ascii=False))
+                messages = prepare_messages(history, [*numbered, handoff], self.settings.token_budget,
                     system_text=ANSWER_SYSTEM + KNOWLEDGE_ANSWER_RULES,
                     request_max_tokens=self.settings.request_token_budget)
                 # 当前全部编号证据实际进入该请求；先严格自评，再原子提交，最后发布正文。
                 decision = await self.model.answer_knowledge(messages)
                 answer, low_confidence = decide_answer(decision, citations)
+                if low_confidence is not None:
+                    business = business_facts_summary(current)
+                    if business:
+                        answer = business + "\n\n" + answer
                 if len(chain.ticket_receipt + answer) > MAX_ANSWER_CHARACTERS:
                     raise AnswerTooLong("回答超过长度限制")
                 stage = "finish"
-                await self.chat.finish_turn(context, chain.ticket_receipt + answer, low_confidence=low_confidence)
+                metadata = await self.chat.finish_turn(context, chain.ticket_receipt + answer,
+                                                       low_confidence=low_confidence, citations=citations)
                 completed = True
                 yield ChatEvent(event="delta", data={"delta": answer})
+                yield ChatEvent(event="answer_metadata", data=metadata)
                 yield ChatEvent(event="done")
                 return
             # 回答阶段没有工具定义，必须改用不含决策指令的 ANSWER_SYSTEM；
@@ -397,8 +406,9 @@ class ChatService:
                     else:
                         answer = item
             stage = "finish"
-            await self.chat.finish_turn(context, answer)
+            metadata = await self.chat.finish_turn(context, answer)
             completed = True
+            yield ChatEvent(event="answer_metadata", data=metadata)
             yield ChatEvent(event="done")
         except (asyncio.CancelledError, GeneratorExit):
             raise

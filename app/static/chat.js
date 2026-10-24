@@ -4,6 +4,7 @@
  */
 import { failurePresentation, streamChat } from "./chat-api.mjs";
 import { renderMarkdown } from "./markdown.mjs";
+import { attachAnswerTools } from "./citations.mjs";
 
 const ui = {
   form: document.querySelector("#chat-form"),
@@ -307,8 +308,11 @@ async function sendMessage(event) {
   }
 
   try {
-    await streamChat({ sessionId, message, signal: controller.signal, onDelta, onToolStatus });
+    let metadata = null;
+    const answer = await streamChat({ sessionId, message, signal: controller.signal, onDelta, onToolStatus,
+      onAnswerMetadata: (value) => { metadata = value; } });
     await renderer.finish();
+    if (metadata) attachAnswerTools(reply, answer, metadata);
     ui.status.textContent = "回复完成，可以接着追问";
   } catch (error) {
     renderer.flush();

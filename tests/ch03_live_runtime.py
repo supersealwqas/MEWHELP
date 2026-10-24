@@ -51,8 +51,15 @@ def inspect_exchange(case: dict, observed: dict) -> dict:
         failures.append("[DONE]必须唯一且是末帧")
     if not answer.strip():
         failures.append("没有非空文本增量")
-    if any(event.get("event") not in {"delta", "done", "tool_status"} for event in events):
+    if any(event.get("event") not in {"delta", "done", "tool_status", "answer_metadata"} for event in events):
         failures.append("SSE出现error或非法事件")
+    metadata = [(index, event.get("data", {})) for index, event in enumerate(events) if event.get("event") == "answer_metadata"]
+    if metadata and (len(metadata) != 1 or metadata[0][0] != len(events) - 2
+                     or metadata[0][1].get("status") != "completed"
+                     or not isinstance(metadata[0][1].get("citations"), list)
+                     or not messages or metadata[0][1].get("turn_id") != messages[0].get("turn_id")
+                     or (observed.get("session_id") and metadata[0][1].get("session_id") != observed["session_id"])):
+        failures.append("回答完成元数据身份、顺序或结构不一致")
     users = [message for message in messages if message["role"] == "user"]
     finals = [message for message in messages if message["role"] == "assistant" and not message.get("tool_calls")]
     if len(users) != 1 or users[0].get("content") != case["query"]:
@@ -199,7 +206,7 @@ def parse_frame(lines: list[str], elapsed: float) -> dict:
     parsed = json.loads(payload)
     if event == "message" and isinstance(parsed, dict) and isinstance(parsed.get("delta"), str):
         event = "delta"
-    if event not in {"delta", "tool_status", "error"} or not isinstance(parsed, dict):
+    if event not in {"delta", "tool_status", "answer_metadata", "error"} or not isinstance(parsed, dict):
         raise ValueError("未知SSE事件")
     return {"event": event, "data": parsed, "elapsed_seconds": elapsed}
 

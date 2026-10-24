@@ -1,4 +1,4 @@
-"""知识生成自评、稳定引用和可发布回答的安全边界。
+"""知识生成自评、工具结束交接、稳定引用和可发布回答的安全边界。
 
 只读取本轮成功知识工具的完整 hits，按 chunk id 去重并给稳定编号。模型的
 useful 为严格布尔，false 固定拒答且产生 self_check 入池草案；true 必须有合法
@@ -33,6 +33,8 @@ class EvidenceCitation(BaseModel):
     section_path: str | None = Field(default=None, description="原文完整章节路径；历史结果未记录时为空，不伪造")
     question: str = Field(min_length=1, description="权威知识问法")
     answer: str = Field(min_length=1, description="本轮模型实际看到的完整知识正文")
+    source_key: str | None = Field(default=None, description="服务端知识仓储确认的稳定来源键，历史缺失时为空")
+    source_revision: str | None = Field(default=None, description="已核对原文版本的 SHA256；无法证明对应版本时为空")
 
 
 class KnowledgeAnswer(BaseModel):
@@ -102,7 +104,8 @@ def collect_citations(current: list) -> list[EvidenceCitation]:
         for _, payload in _knowledge_results(current):
             for hit in payload["data"]["hits"]:
                 item = EvidenceCitation(n=len(by_id) + 1, chunk_id=hit["id"], question=hit["question"],
-                                        answer=hit["answer"], section_path=hit.get("section_path"))
+                                        answer=hit["answer"], section_path=hit.get("section_path"),
+                                        source_key=hit.get("source_key"), source_revision=hit.get("source_revision"))
                 existing = by_id.get(item.chunk_id)
                 if existing is not None:
                     if (existing.question, existing.answer, existing.section_path) != (item.question, item.answer, item.section_path):
@@ -114,11 +117,60 @@ def collect_citations(current: list) -> list[EvidenceCitation]:
     return list(by_id.values())
 
 
+def business_facts_summary(current: list) -> str:
+    """保留知识不足时已经获得的本轮订单/物流/价格库存事实。
+
+    参数：current 本轮配对工具结果，不读取历史、不包括工单回执（由聊天服务保留）。
+    返回：str，按实际成功字段形成简短业务事实说明，没有可信业务结果为空。
+    异常：KnowledgeAnswerError，成功业务结果格式非法。
+    """
+    allowed = {"query_order", "query_logistics", "query_product"}
+    calls = {call["id"]: call["name"] for message in current if isinstance(message, AIMessage)
+             for call in message.tool_calls if call.get("name") in allowed}
+    parts = []
+    for message in current:
+        if not isinstance(message, ToolMessage) or message.tool_call_id not in calls:
+            continue
+        try:
+            result = json.loads(message.content)
+            data = result.get("data")
+            if result.get("ok") is not True or not isinstance(data, dict):
+                continue
+            name = calls[message.tool_call_id]
+            if name == "query_order" and data.get("order_id") and data.get("status"):
+                parts.append(f"订单 {data['order_id']} 的本轮查询状态：{data['status']}。")
+            elif name == "query_logistics" and data.get("tracking_no"):
+                fields = [str(data[key]) for key in ("status", "carrier", "latest_node", "updated_at") if data.get(key) is not None]
+                parts.append(f"物流单号 {data['tracking_no']} 的本轮查询结果：{'；'.join(fields)}。")
+            elif name == "query_product" and data.get("name"):
+                fields = []
+                if data.get("price") is not None:
+                    fields.append(f"价格 {data['price']} {data.get('currency', '')}".strip())
+                if data.get("stock") is not None:
+                    fields.append(f"库存 {data['stock']}")
+                if fields:
+                    parts.append(f"商品 {data['name']} 的本轮查询结果：{'；'.join(fields)}。")
+        except (ValueError, TypeError, AttributeError) as error:
+            raise KnowledgeAnswerError("本轮业务结果格式不合法") from error
+    return "\n".join(parts)
+
+
+def edge_order[T](items: list[T]) -> list[T]:
+    """将已按相关性排序的证据交替放在提示首尾，减少重要证据埋在中间。
+
+    参数：items 从高到低排名的证据列表，可为空；不改变元素及原列表。
+    返回：新列表，十条时原排名顺序为1、3、5、7、9、10、8、6、4、2。
+    异常：无主动业务异常。
+    """
+    # 奇数名次依次放左侧，偶数名次反向放右侧；原编号随元素保留，不重编号。
+    return items[::2] + items[1::2][::-1]
+
+
 def number_knowledge_results(current: list, citations: list[EvidenceCitation]) -> list:
-    """只给知识 hits 添加稳定编号，不截断或修改原正文。
+    """给知识 hits 添加稳定编号，并对每个工具结果做首尾排列，不截断正文。
 
     参数：current 本轮消息；citations 为 collect_citations 得到的完整去重映射。
-    返回：list，本轮消息副本，知识 hits 中增加 n；原消息/持久化工具事实不变。
+    返回：list，本轮消息副本，知识 hits 增加 n 后首尾排列；原消息/持久化工具事实不变。
     异常：KnowledgeAnswerError，本轮成功结果非法；KeyError，映射不匹配。
     """
     results = {message.tool_call_id: payload for message, payload in _knowledge_results(current)}
@@ -127,7 +179,8 @@ def number_knowledge_results(current: list, citations: list[EvidenceCitation]) -
     for message in current:
         if isinstance(message, ToolMessage) and message.tool_call_id in results:
             payload = results[message.tool_call_id]
-            payload["data"]["hits"] = [{**hit, "n": numbers[hit["id"]]} for hit in payload["data"]["hits"]]
+            payload["data"]["hits"] = edge_order(
+                [{**hit, "n": numbers[hit["id"]]} for hit in payload["data"]["hits"]])
             message = message.model_copy(update={"content": json.dumps(payload, ensure_ascii=False)})
         numbered.append(message)
     return numbered
@@ -149,6 +202,22 @@ def decide_answer(result: KnowledgeAnswer, citations: list[EvidenceCitation]) ->
             or inline != cited or len(cited) != len(result.citation_numbers)):
         raise KnowledgeAnswerError("知识答案缺少有效本轮引用或引用编号不一致")
     return result.answer, None
+
+
+KNOWLEDGE_ANSWER_HANDOFF = "本轮工具查询阶段已经结束，不能再次申请或模拟任何工具调用。现在只对query字段中的原始问题进行知识有用性自评，依据前面本轮完整工具事实，仅输出规定的JSON对象；不要输出其他文字。"
+
+
+def knowledge_answer_handoff(query: str) -> dict[str, str]:
+    """明确结束工具阶段并按原文重申本轮问题，避免无工具定义请求继续申请工具。
+
+    参数：query 为非空的本轮真实问题，保留空白、型号、否定词与时间条件，不改写。
+    返回：dict[str, str]，包含可信阶段指令和原始query，调用者将其计入完整请求预算。
+    异常：ValueError，query不是字符串或只有空白。
+    """
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("知识生成交接必须保留非空原始问题")
+    # 原问作为JSON数据传递，不插入指令模板、不从历史推测或截断问题。
+    return {"instruction": KNOWLEDGE_ANSWER_HANDOFF, "query": query}
 
 
 KNOWLEDGE_ANSWER_RULES = """

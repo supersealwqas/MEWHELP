@@ -32,6 +32,56 @@ class ResponseModel:
             self.closed = True
 
 
+async def test_knowledge_generation_handoff_preserves_raw_query_and_completes_refusal(monkeypatch) -> None:
+    """原问题与工具结束指令须一起进入最终请求，不能把工具尾帧空输出算拒答。
+
+    参数：monkeypatch 仅替换上游网络边界。
+    返回：None，真实聊天服务通过自评后原子完成并按原话入池。
+    异常：AssertionError，阶段未交接、原话改变、失败误入池或流未关闭。
+    """
+    from app.core import llm
+    from app.knowledge.answering import KnowledgeAnswer
+
+    raw = '  MH-W99水箱容量是多少？\n不能用MH-W20代替。  '
+
+    class EndingAwareGateway(ResponseModel):
+        """模拟无工具定义请求以工具结果结束时空输出、明确新任务后正常自评的网关。"""
+
+        async def astream(self, messages):
+            """响应真实请求末帧。参数：messages 实际输入；返回：模型流；异常：原测试异常。"""
+            ending = json.loads(messages[-1].content)
+            if isinstance(messages[-1], HumanMessage) and ending.get("query") == raw and ending.get("instruction"):
+                self.frames = [AIMessageChunk(content='{"useful":false,"reason":"无该型号原文","answer":"","citation_numbers":[]}')]
+            async for chunk in super().astream(messages):
+                yield chunk
+
+    upstream = EndingAwareGateway([AIMessageChunk(content="")])
+    monkeypatch.setattr(llm, "get_chat_model", lambda **kwargs: upstream)
+    service, repository, _ = _service(KnowledgeAnswer(useful=False, reason="不足", answer="", citation_numbers=[]), low_score=True)
+    service.model.answer_knowledge = llm.ChatModelAdapter().answer_knowledge
+    events = [event async for event in service.stream_turn(ChatRequest(session_id="handoff-refusal", message=raw))]
+    assert events[-1].event == "done" and upstream.closed
+    assert len(repository.low_confidence) == 1
+    assert repository.low_confidence[0]["raw_question"] == raw
+    assert repository.low_confidence[0]["source"] == "self_check"
+
+
+async def test_adapter_network_error_is_not_converted_to_refusal(monkeypatch) -> None:
+    """模型网络故障必须传播，不能本地制造useful=false或遗漏流关闭。
+
+    参数：monkeypatch 上游替换器。
+    返回：None，故障保持原异常时正常结束。
+    异常：AssertionError，故障被吞或流未关闭。
+    """
+    from app.core import llm
+
+    upstream = ResponseModel([ConnectionError("private upstream failure")])
+    monkeypatch.setattr(llm, "get_chat_model", lambda **kwargs: upstream)
+    with pytest.raises(ConnectionError):
+        await llm.ChatModelAdapter().answer_knowledge([])
+    assert upstream.closed
+
+
 async def test_adapter_strict_json_self_check_and_closes_stream(monkeypatch) -> None:
     """useful 正常布尔与完整 JSON 分片须聚合，资源立即关闭。参数：替换器；返回：None；异常：断言失败。"""
     from app.core import llm
@@ -91,6 +141,44 @@ def test_citations_collects_all_hits_not_only_answer_reference_subset() -> None:
     assert citations[-1].chunk_id == 10 and citations[-1].section_path == "政策 / 条件"
 
 
+@pytest.mark.parametrize("ranks,expected", [
+    ([], []), ([1], [1]), ([1, 2], [1, 2]), ([1, 2, 3], [1, 3, 2]),
+    ([1, 2, 3, 4, 5], [1, 3, 5, 4, 2]),
+    (list(range(1, 11)), [1, 3, 5, 7, 9, 10, 8, 6, 4, 2]),
+])
+def test_edge_order_places_ranked_evidence_at_both_ends_without_mutation(ranks, expected) -> None:
+    """偶数、奇数和小集合按原排名交替放首尾，不改原列表。参数：原排名/预期位置；返回：None；异常：断言失败。"""
+    from app.knowledge.answering import edge_order
+
+    items = [{"rank": rank, "answer": f"完整原文{rank}"} for rank in ranks]
+    original = [dict(item) for item in items]
+    ordered = edge_order(items)
+    assert [item["rank"] for item in ordered] == expected
+    assert items == original and ordered is not items
+    assert {id(item) for item in ordered} == {id(item) for item in items}
+
+
+def test_numbered_knowledge_groups_keep_citation_ids_and_saved_facts_unchanged() -> None:
+    """每个工具结果独立首尾排列，稳定编号和原始持久化正文不变。参数：无；返回：None；异常：断言失败。"""
+    from app.knowledge.answering import collect_citations, number_knowledge_results
+
+    hits = [{"id": rank, "question": f"问{rank}", "answer": f"完整原文{rank}", "section_path": "政策 / 条件"}
+            for rank in range(1, 14)]
+    current = [AIMessage(content="", tool_calls=[{"id": "faq", "name": "query_faq", "args": {"keyword": "政策"}},
+                                                {"id": "refund", "name": "query_refund_policy", "args": {"query": "退款"}}]),
+               ToolMessage(content=json.dumps({"ok": True, "data": {"hits": hits[:10]}}), tool_call_id="faq"),
+               ToolMessage(content=json.dumps({"ok": True, "data": {"hits": hits[10:]}}), tool_call_id="refund")]
+    original = [message.model_dump() for message in current]
+    citations = collect_citations(current)
+    numbered = number_knowledge_results(current, citations)
+    groups = [json.loads(message.content)["data"]["hits"] for message in numbered if isinstance(message, ToolMessage)]
+    assert [hit["id"] for hit in groups[0]] == [1, 3, 5, 7, 9, 10, 8, 6, 4, 2]
+    assert [hit["id"] for hit in groups[1]] == [11, 13, 12]
+    assert all(hit["n"] == hit["id"] and hit["answer"] == f"完整原文{hit['id']}" for group in groups for hit in group)
+    assert [item.n for item in citations] == list(range(1, 14))
+    assert [message.model_dump() for message in current] == original
+
+
 class SelfCheckModel:
     """为真实聊天服务提供受约束自评边界，记录实际模型证据。"""
 
@@ -120,6 +208,43 @@ def _service(decision, *, low_score: bool = False):
     service.executor.support = SupportRepository(None, search)
     service.model = SelfCheckModel(decision)
     return service, store, service.model
+
+
+@pytest.mark.parametrize("tool_name,data,expected", [
+    ("query_order", {"order_id": "1001", "status": "已发货"}, "订单 1001"),
+    ("query_logistics", {"tracking_no": "SF001", "status": "运输中", "latest_node": "杭州转运中心"}, "杭州转运中心"),
+    ("query_product", {"name": "猫粮", "price": 39.9, "currency": "CNY", "stock": 2}, "39.9"),
+])
+def test_refusal_business_summary_uses_only_successful_current_facts(tool_name: str, data: dict, expected: str) -> None:
+    """政策不足时仍能展示本轮可信业务事实，失败结果不得进入摘要。参数：工具/事实/期望；返回：None；异常：断言失败。"""
+    from app.knowledge.answering import business_facts_summary
+
+    messages = [AIMessage(content="", tool_calls=[{"id": "business", "name": tool_name, "args": {}}]),
+                ToolMessage(content=json.dumps({"ok": True, "data": data}), tool_call_id="business")]
+    assert expected in business_facts_summary(messages)
+    failed = [messages[0], ToolMessage(content=json.dumps({"ok": False, "data": data}), tool_call_id="business")]
+    assert business_facts_summary(failed) == ""
+
+
+async def test_useful_false_cannot_override_valid_business_order_fact() -> None:
+    """FAQ没回答政策时仍须保留已查到的订单状态，不能整轮仅拒答。参数：无；返回：None；异常：断言失败。"""
+    from app.knowledge.answering import KnowledgeAnswer, FIXED_KNOWLEDGE_REFUSAL
+
+    service, repository, model = _service(KnowledgeAnswer(useful=False, reason="没有退款政策", answer="", citation_numbers=[]))
+    decisions = [AIMessage(content="", tool_calls=[{"id": "order", "name": "query_order", "args": {"order_id": "1001"}}]),
+                 AIMessage(content="", tool_calls=[{"id": "faq", "name": "query_faq", "args": {"keyword": "退货"}}]), AIMessage(content="")]
+    calls = []
+
+    async def decide(messages, tools):
+        """模拟工具决策边界。参数：消息/工具；返回：申请；异常：无。"""
+        calls.append(messages)
+        return decisions[len(calls) - 1]
+
+    service.model.decide = decide
+    events = [event async for event in service.stream_turn(ChatRequest(session_id="partial-order", message="订单1001的状态是什么，还能退货吗？"))]
+    shown = "".join(event.data["delta"] for event in events if event.event == "delta")
+    assert "已发货" in shown and FIXED_KNOWLEDGE_REFUSAL in shown
+    assert events[-1].event == "done" and len(repository.low_confidence) == 1
 
 
 async def test_useful_false_refuses_and_pools_raw_question_without_guess() -> None:

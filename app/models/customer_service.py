@@ -40,6 +40,7 @@ class Message(Base):
     role: Mapped[str] = mapped_column(Enum("user", "assistant", "tool"), comment="角色:用户/助手/工具结果")
     content: Mapped[str | None] = mapped_column(Text, nullable=True, comment="消息正文")
     tool_calls: Mapped[list | None] = mapped_column(JSON, nullable=True, comment="assistant 工具调用申请单")
+    rag_metadata: Mapped[dict | None] = mapped_column(JSON, nullable=True, comment="最终回答状态与本轮完整引用快照")
     tool_call_id: Mapped[str | None] = mapped_column(String(64, collation="utf8mb4_bin"), nullable=True, comment="tool 对应申请单 id")
     turn_id: Mapped[str] = mapped_column(String(36, collation="utf8mb4_bin"), comment="服务端轮次编号")
     turn_status: Mapped[str] = mapped_column(String(16), default="running", server_default="running", comment="轮次执行状态")
