@@ -69,8 +69,9 @@ def apply_sentence_overlap(chunks: list[str], overlap: int = 60) -> list[str]:
     for previous, current in zip(chunks, chunks[1:]):
         previous_end = previous_start + len(previous)
         content_end = previous_end - (len(previous) - len(previous.rstrip()))
+        # 最后一句可能从更早基础块开始；结束于上一块尾部时回取原文整句，不能只复制尾片段。
         complete = [(left, right) for left, right in sentences
-                    if left >= previous_start and right <= content_end]
+                    if right > previous_start and right <= content_end]
         tail_start = content_end
         # 基础块的末尾仍是半句时不越过半句去复制前面句子。
         if complete and complete[-1][1] == content_end:

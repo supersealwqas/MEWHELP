@@ -61,7 +61,11 @@ async def test_refund_tool_sends_thirty_authoritative_hits_to_answer_model() -> 
     assert result.ok and len(result.data["hits"]) == 30
     answer_input = next(messages for phase, messages in model.inputs if phase == "answer")
     facts = [json.loads(message.content)["data"]["hits"] for message in answer_input if isinstance(message, ToolMessage)]
-    assert len(facts[0]) == 30 and facts[0][-1]["answer"] == "权威答案30。"
+    assert len(facts[0]) == 30
+    assert {hit["id"]: hit["answer"] for hit in facts[0]} == {
+        identifier: f"权威答案{identifier}。" for identifier in range(1, 31)
+    }
+    assert [hit["id"] for hit in facts[0]] == [*range(1, 31, 2), *range(30, 1, -2)]
 
 
 async def test_hybrid_faq_tool_uses_trusted_full_current_query_for_clause_split() -> None:

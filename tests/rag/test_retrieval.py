@@ -64,6 +64,21 @@ def _search(chunks: list[ChunkSnapshot], *, groups=None, scores=None, **override
     return service, encoder, index, reranker
 
 
+async def test_duplicate_subquery_evidence_preserves_strongest_score_for_faq_gate() -> None:
+    """同主键在另一子句高相关时不能因先遇低分而被错误拒答。参数：无；返回：None；异常：断言失败。"""
+    from app.knowledge.rerank import RankedChunk
+
+    search, _, _, reranker = _search([_chunk(1)])
+
+    async def rank(query, chunks, *, top_n):
+        """模拟同一证据对两子句的不同真实相关度。参数：查询/候选/数量；返回：排名；异常：无。"""
+        return [RankedChunk(chunk=chunks[0], score=0.9 if query == "退款处理时限" else 0.1)]
+
+    reranker.rank = rank
+    result = await search.query_faq("退货申请条件，退款处理时限")
+    assert [row["id"] for row in result] == [1]
+
+
 async def test_default_recall_50_fused_50_rerank_10() -> None:
     """避免把两路共 100 或旧 FAQ 3 条用于重排链路。参数：无；返回：None；异常：断言失败。"""
     search, encoder, index, reranker = _search([_chunk(identifier) for identifier in range(1, 61)])

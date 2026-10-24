@@ -17,6 +17,16 @@ def _spec() -> DocumentSpec:
                         content_type="policy", key_sections=["退款"])
 
 
+def test_long_sentence_overlap_does_not_start_from_middle_of_previous_sentence() -> None:
+    """跨基础块的长句在下一块重叠必须保留完整句，而不是上一块的尾片段。参数：无；返回：None；异常：断言失败。"""
+    from app.knowledge.documents import build_document_chunks
+
+    long_sentence = "甲" * 450 + "。"
+    later = "乙" * 399 + "。"
+    chunks = build_document_chunks("# 政策\n" + long_sentence + later, _spec(), len)
+    assert chunks[-1].text.answer == long_sentence + later
+
+
 def test_unpunctuated_text_uses_400_characters_without_base_overlap() -> None:
     """防止 token 计数或内置 overlap 改变 400 字基础切分。参数：无；返回：None；异常：断言失败。"""
     from app.knowledge.documents import recursive_split

@@ -31,6 +31,15 @@ def _limit(value: int) -> None:
         raise ValueError("检索 limit 必须为 1–16384 的整数")
 
 
+def _id_filter(ids: list[int] | None) -> str:
+    """构造只含整数的原生筛选。参数：ids 权威主键或None；返回：表达式；异常：ValueError，非法主键。"""
+    if ids is None:
+        return ""
+    if not ids or any(type(identifier) is not int or identifier <= 0 for identifier in ids):
+        raise ValueError("过滤主键必须是非空正整数列表")
+    return "id in " + json.dumps(sorted(set(ids)), separators=(",", ":"))
+
+
 def _parse_hits(results: list) -> list[VectorHit]:
     """将 SDK 命中转为带同步指纹的有限分数对象。
 
@@ -218,36 +227,38 @@ class MilvusHybridIndex(MilvusVectorIndex):
         except Exception as error:
             raise VectorIndexUnavailable("Milvus 混合索引写入失败") from error
 
-    async def _search_field(self, data: list, field: str, metric: str, limit: int) -> list[VectorHit]:
-        """明确指定向量字段执行单路召回。参数：data 查询、field 字段、metric 度量、limit 数量；返回：命中；异常：索引错误。"""
+    async def _search_field(self, data: list, field: str, metric: str, limit: int,
+                            filter_ids: list[int] | None = None) -> list[VectorHit]:
+        """明确字段和前置过滤执行单路召回。参数：data 查询、field 字段、metric 度量、limit 数量、filter_ids 可选权威主键；返回：命中；异常：ValueError/索引错误。"""
         _limit(limit)
+        expression = _id_filter(filter_ids)
         try:
             results = await _run_rpc(partial(self._require_client().search, self._config.milvus_collection,
-                data=data, anns_field=field, limit=limit, output_fields=_SYNC_FIELDS,
+                data=data, anns_field=field, limit=limit, output_fields=_SYNC_FIELDS, filter=expression,
                 search_params={"metric_type": metric}, consistency_level="Strong", timeout=_RPC_TIMEOUT_SECONDS))
         except Exception as error:
             raise VectorIndexUnavailable("Milvus 单路检索失败") from error
         return _parse_hits(results)
 
-    async def search(self, vector: list[float], limit: int) -> list[VectorHit]:
-        """在混合集合执行纯 Dense 召回。参数：vector 合法向量、limit 正数；返回：命中；异常：ValueError/索引错误。"""
+    async def search(self, vector: list[float], limit: int, *, filter_ids: list[int] | None = None) -> list[VectorHit]:
+        """在混合集合执行纯 Dense 召回。参数：vector 合法向量、limit 正数、filter_ids 可选前置过滤主键；返回：命中；异常：ValueError/索引错误。"""
         if not valid_dense_vector(vector):
             raise VectorIndexUnavailable("查询向量不合法")
-        return await self._search_field([vector], "vector", "COSINE", limit)
+        return await self._search_field([vector], "vector", "COSINE", limit, filter_ids)
 
-    async def search_bm25(self, text: str, limit: int = 50) -> list[VectorHit]:
-        """执行 Milvus 原生 BM25 召回。参数：text 非空查询、limit 默认 50；返回：命中；异常：ValueError/索引错误。"""
+    async def search_bm25(self, text: str, limit: int = 50, *, filter_ids: list[int] | None = None) -> list[VectorHit]:
+        """执行 Milvus 原生 BM25 召回。参数：text 非空查询、limit 默认 50、filter_ids 可选前置过滤主键；返回：命中；异常：ValueError/索引错误。"""
         if not text.strip():
             raise ValueError("BM25 查询不能为空")
-        return await self._search_field([text], "sparse_vector", "BM25", limit)
+        return await self._search_field([text], "sparse_vector", "BM25", limit, filter_ids)
 
     async def hybrid_search(
         self, vector: list[float], text: str, *, dense_limit: int = 50,
-        sparse_limit: int = 50, limit: int = 50,
+        sparse_limit: int = 50, limit: int = 50, filter_ids: list[int] | None = None,
     ) -> list[VectorHit]:
         """两路分别召回并由 Milvus RRF 融合，默认单次输出最多 50。
 
-        参数：vector 为合法 Dense 查询向量；text 非空 BM25 查询；dense_limit/sparse_limit 两路各 50；limit 融合输出 50。
+        参数：vector 为合法 Dense 查询向量；text 非空 BM25 查询；dense_limit/sparse_limit 两路各 50；limit 融合输出 50；filter_ids 可选权威主键，同一筛选用于两路。
         返回：list[VectorHit]，融合排名及同步指纹；不把两路并集 100 全交给重排。
         异常：ValueError，限额或查询非法；VectorIndexUnavailable，向量、SDK 或命中非法。
         """
@@ -259,9 +270,10 @@ class MilvusHybridIndex(MilvusVectorIndex):
             raise ValueError("混合查询不能为空")
         if not valid_dense_vector(vector):
             raise VectorIndexUnavailable("查询向量不合法")
+        expression = _id_filter(filter_ids)
         requests = [
-            AnnSearchRequest([vector], "vector", {"metric_type": "COSINE"}, dense_limit),
-            AnnSearchRequest([text], "sparse_vector", {"metric_type": "BM25"}, sparse_limit),
+            AnnSearchRequest([vector], "vector", {"metric_type": "COSINE"}, dense_limit, expr=expression),
+            AnnSearchRequest([text], "sparse_vector", {"metric_type": "BM25"}, sparse_limit, expr=expression),
         ]
         try:
             results = await _run_rpc(partial(self._require_client().hybrid_search, self._config.milvus_collection,

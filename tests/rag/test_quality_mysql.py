@@ -15,9 +15,26 @@ from sqlalchemy import delete, inspect, select
 
 from app.config import Settings
 from app.db.migrate_rag_quality import migrate_quality_tables, validate_quality_schema
+from app.db.migrate_citations import migrate_citation_metadata
 from app.db.session import create_database
-from app.models.customer_service import Base, Conversation, Message
+from app.models.customer_service import Conversation, Message
 from app.models.rag_quality import FaithCase, LowConfidenceQuestion
+
+
+async def prepare_quality_test_schema(engine, config, *, include_messages: bool = False) -> None:
+    """为每个独立用例按外键顺序补齐所需表，避免依赖执行顺序。
+
+    参数：engine 专用测试库引擎；config 已限定mewhelp_ch04_test；include_messages 是否使用消息仓储。
+    返回：None；不清空表，不创建无关FAQ和工单表。
+    异常：DDL或迁移失败原样传播。
+    """
+    async with engine.begin() as connection:
+        await connection.run_sync(lambda sync: Conversation.__table__.create(sync, checkfirst=True))
+        if include_messages:
+            await connection.run_sync(lambda sync: Message.__table__.create(sync, checkfirst=True))
+    await migrate_quality_tables(config)
+    if include_messages:
+        await migrate_citation_metadata(config)
 
 
 @pytest.mark.skipif(os.getenv("MEWHELP_RUN_QUALITY_MYSQL") != "1", reason="需要显式 MEWHELP_RUN_QUALITY_MYSQL=1")
@@ -31,9 +48,7 @@ async def test_refusal_and_pool_commit_idempotently_and_failure_rolls_back(monke
     engine, factory = create_database(config)
     context = None
     try:
-        async with engine.begin() as connection:
-            await connection.run_sync(lambda sync: Message.__table__.create(sync, checkfirst=True))
-        await migrate_quality_tables(config)
+        await prepare_quality_test_schema(engine, config, include_messages=True)
         repository = module.ChatRepository(factory)
         raw = "  烦死了，这个到底怎么退啊？！  "
         context = await repository.start_turn(ToolContext(session_id="pool-" + uuid4().hex, user_id="quality-test",
@@ -76,14 +91,16 @@ async def test_faith_case_concurrent_recurrence_updates_latest_snapshot_without_
     config = Settings(_env_file=os.getenv("MEWHELP_TEST_ENV_FILE", ".env")).model_copy(update={"mysql_database": "mewhelp_ch04_test"})
     engine, factory = create_database(config)
     eval_id = "T" + uuid4().hex[:15]
+    recorded = False
     try:
-        await migrate_quality_tables(config)
+        await prepare_quality_test_schema(engine, config)
         repository = FaithCaseRepository(factory)
         citations = [EvidenceCitation(n=index, chunk_id=index, section_path="售后 / 政策", question=f"问{index}", answer=f"原文{index}")
                      for index in range(1, 11)]
         draft = FaithCaseDraft(eval_id=eval_id, bucket="A_policy", query="退款到账几天", strategy="hybrid_rerank",
                                answer="保证两天到账[1]", reason="证据没有到账时限", citations=citations, judge_model="judge-test")
         await repository.record(draft)
+        recorded = True
         async with factory() as session:
             first = await session.scalar(select(FaithCase).where(FaithCase.eval_id == eval_id))
             first_time = first.first_seen_at
@@ -104,9 +121,13 @@ async def test_faith_case_concurrent_recurrence_updates_latest_snapshot_without_
             assert row.answer == "保证三天到账[2]" and row.reason == "又编造到账天数"
             assert len(row.citations) == 10 and row.citations[-1]["answer"] == "原文10"
     finally:
-        async with factory.begin() as session:
-            await session.execute(delete(FaithCase).where(FaithCase.eval_id == eval_id))
-        await engine.dispose()
+        try:
+            # 初始化或首次写入失败时没有本例已提交记录，不对未知结构发送DELETE。
+            if recorded:
+                async with factory.begin() as session:
+                    await session.execute(delete(FaithCase).where(FaithCase.eval_id == eval_id))
+        finally:
+            await engine.dispose()
 
 
 @pytest.mark.skipif(os.getenv("MEWHELP_RUN_QUALITY_MYSQL") != "1", reason="需要显式 MEWHELP_RUN_QUALITY_MYSQL=1")
@@ -119,16 +140,13 @@ async def test_quality_migration_is_repeatable_and_retains_existing_utf8_rows() 
     session_key = "quality-" + uuid4().hex
     conversation_id = None
     try:
-        # 专用新库只补会话表；不调用 Base.metadata.create_all 重建/创建无关业务表。
-        async with engine.begin() as connection:
-            await connection.run_sync(lambda sync: Conversation.__table__.create(sync, checkfirst=True))
-        await migrate_quality_tables(config)
+        await prepare_quality_test_schema(engine, config)
         async with factory.begin() as session:
             conversation = Conversation(session_id=session_key, user_id="quality-test")
             session.add(conversation)
             await session.flush()
-            conversation_id = conversation.id
-            session.add(LowConfidenceQuestion(conversation_id=conversation_id, raw_question="你们到底能不能退啊？", source="self_check", reason="当前证据不足"))
+            session.add(LowConfidenceQuestion(conversation_id=conversation.id, raw_question="你们到底能不能退啊？", source="self_check", reason="当前证据不足"))
+        conversation_id = conversation.id
         assert await migrate_quality_tables(config) == []
         async with engine.connect() as connection:
             await connection.run_sync(lambda sync: validate_quality_schema(inspect(sync)))
