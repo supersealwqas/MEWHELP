@@ -21,6 +21,7 @@ from app.api.actions import router as actions_router
 from app.api.citations import router as citations_router
 from app.api.extract import router as extract_router
 from app.api.rageval import router as rageval_router
+from app.api.rageval import create_job_manager
 from app.core.logging import setup_logging
 from app.config import settings
 from app.db.session import create_database
@@ -159,12 +160,20 @@ def create_app(runtime_factory=None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(application):
         """先恢复后接收请求。参数：应用；返回：生命周期；异常：运行时初始化失败。"""
-        async with (runtime_factory or create_runtime)() as service:
-            application.state.chat_service = service
-            try:
-                yield
-            finally:
-                del application.state.chat_service
+        manager = create_job_manager()
+        application.state.evaluation_jobs = manager
+        try:
+            async with (runtime_factory or create_runtime)() as service:
+                application.state.chat_service = service
+                try:
+                    yield
+                finally:
+                    del application.state.chat_service
+        finally:
+            # 应用关闭或启动失败都收回本实例评估资源，外层取消不能跳过清理。
+            with anyio.CancelScope(shield=True):
+                await manager.close()
+            del application.state.evaluation_jobs
 
     application = FastAPI(title="MewHelp E-Commerce Customer Service",
         description="MewHelp 电商智能客服系统与售后工单结构化提取服务 API", version="0.1.0", lifespan=lifespan)

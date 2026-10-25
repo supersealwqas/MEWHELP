@@ -46,6 +46,29 @@ def test_runtime_available_only_within_lifespan():
     assert states == ["open", "closed"] and not hasattr(app.state, "chat_service")
 
 
+def test_evaluation_owner_lives_and_closes_with_application(monkeypatch, tmp_path):
+    """应用没有拥有或关闭评估管理器时失败。参数：隔离报告目录；返回：None；异常：断言失败。"""
+    from app.api import rageval
+    from app.main import create_app
+
+    @asynccontextmanager
+    async def runtime():
+        """隔离聊天外部资源。参数：无；返回：服务占位；异常：无。"""
+        yield object()
+
+    monkeypatch.setattr(rageval, "REPORTS_ROOT", tmp_path)
+    monkeypatch.setattr(rageval, "JOB_STATE", tmp_path / "state.json")
+    monkeypatch.setattr(rageval, "JOB_LOG", tmp_path / "job.log")
+    application = create_app(runtime_factory=runtime)
+    with TestClient(application):
+        assert hasattr(application.state, "evaluation_jobs")
+        manager = application.state.evaluation_jobs
+        assert manager.status()["status"] == "idle"
+    assert not hasattr(application.state, "evaluation_jobs")
+    with pytest.raises(RuntimeError, match="关闭"):
+        manager.start(tmp_path / "dataset.json", ["dense"])
+
+
 async def test_ch05_runtime_rejects_explicit_dense_before_opening_resources(monkeypatch, offline_settings):
     """显式dense配置悄悄换检索器或继续启动时失败。参数：隔离配置/替换器；返回：None；异常：预期ValueError。"""
     from app import main

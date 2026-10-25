@@ -218,3 +218,86 @@ def test_cli_treats_completed_with_errors_as_success() -> None:
     import inspect
     source = inspect.getsource(run)
     assert '"completed", "completed_with_errors"' in source
+
+
+def test_mixed_cli_and_legacy_reports_are_sorted_and_paired(monkeypatch, tmp_path) -> None:
+    """遗漏CLI命名或仅按字符串排序、猜测校准时失败。参数：隔离目录/替换器；返回：None；异常：断言失败。"""
+    names = ["20261024-evaluation-235959", "20261025T000000Z-calibrate-ab123456",
+             "20261025T010000Z-compare-ab123456", "20261026-calibration-01"]
+    client = _client(monkeypatch, tmp_path, {name: _summary(0.95 if "compare" in name else 0.5) for name in names})
+    root = tmp_path / "ch04"
+    policy = {"thresholds": {"dense": {"minimum": 0.77}}}
+    (root / names[1] / "policy.json").write_text(json.dumps(policy), encoding="utf-8")
+    summary = _summary(0.95)
+    summary["metadata"]["policy_digest"] = digest_json(policy)
+    (root / names[2] / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    body = client.get("/api/rag-eval/overview").json()
+    assert body["meta"]["run"] == names[2]
+    assert body["best"]["mrr"] == 0.95
+    assert body["calibration"]["thresholds"]["dense"]["minimum"] == 0.77
+    assert [row["name"] for row in client.get("/api/rag-eval/runs").json()["runs"]] == list(reversed(names))
+
+
+@pytest.mark.parametrize("bad", [[], {}, {**_summary(), "metadata": []},
+                                  {**_summary(), "strategies": {"dense": []}},
+                                  {**_summary(), "status": []},
+                                  {**_summary(), "metadata": {"dataset_digest": "d" * 64, "corpus_digest": "c" * 64, "source_revision": 42}},
+                                  {**_summary(), "strategies": {"dense": {"error_count": "broken"}}},
+                                  {**_summary(), "status": "interrupted"}])
+def test_invalid_reports_are_ignored_by_overview_and_runs(monkeypatch, tmp_path, bad) -> None:
+    """损坏JSON对象被列出或覆盖有效成绩时失败。参数：隔离目录/坏摘要；返回：None；异常：断言失败。"""
+    client = _client(monkeypatch, tmp_path, {"20261024-evaluation-01": _summary(),
+                                          "20261026-evaluation-01": bad,
+                                          "unrelated-report": _summary()})
+    body = client.get("/api/rag-eval/overview").json()
+    assert body["meta"]["run"] == "20261024-evaluation-01"
+    assert client.get("/api/rag-eval/runs").json()["runs"] == [{"name": "20261024-evaluation-01"}]
+
+
+def test_cli_comparison_never_pairs_unmatched_policy(monkeypatch, tmp_path) -> None:
+    """支持CLI目录后失去policy身份核对时失败。参数：隔离目录/替换器；返回：None；异常：断言失败。"""
+    client = _client(monkeypatch, tmp_path, {"20261026T000000Z-compare-123456ab": _summary(),
+                                          "20261026T000000Z-calibrate-123456ab": _summary()})
+    (tmp_path / "ch04/20261026T000000Z-calibrate-123456ab/policy.json").write_text(
+        json.dumps({"thresholds": {"dense": {"minimum": 0.9}}}), encoding="utf-8")
+    body = client.get("/api/rag-eval/overview").json()
+    assert body["present"] is True
+    assert body["calibration"]["present"] is False
+
+
+def test_same_day_reports_sort_by_time_instead_of_name(monkeypatch, tmp_path) -> None:
+    """同日CLI字符串排序盖过更晚网页报告时失败。参数：隔离目录；返回：None；异常：断言失败。"""
+    names = ["20261026-evaluation-235959", "20261026T000000Z-compare-123456ab"]
+    client = _client(monkeypatch, tmp_path, {name: _summary() for name in names})
+    assert client.get("/api/rag-eval/overview").json()["meta"]["run"] == names[0]
+    assert [row["name"] for row in client.get("/api/rag-eval/runs").json()["runs"]] == names
+
+
+def test_manifest_type_and_calibration_metadata_must_match(monkeypatch, tmp_path):
+    """改名报告或不同校准摘要携带相同policy时被误用会失败。参数：隔离目录；返回：None；异常：断言失败。"""
+    comparison = _summary()
+    policy = {"metadata": {**comparison["metadata"], "dataset_digest": "e" * 64},
+              "thresholds": {"dense": {"minimum": 0.8}}}
+    comparison["metadata"]["policy_digest"] = digest_json(policy)
+    client = _client(monkeypatch, tmp_path, {"20261024-evaluation-01": comparison,
+        "20261024-calibration-01": _summary(), "20261026T000000Z-compare-123456ab": _summary()})
+    root = tmp_path / "ch04"
+    (root / "20261024-calibration-01/policy.json").write_text(json.dumps(policy), encoding="utf-8")
+    (root / "20261026T000000Z-compare-123456ab/manifest.json").write_text(
+        json.dumps({"retrieval_only": True}), encoding="utf-8")
+    body = client.get("/api/rag-eval/overview").json()
+    assert body["meta"]["run"] == "20261024-evaluation-01"
+    assert body["calibration"]["present"] is False
+    assert len(client.get("/api/rag-eval/runs").json()["runs"]) == 2
+
+
+def test_nullable_source_revision_and_unreadable_policy_keep_comparison(monkeypatch, tmp_path):
+    """正式元信息允许无Git版本且损坏policy不能遮蔽成绩。参数：隔离目录；返回：None；异常：断言失败。"""
+    summary = _summary()
+    summary["metadata"]["source_revision"] = None
+    client = _client(monkeypatch, tmp_path, {"20261024-evaluation-01": summary,
+                                          "20261024-calibration-01": _summary()})
+    (tmp_path / "ch04/20261024-calibration-01/policy.json").write_bytes(b"\xff")
+    body = client.get("/api/rag-eval/overview").json()
+    assert body["present"] is True and body["meta"]["source_revision"] == ""
+    assert body["calibration"]["present"] is False

@@ -12,15 +12,14 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
-import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 
+from app.evaluation.jobs import EvaluationJobManager
 from app.evaluation.policy import digest_json
 
 router = APIRouter(prefix="/api/rag-eval", tags=["rag-eval"])
@@ -30,10 +29,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 REPORTS_ROOT = REPO_ROOT / "reports" / "ch04"
 JOB_STATE = REPORTS_ROOT / "rageval-job.json"
 JOB_LOG = REPORTS_ROOT / "rageval-job.log"
-# 单次评估最多跑多久，超时由子进程自身终止，避免僵尸进程长期占用 GPU。
+# 校准与比较共享整体上限，由应用生命周期拥有的管理器负责超时清理。
 JOB_TIMEOUT_SECONDS = 3600
-# 当前进程内持有的任务对象，用于停止与去重；服务重启后自然清空。
-_RUNS: dict[str, dict] = {}
 
 STRATEGIES = ("dense", "bm25", "hybrid", "hybrid_rerank")
 STRATEGY_LABELS = {
@@ -53,20 +50,41 @@ BUCKET_LABELS = {
     "F_unanswerable": "库外问题",
 }
 _RUN_NAME = re.compile(r"^\d{8}-(?:calibration|evaluation)-\d+$")
+_CLI_RUN_NAME = re.compile(r"^(\d{8}T\d{6}Z)-(calibrate|compare)-[0-9a-f]{8}$")
+
+
+def _run_identity(directory: Path) -> tuple[str, float, int] | None:
+    """统一解析CLI和历史网页目录的类型与时间。参数：directory目录；返回：类型/时间/序号或None；异常：无。"""
+    try:
+        if match := _CLI_RUN_NAME.fullmatch(directory.name):
+            stamp, command = match.groups()
+            instant = datetime.strptime(stamp, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+            return ("calibration" if command == "calibrate" else "evaluation", instant.timestamp(), 0)
+        if _RUN_NAME.fullmatch(directory.name):
+            date, kind, number = directory.name.split("-")
+            # 网页历史命名使用主机本地时间；更早的短后缀是当日序号。
+            stamp = datetime.strptime(date + (number if len(number) == 6 else "000000"), "%Y%m%d%H%M%S")
+            return kind, stamp.timestamp(), int(number)
+    except ValueError:
+        pass
+    return None
 
 
 def _run_dirs() -> list[Path]:
-    """列出形如 `20261024-evaluation-01` 的运行目录，按名称倒序（最新在前）。
+    """列出CLI与历史网页的有效运行目录，按解析时间倒序（最新在前）。
 
     参数：无。
-    返回：list[Path]，只包含含 summary.json 的目录。
+    返回：list[Path]，只包含有效完成摘要的受约束运行目录。
     异常：无；目录不可读时返回空列表。
     """
     if not REPORTS_ROOT.is_dir():
         return []
-    found = [p for p in REPORTS_ROOT.iterdir()
-             if p.is_dir() and _RUN_NAME.match(p.name) and (p / "summary.json").is_file()]
-    return sorted(found, key=lambda p: p.name, reverse=True)
+    try:
+        found = [(p, identity) for p in REPORTS_ROOT.iterdir()
+                 if p.is_dir() and (identity := _run_identity(p)) and _read_summary(p) is not None]
+    except OSError:
+        return []
+    return [p for p, _ in sorted(found, key=lambda item: (*item[1][1:], item[0].name), reverse=True)]
 
 
 def _read_summary(directory: Path) -> dict | None:
@@ -78,8 +96,37 @@ def _read_summary(directory: Path) -> dict | None:
     """
     path = directory / "summary.json"
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        summary = json.loads(path.read_text(encoding="utf-8"))
+        # 目录名仅决定来源类型；缺元信息、未完成或结构损坏的内容不能成为成绩。
+        if not isinstance(summary, dict) or summary.get("status") not in ("completed", "completed_with_errors"):
+            return None
+        metadata, strategies = summary.get("metadata"), summary.get("strategies")
+        if not isinstance(metadata, dict) or not isinstance(strategies, dict) or not strategies:
+            return None
+        if any(not isinstance(metadata.get(key), str) or not re.fullmatch(r"[0-9a-f]{64}", metadata[key])
+               for key in ("dataset_digest", "corpus_digest")):
+            return None
+        if metadata.get("source_revision") is not None and not isinstance(metadata["source_revision"], str):
+            return None
+        if any(name not in STRATEGIES or not isinstance(record, dict) for name, record in strategies.items()):
+            return None
+        if any(type(record.get("error_count", 0)) is not int or record.get("error_count", 0) < 0
+               for record in strategies.values()):
+            return None
+        # JSON标准不接受NaN/Infinity，避免坏指标拖垮HTTP序列化。
+        json.dumps(summary, allow_nan=False)
+        if any(not isinstance(summary.get(key, {}), dict) for key in ("buckets", "difficulties")):
+            return None
+        # 有运行清单时核对明确的校准标志，拒绝被改名的异类报告。
+        manifest_path = directory / "manifest.json"
+        if manifest_path.exists():
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            identity = _run_identity(directory)
+            if (not isinstance(manifest, dict) or identity is None
+                    or manifest.get("retrieval_only") is not (identity[0] == "calibration")):
+                return None
+        return summary
+    except (OSError, ValueError, UnicodeError):
         return None
 
 
@@ -94,7 +141,7 @@ def _pick_pair() -> tuple[dict | None, dict | None, str | None]:
     comparison = None
     comparison_name = None
     for directory in directories:
-        if "evaluation" not in directory.name:
+        if _run_identity(directory)[0] != "evaluation":
             continue
         summary = _read_summary(directory)
         if summary is not None:
@@ -108,7 +155,7 @@ def _pick_pair() -> tuple[dict | None, dict | None, str | None]:
     if not isinstance(policy_digest, str) or not policy_digest:
         return None, comparison, comparison_name
     for directory in directories:
-        if "calibration" not in directory.name:
+        if _run_identity(directory)[0] != "calibration":
             continue
         policy = _read_policy(directory)
         try:
@@ -117,6 +164,8 @@ def _pick_pair() -> tuple[dict | None, dict | None, str | None]:
             # 损坏产物中的非有限数字不是有效JSON策略，不能拖垮已有成绩展示。
             continue
         if matched and (summary := _read_summary(directory)) is not None:
+            if "metadata" in policy and policy["metadata"] != summary["metadata"]:
+                continue
             return {**summary, "thresholds": policy["thresholds"]}, comparison, comparison_name
     return None, comparison, comparison_name
 
@@ -130,7 +179,7 @@ def _read_policy(directory: Path) -> dict:
     """
     try:
         policy = json.loads((directory / "policy.json").read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError, UnicodeError):
         return {}
     return policy if isinstance(policy, dict) and isinstance(policy.get("thresholds"), dict) else {}
 
@@ -204,26 +253,17 @@ def _series(container: dict, section: str) -> dict:
     return {name: record for name, record in block.items() if name in STRATEGIES}
 
 
-def _job_state() -> dict:
-    """读取重跑任务状态文件。
+def create_job_manager() -> EvaluationJobManager:
+    """建立本应用的评估所有者。参数：无；返回：管理器；异常：无。"""
+    return EvaluationJobManager(REPO_ROOT, REPORTS_ROOT, timeout_seconds=JOB_TIMEOUT_SECONDS,
+                                state_path=JOB_STATE, log_path=JOB_LOG)
 
-    参数：无。
-    返回：dict，无任务时返回 idle 状态。
-    异常：无。
-    """
-    try:
-        state = json.loads(JOB_STATE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {"status": "idle", "message": "尚未运行"}
-    # 进程已消失但状态仍是 running，说明被外部终止，如实标注而不是假装还在跑。
-    pid = state.get("pid")
-    if state.get("status") == "running" and isinstance(pid, int):
-        try:
-            os.kill(pid, 0)
-        except OSError:
-            state["status"] = "interrupted"
-            state["message"] = "进程已退出，任务未正常结束"
-    return state
+
+def _job_state(request: Request) -> dict:
+    """读取生命周期所有者或降级读取历史状态。参数：request请求；返回：状态；异常：无。"""
+    manager = getattr(request.app.state, "evaluation_jobs", None)
+    # 未进入lifespan的只读请求仍可看历史报告，但临时读取者永远不能启动作业。
+    return (manager or create_job_manager()).status()
 
 
 def _log_tail(lines: int = 40) -> str:
@@ -241,15 +281,15 @@ def _log_tail(lines: int = 40) -> str:
 
 
 @router.get("/overview")
-async def overview() -> dict:
+async def overview(request: Request) -> dict:
     """返回看板所需的全部数据：元信息、KPI、分桶矩阵与重跑状态。
 
-    参数：无。
+    参数：request 当前请求，用于读取应用持有的评估状态。
     返回：dict，present=False 表示还没有可展示的比较结果。
     异常：HTTPException，产物读取出现不可恢复错误。
     """
     calibration, comparison, note = _pick_pair()
-    job = _job_state()
+    job = _job_state(request)
     runs = [{"name": p.name} for p in _run_dirs()[:20]]
     if comparison is None:
         return {"present": False, "hint": note, "job": job, "runs": runs,
@@ -306,31 +346,28 @@ async def runs() -> dict:
 
 
 @router.get("/job")
-async def job() -> dict:
+async def job(request: Request) -> dict:
     """返回重跑任务状态与日志尾部。
 
-    参数：无。
+    参数：request 当前请求，用于读取应用持有的评估状态。
     返回：dict，status/log 两个字段。
     异常：无。
     """
-    return {**_job_state(), "log": _log_tail()}
+    return {**_job_state(request), "log": _log_tail()}
 
 
 @router.post("/rerun")
 async def rerun(
+    request: Request,
     dataset: str = Query(default="data/evaluation/ch04.json", description="题集路径，相对项目根目录"),
     strategies: str = Query(default="dense,bm25,hybrid,hybrid_rerank", description="逗号分隔的策略列表"),
 ) -> dict:
     """在后台启动一次「校准 + 固定集比较」，不阻塞请求。
 
-    参数：dataset 题集路径；strategies 逗号分隔的策略名。
+    参数：request 当前请求；dataset 题集路径；strategies 逗号分隔的策略名。
     返回：dict，含 pid 与启动信息。
-    异常：HTTPException 409，已有任务在跑；400，参数非法。
+    异常：HTTPException 409，已有任务或清理未完成；400，参数非法；503，未进入应用生命周期。
     """
-    current = _job_state()
-    if current.get("status") == "running":
-        raise HTTPException(status_code=409, detail="已有评估任务在运行，请等待结束")
-
     chosen = [item.strip() for item in strategies.split(",") if item.strip()]
     invalid = [item for item in chosen if item not in STRATEGIES]
     if not chosen or invalid:
@@ -342,104 +379,10 @@ async def rerun(
     if not dataset_path.is_file():
         raise HTTPException(status_code=400, detail=f"题集不存在：{dataset}")
 
-    REPORTS_ROOT.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    calibration_dir = REPORTS_ROOT / f"{stamp[:8]}-calibration-{stamp[-6:]}"
-    comparison_dir = REPORTS_ROOT / f"{stamp[:8]}-evaluation-{stamp[-6:]}"
-
-    state = {
-        "status": "running",
-        "pid": None,
-        "started_at": datetime.now(timezone.utc).isoformat(),
-        "finished_at": None,
-        "returncode": None,
-        "dataset": dataset_path.name,
-        "strategies": chosen,
-        "calibration_dir": calibration_dir.name,
-        "comparison_dir": comparison_dir.name,
-        "message": "正在校准并比较四策略，完成后刷新页面查看",
-    }
-    JOB_LOG.write_text("", encoding="utf-8")
-    log_handle = open(JOB_LOG, "a", encoding="utf-8", buffering=1)
-    state["pid"] = None
-    _write_state(state)
-    # 两段串行：先校准出 policy.json，再用它跑固定集比较。
-    asyncio.create_task(_run_job(dataset_path, chosen, calibration_dir, comparison_dir, log_handle, state))
-    return {"started": True, **state}
-
-
-def _cli_argv(*args: str) -> list[str]:
-    """组装一条 CLI 命令的 argv。
-
-    参数：args 子命令与选项。
-    返回：list[str]，交给 create_subprocess_exec，不经过 shell。
-    异常：无。
-    """
-    # 用 uv run 保证子进程使用项目 venv，而不是宿主 PATH 上的其它 Python。
-    return ["uv", "run", "python", "-m", "app.evaluation.cli", *args]
-
-
-async def _run_job(dataset: Path, strategies: list[str], calibration: Path,
-                   comparison: Path, log_handle, state: dict) -> None:
-    """依次执行校准与比较，把进度和终态写进日志与状态文件。
-
-    参数：dataset 题集；strategies 策略列表；calibration/comparison 输出目录；
-        log_handle 追加写日志；state 可变状态字典。
-    返回：None。
-    异常：无；启动或子进程失败都转成 failed 状态，不让任务静默消失。
-    """
+    manager = getattr(request.app.state, "evaluation_jobs", None)
+    if manager is None:
+        raise HTTPException(status_code=503, detail="评估运行时尚未启动")
     try:
-        stages = [
-            _cli_argv("calibrate", "--split", "calibration", "--dataset", str(dataset),
-                      "--strategies", *strategies, "--output-dir", str(calibration)),
-            _cli_argv("compare", "--split", "evaluation", "--dataset", str(dataset),
-                      "--strategies", *strategies,
-                      "--policy", str(calibration / "policy.json"),
-                      "--output-dir", str(comparison)),
-        ]
-        for index, argv in enumerate(stages, start=1):
-            log_handle.write(chr(10) + "$ " + " ".join(argv) + chr(10))
-            log_handle.flush()
-            process = await asyncio.create_subprocess_exec(
-                *argv, cwd=str(REPO_ROOT), stdout=log_handle,
-                stderr=asyncio.subprocess.STDOUT,
-                env={**os.environ, "PYTHONUNBUFFERED": "1"}, start_new_session=True,
-            )
-            state["pid"] = process.pid
-            _write_state(state)
-            returncode = await process.wait()
-            if returncode != 0:
-                state.update({"status": "failed", "returncode": returncode,
-                              "finished_at": datetime.now(timezone.utc).isoformat(),
-                              "message": f"第 {index} 阶段失败，退出码 {returncode}，见日志"})
-                _write_state(state)
-                return
-        state.update({"status": "done", "returncode": 0,
-                      "finished_at": datetime.now(timezone.utc).isoformat(),
-                      "message": "评估完成，刷新页面查看最新结果"})
-        _write_state(state)
-    except Exception as error:
-        # 任务协程里任何异常都要落成 failed，否则页面会一直显示运行中。
-        log_handle.write(chr(10) + "启动失败：" + type(error).__name__ + ": " + str(error) + chr(10))
-        state.update({"status": "failed", "returncode": None,
-                      "finished_at": datetime.now(timezone.utc).isoformat(),
-                      "message": f"无法启动评估进程：{error}"})
-        _write_state(state)
-    finally:
-        try:
-            log_handle.close()
-        except OSError:
-            pass
-
-
-def _write_state(state: dict) -> None:
-    """把任务状态写入状态文件，供跨请求与重启后读取。
-
-    参数：state 状态字典。
-    返回：None。
-    异常：无；写盘失败静默忽略，不让接口因为状态文件报错。
-    """
-    try:
-        JOB_STATE.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
-    except OSError:
-        pass
+        return manager.start(dataset_path, chosen)
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
