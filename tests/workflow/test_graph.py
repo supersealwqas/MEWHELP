@@ -41,8 +41,18 @@ async def test_weak_evidence_finishes_without_main_model_and_records_only_low_co
     assert state["stop_reason"] == "retrieval_low_conf"
     assert deps.chat.finished[0]["low_confidence"].source == "retrieval_low_conf"
 
-async def test_overlong_knowledge_stops_without_retrieval_or_low_confidence():
-    """2001字知识输入执行检索、Agent或入池时失败。参数：无；返回：None；异常：断言失败。"""
+@pytest.mark.parametrize("budget_env", ["TOKEN_BUDGET", "CHAT_TOKEN_BUDGET"])
+async def test_overlong_knowledge_stops_without_retrieval_or_low_confidence(monkeypatch, budget_env):
+    """宿主低预算不得干扰2001字知识输入的业务长度检查。
+
+    参数：monkeypatch隔离环境变更；budget_env为当前或旧版预算环境变量名。
+    返回：None，断言仍以input_limit结束且不检索、不执行Agent或入池。
+    异常：AssertionError或ContextBudgetExceeded表示业务边界或测试隔离失效。
+    """
+    # 模拟第三方SDK导入.env后遗留的配置，不改变本例明确使用的离线预算。
+    monkeypatch.delenv("TOKEN_BUDGET", raising=False)
+    monkeypatch.delenv("CHAT_TOKEN_BUDGET", raising=False)
+    monkeypatch.setenv(budget_env, "31")
     deps = dependencies(intents=["退款退货"])
     trace = NodeTrace()
     state = await build_workflow(deps, checkpointer=None).ainvoke(turn("问" * 2001), {"callbacks": [trace]})

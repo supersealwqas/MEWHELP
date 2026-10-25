@@ -2,6 +2,7 @@
 from copy import deepcopy
 from uuid import uuid4
 from langchain_core.callbacks import BaseCallbackHandler
+from app import config
 from app.config import Settings
 from app.knowledge.rerank import RankedChunk
 from app.knowledge.schemas import ChunkSnapshot
@@ -90,9 +91,11 @@ class StrictSearch:
 def dependencies(*, intents=("订单",), decisions=(), answers=(), ranked=(), results=(), **settings):
     """参数：有限依赖脚本与配置覆盖；返回：WorkflowDependencies；异常：配置校验错误。"""
     chat = StrictChat()
+    # 沿用全局夹具的离线快照，避免SDK导入.env污染预算；用例显式覆盖仍参与校验。
+    options = {**config.settings.model_dump(), **settings}
     return WorkflowDependencies(ScriptedWorkflowModel(intents=intents, decisions=decisions, answers=answers),
         StrictSearch(ranked), StrictExecutor(chat, results), chat,
-        Settings(_env_file=None, chat_base_url="http://127.0.0.1:9/v1", chat_model="offline", chat_api_key="offline", **settings))
+        Settings(_env_file=None, **options))
 
 def turn(query="查订单1001", *, session="session", turn_id=None):
     """参数：query原问、session会话、turn_id可选轮ID；返回：新轮State；异常：原问错误。"""
