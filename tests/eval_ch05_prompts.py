@@ -1,4 +1,4 @@
-"""CH05 冻结标注的真实模型评估入口；只调用分类模型，不连接数据库或执行工具。"""
+"""CH05 冻结标注真实评估：intent只分类；agent显式test后执行隔离真实工作流。"""
 
 import argparse
 import asyncio
@@ -114,13 +114,21 @@ async def evaluate(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     """解析并执行真实评估。参数：argv 可选命令参数；返回：退出码；异常：参数错误由 argparse 报告。"""
-    parser = argparse.ArgumentParser(description="CH05 真实意图评估，不执行工具或数据库写入")
-    parser.add_argument("--suite", choices=["intent"], required=True)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--suite", choices=["intent", "agent"], required=True)
+    parser.add_argument("--test", action="store_true", help="agent必须显式授权具名测试资源")
     parser.add_argument("--cases", type=Path, required=True)
     parser.add_argument("--report-dir", type=Path, required=True)
     parser.add_argument("--env-file", type=Path, help="只读加载指定环境文件，不修改或复制凭据")
+    parser.add_argument("--token-budget", type=int, help="agent显式消息预算，可覆盖旧env")
+    parser.add_argument("--request-token-budget", type=int, help="agent显式完整请求预算")
     args = parser.parse_args(argv)
+    if args.suite == "agent" and not args.test:
+        parser.error("agent suite requires --test")
     try:
+        if args.suite == "agent":
+            from tests.ch05_live_runtime import run_cli
+            return run_cli(args, suite="agent")
         return asyncio.run(evaluate(args))
     except Exception as error:
         print(json.dumps({"error_type":type(error).__name__}, ensure_ascii=False), flush=True)

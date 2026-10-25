@@ -121,3 +121,32 @@ async def test_fifth_decision_can_answer_after_four_tools():
     state = await build_workflow(deps, checkpointer=None).ainvoke(turn())
     assert state["decision_count"] == 5 and state["tool_count"] == 4 and state["answer"] == "已查询完成"
     assert state["budget"]["model_calls"] == 7
+
+
+@pytest.mark.parametrize("actions", [["create_ticket"], ["handoff"], ["handoff", "create_ticket"], []])
+async def test_answer_receives_current_confirmed_suggestion_context(actions):
+    """正文只接当前按钮的中文操作语义，不接可被复述的内部字段。参数：actions当前建议；返回：None；异常：断言失败。"""
+    deps = dependencies(intents=["售后"], decisions=[AgentDecision(kind="answer", suggested_actions=actions)], answers=[["请按页面提示确认"]])
+    state = await build_workflow(deps, checkpointer=None).ainvoke(turn("设备故障，请创建售后工单"))
+    actual = next(item["messages"] for item in deps.model.inputs if item["stage"] == "answer")
+    description = actual[-1]["content"]
+    assert actual[-1]["role"] == "system"
+    assert {action["kind"] for action in state["suggested_actions"]} == set(actions)
+    assert ("创建工单" in description) == ("create_ticket" in actions)
+    assert ("转人工" in description) == ("handoff" in actions)
+    if "create_ticket" in actions:
+        assert "弹窗" in description and "确认" in description
+    if not actions:
+        assert "没有" in description and "按钮" in description
+    all_input = json.dumps(actual, ensure_ascii=False)
+    assert not any(field in all_input for field in
+        ("reply_kind", "available_actions", "action_instructions", "create_ticket", "handoff", "user_id", "action_id"))
+
+
+async def test_answer_action_instructions_cannot_bypass_message_budget():
+    """新增按钮说明也必须过现有输入预算，不能预算外加给模型。参数：无；返回：None；异常：断言失败。"""
+    deps = dependencies(token_budget=80, intents=["售后"],
+        decisions=[AgentDecision(kind="answer", suggested_actions=["create_ticket"])], answers=[["旧路径会越过新增说明预算"]])
+    state = await build_workflow(deps, checkpointer=None).ainvoke(turn("请建单"))
+    assert state["stop_reason"] == "budget_exceeded"
+    assert not any(item["stage"] == "answer" for item in deps.model.inputs)

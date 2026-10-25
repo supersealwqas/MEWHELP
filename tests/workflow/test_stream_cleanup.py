@@ -97,3 +97,74 @@ async def test_shared_guard_rejects_chat_while_confirmation_holds_session(tmp_pa
             assert (await collect(service))[-1].event == "error"
             assert await deps.chat.load_turns(1) == []
         assert (await collect(service))[-1].event == "done"
+
+
+@pytest.mark.parametrize("stage", ["classify", "answer_before_delta", "answer_after_delta", "tool"])
+async def test_receive_disconnect_waits_for_real_graph_before_mark_and_unlock(tmp_path, stage):
+    """ASGI2.3接收断连重复取消时，真实父子图必须先清理再终态/解锁。参数：tmp_path/阻塞阶段；返回：None；异常：断言失败。"""
+    from tests.workflow.graph_fakes import call
+    decisions = [AgentDecision(kind="tools", tool_calls=[call("old", order_id="1001")])] if stage == "tool" else [AgentDecision(kind="answer")]
+    async with service_runtime(tmp_path, intents=["订单"], decisions=decisions) as (service, deps, _):
+        entered, first_delta, closed, cancelled, release = (asyncio.Event() for _ in range(5))
+        marked_after_close, sent = [], []
+        original_mark = deps.chat.mark_turn
+
+        async def block(*args, **kwargs):
+            """只替代外部等待，不替代服务/图的取消。参数：原边界参数；返回：None；异常：取消。"""
+            entered.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            finally:
+                # 慢清理保证测试能发现仅发取消、未等待退出的缺陷。
+                await asyncio.sleep(.01)
+                closed.set()
+
+        async def answer(messages, ledger):
+            """在首帧前后分别阻塞。参数：模型契约；返回：正文流；异常：取消。"""
+            if stage == "answer_after_delta":
+                yield "部分答案"
+            await block()
+            yield "不应继续"
+
+        async def mark(context, status):
+            """记录真实mark之前的资源状态。参数：上下文/终态；返回：仓储结果；异常：数据库错误。"""
+            marked_after_close.append(closed.is_set())
+            return await original_mark(context, status)
+
+        async def receive():
+            """通过真实receive断连触发Starlette取消域。参数：无；返回：http.disconnect；异常：取消。"""
+            await (first_delta if stage == "answer_after_delta" else entered).wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            """正常发送，不用send故障代替接收断连。参数：ASGI消息；返回：None；异常：无。"""
+            sent.append(message)
+            if b"delta" in message.get("body", b""):
+                first_delta.set()
+
+        deps.chat.mark_turn = mark
+        if stage == "classify":
+            deps.model.classify = block
+        elif stage == "tool":
+            deps.executor.execute = block
+        else:
+            deps.model.stream_answer = answer
+        before = set(asyncio.all_tasks())
+        response = await chat(ChatRequest(session_id="s", message="查订单"), service)
+        try:
+            await asyncio.wait_for(response({"type":"http", "asgi":{"spec_version":"2.3"}}, receive, send), 3)
+            assert cancelled.is_set() and closed.is_set()
+            assert marked_after_close == [True]
+            assert "s" not in service.guard._active
+            assert not [task for task in asyncio.all_tasks() - before if not task.done()]
+            assert not any(b"[DONE]" in item.get("body", b"") for item in sent)
+            assert (await deps.chat.load_turns(1))[0].turn_status == "cancelled"
+        finally:
+            # 红测时释放遗留假等待，避免失败探针污染后续测试或关闭后的SQLite。
+            release.set()
+            pending = [task for task in asyncio.all_tasks() - before if not task.done()]
+            if pending:
+                await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), 3)

@@ -517,6 +517,39 @@ class ChatService:
         self.chat, self.graph, self.executor, self.settings = chat_repository, graph, executor, settings
         self.guard = guard if guard is not None else ConversationGuard()
 
+    async def _stream_workflow(self, state: dict, config: dict):
+        """由独占asyncio任务拥有整个图，隔离ASGI取消域的重复取消。
+
+        参数：state本轮初态、config图配置；返回：原namespace/custom事件流。
+        异常：图错误原样传播；消费者取消时只取消生产任务一次，等待节点和模型关闭后才退出。
+        """
+        queue = asyncio.Queue()
+        finished = object()
+
+        async def produce():
+            """完整消费原图并在所有出口唤醒消费者。参数：无；返回：None；异常：原图错误/取消。"""
+            try:
+                async with aclosing(self.graph.astream(state, config, stream_mode="custom", subgraphs=True,
+                                                       durability="sync")) as upstream:
+                    async for item in upstream:
+                        queue.put_nowait(item)
+            finally:
+                queue.put_nowait(finished)
+
+        # 不放进AnyIO task group，避免其level cancellation打断LangGraph自己的退出任务。
+        task = asyncio.create_task(produce())
+        try:
+            while (item := await queue.get()) is not finished:
+                yield item
+            await task
+        finally:
+            if not task.done():
+                task.cancel()
+            with anyio.CancelScope(shield=True):
+                # 正常消费路径上方已传播原异常；关闭时只负责收回任务，不覆盖外层取消/发送错误。
+                with suppress(asyncio.CancelledError, Exception):
+                    await task
+
     async def _initial_state(self, context: ToolContext, config: dict):
         """从checkpoint游标增量对账后创建完整新input，禁止恢复旧申请。
 
@@ -555,8 +588,7 @@ class ChatService:
                     started = True
                     config = {"configurable": {"thread_id": request.session_id}}
                     state = await self._initial_state(context, config)
-                    stream = self.graph.astream(state, {**config, "callbacks": [_WorkflowTrace()]},
-                        stream_mode="custom", subgraphs=True, durability="sync")
+                    stream = self._stream_workflow(state, {**config, "callbacks": [_WorkflowTrace()]})
                     async for namespace, payload in stream:
                         # 只有框架custom通道的两类公开事件可转发；内部JSON/工具参数不成为正文。
                         if not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):

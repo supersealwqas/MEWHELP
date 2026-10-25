@@ -156,7 +156,16 @@ def build_agent_graph(deps: "WorkflowDependencies"):
             return {"answer": state["answer"]}
         ledger = BudgetLedger.from_snapshot(state["budget"])
         try:
-            messages = model_messages(state, deps.settings, ANSWER_PROMPT)
+            instructions = {
+                "create_ticket": "请点击本条回复后的“创建工单”按钮，在弹窗中确认后提交。",
+                "handoff": "如需人工协助，可点击本条回复后的“转人工”按钮。",
+            }
+            action_text = ("本轮回复后可用按钮的操作说明如下：\n" +
+                           "\n".join(instructions[kind] for kind in state["suggested_kinds"])) if state["suggested_kinds"] else "本轮回复后没有可操作的按钮，请按已有事实回答或追问。"
+            # 正文模型只需要中文按钮语义；不传内部字段、枚举、身份或动作ID。完整说明仍先过原预算。
+            answer_state = {**state, "messages": [*state["messages"],
+                {"role": "system", "content": action_text}]}
+            messages = model_messages(answer_state, deps.settings, ANSWER_PROMPT)
             parts = []
             async with aclosing(deps.model.stream_answer(messages, ledger)) as stream:
                 async for delta in stream:
