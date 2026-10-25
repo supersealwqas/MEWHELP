@@ -149,8 +149,9 @@ async def test_shared_chat_guard_and_double_click_return_busy_then_same_receipt(
         assert repeated.json() == next(item.json() for item in pair if item.status_code == 200)
 
 
-async def test_committed_ticket_failed_audit_returns_real_receipt_then_repairs(tmp_path, monkeypatch):
-    """提交后收尾失败被误报没建成、恢复改源轮或多回执时失败。参数：tmp_path/monkeypatch；返回：None；异常：断言失败。"""
+@pytest.mark.parametrize("terminal", ["cancelled", "failed"])
+async def test_committed_ticket_failed_audit_returns_real_receipt_then_repairs(tmp_path, monkeypatch, terminal):
+    """提交后收尾失败被误报没建成、恢复改源轮或多回执时失败。参数：tmp_path/monkeypatch/terminal中断终态；返回：None；异常：断言失败。"""
     async with action_runtime(tmp_path) as (chat, actions, client, factory):
         body = await saved_suggestion(chat.chat)
         original = actions.repository.finish_ticket_action
@@ -162,7 +163,12 @@ async def test_committed_ticket_failed_audit_returns_real_receipt_then_repairs(t
         monkeypatch.setattr(actions.repository, "finish_ticket_action", fail_finish)
         first = await client.post("/api/actions/tickets", json=body)
         assert first.status_code == 200 and first.json()["audit_sync_pending"] is True
-        assert await chat.chat.recover_interrupted_turns() == 1
+        if terminal == "cancelled":
+            assert await chat.chat.recover_interrupted_turns() == 1
+        else:
+            from app.schemas.workflow import TicketConfirmation
+            prepared = await actions.repository.prepare_ticket(TicketConfirmation(**body))
+            await chat.chat.mark_turn(prepared.context, "failed")
         monkeypatch.setattr(actions.repository, "finish_ticket_action", original)
         second = await client.post("/api/actions/tickets", json=body)
         assert second.status_code == 200 and second.json()["audit_sync_pending"] is False
@@ -215,6 +221,34 @@ async def test_cancelled_before_execution_can_reconfirm_but_started_unknown_cann
         response = await client.post("/api/actions/tickets", json=another)
         assert response.status_code == 503 and response.json()["detail"]["outcome"] == "unknown"
         assert len((await records(factory))[2]) == 1
+
+
+async def test_failed_before_execution_stays_unknown_when_original_action_retried(tmp_path, monkeypatch):
+    """执行前异常产生failed后，重试查询不能变成新写入。参数：tmp_path独占目录、monkeypatch故障注入；返回：None；异常：断言失败。"""
+    async with action_runtime(tmp_path) as (chat, actions, client, factory):
+        body = await saved_suggestion(chat.chat)
+
+        async def fail_before_execution(action):
+            """在真实服务写执行边界之前失败。参数：action已准备动作；返回：无；异常：受控OSError。"""
+            raise OSError("执行边界暂不可写")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(actions.repository, "begin_ticket_execution", fail_before_execution)
+            first = await client.post("/api/actions/tickets", json=body)
+        assert first.status_code == 503 and first.json()["detail"]["outcome"] == "unknown"
+        _, before_rows, before_tickets = await records(factory)
+        assert before_tickets == [] and len(before_rows) == 4
+        assert [row.turn_status for row in before_rows] == ["completed", "completed", "failed", "failed"]
+        assert before_rows[2].rag_metadata["execution_started"] is False
+
+        # 恢复真实begin实现后，原请求仍只能查结果；failed不能按取消状态放行执行。
+        for _ in range(2):
+            retry = await client.post("/api/actions/tickets", json=body)
+            assert retry.status_code == 503 and retry.json()["detail"]["outcome"] == "unknown"
+        _, after_rows, after_tickets = await records(factory)
+        assert after_tickets == [] and [row.id for row in after_rows] == [row.id for row in before_rows]
+        assert [row.turn_status for row in after_rows] == ["completed", "completed", "failed", "failed"]
+        assert after_rows[2].rag_metadata["execution_started"] is False
 
 
 async def test_special_finish_rejects_forged_context_and_never_reopens_normal_turn(tmp_path):

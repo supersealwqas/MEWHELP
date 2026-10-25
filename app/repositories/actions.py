@@ -153,7 +153,9 @@ class ActionRepository:
         """记录写执行边界，未知提交不能重跑。参数：action已准备动作；返回：None；异常：PersistenceUncertain/数据库错误。"""
         async with self.factory.begin() as session:
             rows = await self._revalidate(session, action)
-            if len(rows) != 2 or rows[0].rag_metadata["execution_started"] or rows[0].turn_status == "completed":
+            # 无结果时只放行首次running或执行前cancelled；failed仍未知，原键重试不能变成写入。
+            if (len(rows) != 2 or rows[0].rag_metadata["execution_started"]
+                    or rows[0].turn_status not in {"running", "cancelled"}):
                 raise PersistenceUncertain("动作执行状态待核实，请使用原动作重试查询")
             # JSON整体赋值触发ORM变更；只对明确未执行的旧取消动作恢复running。
             rows[0].rag_metadata = {**rows[0].rag_metadata, "execution_started": True}
