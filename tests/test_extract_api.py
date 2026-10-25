@@ -15,6 +15,8 @@ import pytest
 from fastapi.testclient import TestClient
 from langchain_core.runnables.base import RunnableSequence
 
+from app.api.extract import get_extractor
+from app.core.llm import get_chat_model
 from app.main import app
 from app.schemas.extract import AfterSalesTicket
 
@@ -211,6 +213,41 @@ class TestExtractEndpointUpstreamFailure:
 class TestExtractEndpointValidation:
     """POST /api/extract 请求体参数校验测试类。"""
 
+    @pytest.mark.parametrize("character", ["猫", "🐱", "𠮷"])
+    def test_extract_accepts_4000_unicode_code_points(
+        self, client: TestClient, character: str
+    ) -> None:
+        """验证4000码点仍能提取，补充平面字符不能按UTF-16长度误拒绝。
+
+        参数：client HTTP客户端、character 单个Unicode码点。
+        返回：None，断言边界输入完整传到提取链。
+        异常：AssertionError，输入被拒绝或截断。
+        """
+        text = character * 4000
+        ticket = AfterSalesTicket(request_type="其他", expected_solution="咨询售后")
+        with patch.object(RunnableSequence, "ainvoke", new_callable=AsyncMock) as invoke:
+            invoke.return_value = ticket
+            response = client.post("/api/extract", json={"text": text})
+        assert response.status_code == 200
+        assert response.json()["expected_solution"] == "咨询售后"
+        invoke.assert_awaited_once_with({"text": text})
+
+    @pytest.mark.parametrize("character", ["猫", "🐱", "𠮷"])
+    def test_extract_rejects_4001_code_points_before_model_creation(
+        self, client: TestClient, character: str
+    ) -> None:
+        """验证超长请求在HTTP校验阶段被拒绝，绝不创建或调用模型。
+
+        参数：client HTTP客户端、character 单个Unicode码点。
+        返回：None，断言422、字段错误及零模型调用。
+        异常：AssertionError，超长文本进入模型边界。
+        """
+        with patch("app.api.extract.get_chat_model") as factory:
+            response = client.post("/api/extract", json={"text": character * 4001})
+        assert response.status_code == 422
+        assert any(error["loc"] == ["body", "text"] for error in response.json()["detail"])
+        factory.assert_not_called()
+
     def test_extract_missing_text_field(self, client: TestClient) -> None:
         """测试缺失 text 必填字段时，返回 HTTP 422 校验失败。
 
@@ -240,6 +277,27 @@ class TestExtractEndpointValidation:
 
 class TestAppMetadataAndRouting:
     """FastAPI 应用与路由元数据测试类。"""
+
+    def test_extract_model_has_explicit_output_limit(self) -> None:
+        """验证实际提取工厂显式传入输出额度，结构化客户端保留原兼容参数。
+
+        参数：无，使用离线配置仅构造客户端，不访问模型。
+        返回：None，断言模型获得1024 tokens的单次输出上限。
+        异常：AssertionError，工厂遗漏上限或改变既有参数。
+        """
+        models = []
+
+        def recording_factory(**kwargs):
+            """记录真实模型工厂入参与返回值。参数：kwargs 客户端参数；返回：模型；异常：配置错误。"""
+            model = get_chat_model(**kwargs)
+            models.append(model)
+            return model
+
+        with patch("app.api.extract.get_chat_model", side_effect=recording_factory) as factory:
+            chain = get_extractor()
+        factory.assert_called_once_with(temperature=0.0, streaming=True, max_tokens=1024)
+        assert models[0].max_tokens == 1024
+        assert isinstance(chain, RunnableSequence)
 
     def test_app_title_and_version(self) -> None:
         """测试 FastAPI 应用实例的元数据符合规划规范。"""

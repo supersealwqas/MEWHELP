@@ -34,7 +34,8 @@ def get_extractor() -> Runnable:
         ValueError: 结构化输出参数不受模型客户端支持时抛出。
     """
     # 保留已验证的网关兼容参数，避免重命名后恢复成不兼容的默认调用方式。
-    model = get_chat_model(temperature=0.0, streaming=True)
+    # 单次提取显式限制输出额度，足够容纳工单JSON并避免无界生成。
+    model = get_chat_model(temperature=0.0, streaming=True, max_tokens=1024)
     structured_model = model.with_structured_output(
         AfterSalesTicket,
         method="function_calling",
@@ -52,7 +53,7 @@ async def extract(req: ExtractRequest) -> AfterSalesTicket:
     以及核心期望解决方案。
 
     参数:
-        req (ExtractRequest): 包含用户待提取售后文本的请求体模型，要求 text 非空且非纯空白字符。
+        req (ExtractRequest): 包含用户待提取售后文本的请求体模型，要求 text 为1至4000个Unicode码点且非纯空白。
 
     返回值:
         AfterSalesTicket: 结构化解析后的工单对象，包含 order_id、request_type 和 expected_solution 字段。

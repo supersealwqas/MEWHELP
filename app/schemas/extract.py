@@ -18,7 +18,8 @@ class ExtractRequest(BaseModel):
     text: str = Field(
         ...,
         min_length=1,
-        description="用户描述售后问题的自然语言文本，不可为空或纯空白字符",
+        max_length=4000,
+        description="用户描述售后问题的自然语言文本，最多4000个Unicode码点，不可为空或纯空白字符",
     )
 
     @field_validator("text")
