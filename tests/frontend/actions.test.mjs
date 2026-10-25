@@ -7,17 +7,29 @@ import * as actions from "../../app/static/actions.mjs";
 
 /** 最小DOM边界；保留真实EventTarget分发，浏览器布局和键盘另由真实页面验收。 */
 class Element extends EventTarget {
+  /** 初始化测试DOM节点；参数：tag为标签名，doc为所属文档；返回：Element实例；异常：无主动抛出。 */
   constructor(tag, doc) { super(); Object.assign(this, { tagName: tag, ownerDocument: doc, children: [], dataset: {}, disabled: false, open: false, attributes: {}, _text: "" }); }
+  /** 替换纯文本并清空子节点；参数：value为文本字符串；返回：无；异常：无主动抛出。 */
   set textContent(value) { this._text = value; this.children = []; }
+  /** 读取本节点与后代文本；参数：无；返回：拼接后的字符串；异常：非法子节点引发TypeError。 */
   get textContent() { return this._text + this.children.map((child) => child.textContent).join(""); }
+  /** 追加子节点并记录父节点；参数：nodes为待追加的测试节点；返回：无；异常：非法节点引发TypeError。 */
   append(...nodes) { for (const node of nodes) { node.parentNode = this; this.children.push(node); } }
+  /** 保存测试节点属性；参数：name为属性名，value为属性字符串；返回：无；异常：无主动抛出。 */
   setAttribute(name, value) { this.attributes[name] = value; }
+  /** 读取测试节点属性；参数：name为属性名；返回：属性字符串或undefined；异常：无主动抛出。 */
   getAttribute(name) { return this.attributes[name]; }
+  /** 记录当前焦点节点；参数：无；返回：无；异常：无效文档引发TypeError。 */
   focus() { this.ownerDocument.activeElement = this; }
+  /** 从父节点中移除本节点；参数：无；返回：无；异常：没有父节点时引发TypeError。 */
   remove() { this.parentNode.children = this.parentNode.children.filter((node) => node !== this); }
+  /** 标记确认弹窗已打开；参数：无；返回：无；异常：无主动抛出。 */
   showModal() { this.open = true; }
+  /** 关闭弹窗并分发真实close事件；参数：无；返回：无；异常：事件处理错误由EventTarget报告。 */
   close() { this.open = false; this.dispatchEvent(new Event("close")); }
+  /** 分发可取消的真实submit事件；参数：无；返回：无；异常：事件处理错误由EventTarget报告。 */
   requestSubmit() { this.dispatchEvent(new Event("submit", { cancelable: true })); }
+  /** 模拟可取消点击并提交所属表单；参数：无；返回：无；异常：事件处理错误由EventTarget报告。 */
   click() {
     if (this.disabled) return;
     this.focus();
@@ -77,6 +89,30 @@ test("投诉回复装配两个按钮但不主动联网或打开弹窗", () => {
   assert.equal(f.calls.length, 0);
   assert.equal(all(f.doc.body).some((node) => node.open), false);
 });
+
+for (const field of ["session_id", "user_id"]) {
+  for (const length of [32, 33, 64]) {
+    test(`${field}包含${length}个emoji时装配两个按钮并按原身份确认`, async () => {
+      const raw = "🐱".repeat(length);
+      const f = setup({ ...metadata(), [field]: raw });
+      assert.equal(all(f.container).filter((node) => node.tagName === "button").length, 2);
+      assert.equal(f.calls.length, 0);
+      button(openTicket(f), "确认建单").click();
+      await setImmediate();
+      assert.equal(f.calls.length, 1);
+      assert.equal(f.calls[0][0], "/api/actions/tickets");
+      assert.equal(f.calls[0][1].method, "POST");
+      assert.deepEqual(JSON.parse(f.calls[0][1].body), { ...body, [field]: raw });
+      assert.match(f.container.textContent, /T-REAL-123/);
+    });
+  }
+  test(`${field}包含65个Unicode码点时拒绝装配且不联网`, () => {
+    const f = setup({ ...metadata(), suggested_actions: [] });
+    assert.throws(() => actions.attachSuggestedActions(f.container, { ...metadata(), [field]: "🐱".repeat(65) }, f.options), /身份/);
+    assert.equal(all(f.container).length, 1);
+    assert.equal(f.calls.length, 0);
+  });
+}
 
 test("转人工零网络且只显示两句固定话，另一个按钮继续可用", () => {
   const f = setup();

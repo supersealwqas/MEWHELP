@@ -14,9 +14,10 @@ const attached = new WeakSet();
 export function attachSuggestedActions(container, metadata, { fetchImpl = globalThis.fetch, appendMessage, onBusy = () => {} } = {}) {
   const suggested = validateSuggestedActions(metadata);
   if (!suggested.length || attached.has(container)) return;
+  // 与确认客户端及后端统一按Unicode码点计数，避免将emoji代理对算成两个字符。
   if (metadata.status !== "completed" || typeof metadata.session_id !== "string" || !metadata.session_id ||
-      metadata.session_id.length > 64 || (metadata.user_id !== undefined &&
-        (typeof metadata.user_id !== "string" || !metadata.user_id || metadata.user_id.length > 64))) {
+      Array.from(metadata.session_id).length > 64 || (metadata.user_id !== undefined &&
+        (typeof metadata.user_id !== "string" || !metadata.user_id || Array.from(metadata.user_id).length > 64))) {
     throw new Error("动作建议缺少已完成的来源身份。");
   }
   const doc = container.ownerDocument;
