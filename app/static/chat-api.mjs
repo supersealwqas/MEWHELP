@@ -38,9 +38,9 @@ async function httpErrorMessage(response) {
 }
 
 /**
- * 根据写操作状态生成失败提示，避免在结果未知或已提交时引导重复建单。
+ * 普通聊天失败可重发；仅为明确收到的旧版写工具状态保留防重复兼容提示。
  * @param {object} options 本轮失败、取消及各调用的最新状态。
- * @param {Error} options.error 接口错误；retry_safe 为服务端可选的安全重试判断。
+ * @param {Error} options.error 接口错误；普通聊天不会因断流推断工单写入。
  * @param {boolean} options.stopped 是否由用户停止接收。
  * @param {Iterable<object>} options.toolStatuses 各工具调用最新状态。
  * @returns {{restoreMessage: boolean, note: string, status: string, feedback: string}} 页面提示及原话回填决策。
@@ -51,7 +51,7 @@ export function failurePresentation({ error, stopped, toolStatuses = [] }) {
     // 参数 tool 为调用最新状态；返回 boolean；无业务异常。failed 表示服务端已确定未执行。
     return tool.name === "create_ticket" && ["running", "retrying", "succeeded"].includes(tool.status);
   });
-  if (error?.retry_safe === false || ticketMayExist) {
+  if (ticketMayExist) {
     return {
       restoreMessage: false,
       note: "工单可能已提交，请先核实已提交结果，避免重复建单。已收到的文字和工单号会保留在本页。",
@@ -87,7 +87,7 @@ export function failurePresentation({ error, stopped, toolStatuses = [] }) {
  */
 export async function streamChat(options, fetcher = globalThis.fetch) {
   if (options.signal?.aborted) {
-    // 尚未发出请求的取消可以安全回填；发出请求后的断流不能据此推断写入结果。
+    // 普通聊天不执行建单，取消和断流不会代表工单提交。
     const error = new DOMException("请求已取消", "AbortError");
     error.retry_safe = true;
     throw error;
@@ -95,25 +95,25 @@ export async function streamChat(options, fetcher = globalThis.fetch) {
   try {
     return await receiveChatStream(options, fetcher);
   } catch (error) {
-    // 状态帧可能尚未送达；仅凭没有徽章，不能认定服务端没有创建工单。
-    if (typeof error.retry_safe !== "boolean") error.retry_safe = false;
+    // 新工作流只建议动作；写入结果未知由独立确认API处理。
+    if (typeof error.retry_safe !== "boolean") error.retry_safe = true;
     throw error;
   }
 }
 
 /**
- * 发送请求并解码响应；由 streamChat 统一标记无法确认提交结果的错误。
+ * 发送普通聊天并解码响应；只在未取消且收到DONE后交付完成元数据。
  * @param {object} options 会话、消息、取消信号和增量回调。
  * @param {typeof fetch} fetcher 浏览器 fetch 或离线网络替身。
  * @returns {Promise<string>} 收到完成帧后的完整回答。
  * @throws {Error} HTTP、网络或协议错误；取消时抛出 AbortError。
  */
-async function receiveChatStream({ sessionId, message, signal, onDelta, onToolStatus, onAnswerMetadata }, fetcher) {
+async function receiveChatStream({ sessionId, userId = "demo-user", message, signal, onDelta, onToolStatus, onAnswerMetadata }, fetcher) {
   // EventSource 不支持此处需要的 POST JSON，因此使用 fetch 的可读响应流。
   const response = await fetcher("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
-    body: JSON.stringify({ session_id: sessionId, message }),
+    body: JSON.stringify({ session_id: sessionId, message, ...(userId === "demo-user" ? {} : { user_id: userId }) }),
     signal,
   });
   if (!response.ok) {
@@ -138,6 +138,8 @@ async function receiveChatStream({ sessionId, message, signal, onDelta, onToolSt
       buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
       let boundary;
       while ((boundary = /\r?\n\r?\n/.exec(buffer)) !== null) {
+        // 取消可能发生在正文回调期间；同一个已缓存分包中的DONE也不能继续装配按钮。
+        if (signal?.aborted) throw signal.reason ?? new DOMException("请求已取消", "AbortError");
         const frame = buffer.slice(0, boundary.index);
         buffer = buffer.slice(boundary.index + boundary[0].length);
         const event = parseEvent(frame);
@@ -168,7 +170,10 @@ async function receiveChatStream({ sessionId, message, signal, onDelta, onToolSt
               new Set(payload.citations.map((item) => item.n)).size !== payload.citations.length) {
             throw new Error("回答完成信息不完整，请保留本页文字并稍后核实。");
           }
-          metadata = payload;
+          const suggested = validateSuggestedActions(payload);
+          if (suggested.some((action) => action.question !== message)) throw new Error("动作建议与本轮原问题不符。");
+          // 绑定发出这一轮请求时的身份，不读取后续页面会话或服务端提供的其他用户。
+          metadata = { ...payload, user_id: userId, suggested_actions: suggested };
           continue;
         }
         if (event.event === "tool_status") {
@@ -194,4 +199,79 @@ async function receiveChatStream({ sessionId, message, signal, onDelta, onToolSt
     try { await reader.cancel(); } catch { /* 已断开的流无需再次取消。 */ }
     reader.releaseLock();
   }
+}
+
+const UUID_V5 = /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const TICKET_TYPES = ["售后", "投诉", "咨询"];
+
+/** 校验建议完整快照；参数为完成元数据；返回独立快照数组；异常：Error，非法建议。 */
+export function validateSuggestedActions(metadata) {
+  const suggested = metadata?.suggested_actions === undefined ? [] : metadata.suggested_actions;
+  const keys = ["action_id", "kind", "source_turn_id", "question", "ticket_type"];
+  if (!Array.isArray(suggested) || suggested.length > 2 || suggested.some((action) =>
+    !action || Object.keys(action).length !== keys.length || keys.some((key) => !Object.hasOwn(action, key)) ||
+    typeof action.action_id !== "string" || !UUID_V5.test(action.action_id) ||
+    action.source_turn_id !== metadata.turn_id || !validText(action.source_turn_id, 36) ||
+    !validText(action.question, 4000) ||
+    (action.kind === "handoff" ? action.ticket_type !== null :
+      action.kind !== "create_ticket" || !TICKET_TYPES.includes(action.ticket_type))) ||
+    new Set(suggested.map((action) => action.kind)).size !== suggested.length ||
+    new Set(suggested.map((action) => action.action_id)).size !== suggested.length) {
+    throw new Error("动作建议信息不完整，请保留本页文字并稍后核实。");
+  }
+  return suggested.map((action) => Object.freeze({ ...action }));
+}
+
+/** 校验与后端一致的Unicode字符数；参数为值/上限；返回布尔；异常：无。 */
+function validText(value, limit) {
+  return typeof value === "string" && Boolean(value.trim()) && Array.from(value).length <= limit;
+}
+
+/** 构造确认错误；参数为安全文字/结果状态/HTTP状态；返回Error；异常：无。 */
+function ticketError(message, outcome, status = 0) {
+  return Object.assign(new Error(message), { outcome, status });
+}
+
+/**
+ * 只向固定接口确认保存的建议，不接受客户端描述或类型。
+ * @param {object} payload 原会话、用户、来源轮、动作键和confirmed:true。
+ * @param {object} options 可注入fetchImpl和取消signal。
+ * @returns {Promise<object>} 已校验的真实回执，含可选审计同步状态。
+ * @throws {Error} 参数错误为not_started；已发请求的未知响应为unknown；业务失败保留服务端分类。
+ */
+export async function confirmTicket(payload, { fetchImpl = globalThis.fetch, signal } = {}) {
+  const keys = ["session_id", "user_id", "source_turn_id", "action_id", "confirmed"];
+  if (!payload || Object.keys(payload).some((key) => !keys.includes(key)) || payload.confirmed !== true ||
+      !validText(payload.session_id, 64) || !validText(payload.user_id === undefined ? "demo-user" : payload.user_id, 64) ||
+      !validText(payload.source_turn_id, 36) || typeof payload.action_id !== "string" || !UUID_V5.test(payload.action_id)) {
+    throw ticketError("确认参数不正确，未提交建单请求。", "not_started");
+  }
+  if (signal?.aborted) throw ticketError("确认已取消，未提交建单请求。", "not_started");
+  let response, result;
+  try {
+    response = await fetchImpl("/api/actions/tickets", { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ ...payload, user_id: payload.user_id ?? "demo-user" }), signal });
+    result = await response.json();
+  } catch {
+    // 请求发出后即使读取或取消失败，也不能将可能已落库的工单误报为失败。
+    throw ticketError("建单结果暂未确认，请先核实，或使用本条建议的原请求重试。", "unknown", response?.status);
+  }
+  if (!response.ok) {
+    const detail = result?.detail;
+    if ([404, 409, 422].includes(response.status) && Array.isArray(detail)) {
+      throw ticketError("确认参数不符合要求，未开始建单。请检查原问题和会话。", "not_started", response.status);
+    }
+    const allowed = response.status === 503 ? ["unknown"] : response.status === 422 ? ["not_started", "failed"] :
+      [404, 409].includes(response.status) ? ["not_started"] : [];
+    if (typeof detail?.message === "string" && typeof detail.code === "string" && allowed.includes(detail.outcome)) {
+      throw ticketError(detail.message, detail.outcome, response.status);
+    }
+    throw ticketError("建单结果暂未确认，请使用原请求核实。", "unknown", response.status);
+  }
+  if (result?.action_id !== payload.action_id || !validText(result.ticket_no, 32) ||
+      !TICKET_TYPES.includes(result.ticket_type) || result.status !== "待处理" ||
+      (result.audit_sync_pending !== undefined && typeof result.audit_sync_pending !== "boolean")) {
+    throw ticketError("未收到有效工单回执，请使用原请求核实。", "unknown", response.status);
+  }
+  return { ...result, audit_sync_pending: result.audit_sync_pending ?? false };
 }

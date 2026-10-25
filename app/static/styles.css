@@ -221,3 +221,16 @@ kbd { font: inherit; }
 .citation-document { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; font-size: 13px; margin: 0; }
 .citation-target { background: #e4f1ea; outline: 2px solid #81a98e; border-radius: 3px; }
 @media (max-width: 540px) { .citation-header, .citation-body { padding: 16px; } .citation-dialog { max-height: 90dvh; } }
+
+/* 建议按钮各自持有状态；确认面板沿用引用面板，长原问在面板内滚动。 */
+.suggested-actions { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 10px; margin-top: 16px; }
+.suggested-action { max-width: 100%; flex: 1 1 150px; }
+.action-button { min-height: 44px; min-width: 44px; white-space: normal; }
+.action-button:focus-visible { outline: 2px solid #3c7758; outline-offset: 3px; }
+.action-note { font-size: 12px; line-height: 1.7; color: #566257; margin: 8px 0 0; overflow-wrap: anywhere; }
+.ticket-dialog { width: min(620px, calc(100vw - 32px)); }
+.ticket-form { display: flex; flex-direction: column; min-height: 0; }
+.ticket-question { white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px; border-radius: 10px; background: #f2f5ef; margin: 4px 0 14px; }
+.ticket-label { font-weight: 600; margin: 0; }
+.ticket-controls { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 10px; padding: 16px 24px; border-top: 1px solid #e7e9e2; }
+@media (max-width: 540px) { .ticket-controls { padding: 16px; } .ticket-controls .action-button { flex: 1 1 auto; } }

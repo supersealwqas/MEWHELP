@@ -5,6 +5,7 @@
 import { failurePresentation, streamChat } from "./chat-api.mjs";
 import { renderMarkdown } from "./markdown.mjs";
 import { attachAnswerTools } from "./citations.mjs";
+import { attachSuggestedActions } from "./actions.mjs";
 
 const ui = {
   form: document.querySelector("#chat-form"),
@@ -22,6 +23,7 @@ const ui = {
 let sessionId = "";
 let activeController = null;
 let activeRenderer = null;
+let pendingActions = 0;
 let followOutput = true;
 
 /**
@@ -30,7 +32,7 @@ let followOutput = true;
  * @throws {Error} 浏览器不支持 Web Crypto 时可能抛出运行环境错误。
  */
 function newConversation() {
-  if (activeController) return;
+  if (activeController || pendingActions) return;
   // getRandomValues 兼容非 HTTPS 的局域网测试，不依赖 randomUUID 的安全上下文限制。
   const bytes = crypto.getRandomValues(new Uint8Array(16));
   let randomId = "";
@@ -193,7 +195,7 @@ function createTextRenderer(node) {
  */
 function updateSendState() {
   ui.input.setCustomValidity("");
-  ui.send.disabled = Boolean(activeController) || !ui.input.value.trim();
+  ui.send.disabled = Boolean(activeController) || pendingActions > 0 || !ui.input.value.trim();
 }
 
 /**
@@ -203,10 +205,10 @@ function updateSendState() {
  * @throws {Error} 无主动抛出的业务异常。
  */
 function setBusy(busy) {
-  ui.input.readOnly = busy;
-  ui.newChat.disabled = busy;
+  ui.input.readOnly = busy || pendingActions > 0;
+  ui.newChat.disabled = busy || pendingActions > 0;
   ui.stop.hidden = !busy;
-  ui.form.setAttribute("aria-busy", String(busy));
+  ui.form.setAttribute("aria-busy", String(busy || pendingActions > 0));
   updateSendState();
 }
 
@@ -251,7 +253,7 @@ function updateToolBadge(badge, tool) {
 async function sendMessage(event) {
   event.preventDefault();
   const message = ui.input.value.trim();
-  if (activeController || !message) return;
+  if (activeController || pendingActions || !message) return;
   ui.welcome.hidden = true;
   ui.feedback.hidden = true;
   followOutput = true;
@@ -312,7 +314,13 @@ async function sendMessage(event) {
     const answer = await streamChat({ sessionId, message, signal: controller.signal, onDelta, onToolStatus,
       onAnswerMetadata: (value) => { metadata = value; } });
     await renderer.finish();
-    if (metadata) attachAnswerTools(reply, answer, metadata);
+    if (metadata) {
+      attachAnswerTools(reply, answer, metadata);
+      attachSuggestedActions(reply.bubble.parentElement, metadata, { appendMessage, onBusy: (busy) => {
+        pendingActions += busy ? 1 : -1;
+        setBusy(Boolean(activeController));
+      } });
+    }
     ui.status.textContent = "回复完成，可以接着追问";
   } catch (error) {
     renderer.flush();
@@ -331,7 +339,7 @@ async function sendMessage(event) {
       ui.feedback.textContent = presentation.feedback;
       ui.feedback.hidden = false;
     }
-    // 工单已开始或服务端明确不可重试时，不自动回填建单原话。
+    // 普通聊天失败可回填；独立建单结果留在原回复的动作状态中。
     ui.input.value = presentation.restoreMessage ? message : "";
   } finally {
     reply.article.classList.remove("is-pending", "is-streaming");

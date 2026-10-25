@@ -267,15 +267,14 @@ for (const status of ["running", "retrying", "succeeded"]) {
 }
 
 /** 无参数；返回 void；服务端明确不可重试但页面仍鼓励重复提交时断言失败。 */
-test("服务端 retry_safe=false 优先于缺失或失败徽章", function explicitUnsafeRetry() {
+test("普通聊天 retry_safe=false 不能被误说成工单已提交", function explicitUnsafeRetry() {
   for (const toolStatuses of [[], [{ name: "create_ticket", status: "failed" }]]) {
     const presentation = failurePresentation({
       error: Object.assign(new Error("请重试。"), { retry_safe: false }),
       stopped: false, toolStatuses,
     });
-    assert.equal(presentation.restoreMessage, false);
-    assert.match(presentation.status, /核实/);
-    assert.doesNotMatch(`${presentation.note}${presentation.feedback}`, /重试|重新发送|新建会话/);
+    assert.equal(presentation.restoreMessage, true);
+    assert.doesNotMatch(`${presentation.note}${presentation.status}${presentation.feedback}`, /工单/);
   }
 });
 
@@ -349,10 +348,10 @@ test("透传请求取消，让页面恢复输入状态", async function abortedR
   }), { name: "AbortError" });
 });
 
-// 状态帧尚未送达不代表服务端没有开始写入；这些传输故障必须保守提示核实。
+// 普通聊天不执行写工具；传输故障不能误报工单可能提交。
 for (const mode of ["fetch-disconnect", "early-eof", "broken-status"]) {
   /** 无参数；返回 Promise<void>；没有状态帧就鼓励重复提交时断言失败。 */
-  test(`无工具徽章时 ${mode} 也不回填建单原话`, async function missingStatus() {
+  test(`普通聊天 ${mode} 可回填且不误报建单`, async function missingStatus() {
     await assert.rejects(streamChat({
       sessionId: "s", message: "请创建工单", signal: new AbortController().signal,
       /** 无有效增量；返回 void；收到意外文字时断言失败。 */
@@ -366,8 +365,8 @@ for (const mode of ["fetch-disconnect", "early-eof", "broken-status"]) {
     }), function checkUnsafe(error) {
       // 参数 error 为客户端异常；返回 boolean；提示可重试时断言失败。
       const presentation = failurePresentation({ error, stopped: false });
-      assert.equal(presentation.restoreMessage, false);
-      assert.doesNotMatch(presentation.feedback, /重试|重新发送/);
+      assert.equal(presentation.restoreMessage, true);
+      assert.doesNotMatch(`${presentation.note}${presentation.status}${presentation.feedback}`, /工单/);
       return true;
     });
   });
@@ -382,4 +381,62 @@ test("服务端明确允许重试时保留原话回填", async function safeRetr
     assert.equal(failurePresentation({ error, stopped: false }).restoreMessage, true);
     return true;
   });
+});
+
+const validAction = { action_id: "00000000-0000-5000-8000-000000000001", kind: "create_ticket",
+  source_turn_id: "old-turn", question: "原问题", ticket_type: "投诉" };
+const completion = { session_id: "old-session", turn_id: "old-turn", status: "completed", citations: [], suggested_actions: [validAction] };
+/** 参数：完成载荷；返回：SSE帧；异常：序列化错误。 */
+function metadataFrame(value) { return `event: answer_metadata\ndata: ${JSON.stringify(value)}\n\n`; }
+
+test("建议仅在DONE后交付并绑定本次原始用户，旧元数据缺动作时归为空", async () => {
+  let source;
+  const seen = [];
+  const response = new Response(new ReadableStream({ start(controller) { source = controller; } }), { headers });
+  const promise = streamChat({ sessionId: "old-session", userId: "original-user", message: "原问题", onDelta() {},
+    onAnswerMetadata: (value) => seen.push(value) }, async () => response);
+  source.enqueue(encoder.encode('data: {"delta":"完成回复"}\n\n' + metadataFrame(completion)));
+  await setImmediate();
+  assert.deepEqual(seen, []);
+  source.enqueue(encoder.encode("data: [DONE]\n\n")); source.close();
+  assert.equal(await promise, "完成回复");
+  assert.equal(seen[0].user_id, "original-user");
+  assert.deepEqual(seen[0].suggested_actions, [validAction]);
+  const old = { ...completion }; delete old.suggested_actions;
+  await streamChat({ sessionId: "old-session", message: "原问题", onDelta() {}, onAnswerMetadata: (value) => seen.push(value) },
+    async () => makeResponse(['data: {"delta":"旧回复"}\n\n' + metadataFrame(old) + "data: [DONE]\n\n"]));
+  assert.deepEqual(seen[1].suggested_actions, []);
+});
+
+for (const [name, suggested] of [
+  ["非数组", null], ["未知类型", [{ ...validAction, kind: "other" }]],
+  ["重复动作", [validAction, validAction]], ["不规范UUID", [{ ...validAction, action_id: validAction.action_id.toUpperCase().replace("00000001", "ABCDEF01") }]],
+  ["来源不符", [{ ...validAction, source_turn_id: "new-turn" }]], ["不是原问题", [{ ...validAction, question: "另一个问题" }]],
+  ["人工带类型", [{ ...validAction, kind: "handoff" }]], ["建单无类型", [{ ...validAction, ticket_type: null }]],
+  ["附加链接", [{ ...validAction, url: "https://example.com" }]], ["超长", [{ ...validAction, question: "字".repeat(4001) }]],
+]) {
+  test(`非法SSE动作${name}不得留下可执行建议`, async () => {
+    const seen = [];
+    await assert.rejects(streamChat({ sessionId: "old-session", message: "原问题", onDelta() {}, onAnswerMetadata: (value) => seen.push(value) },
+      async () => makeResponse(['data: {"delta":"回复"}\n\n' + metadataFrame({ ...completion, suggested_actions: suggested }) + "data: [DONE]\n\n"])), /建议|完成信息/);
+    assert.deepEqual(seen, []);
+  });
+}
+
+for (const ending of ["", 'event: error\ndata: {"error":"失败"}\n\n']) {
+  test(`有效动作后${ending ? "错误" : "断流"}不提前交付`, async () => {
+    const seen = [];
+    await assert.rejects(streamChat({ sessionId: "old-session", message: "原问题", onDelta() {}, onAnswerMetadata: (value) => seen.push(value) },
+      async () => makeResponse(['data: {"delta":"部分回复"}\n\n' + metadataFrame(completion) + ending])));
+    assert.deepEqual(seen, []);
+  });
+}
+
+test("收到同包正文时取消，后续完成帧也不能交付可执行建议", async () => {
+  const seen = [];
+  const controller = new AbortController();
+  await assert.rejects(streamChat({ sessionId: "old-session", message: "原问题", signal: controller.signal,
+    onDelta() { controller.abort(); }, onAnswerMetadata: (value) => seen.push(value) },
+    async () => makeResponse(['data: {"delta":"部分回复"}\n\n' + metadataFrame(completion) + "data: [DONE]\n\n"])), { name: "AbortError" });
+  assert.deepEqual(seen, []);
 });
