@@ -5,7 +5,9 @@ import json
 import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 from app.schemas.chat import ChatRequest
+from app.schemas.workflow import AgentDecision
 from tests.chat_fakes import make_chat_service as make_service
+from tests.chat_fakes import make_workflow_service
 
 
 def request(session_id="s"):
@@ -213,14 +215,14 @@ def owned_call(order_id="2003", call_id="c1"):
 
 async def test_order_not_owned_bypasses_model_and_uses_fixed_reply():
     """归属拒绝不得交给模型改写，且必须完成持久化后再 done。参数：无；返回：None；异常：断言失败。"""
-    service, repo, _, model = make_service(AIMessage(content="", tool_calls=[owned_call()]))
+    service, repo, _, model = make_workflow_service(decisions=[AgentDecision(kind="tools", tool_calls=[owned_call()])])
     events = [e async for e in service.stream_turn(request())]
     # 仍保留 running/succeeded 之外的失败状态徽章，随后是固定回复与完成帧。
     assert [e.event for e in events] == ["tool_status", "tool_status", "delta", "answer_metadata", "done"]
     assert events[1].data["status"] == "failed"
     assert events[2].data["delta"] == "没有找到您的这笔订单，请确认订单号或物流单号后重试。"
     # 只发生决策阶段调用，回答阶段被完全跳过。
-    assert [step for step, _ in model.inputs] == ["decide"]
+    assert [row["stage"] for row in model.inputs] == ["classify", "decide"]
     turn = next(iter(repo.turns.values()))
     assert turn.turn_status == "completed" and turn.messages[-1].content == events[2].data["delta"]
     stored = next(iter(repo.results.values()))
@@ -231,7 +233,7 @@ async def test_unknown_and_foreign_orders_produce_identical_reply():
     """未知订单与他人订单的回复必须逐字一致，不泄露存在性。参数：无；返回：None；异常：断言失败。"""
     replies = []
     for order_id in ("2003", "missing-order"):
-        service, _, _, _ = make_service(AIMessage(content="", tool_calls=[owned_call(order_id)]))
+        service, _, _, _ = make_workflow_service(decisions=[AgentDecision(kind="tools", tool_calls=[owned_call(order_id)])])
         events = [e async for e in service.stream_turn(request())]
         replies.append(events[2].data["delta"])
     assert replies[0] == replies[1]

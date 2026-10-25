@@ -9,6 +9,7 @@ from app.models.rag_quality import LowConfidenceQuestion
 from app.models.customer_service import Conversation, Message
 from app.schemas.history import StoredMessage, StoredTurn
 from app.schemas.tools import ToolContext, ToolResult
+from app.schemas.workflow import HistoryDelta, RetrievalLowConfidence, SuggestedAction
 
 
 def result_query(context: ToolContext):
@@ -85,6 +86,35 @@ class ChatRepository:
                                               tool_calls=row.tool_calls, tool_call_id=row.tool_call_id))
         return list(turns.values())
 
+    async def load_history_delta(self, conversation_id: int, after_message_id: int, *,
+                                 refresh_turn_id: str | None = None, exclude_turn_id: str | None = None) -> HistoryDelta:
+        """只按新主键定位轮次，再读取这些轮的完整消息；可刷新无新消息的中断终态。
+
+        参数：conversation_id可信会话；after_message_id非负游标；refresh_turn_id旧未完成轮；exclude_turn_id当前轮。
+        返回：HistoryDelta，完整受影响轮和单调游标；零游标只用于首次导入。
+        异常：ValueError，负游标；数据库读取错误透传。
+        """
+        if after_message_id < 0:
+            raise ValueError("历史游标不能为负")
+        async with self.factory() as session:
+            changed = (await session.execute(select(Message.id, Message.turn_id).where(
+                Message.conversation_id == conversation_id, Message.id > after_message_id).order_by(Message.id))).all()
+            last_id = max((row.id for row in changed), default=after_message_id)
+            affected = {row.turn_id for row in changed}
+            if refresh_turn_id:
+                affected.add(refresh_turn_id)
+            affected.discard(exclude_turn_id)
+            if not affected:
+                return HistoryDelta(turns=[], last_message_id=last_id)
+            rows = (await session.scalars(select(Message).where(Message.conversation_id == conversation_id,
+                Message.turn_id.in_(affected)).order_by(Message.id))).all()
+        turns: dict[str, StoredTurn] = {}
+        for row in rows:
+            turn = turns.setdefault(row.turn_id, StoredTurn(turn_id=row.turn_id, turn_status=row.turn_status))
+            turn.messages.append(StoredMessage(role=row.role, content=row.content or "",
+                                              tool_calls=row.tool_calls, tool_call_id=row.tool_call_id))
+        return HistoryDelta(turns=list(turns.values()), last_message_id=last_id)
+
     async def save_tool_calls(self, context: ToolContext, calls: list[dict]) -> None:
         """执行前保存模型原申请。参数：上下文和申请列表；返回：None；异常：数据库写入失败。"""
         async with self.factory.begin() as session:
@@ -116,19 +146,31 @@ class ChatRepository:
             return existing_result
         return result
 
-    async def finish_turn(self, context: ToolContext, content: str, *, low_confidence: SelfCheckFailure | None = None,
-                          citations: list[EvidenceCitation] | None = None) -> dict:
+    async def finish_turn(self, context: ToolContext, content: str, *,
+                          low_confidence: SelfCheckFailure | RetrievalLowConfidence | None = None,
+                          citations: list[EvidenceCitation] | None = None,
+                          suggested_actions: list[SuggestedAction] | None = None,
+                          workflow_metadata: dict | None = None) -> dict:
         """原子保存最终回复、完成状态及可选 useful=false 问题池记录。
 
-        参数：context 可信会话/轮次/原话；content 完整回复；low_confidence 只有自评不足可传；citations 模型证据全集。
+        参数：context可信身份/原话；content完整回复；low_confidence自评或检索弱证据；citations完整引用；
+            suggested_actions服务端建议快照；workflow_metadata本轮流程摘要，两者均可省略以保留旧调用。
         返回：dict，提交成功后的完成元数据；同轮一致结果重试幂等，不重复原话入池。
         异常：ValueError，正文过长/身份或原话不符；PersistenceUncertain，已完成结果不同；数据库错误。
         """
-        if low_confidence is not None and not content.endswith(FIXED_KNOWLEDGE_REFUSAL):
+        if isinstance(low_confidence, SelfCheckFailure) and not content.endswith(FIXED_KNOWLEDGE_REFUSAL):
             raise ValueError("自评不足入池必须与固定知识拒答一起保存")
+        if isinstance(low_confidence, RetrievalLowConfidence):
+            from app.workflow.routing import fixed_reply
+            if content != fixed_reply("fallback")["answer"]:
+                raise ValueError("检索弱证据入池必须与固定兜底一起保存")
+        elif low_confidence is not None and not isinstance(low_confidence, SelfCheckFailure):
+            raise ValueError("未知的低证据入口")
         if len(content.encode("utf-8")) > 65535:
             raise ValueError("回答正文过长，无法保存")
         citations = citations or []
+        actions = [action.model_dump(mode="json") for action in (suggested_actions or [])]
+        low_snapshot = low_confidence.model_dump(mode="json") if low_confidence else None
         async with self.factory.begin() as session:
             # 锁定同一轮最早用户消息，使并发完成互斥，无须给用户DDL增加turn_id字段。
             user = await session.scalar(select(Message).where(
@@ -150,12 +192,20 @@ class ChatRepository:
                 same = len(originals) == len(snapshots) and all(
                     all(snapshot.get(key) == value for key, value in original.items())
                     for original, snapshot in zip(originals, snapshots))
-                if existing is None or existing.content != content or not isinstance(saved, dict) or not same:
+                same_extra = isinstance(saved, dict) and saved.get("suggested_actions", []) == actions \
+                    and saved.get("workflow") == workflow_metadata and saved.get("low_confidence") == low_snapshot
+                if existing is None or existing.content != content or not same_extra or not same:
                     raise PersistenceUncertain("轮次已完成但结果不同，需核查")
                 return existing.rag_metadata
             if user.turn_status != "running":
                 raise PersistenceUncertain("轮次已结束，不能重新提交回复")
             metadata = answer_metadata(context, await self._complete_sources(session, citations))
+            if suggested_actions is not None:
+                metadata["suggested_actions"] = actions
+            if workflow_metadata is not None:
+                metadata["workflow"] = workflow_metadata
+            if low_snapshot is not None:
+                metadata["low_confidence"] = low_snapshot
             session.add(Message(conversation_id=context.conversation_id, turn_id=context.turn_id,
                                 role="assistant", content=content, turn_status="completed", rag_metadata=metadata))
             if low_confidence is not None:

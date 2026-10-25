@@ -1,13 +1,16 @@
-"""有界多工具聊天服务，负责会话互斥、顺序执行、事实回灌和最终流式回答。"""
+"""在线持久化工作流服务及显式旧章服务，负责会话互斥、增量历史对账和流资源清理。"""
 
 import asyncio
 import json
 import logging
-from contextlib import aclosing, suppress
+from time import perf_counter
+from typing import AsyncIterator
+from contextlib import aclosing, asynccontextmanager, suppress
 from dataclasses import dataclass
 from uuid import uuid4
 import anyio
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.callbacks import BaseCallbackHandler
 from app.core.memory import ContextBudgetExceeded, assemble_turns, prepare_messages, valid_tool_calls
 from app.core.prompts import ANSWER_NUDGE, ANSWER_SYSTEM, CUSTOMER_SERVICE_SYSTEM, TOOL_DECISION_SYSTEM
 from app.knowledge.answering import (
@@ -62,8 +65,8 @@ def fixed_reply(result: ToolResult) -> str | None:
     return FIXED_REJECTION_REPLIES.get(result.error.code)
 
 
-class ChatService:
-    """一个应用实例共享的聊天协调器；数据库事务不跨模型请求。"""
+class LegacyChatService:
+    """保留CH02–CH04独立验收的旧编排；生产默认入口使用显式注图的ChatService。"""
 
     def __init__(self, chat_repository, support_repository, model_adapter, registry, settings):
         """注入业务依赖。参数：存储、模型、注册表和配置；返回：None；异常：执行器配置错误。"""
@@ -328,7 +331,7 @@ class ChatService:
             raise ValueError("模型未返回有效文本")
         yield answer
 
-    async def stream_turn(self, request: ChatRequest):
+    async def stream_turn(self, request: ChatRequest) -> AsyncIterator[ChatEvent]:
         """处理一次提问。参数：已校验请求；返回：ChatEvent 异步流；异常：客户端取消向外传播。"""
         key = request.session_id
         if key in self._active:
@@ -435,3 +438,160 @@ class ChatService:
                 logger.warning("轮次终态保存失败 turn_id=%s type=%s", context.turn_id, type(error).__name__)
             finally:
                 self._active.discard(key)
+
+
+class ConversationBusy(RuntimeError):
+    """聊天或确认动作已占用会话；调用者可以立即返回忙状态，不排队执行。"""
+
+
+class ConversationGuard:
+    """单进程共享的非阻塞会话互斥，聊天与后续确认服务必须注入同一实例。"""
+
+    def __init__(self):
+        """建立占用集合。参数：无；返回：None；异常：无。"""
+        self._active: set[str] = set()
+
+    @asynccontextmanager
+    async def hold(self, session_id: str):
+        """立即获取并保证释放会话。参数：session_id会话键；返回：异步上下文；异常：ConversationBusy，已有占用。"""
+        # 检查和占用之间没有await；单worker事件循环内不存在抢占窗口。
+        if session_id in self._active:
+            raise ConversationBusy("当前会话正在处理")
+        self._active.add(session_id)
+        try:
+            yield
+        finally:
+            self._active.discard(session_id)
+
+
+class _WorkflowTrace(BaseCallbackHandler):
+    """仅记录语义节点的安全摘要，排除用户原话、工具参数及模型内部推理。"""
+
+    run_inline = True
+    _names = frozenset({"resolve_reference", "classify_intent", "retrieve_knowledge", "confidence_check",
+                       "main_agent", "complaint_reply", "chitchat_reply", "fallback_reply", "log_turn",
+                       "decision", "tools", "answer"})
+
+    def __init__(self):
+        """建立本轮回调计时。参数：无；返回：None；异常：无。"""
+        self.running = {}
+
+    def _record(self, phase, name, state, elapsed=0, error=None):
+        """输出允许字段。参数：阶段/节点/State/耗时/错误类型；返回：None；异常：日志错误由框架处理。"""
+        context = state.get("context", {})
+        gate = state.get("gate") or {}
+        logger.info("workflow node=%s phase=%s turn=%s thread=%s intent=%s gate=%s tools=%s step=%s "
+                    "budget=%s elapsed_ms=%.1f stop=%s error=%s", name, phase, context.get("turn_id"),
+                    context.get("session_id"), state.get("intent"),
+                    {key: gate.get(key) for key in ("passed", "max_score", "threshold")},
+                    [call.get("name") for call in state.get("pending_calls", [])], state.get("decision_count"),
+                    state.get("budget"), elapsed * 1000, state.get("stop_reason"), error)
+
+    def on_chain_start(self, serialized, inputs, *, run_id, **kwargs):
+        """记录语义节点进入。参数：框架回调和运行ID；返回：None；异常：无。"""
+        name = kwargs.get("name")
+        if name in self._names and isinstance(inputs, dict):
+            self.running[run_id] = (name, inputs, perf_counter())
+            self._record("enter", name, inputs)
+
+    def on_chain_end(self, outputs, *, run_id, **kwargs):
+        """合并节点增量后记录退出。参数：输出/运行ID；返回：None；异常：无。"""
+        item = self.running.pop(run_id, None)
+        if item:
+            name, state, started = item
+            self._record("exit", name, {**state, **(outputs if isinstance(outputs, dict) else {})}, perf_counter() - started)
+
+    def on_chain_error(self, error, *, run_id, **kwargs):
+        """只记录异常类型并结束计时。参数：error框架错误、run_id运行ID；返回：None；异常：无。"""
+        item = self.running.pop(run_id, None)
+        if item:
+            name, state, started = item
+            self._record("exit", name, state, perf_counter() - started, type(error).__name__)
+
+
+class ChatService:
+    """显式消费真实编译图的在线入口；完成事务和最终checkpoint均成功后才发布完成帧。"""
+
+    def __init__(self, chat_repository, graph, executor, settings, *, guard: ConversationGuard | None = None):
+        """注入共享资源。参数：仓储/编译图/已有执行器/配置及可选共享互斥；返回：None；异常：无。"""
+        self.chat, self.graph, self.executor, self.settings = chat_repository, graph, executor, settings
+        self.guard = guard if guard is not None else ConversationGuard()
+
+    async def _initial_state(self, context: ToolContext, config: dict):
+        """从checkpoint游标增量对账后创建完整新input，禁止恢复旧申请。
+
+        参数：context新轮可信身份；config只包含thread_id的图配置。
+        返回：ConversationState，合并后的历史及全部重置的本轮字段。
+        异常：数据库/SQLite读取失败；损坏历史校验错误。
+        """
+        from app.workflow.state import new_turn_state
+
+        previous = (await self.graph.aget_state(config)).values
+        old_context = previous.get("context", {})
+        refresh = old_context.get("turn_id") if not previous.get("completion_metadata") else None
+        delta = await self.chat.load_history_delta(context.conversation_id, previous.get("audit_cursor", 0),
+            refresh_turn_id=refresh, exclude_turn_id=context.turn_id)
+        merged = {turn["turn_id"]: turn for turn in previous.get("history_turns", [])}
+        for turn in delta.turns:
+            merged[turn.turn_id] = turn.model_dump(mode="json")
+        return new_turn_state(context, list(merged.values()), delta.last_message_id)
+
+    async def stream_turn(self, request: ChatRequest) -> AsyncIterator[ChatEvent]:
+        """消费带namespace的安全custom事件并拥有整轮图资源。
+
+        参数：request已校验的用户请求；返回：ChatEvent异步流，只有成功终态发布metadata/done。
+        异常：取消和GeneratorExit透传；其他错误转换成不包含敏感原文的error帧。
+        """
+        context = ToolContext(session_id=request.session_id, user_id=request.user_id,
+                              turn_id=str(uuid4()), user_message=request.message)
+        started, completed, terminal, stream = False, False, "cancelled", None
+        try:
+            async with self.guard.hold(request.session_id):
+                try:
+                    from app.workflow.prompts import INTENT_PROMPT
+                    prepare_messages([], [HumanMessage(content=request.message)], self.settings.token_budget,
+                        system_text=INTENT_PROMPT, request_max_tokens=self.settings.request_token_budget)
+                    context = await self.chat.start_turn(context, request.message)
+                    started = True
+                    config = {"configurable": {"thread_id": request.session_id}}
+                    state = await self._initial_state(context, config)
+                    stream = self.graph.astream(state, {**config, "callbacks": [_WorkflowTrace()]},
+                        stream_mode="custom", subgraphs=True, durability="sync")
+                    async for namespace, payload in stream:
+                        # 只有框架custom通道的两类公开事件可转发；内部JSON/工具参数不成为正文。
+                        if not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
+                            continue
+                        data = payload["data"]
+                        if payload.get("event") == "delta" and isinstance(data.get("delta"), str) and data["delta"]:
+                            yield ChatEvent(event="delta", data={"delta": data["delta"]})
+                        elif payload.get("event") == "tool_status":
+                            allowed = {key: data[key] for key in ("tool_call_id", "name", "status", "label", "is_mock") if key in data}
+                            yield ChatEvent(event="tool_status", data=allowed)
+                    final = await self.graph.aget_state(config)
+                    metadata = final.values.get("completion_metadata", {})
+                    if final.next or metadata.get("turn_id") != context.turn_id or metadata.get("status") != "completed":
+                        raise PersistenceUncertain("工作流最终状态尚未确认")
+                    completed = True
+                    yield ChatEvent(event="answer_metadata", data=metadata)
+                    yield ChatEvent(event="done")
+                except (asyncio.CancelledError, GeneratorExit):
+                    raise
+                except Exception as error:
+                    terminal = "failed"
+                    logger.warning("客服工作流失败 turn=%s thread=%s type=%s", context.turn_id,
+                                   context.session_id, type(error).__name__)
+                    yield ChatEvent(event="error", data={"error": LegacyChatService._error_message(error), "retry_safe": True})
+                finally:
+                    # 关闭图会取消其模型/工具任务；屏蔽ASGI取消域直到上游和短事务真正退出。
+                    with anyio.CancelScope(shield=True):
+                        try:
+                            if stream is not None:
+                                await stream.aclose()
+                        finally:
+                            if started and not completed:
+                                try:
+                                    await self.chat.mark_turn(context, terminal)
+                                except Exception as error:
+                                    logger.warning("轮次终态保存失败 turn=%s type=%s", context.turn_id, type(error).__name__)
+        except ConversationBusy:
+            yield ChatEvent(event="error", data={"error": "当前会话正在回复，请稍后再发", "retry_safe": True})

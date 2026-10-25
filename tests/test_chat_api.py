@@ -3,7 +3,8 @@
 import json
 import pytest
 from fastapi.testclient import TestClient
-from langchain_core.messages import AIMessage, HumanMessage
+from app.schemas.workflow import AgentDecision
+from app.workflow.model import WorkflowOutputError
 from app.main import app
 
 
@@ -29,11 +30,13 @@ def test_message_length_limit_is_validated_before_service(client, offline_chat_r
 def test_chat_sse_normal_multi_chunk_stream(client, offline_chat_runtime):
     """验证真实增量和完成帧，数据库完成在 done 之前。参数：客户端、依赖；返回：None；异常：断言失败。"""
     _, repo, _, model = offline_chat_runtime
-    model.chunks = ["您", "好", "！我是", "小喵。"]
-    response = send(client)
+    chunks = ["您", "好", "！我是", "小喵。"]
+    model.answers.clear()
+    model.answers.append(chunks)
+    response = send(client, "我的订单进度")
     assert response.status_code == 200 and "text/event-stream" in response.headers["content-type"]
     assert response.headers["cache-control"] == "no-cache" and response.headers["connection"] == "keep-alive"
-    for word in model.chunks:
+    for word in chunks:
         assert "data: " + json.dumps({"delta": word}, ensure_ascii=False) + "\n\n" in response.text
     assert response.text.endswith("data: [DONE]\n\n")
     turn = next(iter(repo.turns.values()))
@@ -42,7 +45,8 @@ def test_chat_sse_normal_multi_chunk_stream(client, offline_chat_runtime):
 
 def test_empty_deltas_filtered(client, offline_chat_runtime):
     """空增量不能进入 SSE。参数：客户端、依赖；返回：None；异常：断言失败。"""
-    offline_chat_runtime[-1].chunks = ["", "喵", "", "购"]
+    offline_chat_runtime[-1].answers.clear()
+    offline_chat_runtime[-1].answers.append(["", "喵", "", "购"])
     response = send(client)
     assert response.text.count('"delta"') == 2 and '"delta": ""' not in response.text
 
@@ -50,19 +54,23 @@ def test_empty_deltas_filtered(client, offline_chat_runtime):
 def test_second_request_contains_completed_history(client, offline_chat_runtime):
     """丢弃数据库历史会使第二次模型输入错误。参数：客户端、依赖；返回：None；异常：断言失败。"""
     model = offline_chat_runtime[-1]
-    model.chunks = ["你好，我是小喵"]
+    model.intents.append("订单")
+    model.decisions.append(AgentDecision(kind="answer"))
+    model.answers.clear()
+    model.answers.extend([["你好，我是小喵"], ["你是张三"]])
     send(client, "我是张三")
     send(client, "我是谁")
-    inputs = model.inputs[2][1]
-    assert [m.content for m in inputs[1:]] == ["我是张三", "你好，我是小喵", "我是谁"]
-    assert isinstance(inputs[1], HumanMessage)
+    inputs = [row for row in model.inputs if row["stage"] == "classify"][-1]["messages"]
+    assert inputs == [{"role": "user", "content": "我是张三"},
+                      {"role": "assistant", "content": "你好，我是小喵"}, {"role": "user", "content": "我是谁"}]
 
 
-@pytest.mark.parametrize("chunks", [[RuntimeError("SECRET")], ["部分", TimeoutError("SECRET")], [""]])
+@pytest.mark.parametrize("chunks", [[RuntimeError("SECRET")], ["部分", TimeoutError("SECRET")], [WorkflowOutputError("空正文")]])
 def test_error_has_no_done_and_preserves_failed_audit(client, offline_chat_runtime, chunks):
     """上游故障和空回复不得伪装成功。参数：客户端、依赖、分片；返回：None；异常：断言失败。"""
     _, repo, _, model = offline_chat_runtime
-    model.chunks = chunks
+    model.answers.clear()
+    model.answers.append(chunks)
     response = send(client)
     assert "event: error" in response.text and "[DONE]" not in response.text and "SECRET" not in response.text
     turn = next(iter(repo.turns.values()))
@@ -71,7 +79,8 @@ def test_error_has_no_done_and_preserves_failed_audit(client, offline_chat_runti
 
 def test_model_factory_failure_is_safe(client, offline_chat_runtime):
     """初始化错误也被编排捕获。参数：客户端、依赖；返回：None；异常：断言失败。"""
-    offline_chat_runtime[-1].decision = ValueError("SECRET")
+    offline_chat_runtime[-1].intents.clear()
+    offline_chat_runtime[-1].intents.append(ValueError("SECRET"))
     response = send(client)
     assert "event: error" in response.text and "SECRET" not in response.text
 
@@ -86,8 +95,8 @@ def test_oversized_current_message_is_not_dropped(client, offline_chat_runtime, 
 
 def test_tool_named_event_precedes_text_and_is_not_text(client, offline_chat_runtime):
     """工具状态必须独立于回答流。参数：客户端、依赖；返回：None；异常：断言失败。"""
-    offline_chat_runtime[-1].decision = AIMessage(content="", tool_calls=[
-        {"name": "query_logistics", "id": "c1", "args": {"tracking_no": "MOCK213502378238"}}])
+    offline_chat_runtime[-1].decisions.appendleft(AgentDecision(kind="tools", tool_calls=[
+        {"name": "query_logistics", "id": "c1", "args": {"tracking_no": "MOCK213502378238"}}]))
     response = send(client, "订单 1001 的物流到哪了")
     assert response.text.count("event: tool_status") == 2
     assert response.text.index("event: tool_status") < response.text.index('"delta"')
@@ -102,11 +111,13 @@ def test_dependent_tools_share_one_sse_reply(client, offline_chat_runtime):
     异常：断言失败。
     """
     _, repository, _, model = offline_chat_runtime
-    model.decisions = [
-        AIMessage(content="", tool_calls=[{"id": "order", "name": "query_order", "args": {"order_id": "1001"}}]),
-        AIMessage(content="", tool_calls=[{"id": "logistics", "name": "query_logistics",
-                                          "args": {"tracking_no": "MOCK213502378238"}}]),
-    ]
+    model.decisions.clear()
+    model.decisions.extend([
+        AgentDecision(kind="tools", tool_calls=[{"id": "order", "name": "query_order", "args": {"order_id": "1001"}}]),
+        AgentDecision(kind="tools", tool_calls=[{"id": "logistics", "name": "query_logistics",
+                                                 "args": {"tracking_no": "MOCK213502378238"}}]),
+        AgentDecision(kind="answer"),
+    ])
     response = send(client, "订单1001的物流到哪了")
     assert response.status_code == 200
     assert response.text.count("event: tool_status") == 4

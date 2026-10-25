@@ -44,3 +44,29 @@ def test_runtime_available_only_within_lifespan():
         assert client.get("/").status_code == 200
         assert hasattr(app.state, "chat_service")
     assert states == ["open", "closed"] and not hasattr(app.state, "chat_service")
+
+
+async def test_ch05_runtime_rejects_explicit_dense_before_opening_resources(monkeypatch, offline_settings):
+    """显式dense配置悄悄换检索器或继续启动时失败。参数：隔离配置/替换器；返回：None；异常：预期ValueError。"""
+    from app import main
+    offline_settings.knowledge_retrieval_mode = "dense"
+
+    def forbidden_database():
+        """配置拒绝前不应接数据库。参数：无；返回：无；异常：AssertionError。"""
+        raise AssertionError("不应创建数据库")
+
+    monkeypatch.setattr(main, "create_database", forbidden_database)
+    with pytest.raises(ValueError, match="hybrid"):
+        async with main.database_runtime():
+            pytest.fail("不应启动")
+
+
+async def test_workflow_file_failure_blocks_runtime_without_memory_fallback(tmp_path):
+    """checkpoint路径失败悄悄降级内存时失败。参数：tmp_path目录；返回：None；异常：预期OSError。"""
+    from app.workflow.runtime import workflow_runtime
+    from tests.workflow.graph_fakes import dependencies
+    invalid = tmp_path / "occupied"
+    invalid.write_text("文件不是目录", encoding="utf-8")
+    with pytest.raises(OSError):
+        async with workflow_runtime(dependencies(), invalid / "workflow.sqlite3"):
+            pytest.fail("不应启动")

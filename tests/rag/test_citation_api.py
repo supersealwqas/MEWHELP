@@ -6,25 +6,25 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.schemas.chat import ChatRequest
-from tests.chat_fakes import make_chat_service
+from tests.chat_fakes import make_workflow_service
 
 
 async def test_completed_greeting_has_metadata_after_commit():
     """普通问候也须先完成保存再发布可反馈标识。参数：无；返回：None；异常：断言错误。"""
-    service, repository, _, _ = make_chat_service(chunks=["您好"])
+    service, repository, _, _ = make_workflow_service(intents=["闲聊"])
     events = []
     async for event in service.stream_turn(ChatRequest(session_id="greeting", message="你好")):
         events.append(event)
         if event.event == "answer_metadata":
             assert repository.turns[event.data["turn_id"]].turn_status == "completed"
     assert [event.event for event in events][-2:] == ["answer_metadata", "done"]
-    assert events[-2].data == {"session_id": "greeting", "turn_id": repository.contexts[0].turn_id,
-                               "status": "completed", "citations": []}
+    assert events[-2].data["turn_id"] == repository.contexts[0].turn_id
+    assert events[-2].data["status"] == "completed" and events[-2].data["citations"] == []
 
 
 async def test_failed_commit_has_no_metadata_or_done():
     """保存失败的片段不能提供反馈或引用入口。参数：无；返回：None；异常：断言错误。"""
-    service, repository, _, _ = make_chat_service(chunks=["您好"])
+    service, repository, _, _ = make_workflow_service(intents=["闲聊"])
     repository.fail_finish = True
     events = [event async for event in service.stream_turn(ChatRequest(session_id="failed", message="你好"))]
     assert events[-1].event == "error"
@@ -33,13 +33,14 @@ async def test_failed_commit_has_no_metadata_or_done():
 
 async def test_all_model_evidence_is_persisted_before_metadata():
     """只引用第一条时也保存模型看到的完整证据快照。参数：无；返回：None；异常：断言错误。"""
-    from app.knowledge.answering import KnowledgeAnswer
-    from tests.rag.test_quality_answer import _service
-    service, repository, _ = _service(KnowledgeAnswer(useful=True, reason="", answer="答复[1]", citation_numbers=[1]))
+    from tests.workflow.graph_fakes import ranked
+    service, repository, _, _ = make_workflow_service(intents=["商品咨询"], answers=[["答复[1]"]],
+                                                    ranked=[ranked(number=1), ranked(number=2)])
     events = [event async for event in service.stream_turn(ChatRequest(session_id="cited", message="政策"))]
     assert events[-2].event == "answer_metadata"
     metadata = events[-2].data
     assert metadata["citations"][0]["answer"]
+    assert len(metadata["citations"]) == 2
     assert repository.metadata[metadata["turn_id"]] == metadata
 
 
@@ -59,7 +60,7 @@ def test_citation_routes_use_saved_scope_and_uniform_404():
     @asynccontextmanager
     async def runtime():
         """注入真实路由的数据库边界。参数：无；返回：服务；异常：无。"""
-        service, _, _, _ = make_chat_service()
+        service, _, _, _ = make_workflow_service()
         service.chat = Repository()
         yield service
 

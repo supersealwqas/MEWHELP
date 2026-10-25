@@ -1,12 +1,25 @@
 """原客服聊天入口的 SSE 编码层，业务编排和数据持久化由 ChatService 负责。"""
 
 import json
+import anyio
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 from app.schemas.chat import ChatRequest
 from app.services.chat import ChatService
 
 router = APIRouter(prefix="/api", tags=["chat"])
+
+
+class ClosingStreamingResponse(StreamingResponse):
+    """响应拥有正文迭代器，即使网络send失败也立即关闭服务和上游流。"""
+
+    async def __call__(self, scope, receive, send):
+        """发送后保证关闭。参数：ASGI请求/接收/发送；返回：None；异常：原网络或取消错误透传。"""
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            with anyio.CancelScope(shield=True):
+                await self.body_iterator.aclose()
 
 
 def get_chat_service(request: Request) -> ChatService:
@@ -32,5 +45,5 @@ async def chat(req: ChatRequest, service: ChatService = Depends(get_chat_service
                     yield prefix + "data: " + json.dumps(event.data, ensure_ascii=False) + "\n\n"
         finally:
             await stream.aclose()
-    return StreamingResponse(event_stream(), media_type="text/event-stream", headers={
+    return ClosingStreamingResponse(event_stream(), media_type="text/event-stream", headers={
         "Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})

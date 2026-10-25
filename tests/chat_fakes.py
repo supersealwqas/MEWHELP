@@ -16,6 +16,12 @@ class MemoryRepository:
         self.fail_finish = False
         self.low_confidence = []
         self.metadata = {}
+        self.message_ids, self.last_message_id = {}, 0
+
+    def _message_added(self, turn_id):
+        """分配单调审计主键。参数：turn_id新增消息的轮；返回：None；异常：无。"""
+        self.last_message_id += 1
+        self.message_ids.setdefault(turn_id, []).append(self.last_message_id)
 
     async def start_turn(self, context, message):
         """保存用户轮次。参数：上下文、原文；返回：带数字 ID 的上下文；异常：无。"""
@@ -23,15 +29,24 @@ class MemoryRepository:
         self.contexts.append(context)
         self.turns[context.turn_id] = StoredTurn(turn_id=context.turn_id, turn_status="running",
             messages=[StoredMessage(role="user", content=message)])
+        self._message_added(context.turn_id)
         return context
 
     async def load_turns(self, conversation_id, exclude_turn_id=None):
         """读取已存轮次。参数：会话和排除轮次；返回：历史列表；异常：无。"""
         return [t for key, t in self.turns.items() if key != exclude_turn_id]
 
+    async def load_history_delta(self, conversation_id, after_message_id, *, refresh_turn_id=None, exclude_turn_id=None):
+        """模拟按消息主键返回完整轮。参数：增量仓储契约；返回：HistoryDelta；异常：无。"""
+        from app.schemas.workflow import HistoryDelta
+        return HistoryDelta(turns=[turn.model_copy(deep=True) for key, turn in self.turns.items()
+            if key != exclude_turn_id and (key == refresh_turn_id or any(i > after_message_id for i in self.message_ids.get(key, [])))],
+            last_message_id=self.last_message_id)
+
     async def save_tool_calls(self, context, calls):
         """保存申请。参数：上下文、申请；返回：None；异常：无。"""
         self.turns[context.turn_id].messages.append(StoredMessage(role="assistant", content="", tool_calls=calls))
+        self._message_added(context.turn_id)
 
     async def get_tool_result(self, context):
         """读取事实。参数：调用上下文；返回：结果或空；异常：无。"""
@@ -44,21 +59,27 @@ class MemoryRepository:
             self.results[key] = result
             self.turns[context.turn_id].messages.append(StoredMessage(role="tool",
                 content=result.model_dump_json(), tool_call_id=context.tool_call_id))
+            self._message_added(context.turn_id)
         return self.results[key]
 
-    async def finish_turn(self, context, content, *, low_confidence=None, citations=None):
-        """模拟原子完成/入池。参数：上下文、回答、自评失败、全部引用；返回：元数据；异常：ConnectionError。"""
+    async def finish_turn(self, context, content, *, low_confidence=None, citations=None, suggested_actions=None, workflow_metadata=None):
+        """模拟原子完成/入池。参数：上下文、回答、失败、引用、建议、流程摘要；返回：元数据；异常：ConnectionError。"""
         from app.knowledge.sources import answer_metadata
         if self.fail_finish:
             raise ConnectionError("SECRET")
         if self.turns[context.turn_id].turn_status == "completed":
             return self.metadata[context.turn_id]
         self.turns[context.turn_id].messages.append(StoredMessage(role="assistant", content=content))
+        self._message_added(context.turn_id)
         if low_confidence is not None:
             self.low_confidence.append({"raw_question": context.user_message, "source": low_confidence.source,
                                         "reason": low_confidence.reason, "conversation_id": context.conversation_id})
         self.turns[context.turn_id].turn_status = "completed"
         self.metadata[context.turn_id] = answer_metadata(context, citations or [])
+        if suggested_actions is not None:
+            self.metadata[context.turn_id]["suggested_actions"] = [item.model_dump(mode="json") for item in suggested_actions]
+        if workflow_metadata is not None:
+            self.metadata[context.turn_id]["workflow"] = workflow_metadata
         return self.metadata[context.turn_id]
 
     async def mark_turn(self, context, status):
@@ -151,7 +172,7 @@ def make_chat_service(decision=None, chunks=None, *, decisions=None):
     返回：服务、会话仓库、客服仓库和模型替身。
     异常：服务或工具注册构造错误。
     """
-    from app.services.chat import ChatService
+    from app.services.chat import LegacyChatService
     from app.tools.registry import build_registry
 
     repository, support = MemoryRepository(), FAQRepository()
@@ -159,4 +180,31 @@ def make_chat_service(decision=None, chunks=None, *, decisions=None):
     config = SimpleNamespace(token_budget=12000, request_token_budget=16000,
                              tool_timeout_seconds=0.05, tool_max_retries=1,
                              tool_retry_delay_seconds=0, tool_max_calls_per_turn=4)
-    return ChatService(repository, support, model, build_registry(), config), repository, support, model
+    return LegacyChatService(repository, support, model, build_registry(), config), repository, support, model
+
+
+def make_workflow_service(*, intents=("订单",), decisions=None, answers=None, ranked=(), settings=None):
+    """构造真实新图和执行器，内存保存器仅用于离线单测。
+
+    参数：有限模型脚本、ranked检索结果、settings可选隔离配置。
+    返回：新服务、仓储、同一执行器的support、模型替身；异常：图/配置错误。
+    """
+    from langgraph.checkpoint.memory import InMemorySaver
+    from app.services.chat import ChatService
+    from app.schemas.workflow import AgentDecision
+    from app.tools.executor import ToolExecutor
+    from app.tools.registry import build_agent_registry
+    from app.workflow.graph import build_workflow
+    from tests.workflow.graph_fakes import dependencies
+
+    deps = dependencies(intents=intents, decisions=decisions if decisions is not None else [AgentDecision(kind="answer")],
+                        answers=answers if answers is not None else [["已", "查到"]], ranked=ranked)
+    if settings is not None:
+        deps.settings = settings
+    repository, support = MemoryRepository(), FAQRepository()
+    deps.chat = repository
+    deps.executor = ToolExecutor(build_agent_registry(), repository, support, deps.settings.tool_timeout_seconds,
+        deps.settings.tool_max_retries, deps.settings.tool_retry_delay_seconds)
+    graph = build_workflow(deps, checkpointer=InMemorySaver())
+    service = ChatService(repository, graph, deps.executor, deps.settings)
+    return service, repository, support, deps.model

@@ -22,7 +22,6 @@ from app.api.extract import router as extract_router
 from app.api.rageval import router as rageval_router
 from app.core.logging import setup_logging
 from app.config import settings
-from app.core.llm import ChatModelAdapter
 from app.db.session import create_database
 from app.knowledge.runtime import online_search_runtime
 from app.api.kb import router as kb_router
@@ -30,7 +29,11 @@ from app.knowledge.store import KnowledgeStore
 from app.repositories.chat import ChatRepository
 from app.repositories.support import SupportRepository
 from app.services.chat import ChatService
-from app.tools.registry import build_registry
+from app.tools.registry import build_agent_registry
+from app.tools.executor import ToolExecutor
+from app.workflow.graph import WorkflowDependencies
+from app.workflow.model import WorkflowModelAdapter
+from app.workflow.runtime import workflow_runtime
 
 # 在应用创建前初始化业务日志，确保所有模块的 logger 都使用统一格式输出。
 setup_logging()
@@ -116,6 +119,8 @@ async def database_runtime():
     异常:
         恢复/数据库/模型/向量/策略初始化失败均阻止启动。
     """
+    if settings.knowledge_retrieval_mode != "hybrid":
+        raise ValueError("CH05工作流要求knowledge_retrieval_mode=hybrid；dense仅适用于旧章独立入口")
     engine, factory = create_database()
     lease_engine = None
     try:
@@ -128,13 +133,13 @@ async def database_runtime():
         )
         store = KnowledgeStore(factory, lease_engine)
         async with online_search_runtime(settings, store) as search:
-            yield ChatService(
-                repository,
-                SupportRepository(factory, search),
-                ChatModelAdapter(),
-                build_registry(include_refund_policy=settings.knowledge_retrieval_mode == "hybrid"),
-                settings,
-            )
+            support = SupportRepository(factory, search)
+            executor = ToolExecutor(build_agent_registry(), repository, support, settings.tool_timeout_seconds,
+                settings.tool_max_retries, settings.tool_retry_delay_seconds,
+                knowledge_timeout_seconds=settings.knowledge_timeout_seconds)
+            deps = WorkflowDependencies(WorkflowModelAdapter(), search, executor, repository, settings)
+            async with workflow_runtime(deps, Path(settings.workflow_checkpoint_path)) as graph:
+                yield ChatService(repository, graph, executor, settings)
     finally:
         with anyio.CancelScope(shield=True):
             try:

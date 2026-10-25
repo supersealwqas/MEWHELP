@@ -21,7 +21,7 @@ from app.repositories.chat import ChatRepository
 from app.repositories.support import SupportRepository
 from app.schemas.chat import ChatRequest
 from app.schemas.tools import ToolResult
-from app.services.chat import ChatService
+from app.services.chat import ChatService, LegacyChatService
 from app.tools.registry import build_registry
 from tests.chat_fakes import ScriptedModel
 
@@ -66,11 +66,27 @@ async def isolated_multi_tool_mysql(request: pytest.FixtureRequest):
             # 只有确认本例标识不存在后才允许 finally 清理；不触发父目录的清库夹具。
             before = await _row_totals(session)
 
-        def build_service(decisions: list[AIMessage]) -> tuple[ChatService, ChatRepository, ScriptedModel]:
-            """构造真实服务和仓库。参数：decisions 脚本决策序列；返回：服务、聊天仓库及模型；异常：构造错误。"""
+        def build_service(decisions, *, workflow=False):
+            """构造真实服务和仓库。参数：decisions脚本，workflow显式新图入口；返回：服务/仓储/模型；异常：构造错误。"""
+            if workflow:
+                from langgraph.checkpoint.memory import InMemorySaver
+                from app.schemas.workflow import AgentDecision
+                from app.tools.executor import ToolExecutor
+                from app.tools.registry import build_agent_registry
+                from app.workflow.graph import WorkflowDependencies, build_workflow
+                from tests.workflow.fakes import ScriptedWorkflowModel
+                from tests.workflow.graph_fakes import StrictSearch
+                chat = ChatRepository(factory)
+                model = ScriptedWorkflowModel(intents=["物流"], decisions=[*decisions, AgentDecision(kind="answer")],
+                                              answers=[["已按工具结果处理。"]])
+                executor = ToolExecutor(build_agent_registry(), chat, SupportRepository(factory))
+                deps = WorkflowDependencies(model, StrictSearch(), executor, chat, config)
+                # 本例只验证业务MySQL配对；官方文件SQLite重开另由workflow专项与Task8覆盖。
+                graph = build_workflow(deps, checkpointer=InMemorySaver())
+                return ChatService(chat, graph, executor, config), chat, model
             model = ScriptedModel(decisions=decisions, chunks=["已按工具结果处理。"])
             chat = ChatRepository(factory)
-            service = ChatService(chat, SupportRepository(factory), model, build_registry(), config)
+            service = LegacyChatService(chat, SupportRepository(factory), model, build_registry(), config)
             return service, chat, model
 
         # 不把含连接及模型凭证的 Settings 直接交给 pytest，避免失败时展示配置详情。
@@ -122,11 +138,12 @@ async def _read_records(factory, session_id: str) -> tuple[Conversation, list[Me
 async def test_mysql_order_logistics_persist_and_restore_in_order(isolated_multi_tool_mysql):
     """多次决策必须落库两组完整工具事实。参数：isolated_multi_tool_mysql 隔离资源；返回：None；异常：断言失败。"""
     factory, session_id, build_service = isolated_multi_tool_mysql
+    from app.schemas.workflow import AgentDecision
     service, chat, model = build_service([
-        _decision({"id": "order", "name": "query_order", "args": {"order_id": "1001"}}),
+        AgentDecision(kind="tools", tool_calls=[{"id": "order", "name": "query_order", "args": {"order_id": "1001"}}]),
         # 本例模拟取用订单工具返回的当前单号；历史 MOCK 前缀兼容在专门用例中验证。
-        _decision({"id": "shipping", "name": "query_logistics", "args": {"tracking_no": "SF213502378238"}}),
-    ])
+        AgentDecision(kind="tools", tool_calls=[{"id": "shipping", "name": "query_logistics", "args": {"tracking_no": "SF213502378238"}}]),
+    ], workflow=True)
     events = [event async for event in service.stream_turn(
         ChatRequest(session_id=session_id, message="订单1001的物流到哪了")
     )]
@@ -144,10 +161,10 @@ async def test_mysql_order_logistics_persist_and_restore_in_order(isolated_multi
     assert shipping.data["latest_node"] == "包裹已到达杭州转运中心"
     assert rows[-1].content == "".join(event.data.get("delta", "") for event in events)
     # 审计载荷保留来源标记；模型输入仅去掉标记，全部订单业务事实必须完整保留。
-    order_messages = [message for message in model.inputs[1][1]
-                      if isinstance(message, ToolMessage) and message.tool_call_id == "order"]
+    order_messages = [message for message in model.inputs[2]["messages"]
+                      if message["role"] == "tool" and message["tool_call_id"] == "order"]
     assert len(order_messages) == 1
-    model_order = json.loads(order_messages[0].content)
+    model_order = json.loads(order_messages[0]["content"])
     assert set(model_order) == {"ok", "data", "error"}
     assert model_order["ok"] is True and model_order["error"] is None
     assert model_order["data"] == order.data and order.is_mock

@@ -1,0 +1,110 @@
+"""真实在线图入口、原子完成快照和低证据问题池的行为验证。"""
+
+import pytest
+from sqlalchemy import select
+
+from app.models.customer_service import Message
+from app.models.rag_quality import LowConfidenceQuestion
+from app.repositories.chat import PersistenceUncertain
+from app.schemas.tools import ToolContext
+from app.schemas.workflow import RetrievalLowConfidence, SuggestedAction
+from tests.workflow.service_fakes import collect, service_runtime
+
+
+async def test_real_graph_persists_suggestions_before_metadata_and_done(tmp_path):
+    """服务绕过图或提前发完成帧会失败。参数：tmp_path独占目录；返回：None；异常：断言失败。"""
+    async with service_runtime(tmp_path, intents=["投诉"]) as (service, deps, factory):
+        events = await collect(service, "  服务太差了  ")
+        assert [event.event for event in events][-2:] == ["answer_metadata", "done"]
+        metadata = events[-2].data
+        assert metadata["suggested_actions"][0]["source_turn_id"] == metadata["turn_id"]
+        assert metadata["suggested_actions"][1]["question"] == "  服务太差了  "
+        async with factory() as session:
+            rows = (await session.scalars(select(Message).order_by(Message.id))).all()
+        assert len(rows) == 2 and all(row.turn_status == "completed" for row in rows)
+        assert rows[-1].rag_metadata == metadata and metadata["workflow"]["intent"] == "投诉"
+        assert deps.executor.calls == []
+
+
+async def test_low_evidence_finish_retry_keeps_one_snapshot_and_one_raw_question(tmp_path):
+    """重复完成入池或新快照不同却接受重试会失败。参数：tmp_path目录；返回：None；异常：断言失败。"""
+    async with service_runtime(tmp_path, intents=["商品咨询"]) as (service, deps, factory):
+        events = await collect(service, "  这个到底能不能用？  ")
+        assert events[-1].event == "done"
+        snapshot = (await service.graph.aget_state({"configurable": {"thread_id": "s"}})).values
+        context = ToolContext.model_validate(snapshot["context"])
+        kwargs = {"low_confidence": RetrievalLowConfidence.model_validate(snapshot["gate"]["low_confidence"]),
+                  "suggested_actions": [SuggestedAction.model_validate(item) for item in snapshot["suggested_actions"]],
+                  "workflow_metadata": events[-2].data["workflow"]}
+        assert await deps.chat.finish_turn(context, snapshot["answer"], **kwargs) == events[-2].data
+        async with factory() as session:
+            rows = (await session.scalars(select(LowConfidenceQuestion))).all()
+            answers = (await session.scalars(select(Message).where(Message.role == "assistant"))).all()
+        assert len(rows) == len(answers) == 1
+        assert rows[0].source == "retrieval_low_conf" and rows[0].raw_question == context.user_message
+        from uuid import NAMESPACE_URL, uuid5
+        changed_action = SuggestedAction(action_id=str(uuid5(NAMESPACE_URL,
+            f"mewhelp:ch05:{context.conversation_id}:{context.turn_id}:handoff")), kind="handoff",
+            source_turn_id=context.turn_id, question=context.user_message, ticket_type=None)
+        with pytest.raises(PersistenceUncertain):
+            await deps.chat.finish_turn(context, snapshot["answer"], **{**kwargs, "suggested_actions": [changed_action]})
+        with pytest.raises(PersistenceUncertain):
+            await deps.chat.finish_turn(context, snapshot["answer"], **{**kwargs, "workflow_metadata": {"intent": "订单"}})
+        with pytest.raises(PersistenceUncertain):
+            await deps.chat.finish_turn(context, snapshot["answer"], **{**kwargs, "low_confidence": None})
+
+
+async def test_complete_snapshot_retry_compares_body_citations_and_suggestions(tmp_path):
+    """完成重试遗漏正文/完整引用/建议比对时失败。参数：tmp_path目录；返回：None；异常：断言失败。"""
+    from app.knowledge.answering import EvidenceCitation
+    from app.schemas.workflow import AgentDecision
+    from tests.workflow.graph_fakes import ranked
+    async with service_runtime(tmp_path, intents=["商品咨询"], ranked=[ranked()],
+            decisions=[AgentDecision(kind="answer", suggested_actions=["handoff"])], answers=[["答复[1]"]]) as (service, deps, _):
+        events = await collect(service, "政策")
+        assert events[-1].event == "done"
+        state = (await service.graph.aget_state({"configurable": {"thread_id": "s"}})).values
+        context = ToolContext.model_validate(state["context"])
+        citations = [EvidenceCitation.model_validate(item) for item in state["evidence"]]
+        actions = [SuggestedAction.model_validate(item) for item in state["suggested_actions"]]
+        kwargs = {"citations": citations, "suggested_actions": actions, "workflow_metadata": events[-2].data["workflow"]}
+        assert await deps.chat.finish_turn(context, "答复[1]", **kwargs) == events[-2].data
+        for content, override in [("另一个答复", {}), ("答复[1]", {"citations": []}),
+                                  ("答复[1]", {"suggested_actions": []}),
+                                  ("答复[1]", {"citations": [citations[0].model_copy(update={"answer": "被替换"})]})]:
+            with pytest.raises(PersistenceUncertain):
+                await deps.chat.finish_turn(context, content, **{**kwargs, **override})
+
+
+async def test_low_confidence_insert_failure_rolls_back_final_message_and_completed_status(tmp_path):
+    """入池失败仍提交回答或completed时失败。参数：tmp_path目录；返回：None；异常：断言失败。"""
+    from sqlalchemy import text
+    async with service_runtime(tmp_path, intents=["商品咨询"]) as (service, deps, factory):
+        async with factory.begin() as session:
+            await session.execute(text("CREATE TRIGGER reject_low_confidence BEFORE INSERT ON low_confidence_questions BEGIN SELECT RAISE(ABORT, 'test failure'); END"))
+        events = await collect(service, "原问")
+        assert events[-1].event == "error" and all(event.event not in {"answer_metadata", "done"} for event in events)
+        turns = await deps.chat.load_turns(1)
+        assert turns[0].turn_status == "failed" and len(turns[0].messages) == 1
+
+
+async def test_node_logs_keep_safe_summary_and_drop_internal_custom_payloads(tmp_path, caplog):
+    """缺语义节点日志或内部custom事件混入正文时失败。参数：tmp_path/caplog；返回：None；异常：断言失败。"""
+    from langgraph.config import get_stream_writer
+    async with service_runtime(tmp_path, intents=["闲聊"]) as (service, deps, _):
+        original = deps.model.classify
+
+        async def classify(messages, ledger):
+            """注入禁止公开的内部事件。参数：模型契约；返回：分类；异常：脚本错误。"""
+            get_stream_writer()({"event": "intent", "data": {"intent": "SECRET_JSON"}})
+            get_stream_writer()({"event": "answer_metadata", "data": {"secret": "SECRET_JSON"}})
+            return await original(messages, ledger)
+
+        deps.model.classify = classify
+        with caplog.at_level("INFO"):
+            events = await collect(service, "SECRET_RAW_原话")
+        assert events[-1].event == "done" and "SECRET_JSON" not in str(events)
+        assert "SECRET_RAW_原话" not in caplog.text
+        for node in ["resolve_reference", "classify_intent", "chitchat_reply", "log_turn"]:
+            assert f"node={node} phase=enter" in caplog.text and f"node={node} phase=exit" in caplog.text
+        assert "budget=" in caplog.text and "elapsed_ms=" in caplog.text and "thread=s" in caplog.text

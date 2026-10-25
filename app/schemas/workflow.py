@@ -3,9 +3,17 @@
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from app.schemas.history import StoredTurn
 
 Intent = Literal["物流", "订单", "商品咨询", "退款退货", "售后", "投诉", "闲聊"]
 ActionKind = Literal["handoff", "create_ticket"]
+
+
+class HistoryDelta(BaseModel):
+    """从消息游标定位的完整受影响轮次，终态刷新不要求产生新消息。"""
+
+    turns: list[StoredTurn] = Field(default_factory=list, description="按原消息顺序返回完整配对的受影响轮次")
+    last_message_id: int = Field(ge=0, description="本次已扫描消息的最大主键，不因排除当前轮倒退")
 
 
 class IntentResult(BaseModel):

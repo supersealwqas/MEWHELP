@@ -437,7 +437,7 @@ async def live_runtime(config):
     from app.knowledge.runtime import knowledge_storage, online_search_runtime
     from app.repositories.chat import ChatRepository
     from app.repositories.support import SupportRepository
-    from app.services.chat import ChatService
+    from app.services.chat import LegacyChatService
     from app.tools.registry import build_registry
 
     class RecordingModel(llm.ChatModelAdapter):
@@ -462,7 +462,7 @@ async def live_runtime(config):
     try:
         async with knowledge_storage(config) as store, online_search_runtime(config, store) as search:
             model = RecordingModel()
-            service = ChatService(ChatRepository(factory), SupportRepository(factory, search), model, build_registry(), config)
+            service = LegacyChatService(ChatRepository(factory), SupportRepository(factory, search), model, build_registry(), config)
             yield SimpleNamespace(service=service, factory=factory, model=model)
     finally:
         llm.settings = original

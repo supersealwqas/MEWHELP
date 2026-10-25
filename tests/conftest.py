@@ -97,11 +97,8 @@ def offline_chat_runtime(monkeypatch, request, offline_settings):
         yield None
         return
     from app import main
-    from app.services.chat import ChatService
-    from app.tools.registry import build_registry
-    from tests.chat_fakes import FAQRepository, MemoryRepository, ScriptedModel
-    repository, support, model = MemoryRepository(), FAQRepository(), ScriptedModel()
-    service = ChatService(repository, support, model, build_registry(), offline_settings)
+    from tests.chat_fakes import make_workflow_service
+    service, repository, support, model = make_workflow_service(settings=offline_settings)
 
     @asynccontextmanager
     async def runtime():

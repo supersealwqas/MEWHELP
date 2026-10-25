@@ -28,7 +28,7 @@ from app.models.knowledge import KnowledgeBase
 from app.repositories.chat import ChatRepository
 from app.repositories.support import SupportRepository
 from app.schemas.tools import KeywordArgs, ToolResult
-from app.services.chat import ChatService
+from app.services.chat import LegacyChatService
 from app.tools.registry import build_registry
 
 
@@ -146,7 +146,7 @@ async def live_runtime(config, policy):
         await index.ensure_ready(create=False)
         await encoder.encode(["知识库启动预热"])
         search = KnowledgeSearch(store, encoder, index, policy)
-        service = ChatService(repository, SupportRepository(factory, search), ChatModelAdapter(), build_registry(), config)
+        service = LegacyChatService(repository, SupportRepository(factory, search), ChatModelAdapter(), build_registry(), config)
         yield SimpleNamespace(service=service, factory=factory, store=store, encoder=encoder, index=index)
     finally:
         if encoder is not None:
