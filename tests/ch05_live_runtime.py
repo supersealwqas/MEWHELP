@@ -452,7 +452,8 @@ async def sample_turn(runtime, url: str, expected: dict, entry: dict, entries: l
         while entry["session_id"] in runtime.service.guard._active:
             await asyncio.sleep(.05)
     data = await register_children(runtime.factory, entry, entries, report_dir)
-    state = (await runtime.service.graph.aget_state({"configurable": {"thread_id": entry["session_id"]}})).values
+    from app.workflow.state import checkpoint_thread_id
+    state = (await runtime.service.graph.aget_state({"configurable": {"thread_id": checkpoint_thread_id(entry["id"])}})).values
     turn_id = entry["turn_ids"][-1] if entry["turn_ids"] else None
     messages = [item for item in data["messages"] if item["turn_id"] == turn_id]
     models = json.loads(json.dumps([model for model in runtime.models if model["turn_id"] == turn_id], ensure_ascii=False))

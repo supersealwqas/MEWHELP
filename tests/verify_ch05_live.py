@@ -136,6 +136,7 @@ async def child_restart(args) -> int:
     """新进程读取旧SQLite并真实续问，再重试原票。参数：受父锁保护的请求路径；返回：退出码；异常：资源错误。"""
     import httpx
     from app.db.session import create_database
+    from app.workflow.state import checkpoint_thread_id
     from tests.ch03_live_runtime import tcp_server
     config = build_config(args, resume=True)
     payload = json.loads(args.restart_request.read_text(encoding="utf-8"))
@@ -146,7 +147,7 @@ async def child_restart(args) -> int:
     try:
         await guard_database(factory, payload["owner"], entries)
         async with live_runtime(config, factory, entries, args.report_dir) as runtime, tcp_server(runtime) as url:
-            previous = (await runtime.service.graph.aget_state({"configurable": {"thread_id": entry["session_id"]}})).values
+            previous = (await runtime.service.graph.aget_state({"configurable": {"thread_id": checkpoint_thread_id(entry["id"])}})).values
             result["persisted_prior_turn"] = previous.get("context", {}).get("turn_id")
             if result["persisted_prior_turn"] != payload["prior_turn_id"]:
                 result["failures"].append("sqlite_previous_turn_missing")

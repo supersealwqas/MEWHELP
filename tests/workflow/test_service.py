@@ -31,7 +31,7 @@ async def test_low_evidence_finish_retry_keeps_one_snapshot_and_one_raw_question
     async with service_runtime(tmp_path, intents=["商品咨询"]) as (service, deps, factory):
         events = await collect(service, "  这个到底能不能用？  ")
         assert events[-1].event == "done"
-        snapshot = (await service.graph.aget_state({"configurable": {"thread_id": "s"}})).values
+        snapshot = (await service.graph.aget_state({"configurable": {"thread_id": "mewhelp:ch05:1"}})).values
         context = ToolContext.model_validate(snapshot["context"])
         kwargs = {"low_confidence": RetrievalLowConfidence.model_validate(snapshot["gate"]["low_confidence"]),
                   "suggested_actions": [SuggestedAction.model_validate(item) for item in snapshot["suggested_actions"]],
@@ -65,7 +65,7 @@ async def test_complete_snapshot_retry_compares_body_citations_and_suggestions(t
             decisions=[AgentDecision(kind="answer", suggested_actions=["handoff"])], answers=[["答复[1]"]]) as (service, deps, _):
         events = await collect(service, "政策")
         assert events[-1].event == "done"
-        state = (await service.graph.aget_state({"configurable": {"thread_id": "s"}})).values
+        state = (await service.graph.aget_state({"configurable": {"thread_id": "mewhelp:ch05:1"}})).values
         context = ToolContext.model_validate(state["context"])
         citations = [EvidenceCitation.model_validate(item) for item in state["evidence"]]
         actions = [SuggestedAction.model_validate(item) for item in state["suggested_actions"]]
@@ -124,4 +124,4 @@ async def test_node_logs_keep_safe_summary_and_drop_internal_custom_payloads(tmp
         assert "SECRET_RAW_原话" not in caplog.text
         for node in ["resolve_reference", "classify_intent", "chitchat_reply", "log_turn"]:
             assert f"node={node} phase=enter" in caplog.text and f"node={node} phase=exit" in caplog.text
-        assert "budget=" in caplog.text and "elapsed_ms=" in caplog.text and "thread=s" in caplog.text
+        assert "budget=" in caplog.text and "elapsed_ms=" in caplog.text and "thread=mewhelp:ch05:1" in caplog.text

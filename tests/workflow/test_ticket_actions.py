@@ -149,6 +149,49 @@ async def test_shared_chat_guard_and_double_click_return_busy_then_same_receipt(
         assert repeated.json() == next(item.json() for item in pair if item.status_code == 200)
 
 
+@pytest.mark.parametrize("session_id", ["s ", " s", "\ts \n"])
+async def test_confirmation_normalizes_identity_while_real_chat_is_active(tmp_path, monkeypatch, session_id):
+    """确认身份空白绕过正在运行的聊天锁时失败。参数：tmp_path目录、monkeypatch等待注入、session_id等价身份；返回：None；异常：断言失败。"""
+    async with action_runtime(tmp_path, intents=["闲聊"]) as (chat, _, client, factory):
+        body = await saved_suggestion(chat.chat)
+        entered, release = asyncio.Event(), asyncio.Event()
+        original = chat.chat.finish_turn
+
+        async def waiting_finish(*args, **kwargs):
+            """仅在真实事务开始前等待，避免SQLite写锁干扰互斥断言。参数：完成事务参数；返回：真实元数据；异常：数据库错误。"""
+            entered.set()
+            await release.wait()
+            return await original(*args, **kwargs)
+
+        monkeypatch.setattr(chat.chat, "finish_turn", waiting_finish)
+        task = asyncio.create_task(collect(chat, "你好", session=" s "))
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            before = await records(factory)
+            response = await client.post("/api/actions/tickets", json={**body, "session_id": session_id, "user_id": " demo-user "})
+            after = await records(factory)
+            assert response.status_code == 409
+            assert [row.id for row in after[1]] == [row.id for row in before[1]]
+            assert after[2] == []
+        finally:
+            release.set()
+            assert (await task)[-1].event == "done"
+        receipt = await client.post("/api/actions/tickets", json={**body, "session_id": session_id, "user_id": " demo-user "})
+        assert receipt.status_code == 200
+        assert (await records(factory))[2][0].description == "  旧订单未收到  "
+
+
+@pytest.mark.parametrize("field", ["session_id", "user_id"])
+async def test_confirmation_rejects_blank_identity_without_writing(tmp_path, field):
+    """纯空白身份进入确认流程时失败。参数：tmp_path独占目录、field身份字段；返回：None；异常：断言失败。"""
+    async with action_runtime(tmp_path) as (chat, _, client, factory):
+        body = await saved_suggestion(chat.chat)
+        response = await client.post("/api/actions/tickets", json={**body, field: " \t "})
+        assert response.status_code == 422
+        _, rows, tickets = await records(factory)
+        assert len(rows) == 2 and tickets == []
+
+
 @pytest.mark.parametrize("terminal", ["cancelled", "failed"])
 async def test_committed_ticket_failed_audit_returns_real_receipt_then_repairs(tmp_path, monkeypatch, terminal):
     """提交后收尾失败被误报没建成、恢复改源轮或多回执时失败。参数：tmp_path/monkeypatch/terminal中断终态；返回：None；异常：断言失败。"""

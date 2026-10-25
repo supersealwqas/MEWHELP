@@ -104,6 +104,15 @@ class TicketConfirmation(BaseModel):
     action_id: str = Field(min_length=36, max_length=36, description="已保存的服务端建议UUIDv5")
     confirmed: Literal[True] = Field(description="用户明确确认，只接受JSON布尔true")
 
+    @field_validator("session_id", "user_id")
+    @classmethod
+    def normalize_identity(cls, value: str) -> str:
+        """与聊天入口统一身份键。参数：value通过类型/长度校验的身份；返回：去首尾空白的标识；异常：ValueError，纯空白身份。"""
+        # 必须在取得共享互斥之前规范化；仅处理身份，不修改来源问题或工单描述。
+        if not value.strip():
+            raise ValueError("会话和用户标识不能为空或纯空白字符")
+        return value.strip()
+
     @field_validator("confirmed", mode="before")
     @classmethod
     def require_real_boolean(cls, value):

@@ -21,6 +21,7 @@ from app.repositories.chat import PersistenceUncertain
 from app.schemas.chat import ChatEvent, ChatRequest, InvalidToolDecision
 from app.schemas.tools import ToolContext, ToolResult
 from app.tools.executor import ToolExecutor
+from app.workflow.state import checkpoint_thread_id
 
 logger = logging.getLogger(__name__)
 
@@ -482,7 +483,7 @@ class _WorkflowTrace(BaseCallbackHandler):
         gate = state.get("gate") or {}
         logger.info("workflow node=%s phase=%s turn=%s thread=%s intent=%s gate=%s tools=%s step=%s "
                     "budget=%s elapsed_ms=%.1f stop=%s error=%s", name, phase, context.get("turn_id"),
-                    context.get("session_id"), state.get("intent"),
+                    checkpoint_thread_id(context.get("conversation_id")), state.get("intent"),
                     {key: gate.get(key) for key in ("passed", "max_score", "threshold")},
                     [call.get("name") for call in state.get("pending_calls", [])], state.get("decision_count"),
                     state.get("budget"), elapsed * 1000, state.get("stop_reason"), error)
@@ -551,7 +552,7 @@ class ChatService:
                     await task
 
     async def _initial_state(self, context: ToolContext, config: dict):
-        """从checkpoint游标增量对账后创建完整新input，禁止恢复旧申请。
+        """先核验checkpoint身份，再增量对账并创建完整新input，禁止恢复旧申请。
 
         参数：context新轮可信身份；config只包含thread_id的图配置。
         返回：ConversationState，合并后的历史及全部重置的本轮字段。
@@ -560,7 +561,15 @@ class ChatService:
         from app.workflow.state import new_turn_state
 
         previous = (await self.graph.aget_state(config)).values
-        old_context = previous.get("context", {})
+        old_context = previous.get("context")
+        if not isinstance(old_context, dict) or any(
+            old_context.get(key) != getattr(context, key) for key in ("conversation_id", "session_id", "user_id")
+        ):
+            # SQLite可独立于MySQL保留；身份缺失或变化时，不导入旧内容、游标或未完成轮。
+            if previous:
+                logger.warning("工作流checkpoint身份不符，重新读取可信历史 thread=%s",
+                               config["configurable"]["thread_id"])
+            previous, old_context = {}, {}
         refresh = old_context.get("turn_id") if not previous.get("completion_metadata") else None
         delta = await self.chat.load_history_delta(context.conversation_id, previous.get("audit_cursor", 0),
             refresh_turn_id=refresh, exclude_turn_id=context.turn_id)
@@ -586,7 +595,7 @@ class ChatService:
                         system_text=INTENT_PROMPT, request_max_tokens=self.settings.request_token_budget)
                     context = await self.chat.start_turn(context, request.message)
                     started = True
-                    config = {"configurable": {"thread_id": request.session_id}}
+                    config = {"configurable": {"thread_id": checkpoint_thread_id(context.conversation_id)}}
                     state = await self._initial_state(context, config)
                     stream = self._stream_workflow(state, {**config, "callbacks": [_WorkflowTrace()]})
                     async for namespace, payload in stream:
@@ -611,7 +620,7 @@ class ChatService:
                 except Exception as error:
                     terminal = "failed"
                     logger.warning("客服工作流失败 turn=%s thread=%s type=%s", context.turn_id,
-                                   context.session_id, type(error).__name__)
+                                   checkpoint_thread_id(context.conversation_id), type(error).__name__)
                     yield ChatEvent(event="error", data={"error": LegacyChatService._error_message(error), "retry_safe": True})
                 finally:
                     # 关闭图会取消其模型/工具任务；屏蔽ASGI取消域直到上游和短事务真正退出。

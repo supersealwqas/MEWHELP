@@ -8,6 +8,11 @@ from app.schemas.tools import ToolContext
 from app.schemas.workflow import ActionKind, Intent
 
 
+def checkpoint_thread_id(conversation_id: int) -> str:
+    """由可信会话主键派生CH05持久化键。参数：conversation_id经仓储核验归属的MySQL主键；返回：命名空间线程键；异常：无。"""
+    return f"mewhelp:ch05:{conversation_id}"
+
+
 class ConversationState(TypedDict, total=False):
     """根图与Agent共用的纯数据；字段整体替换，不使用累加reducer或保存运行依赖。"""
 
