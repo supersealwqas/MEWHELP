@@ -8,13 +8,16 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Annotated
+from typing import Annotated, TYPE_CHECKING
 
 import anyio
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.knowledge.schemas import KnowledgeUnavailable
+
+if TYPE_CHECKING:
+    from app.core.model_budget import BudgetLedger
 
 QUERY_REWRITE_RULES = """你是单轮检索查询归一器，不回答问题。输入JSON只包含当前query和可选keyword。
 query是用户本轮原话，keyword仅是本轮检索提示，不得用它覆盖或改变原意。不要读取或推测历史对象。
@@ -83,12 +86,13 @@ class QueryRewriter:
             raise ValueError("改写请求预算必须为正整数")
         self.model_factory, self.request_budget = model_factory, request_budget
 
-    async def rewrite(self, query: str, *, keyword: str | None = None) -> QueryRewrite:
+    async def rewrite(self, query: str, *, keyword: str | None = None,
+                      budget: BudgetLedger | None = None) -> QueryRewrite:
         """归一本轮输入并严格校验，错误不回退到另一检索。
 
-        参数：query 1–2000字符原问；keyword 可选1–100字符本轮检索提示。
+        参数：query 1–2000字符原问；keyword 可选1–100字符本轮检索提示；budget 请求独占可选账本。
         返回：QueryRewrite，最多四同义词。
-        异常：QueryRewriteError，输入/预算/网络/协议失败；取消原样传播且关闭上游流。
+        异常：QueryRewriteError，输入/网络/协议失败；WorkflowBudgetExceeded，工作流额度不足；取消原样传播且关闭上游流。
         """
         if not isinstance(query, str) or not query.strip() or len(query) > 2000:
             raise QueryRewriteError("原问必须为1–2000字符")
@@ -100,14 +104,25 @@ class QueryRewriter:
 
         messages = [SystemMessage(content=QUERY_REWRITE_RULES),
                     HumanMessage(content=json.dumps({"query": query, "keyword": keyword}, ensure_ascii=False))]
-        if _estimate_message_tokens(messages) > self.request_budget:
+        input_units = _estimate_message_tokens(messages)
+        if input_units > self.request_budget:
             raise QueryRewriteError("单轮改写请求超预算，请缩小问题范围")
+        if budget is not None:
+            # 先占额再接触模型；工作流预算错误不包装为知识模型故障。
+            budget.reserve("rewrite", input_units, 2048)
         try:
-            model = (self.model_factory or get_chat_model)(streaming=True, temperature=0.0, max_tokens=2048)
+            options = {}
+            if budget is not None:
+                from app.config import settings
+                options["stream_usage"] = settings.workflow_stream_usage
+            model = (self.model_factory or get_chat_model)(streaming=True, temperature=0.0, max_tokens=2048,
+                                                           max_retries=1, **options)
             parts, size = [], 0
+            gathered = None
             stream = model.astream(messages)
             try:
                 async for chunk in stream:
+                    gathered = chunk if gathered is None else gathered + chunk
                     if chunk.tool_calls or chunk.invalid_tool_calls or getattr(chunk, "tool_call_chunks", None):
                         raise QueryRewriteError("查询改写不能申请工具")
                     content = chunk.content if isinstance(chunk.content, str) else "".join(
@@ -119,8 +134,13 @@ class QueryRewriter:
                         raise QueryRewriteError("单轮改写输出超过长度上限")
                     parts.append(content)
             finally:
+                if budget is not None:
+                    budget.record_usage("rewrite", gathered.usage_metadata if gathered is not None else None,
+                        gathered.response_metadata.get("finish_reason") if gathered is not None else None)
                 with anyio.CancelScope(shield=True):
                     await stream.aclose()
+            if gathered is not None and gathered.response_metadata.get("finish_reason") == "length":
+                raise QueryRewriteError("查询改写输出被截断")
             payload = json.loads("".join(parts), object_pairs_hook=_unique_object, parse_constant=_reject_constant)
             result = QueryRewrite.model_validate(payload)
             validate_rewrite(query, result)

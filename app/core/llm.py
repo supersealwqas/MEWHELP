@@ -20,6 +20,44 @@ from app.knowledge.answering import KnowledgeAnswer, KnowledgeAnswerError
 from app.schemas.chat import InvalidToolDecision
 
 
+def strict_json_object(raw: str) -> dict:
+    """严格解析完整 JSON 对象，不补全坏参数。参数：raw 原始字符串；返回：dict；异常：ValueError/TypeError，重复键或非有限数值。"""
+    def unique(pairs):
+        """拒绝重复键。参数：pairs 键值列表；返回：dict；异常：ValueError。"""
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("JSON 重复键")
+            result[key] = value
+        return result
+
+    def reject(value):
+        """拒绝非有限常量。参数：value 原数值；返回：不返回；异常：ValueError。"""
+        raise ValueError("JSON 非有限数值")
+
+    result = json.loads(raw, object_pairs_hook=unique, parse_constant=reject)
+    if not isinstance(result, dict):
+        raise ValueError("JSON 必须是对象")
+    # parse_constant 不处理指数溢出；复核整棵树防止深层 inf 漏过。
+    json.dumps(result, allow_nan=False)
+    return result
+
+
+def decision_message(gathered: AIMessageChunk) -> AIMessage:
+    """将已聚合分片转成保留计量的严格消息。参数：gathered 完整分片；返回：AIMessage；异常：InvalidToolDecision，参数损坏。"""
+    metadata = {"usage_metadata": gathered.usage_metadata, "response_metadata": gathered.response_metadata}
+    if isinstance(gathered, AIMessageChunk) and gathered.tool_call_chunks:
+        try:
+            calls = [{"name": chunk.get("name"), "id": chunk.get("id"),
+                      "args": strict_json_object(chunk.get("args") or "")}
+                     for chunk in gathered.tool_call_chunks]
+            return AIMessage(content=gathered.content, tool_calls=calls, **metadata)
+        except (ValueError, TypeError, ValidationError) as error:
+            raise InvalidToolDecision(tool_call_chunks=gathered.tool_call_chunks) from error
+    return AIMessage(content=gathered.content, tool_calls=gathered.tool_calls,
+                     invalid_tool_calls=gathered.invalid_tool_calls, **metadata)
+
+
 def get_chat_model(
     streaming: bool = False,
     model: str | None = None,
@@ -81,24 +119,7 @@ class ChatModelAdapter:
                 await stream.aclose()
         if gathered is None:
             raise ValueError("模型未返回决策")
-        # LangChain 的分片解析允许自动补全 JSON；业务执行前必须严格解析原始全文。
-        if isinstance(gathered, AIMessageChunk) and gathered.tool_call_chunks:
-            try:
-                calls = []
-                for chunk in gathered.tool_call_chunks:
-                    args = json.loads(chunk.get("args") or "")
-                    if not isinstance(args, dict):
-                        raise ValueError("工具参数必须是对象")
-                    # Python 容许 NaN/Infinity，指数也可能溢出成 inf；MySQL JSON 不接受这些值。
-                    # 在落库前严格校验整棵参数树，失败时保留原始字符串审计而非写入坏 JSON。
-                    json.dumps(args, allow_nan=False)
-                    calls.append({"name": chunk.get("name"), "id": chunk.get("id"), "args": args})
-                return AIMessage(content="", tool_calls=calls)
-            except (ValueError, TypeError, ValidationError) as error:
-                # 空参数与坏 JSON 不能修补成合法申请；保留原文供服务保存，日志只记安全异常类型。
-                raise InvalidToolDecision(tool_call_chunks=gathered.tool_call_chunks) from error
-        return AIMessage(content=gathered.content, tool_calls=gathered.tool_calls,
-                         invalid_tool_calls=gathered.invalid_tool_calls)
+        return decision_message(gathered)
 
     async def answer_knowledge(self, messages) -> KnowledgeAnswer:
         """有界聚合知识答案 JSON，严格校验 useful，不依赖网关 json_schema 支持。

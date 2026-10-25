@@ -51,6 +51,12 @@ class Settings(BaseSettings):
         gt=0,
         description="完整输入估算预算，包含系统提示、对话和本阶段工具定义，不含模型输出，并非真实上下文窗口",
     )
+    workflow_checkpoint_path: str = Field(default=".data/checkpoints/ch05.sqlite3", min_length=1,
+                                          description="CH05 单实例工作流 SQLite checkpoint 文件路径")
+    workflow_max_decisions: int = Field(default=5, ge=1, le=5, description="每轮最多内部决策次数")
+    workflow_max_model_calls: int = Field(default=9, ge=1, le=9, description="每轮逻辑模型请求总上限，含一次空正文补救")
+    workflow_total_token_budget: int = Field(default=240000, gt=0, description="每轮含 SDK 重试预留的保守估算总额，不是精确 Token 账单")
+    workflow_stream_usage: bool = Field(default=False, description="显式请求兼容网关流式用量；缺失用量仍记未知")
 
     # 本章 MySQL 持久化及工具的有限执行配置。
     mysql_host: str = Field(default="127.0.0.1", description="MySQL 主机地址")
