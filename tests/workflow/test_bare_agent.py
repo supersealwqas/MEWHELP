@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -219,6 +220,81 @@ async def test_incomplete_or_ambiguous_protocol_never_executes(bare_runtime, res
     result = await run(bare_runtime)
     assert result.stop_reason == reason and result.tool_names == []
     assert len(bare_runtime.requests) == 1
+
+
+@pytest.mark.parametrize("missing_field", ["function", "name", "arguments"])
+async def test_missing_tool_structure_returns_protocol_error_with_diagnostic(bare_runtime, missing_field):
+    """SDK 宽松接受缺字段后被误当资源故障时失败。
+
+    参数：bare_runtime 真实 SDK 与执行器夹具；missing_field 本次删除的申请字段。
+    返回：None。
+    异常：断言失败，或未被产品正确分类的异常。
+    """
+    rt = bare_runtime
+    malformed = tool_call("query_order", {"order_id": "1001"})
+    if missing_field == "function":
+        del malformed[missing_field]
+    else:
+        del malformed["function"][missing_field]
+    rt.responses.append(completion(calls=[malformed]))
+    result = await run(rt)
+    assert result.stop_reason == "protocol_error" and result.tool_names == []
+    assert result.steps == 1 and rt.repository.results == {}
+    diagnostic = rt.repository.turns[rt.context.turn_id].messages[-1].tool_calls
+    assert diagnostic == [{"type": "invalid_tool_decision", "raw_tool_calls": [malformed]}]
+
+
+async def test_cli_missing_function_is_protocol_exit_two(bare_runtime, monkeypatch, capsys):
+    """缺字段响应误返回资源失败退出码 3 时失败，循环和 SDK 保持真实。
+
+    参数：bare_runtime 外部边界夹具；monkeypatch 替换数据库/客户端构造；capsys 捕获 CLI 输出。
+    返回：None。
+    异常：断言失败。
+    """
+    import openai
+    from app import config
+    from app.db import session
+    from app.repositories import chat
+    from examples.ch05_bare_agent import build_parser, run_cli
+
+    async def scalar(statement):
+        """替代测试库身份查询。参数：statement SQL；返回：str 测试库名；异常：无。"""
+        return "mewhelp_test"
+
+    @asynccontextmanager
+    async def connect():
+        """替代数据库连接边界。参数：无；返回：异步连接上下文；异常：无。"""
+        yield SimpleNamespace(scalar=scalar)
+
+    async def dispose():
+        """释放无外部资源的连接替身。参数：无；返回：None；异常：无。"""
+
+    def database(settings, *, database):
+        """提供隔离数据库边界。参数：settings 配置、database 目标库；返回：引擎与工厂；异常：无。"""
+        return SimpleNamespace(connect=connect, dispose=dispose), None
+
+    def repository(factory):
+        """复用既有内存仓储。参数：factory 会话工厂；返回：MemoryRepository；异常：无。"""
+        return bare_runtime.repository
+
+    def client(**options):
+        """复用真实 SDK。参数：options CLI 构造选项；返回：AsyncOpenAI；异常：无。"""
+        return bare_runtime.client
+
+    def settings(**options):
+        """提供已有离线配置。参数：options 环境选项；返回：Settings；异常：无。"""
+        return config.settings
+
+    monkeypatch.setattr(config, "Settings", settings)
+    monkeypatch.setattr(session, "create_database", database)
+    monkeypatch.setattr(chat, "ChatRepository", repository)
+    monkeypatch.setattr(openai, "AsyncOpenAI", client)
+    bare_runtime.responses.append(completion(calls=[{"id": "missing-function", "type": "function"}]))
+    code = await run_cli(build_parser().parse_args(["--test", "--question", "查订单 1001"]))
+    output = json.loads(capsys.readouterr().out)
+    assert code == 2 and output["stop_reason"] == "protocol_error" and output["tool_names"] == []
+    turn = bare_runtime.repository.turns[bare_runtime.repository.contexts[-1].turn_id]
+    assert turn.turn_status == "failed" and turn.messages[-1].tool_calls[0]["type"] == "invalid_tool_decision"
 
 
 def test_cli_requires_explicit_resource_mode_without_loading_credentials():

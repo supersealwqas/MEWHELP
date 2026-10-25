@@ -135,10 +135,14 @@ async def run_bare_agent(question: str, *, client, executor, registry, context: 
             return result
         raw_calls = [call.model_dump(mode="json", exclude_none=True) for call in message.tool_calls]
         ids = [call.get("id") for call in raw_calls]
-        # 缺失/重复 ID 无法构成唯一配对，只存原始协议诊断，不伪造可执行申请。
+        functions = [call.get("function") for call in raw_calls]
+        # SDK 可宽松构造缺字段对象；先核验完整结构，非法申请只存协议诊断，不伪造调用。
         if (choice.finish_reason != "tool_calls" or any(not isinstance(value, str) or not value for value in ids)
                 or len(set(ids)) != len(ids) or seen_ids.intersection(ids)
-                or any(call.get("type") != "function" for call in raw_calls)):
+                or any(call.get("type") != "function" for call in raw_calls)
+                or any(not isinstance(function, dict) or not isinstance(function.get("name"), str)
+                       or not function["name"] or not isinstance(function.get("arguments"), str)
+                       for function in functions)):
             await executor.chat.save_tool_calls(context, [{"type": "invalid_tool_decision", "raw_tool_calls": raw_calls}])
             return _stop(result, "protocol_error")
 
