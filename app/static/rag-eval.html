@@ -182,6 +182,14 @@ const STRATEGY_ORDER = ["dense", "bm25", "hybrid", "hybrid_rerank"];
 let state = null;
 let retrievalMetric = "mrr@10";
 let genMetric = "faithfulness_macro";
+// 数据刷新与任务状态分别编号，后返回的旧响应不得覆盖新成绩或新任务状态。
+let loadRequest = 0;
+let jobRevision = 0;
+let currentJob = {};
+let rerunPending = false;
+let polling = false;
+let pollInFlight = false;
+let pollTimer = null;
 
 /** 取数值，兼容 {value: x} 与裸数字两种结构。 */
 function val(record, key) {
@@ -425,7 +433,7 @@ function renderJob(job) {
   pill.className = `pill ${status === "running" ? "running" : status === "failed" ? "failed" : "done"}`;
   pill.textContent = { idle: "未运行", running: "运行中", done: "已完成", failed: "失败", interrupted: "已中断" }[status] || status;
   msg.textContent = job.message || "";
-  $("rerunBtn").disabled = status === "running";
+  $("rerunBtn").disabled = rerunPending || status === "running";
   const logBox = $("logBox");
   if (job.log) {
     logBox.style.display = "";
@@ -441,41 +449,71 @@ function renderEmpty(data) {
   box.textContent = data.hint || "还没有可展示的评估结果。";
   $("retrievalChart").textContent = "";
   $("retrievalChart").appendChild(box);
-  renderJob(data.job || {});
 }
 
+/** 加载最新成绩；参数：无；返回：Promise<void>；异常：接口错误在页面展示。 */
 async function load() {
+  const request = ++loadRequest;
+  const revision = jobRevision;
+  let data;
   try {
-    state = await api("/api/rag-eval/overview");
+    data = await api("/api/rag-eval/overview");
   } catch (error) {
-    $("retrievalChart").textContent = `取数失败：${error.message}`;
+    if (request === loadRequest) $("retrievalChart").textContent = `取数失败：${error.message}`;
     return;
   }
+  if (request !== loadRequest) return;
+  state = data;
   if (!state.present) {
     renderEmpty(state);
-    return;
+  } else {
+    renderMeta(state);
+    renderKpi(state);
+    renderRetrieval(state);
+    renderGen(state);
+    renderOverallTable(state);
+    renderDifficultyTable(state);
   }
-  renderMeta(state);
-  renderKpi(state);
-  renderRetrieval(state);
-  renderGen(state);
-  renderOverallTable(state);
-  renderDifficultyTable(state);
-  renderJob(state.job || {});
+  // 刷新期间若轮询或重跑已推进状态，只更新成绩，不回退任务与按钮。
+  if (revision === jobRevision && !rerunPending) updateJob(state.job || {});
 }
 
-/** 重跑期间轮询任务状态与日志，结束后自动刷新数据。 */
+/** 接收任务状态并协调单一轮询；参数：job后端任务；返回：无；异常：无主动抛出。 */
+function updateJob(job) {
+  jobRevision += 1;
+  currentJob = job;
+  renderJob(job);
+  polling = job.status === "running";
+  if (!polling && pollTimer !== null) {
+    clearTimeout(pollTimer);
+    pollTimer = null;
+  }
+  if (polling && pollTimer === null) pollJob();
+}
+
+/** 轮询状态与日志，终态刷新成绩；参数：无；返回：Promise<void>；异常：网络错误稍后重试。 */
 async function pollJob() {
+  // 刷新、重跑、定时器共用此入口，任何时刻最多一个job请求在途。
+  if (!polling || rerunPending || pollInFlight) return;
+  pollInFlight = true;
+  const revision = jobRevision;
+  let delay = 3000;
   try {
     const job = await api("/api/rag-eval/job");
-    renderJob(job);
-    if (job.status === "running") {
-      setTimeout(pollJob, 3000);
-    } else {
-      await load();
-    }
+    if (revision !== jobRevision || rerunPending) return;
+    updateJob(job);
+    if (!polling) await load();
   } catch {
-    setTimeout(pollJob, 5000);
+    if (revision === jobRevision) delay = 5000;
+  } finally {
+    pollInFlight = false;
+    // 即使旧请求被忽略，也由此处续接当前任务，避免断链或生成多个定时器。
+    if (polling && !rerunPending && pollTimer === null) {
+      pollTimer = setTimeout(() => {
+        pollTimer = null;
+        pollJob();
+      }, delay);
+    }
   }
 }
 
@@ -501,18 +539,31 @@ for (const button of document.querySelectorAll("#genSeg button")) {
 
 $("refreshBtn").addEventListener("click", load);
 $("rerunBtn").addEventListener("click", async () => {
+  if (rerunPending) return;
+  rerunPending = true;
+  loadRequest += 1;
+  jobRevision += 1;
+  polling = false;
+  if (pollTimer !== null) {
+    clearTimeout(pollTimer);
+    pollTimer = null;
+  }
   $("rerunBtn").disabled = true;
   try {
     await api("/api/rag-eval/rerun", { method: "POST" });
+    rerunPending = false;
+    // 提交期间发出的overview也属于旧任务，不能在启动成功后中止轮询。
+    jobRevision += 1;
+    polling = true;
     pollJob();
   } catch (error) {
+    rerunPending = false;
+    updateJob(currentJob);
     $("jobMsg").textContent = `启动失败：${error.message}`;
-    $("rerunBtn").disabled = false;
   }
 });
 
 load();
-if (state?.job?.status === "running") pollJob();
 </script>
 </body>
 </html>
