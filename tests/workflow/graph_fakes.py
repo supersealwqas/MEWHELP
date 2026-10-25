@@ -62,7 +62,11 @@ class StrictExecutor:
         result = self.script.pop(0)
         if isinstance(result, Exception):
             raise result
-        return await self.chat.save_tool_result(context, result)
+        result = await self.chat.save_tool_result(context, result)
+        await on_status({"tool_call_id": call["id"], "name": call["name"],
+                         "status": "succeeded" if result.ok else "failed",
+                         "label": "已完成" if result.ok else "未完成", "is_mock": result.is_mock})
+        return result
 
 class StrictSearch:
     """普通与退款入口可独立断言，异常不自动转换为空结果。"""

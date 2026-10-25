@@ -58,13 +58,22 @@ async def test_order_rejection_skips_remaining_logistics_and_never_calls_model_a
 
 @pytest.mark.parametrize("result", [ToolResult.failed("TOOL_TIMEOUT", "超时"), ConnectionError("故障")])
 async def test_tool_failure_pairs_unexecuted_remainder(result):
-    """工具故障后剩余申请悬空或继续调用时失败。参数：result受控错误；返回：None；异常：断言失败。"""
+    """工具故障后状态仍查询中、剩余申请悬空或继续调用时失败。参数：result受控错误；返回：None；异常：断言失败。"""
     deps = dependencies(decisions=[AgentDecision(kind="tools", tool_calls=[call("a"), call("b")])], results=[result])
-    state = await build_workflow(deps, checkpointer=None).ainvoke(turn())
+    frames, state = [], None
+    async for namespace, mode, payload in build_workflow(deps, checkpointer=None).astream(
+            turn(), stream_mode=["custom", "values"], subgraphs=True):
+        if mode == "values" and not namespace:
+            state = payload
+        elif mode == "custom" and payload["event"] == "tool_status":
+            frames.append(payload["data"])
     assert len(deps.executor.calls) == 1
     assert [r[0] for r in deps.chat.results] == ["a", "b"]
     assert all(not result.ok for _, result in deps.chat.results)
     assert state["stop_reason"] == "tool_failed" and state["pending_calls"] == []
+    assert [(frame["tool_call_id"], frame["status"]) for frame in frames] == [
+        ("a", "running"), ("a", "failed"), ("b", "failed")]
+    assert frames[1]["label"] == "未完成" and frames[2]["label"] == "未执行"
 
 @pytest.mark.parametrize("second", [call("a"), call("b", order_id=" a ")], ids=["same-id", "same-arguments"])
 async def test_duplicate_id_or_signature_never_executes_twice(second):

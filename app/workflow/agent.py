@@ -133,6 +133,10 @@ def build_agent_graph(deps: "WorkflowDependencies"):
                     raise
                 except Exception:
                     result = await deps.chat.save_tool_result(call_context, ToolResult.failed("TOOL_EXECUTION_FAILED", "工具执行未能完成"))
+                    # 补写结果成功后同步发布终态；仓储若返回已存在的成功事实则尊重它。
+                    await on_status({"tool_call_id": call["id"], "name": call["name"],
+                                     "status": "succeeded" if result.ok else "failed",
+                                     "label": "已完成" if result.ok else "未完成", "is_mock": result.is_mock})
                 if not result.ok:
                     answer = rejection_reply(result) or ""
                     reason = "order_not_owned" if answer else "tool_failed"
