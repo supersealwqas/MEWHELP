@@ -37,7 +37,7 @@ async def test_new_application_recovers_committed_facts_without_reexecution(data
             rows = (await session.scalars(select(Message).where(Message.turn_id == "old-turn"))).all()
             assert all(row.turn_status == "cancelled" for row in rows)
             if with_result:
-                assert (await session.get(Conversation, ctx.conversation_id)).status == "已转人工"
+                assert (await session.get(Conversation, ctx.conversation_id)).status == "进行中"
                 assert await session.get(Ticket, result.data["ticket_no"]) is not None
         events = [e async for e in service.stream_turn(ChatRequest(session_id="restart", message="刚才提交了吗"))]
         assert events[-1].event == "done"

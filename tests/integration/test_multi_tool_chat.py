@@ -9,7 +9,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
-from langchain_core.messages import AIMessage, ToolMessage
+import httpx
 from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,9 +21,7 @@ from app.repositories.chat import ChatRepository
 from app.repositories.support import SupportRepository
 from app.schemas.chat import ChatRequest
 from app.schemas.tools import ToolResult
-from app.services.chat import ChatService, LegacyChatService
-from app.tools.registry import build_registry
-from tests.chat_fakes import ScriptedModel
+from app.services.chat import ChatService
 
 pytestmark = pytest.mark.mysql
 
@@ -66,28 +64,23 @@ async def isolated_multi_tool_mysql(request: pytest.FixtureRequest):
             # 只有确认本例标识不存在后才允许 finally 清理；不触发父目录的清库夹具。
             before = await _row_totals(session)
 
-        def build_service(decisions, *, workflow=False):
-            """构造真实服务和仓库。参数：decisions脚本，workflow显式新图入口；返回：服务/仓储/模型；异常：构造错误。"""
-            if workflow:
-                from langgraph.checkpoint.memory import InMemorySaver
-                from app.schemas.workflow import AgentDecision
-                from app.tools.executor import ToolExecutor
-                from app.tools.registry import build_agent_registry
-                from app.workflow.graph import WorkflowDependencies, build_workflow
-                from tests.workflow.fakes import ScriptedWorkflowModel
-                from tests.workflow.graph_fakes import StrictSearch
-                chat = ChatRepository(factory)
-                model = ScriptedWorkflowModel(intents=["物流"], decisions=[*decisions, AgentDecision(kind="answer")],
-                                              answers=[["已按工具结果处理。"]])
-                executor = ToolExecutor(build_agent_registry(), chat, SupportRepository(factory))
-                deps = WorkflowDependencies(model, StrictSearch(), executor, chat, config)
-                # 本例只验证业务MySQL配对；官方文件SQLite重开另由workflow专项与Task8覆盖。
-                graph = build_workflow(deps, checkpointer=InMemorySaver())
-                return ChatService(chat, graph, executor, config), chat, model
-            model = ScriptedModel(decisions=decisions, chunks=["已按工具结果处理。"])
+        def build_service(decisions):
+            """构造真实新图服务和仓库。参数：decisions有限决策脚本；返回：服务/仓储/模型；异常：构造错误。"""
+            from langgraph.checkpoint.memory import InMemorySaver
+            from app.schemas.workflow import AgentDecision
+            from app.tools.executor import ToolExecutor
+            from app.tools.registry import build_agent_registry
+            from app.workflow.graph import WorkflowDependencies, build_workflow
+            from tests.workflow.fakes import ScriptedWorkflowModel
+            from tests.workflow.graph_fakes import StrictSearch
             chat = ChatRepository(factory)
-            service = LegacyChatService(chat, SupportRepository(factory), model, build_registry(), config)
-            return service, chat, model
+            model = ScriptedWorkflowModel(intents=["物流"], decisions=[*decisions, AgentDecision(kind="answer")],
+                                          answers=[["已按工具结果处理。"]])
+            executor = ToolExecutor(build_agent_registry(), chat, SupportRepository(factory))
+            deps = WorkflowDependencies(model, StrictSearch(), executor, chat, config)
+            # 本例只验证业务MySQL配对；官方文件SQLite重开另由workflow专项与Task8覆盖。
+            graph = build_workflow(deps, checkpointer=InMemorySaver())
+            return ChatService(chat, graph, executor, config), chat, model
 
         # 不把含连接及模型凭证的 Settings 直接交给 pytest，避免失败时展示配置详情。
         yield factory, session_id, build_service
@@ -116,11 +109,6 @@ async def isolated_multi_tool_mysql(request: pytest.FixtureRequest):
             await engine.dispose()
 
 
-def _decision(*calls: dict) -> AIMessage:
-    """构造模型工具申请。参数：calls 一个决策中的完整工具调用；返回：AIMessage；异常：消息校验错误。"""
-    return AIMessage(content="", tool_calls=list(calls))
-
-
 async def _read_records(factory, session_id: str) -> tuple[Conversation, list[Message], list[Ticket]]:
     """读取本例真实落库记录。参数：factory 会话工厂、session_id 唯一标识；返回：会话、消息、工单；异常：数据库错误或无会话。"""
     async with factory() as session:
@@ -143,7 +131,7 @@ async def test_mysql_order_logistics_persist_and_restore_in_order(isolated_multi
         AgentDecision(kind="tools", tool_calls=[{"id": "order", "name": "query_order", "args": {"order_id": "1001"}}]),
         # 本例模拟取用订单工具返回的当前单号；历史 MOCK 前缀兼容在专门用例中验证。
         AgentDecision(kind="tools", tool_calls=[{"id": "shipping", "name": "query_logistics", "args": {"tracking_no": "SF213502378238"}}]),
-    ], workflow=True)
+    ])
     events = [event async for event in service.stream_turn(
         ChatRequest(session_id=session_id, message="订单1001的物流到哪了")
     )]
@@ -175,65 +163,41 @@ async def test_mysql_order_logistics_persist_and_restore_in_order(isolated_multi
     assert [history[2].content, history[4].content] == [rows[2].content, rows[4].content]
 
 
-@pytest.mark.parametrize("same_batch", [True, False], ids=["same-batch", "successive-decisions"])
-async def test_mysql_duplicate_ticket_new_id_creates_only_one_ticket(isolated_multi_tool_mysql, same_batch):
-    """新ID的重复建单只能留下一个真实工单。参数：isolated_multi_tool_mysql 隔离资源、same_batch 是否同批；返回：None；异常：断言失败。"""
+async def test_mysql_chat_suggestion_requires_independent_confirmation(isolated_multi_tool_mysql):
+    """普通聊天只保存建议，确认API重复提交仍只有一票及独立历史。参数：隔离资源；返回：None；异常：断言失败。"""
+    from fastapi import FastAPI
+    from app.api.actions import get_ticket_action_service, router
+    from app.repositories.actions import ActionRepository
+    from app.schemas.workflow import AgentDecision
+    from app.services.actions import TicketActionService
+    from app.tools.executor import ToolExecutor
+    from app.tools.registry import build_ticket_registry
     factory, session_id, build_service = isolated_multi_tool_mysql
-    first = {"id": "ticket-1", "name": "create_ticket", "args": {"description": "订单1001未送达", "ticket_type": "售后"}}
-    second = {"id": "ticket-2", "name": "create_ticket", "args": {"description": "补充请人工确认订单状态", "ticket_type": "售后"}}
-    decisions = [_decision(first, second)] if same_batch else [_decision(first), _decision(second)]
-    service, chat, _ = build_service(decisions)
-    events = [event async for event in service.stream_turn(
-        ChatRequest(session_id=session_id, message="订单1001未送达，请创建工单并请人工确认")
-    )]
+    service, chat, _ = build_service([AgentDecision(kind="answer", suggested_actions=["create_ticket"])])
+    question = "  订单1001未送达，请创建工单  "
+    events = [event async for event in service.stream_turn(ChatRequest(session_id=session_id, message=question))]
     assert events[-1].event == "done"
+    conversation, source_rows, tickets = await _read_records(factory, session_id)
+    assert tickets == [] and all(row.turn_status == "completed" for row in source_rows)
+    suggestion = events[-2].data["suggested_actions"][0]
+    actions = TicketActionService(ActionRepository(factory),
+        ToolExecutor(build_ticket_registry(), chat, SupportRepository(factory)), service.guard)
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_ticket_action_service] = lambda: actions
+    body = {"session_id": session_id, "source_turn_id": suggestion["source_turn_id"], "action_id": suggestion["action_id"], "confirmed": True}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        first = await client.post("/api/actions/tickets", json=body)
+        retry = await client.post("/api/actions/tickets", json=body)
+    assert first.status_code == retry.status_code == 200 and first.json() == retry.json()
     conversation, rows, tickets = await _read_records(factory, session_id)
-    assert len(tickets) == 1 and tickets[0].description == "订单1001未送达"
-    assert tickets[0].status == "待处理" and conversation.status == "已转人工"
-    calls = [call for row in rows for call in (row.tool_calls or [])]
-    results = [row for row in rows if row.role == "tool"]
-    assert [call["id"] for call in calls] == ["ticket-1", "ticket-2"]
-    assert [row.tool_call_id for row in results] == ["ticket-1", "ticket-2"]
-    saved = ToolResult.model_validate_json(results[0].content)
-    rejected = ToolResult.model_validate_json(results[1].content)
-    assert saved.ok and saved.data["ticket_no"] == tickets[0].ticket_no
-    assert not rejected.ok and rejected.error.code == "WRITE_TOOL_LIMIT"
-    assert all(row.turn_status == "completed" for row in rows)
-    assert tickets[0].ticket_no in rows[-1].content
-    assert rows[-1].content == "".join(event.data.get("delta", "") for event in events)
-    history = assemble_turns(await chat.load_turns(conversation.id))[0]
-    assert [message.tool_call_id for message in history if isinstance(message, ToolMessage)] == ["ticket-1", "ticket-2"]
-
-
-async def test_mysql_cancel_at_ticket_receipt_retains_partial_batch_fact(isolated_multi_tool_mysql):
-    """回执处取消须保留已提交工单并隐藏未执行申请。参数：isolated_multi_tool_mysql 隔离资源；返回：None；异常：断言失败。"""
-    factory, session_id, build_service = isolated_multi_tool_mysql
-    service, chat, model = build_service([_decision(
-        {"id": "ticket", "name": "create_ticket", "args": {"description": "订单1001未送达", "ticket_type": "售后"}},
-        {"id": "order", "name": "query_order", "args": {"order_id": "1001"}},
-    )])
-    stream = service.stream_turn(ChatRequest(session_id=session_id, message="创建工单并查询订单1001"))
-    receipt = ""
-    try:
-        async for event in stream:
-            if event.event == "delta":
-                receipt = event.data["delta"]
-                break
-        assert "工单已创建" in receipt
-    finally:
-        # 此时第二个工具尚未开始，关闭真实生成器并等待取消终态写入。
-        await stream.aclose()
-    conversation, rows, tickets = await _read_records(factory, session_id)
-    assert len(tickets) == 1 and tickets[0].ticket_no in receipt
-    assert [row.role for row in rows] == ["user", "assistant", "tool"]
-    assert all(row.turn_status == "cancelled" for row in rows)
-    assert [call["id"] for call in rows[1].tool_calls] == ["ticket", "order"]
-    assert rows[2].tool_call_id == "ticket"
-    assert [phase for phase, _ in model.inputs] == ["decide"]
+    assert len(tickets) == 1 and tickets[0].description == question
+    assert conversation.status == "进行中" and all(row.turn_status == "completed" for row in rows)
     turns = await chat.load_turns(conversation.id)
-    assert len(turns) == 1 and turns[0].turn_status == "cancelled"
-    history = assemble_turns(turns)[0]
-    assert [message.type for message in history] == ["human", "ai", "tool", "ai"]
-    assert [call["id"] for call in history[1].tool_calls] == ["ticket"]
-    assert history[2].tool_call_id == "ticket" and tickets[0].ticket_no in history[2].content
-    assert "未完成" in history[-1].content
+    assert len(turns) == 2 and turns[0].turn_id == suggestion["source_turn_id"]
+    assert [message.type for message in assemble_turns(turns)[1]] == ["human", "ai", "tool", "ai"]
+    assert tickets[0].ticket_no in turns[1].messages[-1].content
+
+
+# 原“聊天回执处取消”的建单场景已迁至test_ch05_actions中的真实硬退出/恢复验收，
+# 使用独立确认动作及非破坏性父资源锁，避免继续把写工具暴露给普通聊天模型。

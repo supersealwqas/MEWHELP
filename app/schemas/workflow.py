@@ -2,8 +2,9 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from app.schemas.history import StoredTurn
+from app.schemas.tools import ToolContext, ToolResult
 
 Intent = Literal["物流", "订单", "商品咨询", "退款退货", "售后", "投诉", "闲聊"]
 ActionKind = Literal["handoff", "create_ticket"]
@@ -91,3 +92,45 @@ class SuggestedAction(BaseModel):
         if (self.kind == "handoff") != (self.ticket_type is None):
             raise ValueError("转人工不能带工单类型，建单建议必须带类型")
         return self
+
+
+class TicketConfirmation(BaseModel):
+    """客户端只能确认保存的建议，不能提供业务类型、描述或回执状态。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    session_id: str = Field(min_length=1, max_length=64, description="建议所属会话标识")
+    user_id: str = Field(default="demo-user", min_length=1, max_length=64, description="当前演示用户标识，必须匹配原会话")
+    source_turn_id: str = Field(min_length=1, max_length=36, description="已完成来源问答轮次")
+    action_id: str = Field(min_length=36, max_length=36, description="已保存的服务端建议UUIDv5")
+    confirmed: Literal[True] = Field(description="用户明确确认，只接受JSON布尔true")
+
+    @field_validator("confirmed", mode="before")
+    @classmethod
+    def require_real_boolean(cls, value):
+        """阻止数字1被Literal强收为确认。参数：value原始输入；返回：True；异常：ValueError，非真正布尔true。"""
+        if value is not True:
+            raise ValueError("必须由用户明确确认")
+        return value
+
+
+class TicketReceipt(BaseModel):
+    """真实已提交票据的回执；审计待同步不改变建单成功事实。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    action_id: str = Field(min_length=36, max_length=36, description="本次确认的稳定动作标识")
+    ticket_no: str = Field(min_length=1, max_length=32, description="真实工单号，重试不变化")
+    ticket_type: Literal["售后", "投诉", "咨询"] = Field(description="来源建议保存的工单分类")
+    status: Literal["待处理"] = Field(description="创建时确定的处理状态，不代表人工接入")
+    audit_sync_pending: bool = Field(default=False, description="工单已提交但独立动作审计收尾仍待修复")
+
+
+class PreparedTicketAction(BaseModel):
+    """仓储从已完成来源验证后派生的独立动作，不接受HTTP直接构造。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    request: TicketConfirmation = Field(description="已验证归属的原确认请求，供收尾重新核验")
+    context: ToolContext = Field(description="稳定动作轮及工具调用三键的可信身份")
+    call: dict = Field(description="仅从保存建议快照生成的create_ticket申请")
+    turn_status: Literal["running", "completed", "failed", "cancelled"] = Field(description="动作轮当前持久化状态")
+    execution_started: bool = Field(default=False, description="是否已越过执行前边界；无结果时不能盲目重复写入")
+    existing_result: ToolResult | None = Field(default=None, description="验明归属之后读出的既有确定工具事实")

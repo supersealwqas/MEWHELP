@@ -66,7 +66,7 @@ async def test_ticket_commit_ack_lost(database, repositories, monkeypatch):
     async with database[1]() as session:
         assert await session.scalar(select(func.count()).select_from(Ticket)) == 1
         assert await session.scalar(select(func.count()).select_from(Message).where(Message.role == "tool")) == 1
-        assert (await session.get(Conversation, ctx.conversation_id)).status == "已转人工"
+        assert (await session.get(Conversation, ctx.conversation_id)).status == "进行中"
 
 
 async def test_rollback_has_no_partial_ticket(database, repositories, monkeypatch):
@@ -105,7 +105,7 @@ async def test_recover_running_preserves_ticket(database, repositories):
     assert turns[0].messages[-1].role == "tool"
     assert (await chat.get_tool_result(ctx)) == result
     async with database[1]() as session:
-        assert (await session.get(Conversation, ctx.conversation_id)).status == "已转人工"
+        assert (await session.get(Conversation, ctx.conversation_id)).status == "进行中"
 
 
 async def test_result_role_and_id_constraints(database, repositories):

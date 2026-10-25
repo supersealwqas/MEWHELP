@@ -17,6 +17,7 @@ from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.api.chat import router as chat_router
+from app.api.actions import router as actions_router
 from app.api.citations import router as citations_router
 from app.api.extract import router as extract_router
 from app.api.rageval import router as rageval_router
@@ -170,6 +171,7 @@ def create_app(runtime_factory=None) -> FastAPI:
     application.add_middleware(SecurityHeadersMiddleware)
     application.include_router(extract_router)
     application.include_router(chat_router)
+    application.include_router(actions_router)
     application.include_router(citations_router)
     application.include_router(kb_router)
     application.include_router(rageval_router)

@@ -13,6 +13,12 @@ from app.repositories.chat import ChatRepository, PersistenceUncertain, result_q
 from app.schemas.tools import ToolContext, ToolResult
 
 
+def ticket_number(context: ToolContext) -> str:
+    """由会话、独立轮次和工具调用键派生稳定票号。参数：context可信三键；返回：32字以内票号；异常：无。"""
+    identity = json.dumps([context.conversation_id, context.turn_id, context.tool_call_id])
+    return "T" + hashlib.sha256(identity.encode()).hexdigest()[:31]
+
+
 class SupportRepository:
     """查询和写入客服业务数据，每次调用独占短事务。"""
 
@@ -76,8 +82,7 @@ class SupportRepository:
         """幂等创建工单并保存成功事实。参数：可信上下文、描述、售后/投诉/咨询；返回：原工单结果；异常：数据库或一致性错误。"""
         if not context.tool_call_id or not description.strip() or ticket_type not in {"售后", "投诉", "咨询"}:
             raise ValueError("工单参数不合法")
-        identity = json.dumps([context.conversation_id, context.turn_id, context.tool_call_id])
-        number = "T" + hashlib.sha256(identity.encode()).hexdigest()[:31]
+        number = ticket_number(context)
         result = ToolResult(ok=True, data={"ticket_no": number, "ticket_type": ticket_type, "status": "待处理"})
         try:
             async with self.factory.begin() as session:
@@ -91,7 +96,6 @@ class SupportRepository:
                     raise ValueError("工单会话不匹配")
                 session.add(Ticket(ticket_no=number, conversation_id=context.conversation_id,
                                    description=description, ticket_type=ticket_type))
-                conversation.status = "已转人工"
                 # 业务数据与成功事实同事务提交，不留下孤立工单。
                 session.add(Message(conversation_id=context.conversation_id, turn_id=context.turn_id,
                                     role="tool", tool_call_id=context.tool_call_id, content=result.model_dump_json()))

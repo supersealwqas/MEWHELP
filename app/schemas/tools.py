@@ -6,7 +6,7 @@ Schema，避免各处自行约定字段名导致协议漂移。
 
 from typing import Annotated, Literal
 from langchain_core.tools import InjectedToolArg
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # 业务拒绝的统一字段名。工具返回业务失败时必须携带这两个键，执行器据此识别并转为失败事实。
 # 集中定义避免工具层与执行器各写一份字符串字面量。
@@ -51,9 +51,18 @@ class RefundPolicyArgs(BusinessArgs):
 
 
 class TicketArgs(BusinessArgs):
-    """人工工单业务参数，不包含会话身份。"""
-    description: str = Field(min_length=1, max_length=2000, description="用户明确要求提交处理的问题描述")
+    """确认后工单参数；只在此关闭去空白，保留原始问题与原始长度。"""
+    model_config = ConfigDict(str_strip_whitespace=False)
+    description: str = Field(min_length=1, max_length=2000, description="用户明确确认的保存原问，保留首尾空白且原始长度不超过2000")
     ticket_type: Literal["售后", "投诉", "咨询"] = Field(description="工单分类，仅售后、投诉、咨询")
+
+    @field_validator("description")
+    @classmethod
+    def reject_blank(cls, value: str) -> str:
+        """拒绝纯空白但不改动原文。参数：value已校验长度的原文；返回：原文；异常：ValueError，只有空白。"""
+        if not value.strip():
+            raise ValueError("工单原问不能只有空白")
+        return value
 
 
 class ToolContext(BaseModel):

@@ -139,12 +139,12 @@ async def query_refund_policy(query: str, config: RunnableConfig, category: str 
     return {"hits": rows}
 
 
-@tool(args_schema=TicketArgs, description="为用户明确提出的人工协助、创建工单或提交处理请求创建工单，返回工单号、类型和处理状态。类型仅支持售后、投诉和咨询，创建后状态为待处理；不执行退款，也不表示人工已接入。不能仅因政策查询无结果而自动创建工单。")
+@tool(args_schema=TicketArgs, description="仅在独立确认接口验证用户明确确认后，以保存的原问和类型创建待处理工单，返回工单号、类型和处理状态。普通聊天及模型建议不执行此工具；建单不改变转人工状态，也不执行退款。")
 async def create_ticket(description: str, ticket_type: str, config: RunnableConfig) -> dict:
     """创建待处理人工工单。
 
     参数:
-        description: 非空问题描述，最多 2000 字符。
+        description: 已确认的保存原问，保留首尾空白，原始长度最多 2000 字符。
         ticket_type: 工单类型，仅支持售后、投诉、咨询。
         config: 当前请求身份与工单服务的可信运行配置。
     返回值:

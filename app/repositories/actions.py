@@ -1,0 +1,188 @@
+"""确认建单的可信边界：锁定已完成建议、准备稳定动作轮并按真实票据幂等收尾。"""
+
+from uuid import NAMESPACE_URL, uuid5
+
+from pydantic import ValidationError
+from sqlalchemy import select
+
+from app.models.customer_service import Conversation, Message, Ticket
+from app.repositories.chat import PersistenceUncertain
+from app.repositories.support import ticket_number
+from app.schemas.tools import TicketArgs, ToolContext, ToolResult
+from app.schemas.workflow import PreparedTicketAction, SuggestedAction, TicketConfirmation, TicketReceipt
+
+
+class ActionNotFound(ValueError):
+    """动作不存在、来源未完成或身份不符；统一对外返回不存在以免泄漏归属。"""
+
+
+class InvalidTicketArguments(ValueError):
+    """保存原问不能作为工单参数；与数据库中的损坏结果严格区分。"""
+
+
+class ActionRepository:
+    """只处理用户确认后的独立建单动作，不重开或修改来源问答。"""
+
+    def __init__(self, session_factory):
+        """保存短事务工厂。参数：session_factory异步会话工厂；返回：None；异常：无。"""
+        self.factory = session_factory
+
+    async def _trusted_action(self, session, request: TicketConfirmation) -> PreparedTicketAction:
+        """先验归属再锁来源、读取建议。参数：session短事务、request确认；返回：可信派生动作；异常：ActionNotFound/InvalidTicketArguments/数据库错误。"""
+        conversation = await session.scalar(select(Conversation).where(
+            Conversation.session_id == request.session_id, Conversation.user_id == request.user_id))
+        if conversation is None:
+            raise ActionNotFound("建议不存在")
+        # 先定位不可变来源主键，再锁单行，避免范围检索锁住动作插入间隙造成死锁。
+        source_id = await session.scalar(select(Message.id).where(
+            Message.conversation_id == conversation.id, Message.turn_id == request.source_turn_id,
+            Message.role == "assistant", Message.tool_calls.is_(None), Message.turn_status == "completed"
+        ).order_by(Message.id.desc()).limit(1))
+        if source_id is None:
+            raise ActionNotFound("建议不存在")
+        source = await session.scalar(select(Message).where(Message.id == source_id).with_for_update())
+        if (source is None or source.conversation_id != conversation.id or source.turn_id != request.source_turn_id
+                or source.role != "assistant" or source.tool_calls is not None or source.turn_status != "completed"
+                or not isinstance(source.rag_metadata, dict)):
+            raise ActionNotFound("建议不存在")
+        raw_actions = source.rag_metadata.get("suggested_actions", [])
+        if not isinstance(raw_actions, list):
+            raise ActionNotFound("建议不存在")
+        candidates = [item for item in raw_actions if isinstance(item, dict) and item.get("action_id") == request.action_id]
+        if len(candidates) != 1:
+            raise ActionNotFound("建议不存在")
+        try:
+            suggestion = SuggestedAction.model_validate(candidates[0])
+        except ValidationError as error:
+            raise ActionNotFound("建议不存在") from error
+        expected_id = str(uuid5(NAMESPACE_URL, f"mewhelp:ch05:{conversation.id}:{request.source_turn_id}:create_ticket"))
+        if suggestion.kind != "create_ticket" or suggestion.source_turn_id != request.source_turn_id or suggestion.action_id != expected_id:
+            raise ActionNotFound("建议不存在")
+        original = await session.scalar(select(Message).where(
+            Message.conversation_id == conversation.id, Message.turn_id == request.source_turn_id,
+            Message.role == "user").order_by(Message.id).limit(1))
+        if original is None or original.turn_status != "completed" or original.content != suggestion.question:
+            raise ActionNotFound("建议不存在")
+        try:
+            arguments = TicketArgs(description=suggestion.question, ticket_type=suggestion.ticket_type)
+        except ValidationError as error:
+            raise InvalidTicketArguments("原始问题不能为空且不能超过2000字") from error
+        context = ToolContext(conversation_id=conversation.id, session_id=conversation.session_id,
+            user_id=conversation.user_id, turn_id=str(uuid5(NAMESPACE_URL, f"mewhelp:ch05:confirm:{expected_id}")),
+            tool_call_id="ticket:" + expected_id, user_message="确认创建工单：" + suggestion.question)
+        return PreparedTicketAction(request=request, context=context,
+            call={"id": context.tool_call_id, "name": "create_ticket", "args": arguments.model_dump()}, turn_status="running")
+
+    def _marker(self, action: PreparedTicketAction) -> dict:
+        """生成独立动作身份标记。参数：action可信动作；返回：确定标记；异常：无。"""
+        return {"action_id": action.request.action_id, "source_turn_id": action.request.source_turn_id}
+
+    async def _action_rows(self, session, action: PreparedTicketAction) -> list[Message]:
+        """在来源锁保护下核验独立动作记录。参数：session事务、action可信动作；返回：有序消息；异常：PersistenceUncertain/数据库错误。"""
+        # MySQL可重复读中普通SELECT仍可能看见等锁前的快照；锁后必须当前读，
+        # 否则第二个prepare会漏掉刚提交的确认消息，再追加一对消息。
+        rows = list((await session.scalars(select(Message).where(
+            Message.conversation_id == action.context.conversation_id, Message.turn_id == action.context.turn_id
+        ).order_by(Message.id).with_for_update())).all())
+        if not rows:
+            return rows
+        marker = self._marker(action)
+        if (len(rows) < 2 or rows[0].role != "user" or rows[0].content != action.context.user_message
+                or not isinstance(rows[0].rag_metadata, dict) or rows[0].rag_metadata.get("ticket_action") != marker
+                or type(rows[0].rag_metadata.get("execution_started")) is not bool
+                or rows[1].role != "assistant" or rows[1].tool_calls != [action.call]
+                or rows[1].rag_metadata != {"ticket_action": marker}
+                or any(row.role == "user" for row in rows[1:])):
+            raise PersistenceUncertain("独立动作记录不一致")
+        allowed = ["user", "assistant", "tool", "assistant"]
+        if len(rows) > 4 or [row.role for row in rows] != allowed[:len(rows)]:
+            raise PersistenceUncertain("独立动作消息配对不一致")
+        if len(rows) >= 3 and rows[2].tool_call_id != action.context.tool_call_id:
+            raise PersistenceUncertain("独立动作工具键不一致")
+        return rows
+
+    async def _verify_success(self, session, action: PreparedTicketAction, result: ToolResult) -> TicketReceipt:
+        """核对成功工具事实及对应真实工单。参数：session事务、action动作、result已保存结果；返回：回执；异常：PersistenceUncertain。"""
+        try:
+            if not result.ok or result.error is not None or result.is_mock or not result.data:
+                raise ValueError("没有真实成功事实")
+            receipt = TicketReceipt(action_id=action.request.action_id, **result.data)
+            ticket = await session.scalar(select(Ticket).where(Ticket.ticket_no == receipt.ticket_no).with_for_update())
+            if (receipt.ticket_no != ticket_number(action.context)
+                    or ticket is None or ticket.conversation_id != action.context.conversation_id
+                    or ticket.description != action.call["args"]["description"]
+                    or ticket.ticket_type != action.call["args"]["ticket_type"]
+                    or receipt.ticket_type != ticket.ticket_type):
+                raise ValueError("工单与建议不匹配")
+        except (ValueError, TypeError) as error:
+            raise PersistenceUncertain("成功事实与工单不一致") from error
+        return receipt
+
+    async def prepare_ticket(self, request: TicketConfirmation) -> PreparedTicketAction:
+        """验证保存快照并只追加一次独立确认与申请。参数：request严格确认；返回：动作/既有状态与结果；异常：ActionNotFound/InvalidTicketArguments/一致性或数据库错误。"""
+        async with self.factory.begin() as session:
+            action = await self._trusted_action(session, request)
+            rows = await self._action_rows(session, action)
+            if not rows:
+                marker = self._marker(action)
+                session.add_all([
+                    Message(conversation_id=action.context.conversation_id, turn_id=action.context.turn_id,
+                        role="user", content=action.context.user_message,
+                        rag_metadata={"ticket_action": marker, "execution_started": False}),
+                    Message(conversation_id=action.context.conversation_id, turn_id=action.context.turn_id,
+                        role="assistant", content=None, tool_calls=[action.call], rag_metadata={"ticket_action": marker}),
+                ])
+                return action
+            result = ToolResult.model_validate_json(rows[2].content) if len(rows) >= 3 else None
+            if result is not None and result.ok:
+                await self._verify_success(session, action, result)
+            return action.model_copy(update={"turn_status": rows[0].turn_status,
+                "execution_started": rows[0].rag_metadata["execution_started"], "existing_result": result})
+
+    async def _revalidate(self, session, action: PreparedTicketAction) -> list[Message]:
+        """收尾或执行前重新核验全部稳定身份。参数：session事务、action传入动作；返回：独立消息；异常：一致性/身份/数据库错误。"""
+        trusted = await self._trusted_action(session, action.request)
+        if trusted.context != action.context or trusted.call != action.call:
+            raise PersistenceUncertain("动作稳定身份不匹配")
+        rows = await self._action_rows(session, trusted)
+        if not rows:
+            raise PersistenceUncertain("独立动作尚未准备")
+        return rows
+
+    async def begin_ticket_execution(self, action: PreparedTicketAction) -> None:
+        """记录写执行边界，未知提交不能重跑。参数：action已准备动作；返回：None；异常：PersistenceUncertain/数据库错误。"""
+        async with self.factory.begin() as session:
+            rows = await self._revalidate(session, action)
+            if len(rows) != 2 or rows[0].rag_metadata["execution_started"] or rows[0].turn_status == "completed":
+                raise PersistenceUncertain("动作执行状态待核实，请使用原动作重试查询")
+            # JSON整体赋值触发ORM变更；只对明确未执行的旧取消动作恢复running。
+            rows[0].rag_metadata = {**rows[0].rag_metadata, "execution_started": True}
+            for row in rows:
+                row.turn_status = "running"
+
+    async def finish_ticket_action(self, action: PreparedTicketAction, result: ToolResult) -> dict:
+        """凭真实成功事务修复独立动作终态并只追加一次回执。
+
+        参数：action仓储派生动作；result执行器返回的成功事实，必须与库中完全一致。
+        返回：dict，保存的确定回执元数据；completed重试比对后原样返回。
+        异常：PersistenceUncertain，三键/事实/回执不一致；身份和数据库错误。
+        """
+        async with self.factory.begin() as session:
+            rows = await self._revalidate(session, action)
+            if len(rows) < 3 or ToolResult.model_validate_json(rows[2].content) != result:
+                raise PersistenceUncertain("没有对应的已提交成功工具结果")
+            receipt = await self._verify_success(session, action, result)
+            metadata = {"status": "completed", "turn_id": action.context.turn_id,
+                        "ticket_action": self._marker(action), "ticket_receipt": receipt.model_dump()}
+            content = f"工单已创建，工单号：{receipt.ticket_no}，类型：{receipt.ticket_type}，状态：{receipt.status}。"
+            if len(rows) == 4:
+                if rows[3].content != content or rows[3].rag_metadata != metadata or any(row.turn_status != "completed" for row in rows):
+                    raise PersistenceUncertain("动作已收尾但回执或终态不同")
+                return rows[3].rag_metadata
+            if any(row.turn_status == "completed" for row in rows):
+                raise PersistenceUncertain("动作缺少完成回执")
+            session.add(Message(conversation_id=action.context.conversation_id, turn_id=action.context.turn_id,
+                role="assistant", content=content, turn_status="completed", rag_metadata=metadata))
+            for row in rows:
+                row.turn_status = "completed"
+            return metadata
