@@ -34,3 +34,18 @@ def build_registry(*, include_refund_policy: bool = True) -> ToolRegistry:
     for business_tool in tools:
         registry.register(business_tool)
     return registry
+
+
+def build_agent_registry() -> ToolRegistry:
+    """提供Agent固定只读范围。参数：无；返回：三项只读注册表；异常：工具注册冲突。"""
+    registry = ToolRegistry()
+    for business_tool in (query_order, query_logistics, query_product):
+        registry.register(business_tool)
+    return registry
+
+
+def build_ticket_registry() -> ToolRegistry:
+    """提供用户确认后的单一建单工具。参数：无；返回：仅create_ticket的注册表；异常：工具注册冲突。"""
+    registry = ToolRegistry()
+    registry.register(create_ticket)
+    return registry

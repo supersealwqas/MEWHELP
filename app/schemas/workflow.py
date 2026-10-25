@@ -1,4 +1,4 @@
-"""CH05 工作流严格契约：七类意图、工具/终止决策及前置证据闸快照。"""
+"""CH05 工作流严格契约：七类意图、工具/终止决策、前置证据闸和服务端动作建议快照。"""
 
 from typing import Literal
 
@@ -59,4 +59,27 @@ class GateDecision(BaseModel):
         expected = self.max_score is not None and self.max_score >= self.threshold
         if self.passed != expected or (self.low_confidence is None) != self.passed:
             raise ValueError("证据闸通过标记、分数和弱证据草案不一致")
+        return self
+
+
+class SuggestedAction(BaseModel):
+    """服务端保存的动作建议快照；不接受模型生成链接、按钮HTML或覆盖原问。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    action_id: str = Field(min_length=36, max_length=36, description="服务端按会话/来源轮/类型生成的稳定UUIDv5")
+    kind: ActionKind = Field(description="仅转人工或建议创建工单，不代表动作已经执行")
+    source_turn_id: str = Field(min_length=1, description="建议产生的原始问答轮次标识")
+    question: str = Field(min_length=1, max_length=4000, description="来源轮完整用户原话，保留首尾空白")
+    ticket_type: Literal["售后", "投诉", "咨询"] | None = Field(description="建单建议的类型；转人工固定为空")
+
+    @model_validator(mode="after")
+    def validate_snapshot(self) -> "SuggestedAction":
+        """验证稳定键及动作类型一致。参数：无；返回：自身；异常：ValueError，键或快照非法。"""
+        from uuid import UUID
+
+        identifier = UUID(self.action_id)
+        if identifier.version != 5 or str(identifier) != self.action_id or not self.question.strip():
+            raise ValueError("动作键必须是规范UUIDv5，原问不得为空白")
+        if (self.kind == "handoff") != (self.ticket_type is None):
+            raise ValueError("转人工不能带工单类型，建单建议必须带类型")
         return self
