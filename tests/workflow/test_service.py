@@ -59,7 +59,9 @@ async def test_complete_snapshot_retry_compares_body_citations_and_suggestions(t
     from app.knowledge.answering import EvidenceCitation
     from app.schemas.workflow import AgentDecision
     from tests.workflow.graph_fakes import ranked
-    async with service_runtime(tmp_path, intents=["商品咨询"], ranked=[ranked()],
+    evidence = ranked()
+    evidence = evidence.model_copy(update={"chunk": evidence.chunk.model_copy(update={"section_path": "退货/七天"})})
+    async with service_runtime(tmp_path, intents=["商品咨询"], ranked=[evidence],
             decisions=[AgentDecision(kind="answer", suggested_actions=["handoff"])], answers=[["答复[1]"]]) as (service, deps, _):
         events = await collect(service, "政策")
         assert events[-1].event == "done"
@@ -71,9 +73,24 @@ async def test_complete_snapshot_retry_compares_body_citations_and_suggestions(t
         assert await deps.chat.finish_turn(context, "答复[1]", **kwargs) == events[-2].data
         for content, override in [("另一个答复", {}), ("答复[1]", {"citations": []}),
                                   ("答复[1]", {"suggested_actions": []}),
+                                  ("答复[1]", {"citations": [citations[0].model_copy(update={"section_path": None})]}),
                                   ("答复[1]", {"citations": [citations[0].model_copy(update={"answer": "被替换"})]})]:
             with pytest.raises(PersistenceUncertain):
                 await deps.chat.finish_turn(context, content, **{**kwargs, **override})
+
+
+@pytest.mark.parametrize("field", ["source_key", "source_revision"])
+async def test_finish_retry_rejects_erasing_original_nullable_source_fields(tmp_path, field):
+    """原始来源字段非空改None却被补全兼容规则忽略时失败。参数：tmp_path目录、field字段；返回：None；异常：断言失败。"""
+    from app.knowledge.answering import EvidenceCitation
+    async with service_runtime(tmp_path) as (_, deps, _):
+        context = await deps.chat.start_turn(ToolContext(session_id="s", user_id="u", turn_id="t", user_message="政策"), "政策")
+        citation = EvidenceCitation(n=1, chunk_id=1, question="条件", answer="完整原文", section_path="退货/七天",
+                                    source_key="doc:policy", source_revision="a" * 64)
+        saved = await deps.chat.finish_turn(context, "答复[1]", citations=[citation])
+        assert await deps.chat.finish_turn(context, "答复[1]", citations=[citation]) == saved
+        with pytest.raises(PersistenceUncertain):
+            await deps.chat.finish_turn(context, "答复[1]", citations=[citation.model_copy(update={field: None})])
 
 
 async def test_low_confidence_insert_failure_rolls_back_final_message_and_completed_status(tmp_path):

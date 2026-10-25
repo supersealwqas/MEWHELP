@@ -151,7 +151,7 @@ class ChatRepository:
                           citations: list[EvidenceCitation] | None = None,
                           suggested_actions: list[SuggestedAction] | None = None,
                           workflow_metadata: dict | None = None) -> dict:
-        """原子保存最终回复、完成状态及可选 useful=false 问题池记录。
+        """原子保存最终回复、完成状态、完整原始引用及可选低证据问题池记录。
 
         参数：context可信身份/原话；content完整回复；low_confidence自评或检索弱证据；citations完整引用；
             suggested_actions服务端建议快照；workflow_metadata本轮流程摘要，两者均可省略以保留旧调用。
@@ -169,6 +169,7 @@ class ChatRepository:
         if len(content.encode("utf-8")) > 65535:
             raise ValueError("回答正文过长，无法保存")
         citations = citations or []
+        originals = [item.model_dump(mode="json") for item in citations]
         actions = [action.model_dump(mode="json") for action in (suggested_actions or [])]
         low_snapshot = low_confidence.model_dump(mode="json") if low_confidence else None
         async with self.factory.begin() as session:
@@ -186,12 +187,16 @@ class ChatRepository:
                     Message.conversation_id == context.conversation_id, Message.turn_id == context.turn_id,
                     Message.role == "assistant", Message.tool_calls.is_(None)).order_by(Message.id.desc()).limit(1))
                 saved = existing.rag_metadata if existing is not None else None
-                # 重试核对模型原始证据；补齐来源不依赖可能已经更新的当前知识库。
-                originals = [{key: value for key, value in item.model_dump().items() if value is not None} for item in citations]
-                snapshots = saved.get("citations", []) if isinstance(saved, dict) else []
-                same = len(originals) == len(snapshots) and all(
-                    all(snapshot.get(key) == value for key, value in original.items())
-                    for original, snapshot in zip(originals, snapshots))
+                if isinstance(saved, dict) and "citation_inputs" in saved:
+                    # 原始输入独立于来源补全快照，None也是值，不能把字段删除当成一致重试。
+                    same = saved["citation_inputs"] == originals
+                else:
+                    # 旧记录未保存原始输入，仅来源键/版本可能经过补全；章节等字段仍完整比较。
+                    snapshots = saved.get("citations", []) if isinstance(saved, dict) else []
+                    same = len(originals) == len(snapshots) and all(
+                        all(snapshot.get(key) == value for key, value in original.items()
+                            if value is not None or key not in {"source_key", "source_revision"})
+                        for original, snapshot in zip(originals, snapshots))
                 same_extra = isinstance(saved, dict) and saved.get("suggested_actions", []) == actions \
                     and saved.get("workflow") == workflow_metadata and saved.get("low_confidence") == low_snapshot
                 if existing is None or existing.content != content or not same_extra or not same:
@@ -200,6 +205,7 @@ class ChatRepository:
             if user.turn_status != "running":
                 raise PersistenceUncertain("轮次已结束，不能重新提交回复")
             metadata = answer_metadata(context, await self._complete_sources(session, citations))
+            metadata["citation_inputs"] = originals
             if suggested_actions is not None:
                 metadata["suggested_actions"] = actions
             if workflow_metadata is not None:

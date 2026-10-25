@@ -90,11 +90,34 @@ async def test_snapshot_saved_and_only_readable_for_completed_owner(repository):
         await repository.finish_turn(context, "答复[1]", citations=[citation.model_copy(update={"answer": "新原文"})])
 
 
+@pytest.mark.parametrize("legacy_snapshot", [False, True])
 @pytest.mark.parametrize("answer,expected_source", [("权威正文", "qa:10"), ("被改写的正文", None)])
-async def test_source_supplement_requires_exact_authoritative_body(repository, answer, expected_source):
-    """来源补齐按主键核对完整正文，变化后不补成新来源。参数：仓储/正文/期望；返回：None；异常：断言错误。"""
+async def test_source_supplement_requires_exact_authoritative_body(repository, answer, expected_source, legacy_snapshot):
+    """来源补齐不破坏原始引用幂等，旧快照也保留兼容。参数：仓储/正文/期望/旧快照标记；返回：None；异常：断言错误。"""
     context = await repository.start_turn(ToolContext(session_id="s", user_id="u", turn_id="t", user_message="问"), "问")
     citation = EvidenceCitation(n=1, chunk_id=20, question="来源问法", answer=answer)
     metadata = await repository.finish_turn(context, "答复[1]", citations=[citation])
     assert metadata["citations"][0]["source_key"] == expected_source
+    if legacy_snapshot:
+        from sqlalchemy import select
+        from app.models.customer_service import Message
+        async with repository.factory.begin() as session:
+            row = await session.scalar(select(Message).where(Message.role == "assistant"))
+            # 以新dict赋值触发SQLAlchemy JSON字段持久化，模拟修复前没有原始快照的记录。
+            metadata = {key: value for key, value in row.rag_metadata.items() if key != "citation_inputs"}
+            row.rag_metadata = metadata
     assert await repository.finish_turn(context, "答复[1]", citations=[citation]) == metadata
+
+
+async def test_legacy_snapshot_still_rejects_erasing_saved_section(repository):
+    """无原始快照的旧记录也不能把真实章节悄悄改为空。参数：repository真实SQL仓储；返回：None；异常：断言失败。"""
+    from sqlalchemy import select
+    from app.models.customer_service import Message
+    context = await repository.start_turn(ToolContext(session_id="s", user_id="u", turn_id="t", user_message="政策"), "政策")
+    citation = EvidenceCitation(n=1, chunk_id=5, question="条件", answer="完整原文", section_path="退货/七天", source_key="qa:8")
+    await repository.finish_turn(context, "答复[1]", citations=[citation])
+    async with repository.factory.begin() as session:
+        row = await session.scalar(select(Message).where(Message.role == "assistant"))
+        row.rag_metadata = {key: value for key, value in row.rag_metadata.items() if key != "citation_inputs"}
+    with pytest.raises(PersistenceUncertain):
+        await repository.finish_turn(context, "答复[1]", citations=[citation.model_copy(update={"section_path": None})])
