@@ -2,7 +2,7 @@
 
 from collections import deque
 
-from app.core.model_budget import BudgetLedger
+from app.core.model_budget import OUTPUT_LIMITS, BudgetLedger
 from app.schemas.workflow import AgentDecision, IntentResult
 
 
@@ -28,8 +28,11 @@ class ScriptedWorkflowModel:
 
     async def classify(self, messages: list, ledger: BudgetLedger) -> IntentResult:
         """返回脚本分类。参数：messages 输入、ledger 本轮账本；返回：IntentResult；异常：脚本/额度/验证错误。"""
-        result = self._take(self.intents, "classify", messages, ledger, 128)
-        return IntentResult(intent=result) if isinstance(result, str) else result
+        result = self._take(self.intents, "classify", messages, ledger, OUTPUT_LIMITS["classify"])
+        if not isinstance(result, str):
+            return result
+        query = next(row["content"] for row in reversed(messages) if row["role"] == "user")
+        return IntentResult(intent=result, knowledge_query=query if result in {"商品咨询", "退款退货"} and len(query) <= 2000 else None)
 
     async def decide(self, messages: list, tools: list, ledger: BudgetLedger) -> AgentDecision:
         """返回脚本内部决定。参数：messages 输入、tools 可见工具、ledger 本轮账本；返回：AgentDecision；异常：脚本/额度错误。"""

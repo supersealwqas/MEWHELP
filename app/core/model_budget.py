@@ -3,11 +3,26 @@
 from collections import Counter
 from copy import deepcopy
 
-OUTPUT_LIMITS = {"classify": 128, "rewrite": 2048, "decide": 2048, "answer": 4096}
+OUTPUT_LIMITS = {"classify": 4096, "rewrite": 2048, "decide": 2048, "answer": 4096}
+
+
+def budget_summary(snapshot: dict | None) -> dict | None:
+    """生成日志和客户端可用的计量摘要，排除原始模型诊断。
+
+    参数：snapshot内部账本快照，可为None；返回：独立摘要或None；异常：输入结构非法时TypeError。
+    """
+    if snapshot is None:
+        return None
+    result = deepcopy(snapshot)
+    for record in result.get("records", []):
+        record.pop("failure", None)
+    return result
 
 
 class WorkflowBudgetExceeded(ValueError):
     """调用次数、完整输入、阶段输出或保守总额不足，调用方必须固定停止。"""
+
+    audit_record: dict | None = None  # 补救被额度拦截时携带此前失败诊断，默认没有诊断。
 
 
 class BudgetLedger:
@@ -45,7 +60,7 @@ class BudgetLedger:
             reserved += (input_units + output_limit) * 2
         if (sum(counts.values()) > self._limits["max_model_calls"]
                 or counts["decide"] > self._limits["max_decisions"] or counts["answer"] > 2
-                or counts["classify"] > 1 or counts["rewrite"] > 1
+                or counts["classify"] > 2 or counts["rewrite"] > 1
                 or reserved > self._limits["total_token_budget"]):
             raise WorkflowBudgetExceeded("本轮模型调用次数或总预算不足")
 
@@ -62,6 +77,16 @@ class BudgetLedger:
             raise ValueError("用量只能写入最近已占额的同阶段请求")
         self._records[-1]["usage"] = deepcopy(usage)
         self._records[-1]["finish_reason"] = finish_reason
+
+    def record_failure(self, stage: str, diagnostic: dict) -> None:
+        """保存最近请求的有界协议诊断，成功补救后仍可追查首次失败。
+
+        参数：stage最近已占额阶段；diagnostic由InvalidToolDecision生成的审计字典。
+        返回：None，诊断随独占账本写入检查点；异常：ValueError，阶段未占额或不匹配。
+        """
+        if not self._records or self._records[-1]["stage"] != stage:
+            raise ValueError("诊断只能写入最近已占额的同阶段请求")
+        self._records[-1]["failure"] = deepcopy(diagnostic)
 
     def snapshot(self) -> dict:
         """生成可持久化且独立的账本。参数：无；返回：dict，任一次缺用量则 actual_tokens 为 None；异常：无。"""

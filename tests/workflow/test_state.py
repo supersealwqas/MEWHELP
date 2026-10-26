@@ -24,7 +24,7 @@ def test_new_turn_replaces_every_runtime_field_and_retains_history():
     ]}]
     previous = new_turn_state(_context("查物流", "prior"), history, 11)
     previous.update(resolved_query="旧问题", messages=[{"role": "tool", "content": "旧事实"}],
-                    intent="物流", route="business", evidence=[{"chunk_id": 9}], evidence_scores=[0.9],
+                    intent="物流", knowledge_query="旧检索问题", route="business", evidence=[{"chunk_id": 9}], evidence_scores=[0.9],
                     gate={"passed": True}, pending_calls=[{"id": "old-call"}], seen_call_ids=["old-call"],
                     seen_call_signatures=["old-signature"], tool_count=4, decision_count=5,
                     suggested_kinds=["handoff"], suggested_actions=[{"action_id": "old-action"}],
@@ -39,7 +39,7 @@ def test_new_turn_replaces_every_runtime_field_and_retains_history():
         "context": {"conversation_id": 42, "session_id": "session", "user_id": "user",
                     "turn_id": "new-turn", "tool_call_id": "", "user_message": "1001"},
         "raw_query": "1001", "resolved_query": "", "history_turns": history, "audit_cursor": 13,
-        "messages": [], "intent": None, "route": None, "evidence": [], "evidence_scores": [],
+        "messages": [], "intent": None, "knowledge_query": None, "route": None, "evidence": [], "evidence_scores": [],
         "gate": None, "pending_calls": [], "seen_call_ids": [], "seen_call_signatures": [],
         "tool_count": 0, "decision_count": 0, "suggested_kinds": [], "suggested_actions": [],
         "answer": "", "stop_reason": None, "completion_metadata": {},

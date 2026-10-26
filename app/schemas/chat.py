@@ -71,13 +71,16 @@ class ChatEvent(BaseModel):
 class InvalidToolDecision(ValueError):
     """携带非法模型申请的审计数据；异常说明不含原始参数，不能直接回灌模型。"""
 
-    def __init__(self, *, tool_calls=None, invalid_tool_calls=None, tool_call_chunks=None):
+    def __init__(self, *, tool_calls=None, invalid_tool_calls=None, tool_call_chunks=None,
+                 raw_output: str | None = None, validation_category: str | None = None):
         """保存诊断所需的模型申请字段。
 
         参数:
             tool_calls: 已解析申请，可包含缺失或重复 ID；没有时为 None。
             invalid_tool_calls: 模型库识别的非法申请；没有时为 None。
             tool_call_chunks: 聚合后的原始申请片段，包含尚未成功解析的参数字符串。
+            raw_output: 无工具终止决定的原文；仅审计最多1000字符，不能作为正文或重试输入。
+            validation_category: 终止决定失败类别，json为JSON格式、shape为字段形状、schema为字段取值。
         返回值:
             None；audit_record 为可保存于 JSON 列的诊断记录，不是可执行申请。
         异常:
@@ -88,3 +91,8 @@ class InvalidToolDecision(ValueError):
         self.audit_record = {"type": "invalid_tool_decision", "tool_calls": tool_calls or [],
                              "invalid_tool_calls": invalid_tool_calls or [],
                              "tool_call_chunks": tool_call_chunks or []}
+        if raw_output is not None:
+            # 只扩展终止决定诊断，保持既有工具错误记录形状；长输出不能无限膨胀审计。
+            self.audit_record["terminal_decision"] = {"raw_output": raw_output[:1000],
+                "raw_length": len(raw_output), "truncated": len(raw_output) > 1000,
+                "validation_category": validation_category}

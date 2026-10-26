@@ -1,7 +1,7 @@
 """有来源约束的历史对话抽取与知识关系判定 Adapter。
 
-复用项目聊天模型工厂的流式接口，完整聚合后再严格解析 JSON；拒绝工具申请、
-非有限数、未知来源、改写问题、伪造引用、缺失 pair 与超限输出。模型失败与
+复用项目聊天模型工厂的流式接口，完整聚合后校验唯一结果工具的原始参数；
+拒绝正文 JSON、非有限数、未知来源、改写问题、伪造引用、缺失 pair 与超限输出。模型失败与
 合法空结果严格区分，不能把异常吞成空知识。
 """
 
@@ -9,17 +9,27 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, TypeVar
 
-import anyio
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
+from app.core.structured import (
+    StructuredOutputError,
+    bind_output_tool,
+    collect_tool_output,
+    output_tool,
+    parse_tool_output,
+)
 from app.knowledge.grounding import GroundingError, validate_grounding
 
 from app.knowledge.prompts import (
     EXTRACTION_INPUT_BUDGET,
     EXTRACTION_PROMPT_VERSION,
+    EXTRACTION_TOOL_NAME,
     OUTPUT_TEXT_LIMIT,
     RELATION_PROMPT_VERSION,
+    RELATION_TOOL_NAME,
+    ExtractionResult,
+    RelationResult,
     extraction_messages,
     relation_messages,
     messages_size,
@@ -33,31 +43,11 @@ from app.knowledge.schemas import (
     RelationPolicy,
 )
 
+_Output = TypeVar("_Output", bound=BaseModel)
+
 
 class KnowledgeModelError(KnowledgeUnavailable):
     """知识模型调用或输出不合法。"""
-
-
-def _reject_constant(value: str) -> None:
-    """拒绝 JSON 中的 NaN/Infinity。参数：常量文本；返回：不返回；异常：ValueError。"""
-    raise ValueError(f"不合法 JSON 常量: {value}")
-
-
-def _content_text(content: Any) -> str:
-    """把模型分片内容转换为文本。参数：字符串或内容块；返回：文本；异常：无。"""
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, list):
-        return ""
-    parts: list[str] = []
-    for block in content:
-        if isinstance(block, str):
-            parts.append(block)
-        elif isinstance(block, dict) and block.get("type") == "text":
-            text = block.get("text")
-            if isinstance(text, str):
-                parts.append(text)
-    return "".join(parts)
 
 
 class KnowledgeModel:
@@ -75,50 +65,32 @@ class KnowledgeModel:
         """
         self._client_factory = client_factory
 
-    async def _stream_json(self, messages: list[Any]) -> dict[str, Any]:
-        """流式聚合完整文本并严格解析 JSON。
+    async def _stream_output(
+        self, messages: list[Any], schema: type[_Output], name: str
+    ) -> _Output:
+        """强制调用唯一结果工具，聚合原始分片后校验参数。
 
         参数:
             messages: 系统与用户消息。
+            schema: 只暴露模型可填写字段的结果契约。
+            name: 本次唯一允许的工具名称。
         返回值:
-            dict: 解析后的 JSON 对象。
+            _Output: 完成严格参数校验的结果对象。
         异常:
-            KnowledgeModelError: 工具申请、空响应、超限或非法 JSON。
+            KnowledgeModelError: 输入超预算，或输出协议、字段与长度不合法。
+            网络错误与取消原样向上传播，底层流由公共收集器负责关闭。
         """
-        input_size = messages_size(messages)
+        tool = output_tool(schema, name)
+        input_size = messages_size(messages, tool=tool)
         if input_size > EXTRACTION_INPUT_BUDGET:
             raise KnowledgeModelError("知识模型输入超过估算预算")
         model = self._client_factory(streaming=True, temperature=0.0)
-        stream = model.astream(messages)
-        parts: list[str] = []
-        total = 0
+        bound = bind_output_tool(model, tool)
         try:
-            async for chunk in stream:
-                if (
-                    getattr(chunk, "tool_calls", None)
-                    or getattr(chunk, "invalid_tool_calls", None)
-                    or getattr(chunk, "tool_call_chunks", None)
-                ):
-                    raise KnowledgeModelError("知识模型返回工具申请，已拒绝")
-                text = _content_text(getattr(chunk, "content", ""))
-                parts.append(text)
-                total += len(text)
-                if total > OUTPUT_TEXT_LIMIT:
-                    raise KnowledgeModelError("知识模型输出超过文本上限")
-        finally:
-            with anyio.CancelScope(shield=True):
-                await stream.aclose()
-        text = "".join(parts)
-        if not text.strip():
-            raise KnowledgeModelError("知识模型返回空响应")
-        try:
-            parsed = json.loads(text, parse_constant=_reject_constant)
-            json.dumps(parsed, allow_nan=False)
-        except (ValueError, TypeError) as error:
-            raise KnowledgeModelError("知识模型返回非法 JSON") from error
-        if not isinstance(parsed, dict):
-            raise KnowledgeModelError("知识模型 JSON 顶层必须是对象")
-        return parsed
+            gathered = await collect_tool_output(bound, messages, max_chars=OUTPUT_TEXT_LIMIT)
+            return parse_tool_output(gathered, schema, name)
+        except StructuredOutputError as error:
+            raise KnowledgeModelError(f"知识模型结构化输出不合法：{error}") from error
 
     async def extract(self, batch: ExtractionBatch) -> list[ExtractedQA]:
         """从固定批次抽取有来源的候选知识。
@@ -130,19 +102,13 @@ class KnowledgeModel:
         异常:
             KnowledgeModelError: 模型失败或输出不符合来源约束。
         """
-        parsed = await self._stream_json(extraction_messages(batch))
-        if set(parsed) != {"qas"}:
-            raise KnowledgeModelError("抽取结果包含额外字段")
-        raw_qas = parsed.get("qas")
-        if not isinstance(raw_qas, list):
-            raise KnowledgeModelError("抽取结果缺少 qas 数组")
+        parsed = await self._stream_output(
+            extraction_messages(batch), ExtractionResult, EXTRACTION_TOOL_NAME
+        )
         source_questions = {turn.message_id: turn.question for turn in batch.turns}
         qas: list[ExtractedQA] = []
-        for raw in raw_qas:
-            try:
-                qa = ExtractedQA.model_validate(raw)
-            except ValidationError as error:
-                raise KnowledgeModelError("抽取结果字段不合法") from error
+        for qa in parsed.qas:
+            # 工具契约只能保证字段形状，来源归属与原文真实性必须继续由业务层验证。
             if any(identifier not in source_questions for identifier in qa.source_ids):
                 raise KnowledgeModelError("抽取结果包含本批之外的来源")
             matching_questions = {
@@ -179,19 +145,14 @@ class KnowledgeModel:
         """
         if not pairs:
             return []
-        parsed = await self._stream_json(relation_messages(items, pairs))
-        raw_decisions = parsed.get("decisions")
-        if not isinstance(raw_decisions, list):
-            raise KnowledgeModelError("关系结果缺少 decisions 数组")
+        parsed = await self._stream_output(
+            relation_messages(items, pairs), RelationResult, RELATION_TOOL_NAME
+        )
         refs = {item.ref for item in items}
         requested = list(dict.fromkeys(pairs))
         requested_set = set(requested)
         decisions: dict[tuple[str, str], RelationDecision] = {}
-        for raw in raw_decisions:
-            try:
-                decision = RelationDecision.model_validate(raw)
-            except ValidationError as error:
-                raise KnowledgeModelError("关系结果字段不合法") from error
+        for decision in parsed.decisions:
             pair = (decision.left_ref, decision.right_ref)
             if decision.left_ref not in refs or decision.right_ref not in refs:
                 raise KnowledgeModelError("关系结果引用了未知证据")

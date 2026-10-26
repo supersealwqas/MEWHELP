@@ -2,9 +2,12 @@
 
 import asyncio
 import json
+from types import SimpleNamespace
 
+import httpx
 import pytest
-from langchain_core.messages import AIMessageChunk
+from langchain_core.messages import AIMessageChunk, HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
 
 from tests.rag.test_retrieval import _chunk, _search
 
@@ -25,6 +28,10 @@ class RewriteModel:
         self.options.append(options)
         return self
 
+    def bind_tools(self, tools, **options):
+        """接受生产工具绑定后提供受控响应。参数：tools公开schema、options强制选择；返回：自身；异常：无。"""
+        return self
+
     async def astream(self, messages):
         """模拟网络分片。参数：完整模型输入；返回：分片流；异常：配置的网络错误或取消。"""
         self.inputs.append(messages)
@@ -38,7 +45,9 @@ class RewriteModel:
                 for chunk in self.payload:
                     yield chunk
             else:
-                yield AIMessageChunk(content=self.payload)
+                yield AIMessageChunk(content="", tool_call_chunks=[{"name": "submit_query_rewrite",
+                    "args": self.payload, "id": "rewrite-1", "index": 0}],
+                    response_metadata={"finish_reason": "tool_calls"})
         finally:
             self.closed = True
 
@@ -92,18 +101,21 @@ async def test_rewrite_cannot_change_or_drop_model_and_quantity(standard):
 async def test_rewrite_network_error_and_cancel_close_stream():
     """网络故障不静默回退，取消不转换为知识不足。参数：无；返回：None；异常：断言失败。"""
     from app.knowledge.query_rewrite import QueryRewriter, QueryRewriteError
+    from app.core.model_budget import BudgetLedger
 
     broken = RewriteModel(error=OSError("network"))
     with pytest.raises(QueryRewriteError):
         await QueryRewriter(broken.factory).rewrite("如何清洗")
     assert broken.closed
     waiting = RewriteModel(wait=True)
-    task = asyncio.create_task(QueryRewriter(waiting.factory).rewrite("如何清洗"))
+    budget = BudgetLedger()
+    task = asyncio.create_task(QueryRewriter(waiting.factory).rewrite("如何清洗", budget=budget))
     await waiting.started.wait()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
     assert waiting.closed
+    assert budget.snapshot()["model_calls"] == 1 and budget.snapshot()["records"][0]["usage"] is None
 
 
 async def test_budget_and_tool_call_are_explicit_errors():
@@ -159,3 +171,109 @@ def test_preparation_preserves_raw_and_keeps_synonyms_out_of_dense():
     assert all("清洁" not in query for group in prepared.groups for query in group)
     assert all(raw in text and "清洁" in text for text in prepared.bm25_queries.values())
     assert all(raw in text and "清洁" not in text for text in prepared.rerank_queries.values())
+
+
+@pytest.fixture
+async def rewrite_sdk():
+    """只替换HTTP响应，保留真实SDK工具序列化。参数：无；返回：工厂/请求/响应脚本；异常：SDK错误。"""
+    requests, responses = [], []
+
+    async def handle(request):
+        """记录实际发包并提供SSE。参数：request请求；返回：httpx.Response；异常：多余请求断言失败。"""
+        requests.append(json.loads(request.content))
+        assert responses, "不得额外调用或回退"
+        body = "".join("data: " + json.dumps(chunk) + "\n\n" for chunk in responses.pop(0)) + "data: [DONE]\n\n"
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=body)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        def factory(**options):
+            """创建使用离线HTTP的真实客户端。参数：options生产模型选项；返回：ChatOpenAI；异常：SDK配置错误。"""
+            return ChatOpenAI(base_url="http://offline.invalid/v1", api_key="offline", model="test-model",
+                              http_async_client=client, **options)
+        yield SimpleNamespace(factory=factory, requests=requests, responses=responses)
+
+
+def rewrite_response(raw, *, tool=True, name="submit_query_rewrite", finish=None, usage=True):
+    """构造完整改写SSE响应。参数：raw参数原文、tool工具或正文、name工具名、finish结束原因、usage用量；返回：块列表；异常：无。"""
+    delta = {"role": "assistant"}
+    if tool:
+        delta["tool_calls"] = [{"index": 0, "id": "rewrite-1", "type": "function",
+            "function": {"name": name, "arguments": raw}}]
+    else:
+        delta["content"] = raw
+    rows = [{"id": "rewrite-test", "object": "chat.completion.chunk", "created": 0,
+        "model": "test-model", "choices": [{"index": 0, "delta": delta, "finish_reason": None}]},
+        {"id": "rewrite-test", "object": "chat.completion.chunk", "created": 0,
+        "model": "test-model", "choices": [{"index": 0, "delta": {},
+            "finish_reason": finish or ("tool_calls" if tool else "stop")}]}]
+    if usage:
+        rows.append({"id": "rewrite-test", "object": "chat.completion.chunk", "created": 0,
+            "model": "test-model", "choices": [],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120}})
+    return rows
+
+
+async def test_rewrite_uses_forced_strict_tool_and_budgets_schema(rewrite_sdk):
+    """未强制结构化工具、原问被改写或schema漏计预算时失败。参数：真实SDK夹具；返回：None；异常：断言失败。"""
+    from app.core.memory import _estimate_message_tokens, _estimate_token_units
+    from app.core.model_budget import BudgetLedger
+    from app.knowledge.query_rewrite import QueryRewriter
+
+    raw = "  MH-W99用了3天，脏了咋洗？\n"
+    rewrite_sdk.responses.append(rewrite_response('{"standard_query":"MH-W99用了3天如何清洗","synonyms":["清洁"]}'))
+    ledger = BudgetLedger()
+    result = await QueryRewriter(rewrite_sdk.factory).rewrite(raw, keyword="保养", budget=ledger)
+    assert result.standard_query == "MH-W99用了3天如何清洗" and result.synonyms == ["清洁"]
+    assert len(rewrite_sdk.requests) == 1
+    request = rewrite_sdk.requests[0]
+    assert json.loads(request["messages"][1]["content"]) == {"query": raw, "keyword": "保养"}
+    assert request["tool_choice"] == {"type": "function", "function": {"name": "submit_query_rewrite"}}
+    assert request["parallel_tool_calls"] is False
+    assert len(request["tools"]) == 1
+    schema = request["tools"][0]["function"]
+    assert schema["name"] == "submit_query_rewrite" and schema["strict"] is True
+    assert schema["parameters"]["additionalProperties"] is False
+    assert set(schema["parameters"]["required"]) == {"standard_query", "synonyms"}
+    actual_messages = [SystemMessage(content=request["messages"][0]["content"]), HumanMessage(content=request["messages"][1]["content"])]
+    record = ledger.snapshot()["records"][0]
+    assert record["input_units"] == _estimate_message_tokens(actual_messages) + _estimate_token_units(request["tools"])
+    assert record["output_limit"] == request["max_completion_tokens"] == 2048
+    assert record["finish_reason"] == "tool_calls" and ledger.snapshot()["actual_tokens"] == 120
+
+
+@pytest.mark.parametrize("tool,name,finish", [(False, "submit_query_rewrite", "stop"),
+    (True, "query_order", "tool_calls"), (True, "submit_query_rewrite", "length")],
+    ids=["text-json", "wrong-tool", "truncated-tool"])
+async def test_rewrite_has_no_text_or_wrong_tool_fallback(rewrite_sdk, tool, name, finish):
+    """自由文本JSON、错误工具或截断被接受或触发额外调用时失败。参数：SDK夹具、响应形式/名称/结束原因；返回：None；异常：断言失败。"""
+    from app.knowledge.query_rewrite import QueryRewriter, QueryRewriteError
+
+    rewrite_sdk.responses.append(rewrite_response('{"standard_query":"如何清洗","synonyms":[]}', tool=tool, name=name, finish=finish))
+    with pytest.raises(QueryRewriteError):
+        await QueryRewriter(rewrite_sdk.factory).rewrite("如何清洗")
+    assert len(rewrite_sdk.requests) == 1
+
+
+async def test_rewrite_request_budget_cannot_omit_tool_definition():
+    """只容得下消息却遗漏工具schema仍发请求时失败。参数：无；返回：None；异常：断言失败。"""
+    from app.core.memory import _estimate_message_tokens
+    from app.knowledge.query_rewrite import QUERY_REWRITE_RULES, QueryRewriter, QueryRewriteError
+
+    query = "饮水机怎么清洗"
+    messages = [SystemMessage(content=QUERY_REWRITE_RULES),
+        HumanMessage(content=json.dumps({"query": query, "keyword": None}, ensure_ascii=False))]
+    model = RewriteModel()
+    with pytest.raises(QueryRewriteError):
+        await QueryRewriter(model.factory, request_budget=_estimate_message_tokens(messages)).rewrite(query)
+    assert model.inputs == [] and model.options == []
+
+
+async def test_rewrite_tool_argument_length_is_bounded(rewrite_sdk):
+    """工具参数超10000字符未被输出长度保护拦截时失败。参数：SDK夹具；返回：None；异常：断言失败。"""
+    from app.knowledge.query_rewrite import QueryRewriter, QueryRewriteError
+
+    # 参数本身能通过JSON与语义校验，尾部空白只应由完整输出长度保护拒绝。
+    rewrite_sdk.responses.append(rewrite_response('{"standard_query":"如何清洗","synonyms":[]}' + " " * 10000))
+    with pytest.raises(QueryRewriteError):
+        await QueryRewriter(rewrite_sdk.factory).rewrite("如何清洗")
+    assert len(rewrite_sdk.requests) == 1

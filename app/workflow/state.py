@@ -23,6 +23,7 @@ class ConversationState(TypedDict, total=False):
     audit_cursor: int  # 已对账消息主键，零表示尚未导入历史。
     messages: list[dict]  # 本轮模型与工具消息的可序列化字典列表。
     intent: Intent | None  # 当前轮的严格七类意图，分类前为空。
+    knowledge_query: str | None  # 分类工具补全的独立知识问题；空值不检索，仅按已有事实回答或澄清。
     route: Literal["knowledge", "business", "complaint", "chitchat"] | None  # 固定四出口。
     evidence: list[dict]  # 本轮完整EvidenceCitation字典，编号保持稳定。
     evidence_scores: list[float]  # 本轮全部归一化重排分，与权威证据同源。
@@ -56,7 +57,7 @@ def new_turn_state(context: ToolContext, history_turns: list[dict], audit_cursor
     return {
         "context": context.model_dump(mode="json"), "raw_query": query, "resolved_query": "",
         "history_turns": deepcopy(history_turns), "audit_cursor": audit_cursor, "messages": [],
-        "intent": None, "route": None, "evidence": [], "evidence_scores": [], "gate": None,
+        "intent": None, "knowledge_query": None, "route": None, "evidence": [], "evidence_scores": [], "gate": None,
         "pending_calls": [], "seen_call_ids": [], "seen_call_signatures": [],
         "tool_count": 0, "decision_count": 0, "budget": BudgetLedger().snapshot(),
         "suggested_kinds": [], "suggested_actions": [], "answer": "", "stop_reason": None,

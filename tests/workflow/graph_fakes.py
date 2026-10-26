@@ -7,6 +7,7 @@ from app.config import Settings
 from app.knowledge.rerank import RankedChunk
 from app.knowledge.schemas import ChunkSnapshot
 from app.schemas.tools import ToolContext, ToolResult
+from app.schemas.workflow import RetrievalLowConfidence
 from app.workflow.graph import WorkflowDependencies
 from app.workflow.state import new_turn_state
 from tests.workflow.fakes import ScriptedWorkflowModel
@@ -41,6 +42,12 @@ class StrictChat:
         assert isinstance(context, ToolContext) and content
         assert {"intent", "route", "stop_reason", "budget", "tool_count", "decision_count"} <= workflow_metadata.keys()
         assert all(item.model_dump(mode="json") for item in citations + suggested_actions)
+        # 复刻真实仓储的低证据契约：弱证据入池必须与固定拒答话术同时保存。
+        # 替身不校验这一条时，图里传错 low_confidence 只会在真实服务上报错。
+        if isinstance(low_confidence, RetrievalLowConfidence):
+            from app.workflow.routing import fixed_reply
+            assert content == fixed_reply("fallback")["answer"], (
+                "检索弱证据入池必须与固定兜底一起保存")
         record = {"context": context, "content": content, "low_confidence": low_confidence,
                   "citations": citations, "suggested_actions": suggested_actions, "workflow_metadata": workflow_metadata}
         self.finished.append(record)

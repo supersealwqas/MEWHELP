@@ -19,6 +19,27 @@ from app.api.extract import get_extractor
 from app.core.llm import get_chat_model
 from app.main import app
 from app.schemas.extract import AfterSalesTicket
+from tests.workflow.test_model import sdk_runtime, call_response, text_response
+
+
+async def test_extractor_forces_named_strict_schema_over_real_sdk(sdk_runtime, monkeypatch):
+    """售后抽取必须强制调用结果工具，不能继续使用auto。参数：HTTP夹具与补丁；返回：None；异常：断言失败。"""
+    monkeypatch.setattr("app.api.extract.get_chat_model", sdk_runtime.factory)
+    sdk_runtime.responses.append(call_response("AfterSalesTicket",
+        '{"order_id":null,"request_type":"退款","expected_solution":"申请退款"}'))
+    result = await get_extractor().ainvoke({"text": "我想退款，没有订单号"})
+    assert result.order_id is None and result.request_type.value == "退款"
+    request = sdk_runtime.requests[0]
+    assert request["tool_choice"] == {"type": "function", "function": {"name": "AfterSalesTicket"}}
+    assert request["parallel_tool_calls"] is False
+    assert request["tools"][0]["function"]["strict"] is True
+
+
+async def test_extractor_has_no_text_json_fallback(sdk_runtime, monkeypatch):
+    """合法正文JSON也不能绕过工具协议返回售后结果。参数：HTTP夹具与补丁；返回：None；异常：断言失败。"""
+    monkeypatch.setattr("app.api.extract.get_chat_model", sdk_runtime.factory)
+    sdk_runtime.responses.append(text_response('{"order_id":null,"request_type":"退款","expected_solution":"申请退款"}'))
+    assert await get_extractor().ainvoke({"text": "申请退款"}) is None
 
 
 @pytest.fixture

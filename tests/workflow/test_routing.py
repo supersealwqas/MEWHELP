@@ -12,7 +12,8 @@ def test_routes_read_intent_from_state(intent, want):
     """错误映射或读取旧 route 时失败。参数：intent 七类意图、want 固定出口；返回：None；异常：断言失败。"""
     from app.workflow.routing import route_by_intent
 
-    assert route_by_intent({"intent": intent, "route": "old-route"}) == want
+    assert route_by_intent({"intent": intent, "route": "old-route",
+        "knowledge_query": "商城政策" if want == "knowledge" else None}) == want
 
 
 @pytest.mark.parametrize("state", [
@@ -66,3 +67,25 @@ def test_fixed_reply_rejects_agent_routes_and_returns_independent_suggestions():
     first = fixed_reply("complaint")
     first["suggested_kinds"].clear()
     assert fixed_reply("complaint")["suggested_kinds"] == ["handoff", "create_ticket"]
+
+
+@pytest.mark.parametrize("query", ["null", " \tnull\n", "None", "nil"], ids=["literal-null", "whitespace-null", "none", "nil"])
+def test_routes_normalize_string_null_placeholder(query):
+    """完整字符串null占位被当知识问题送去检索时失败。
+
+    参数：query为模型常见的空值字面量。返回：None。
+    异常：断言失败，占位被当成知识检索问题。
+    """
+    from app.workflow.routing import route_by_intent
+
+    # 严格schema已在IntentResult层确定性还原为None，路由不应再把它当知识问法送去检索。
+    assert route_by_intent({"intent": "商品咨询", "knowledge_query": query}) == "business"
+
+
+@pytest.mark.parametrize("query,expected", [(None, "business"),
+    ("商品说明中null字段是什么意思？", "knowledge")], ids=["real-null", "null-in-question"])
+def test_routes_preserve_real_null_and_normal_null_word(query, expected):
+    """真实None或含null词语的正常知识问题被空值保护误伤时失败。参数：query合法值、expected出口；返回：None；异常：断言失败。"""
+    from app.workflow.routing import route_by_intent
+
+    assert route_by_intent({"intent": "商品咨询", "knowledge_query": query}) == expected

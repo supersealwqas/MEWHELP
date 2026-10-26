@@ -125,3 +125,69 @@ async def test_node_logs_keep_safe_summary_and_drop_internal_custom_payloads(tmp
         for node in ["resolve_reference", "classify_intent", "chitchat_reply", "log_turn"]:
             assert f"node={node} phase=enter" in caplog.text and f"node={node} phase=exit" in caplog.text
         assert "budget=" in caplog.text and "elapsed_ms=" in caplog.text and "thread=mewhelp:ch05:1" in caplog.text
+
+
+async def test_failed_classification_keeps_diagnostic_without_exposing_it_to_user(tmp_path):
+    """分类最终失败时原始工具诊断必须落库，不能作为正文或可执行工具回灌。
+
+    参数：tmp_path独占测试库目录；返回：None；异常：断言失败或资源错误。
+    """
+    from app.schemas.chat import InvalidToolDecision
+
+    async with service_runtime(tmp_path) as (service, deps, factory):
+        async def classify(messages, ledger):
+            """模拟最终协议失败。参数：messages与ledger契约；返回：无；异常：InvalidToolDecision。"""
+            raise InvalidToolDecision(raw_output="SECRET_BAD_CLASSIFICATION", validation_category="intent_structure")
+
+        deps.model.classify = classify
+        events = await collect(service, "他是什么物品？从哪里到哪里")
+        assert events[-1].event == "error" and "SECRET_BAD_CLASSIFICATION" not in str(events)
+        async with factory() as session:
+            rows = (await session.scalars(select(Message).order_by(Message.id))).all()
+        audits = [row for row in rows if row.tool_calls]
+        assert len(audits) == 1
+        assert audits[0].tool_calls[0]["terminal_decision"]["raw_output"] == "SECRET_BAD_CLASSIFICATION"
+        assert all(row.turn_status == "failed" for row in rows)
+
+
+async def test_recovered_classification_diagnostic_stays_out_of_operational_log(tmp_path, caplog):
+    """补救后账本诊断可查，但节点安全日志不能输出模型原文。参数：tmp_path/caplog；返回：None；异常：断言失败。"""
+    from app.schemas.chat import InvalidToolDecision
+    from app.schemas.workflow import IntentResult
+
+    async with service_runtime(tmp_path) as (service, deps, _):
+        async def classify(messages, ledger):
+            """记录结构失败后成功分类。参数：messages与ledger契约；返回：闲聊分类；异常：预算错误。"""
+            ledger.reserve("classify", 50, 128)
+            ledger.record_failure("classify", InvalidToolDecision(raw_output="SECRET_CLASSIFICATION_RAW").audit_record)
+            ledger.reserve("classify", 100, 128)
+            return IntentResult(intent="闲聊", knowledge_query=None)
+
+        deps.model.classify = classify
+        with caplog.at_level("INFO"):
+            events = await collect(service)
+        assert events[-1].event == "done"
+        state = (await service.graph.aget_state({"configurable": {"thread_id": "mewhelp:ch05:1"}})).values
+        assert state["budget"]["records"][0]["failure"]["terminal_decision"]["raw_output"] == "SECRET_CLASSIFICATION_RAW"
+        assert "SECRET_CLASSIFICATION_RAW" not in caplog.text
+        assert "SECRET_CLASSIFICATION_RAW" not in str(events)
+
+
+async def test_diagnostic_storage_error_does_not_hide_the_safe_error_frame(tmp_path):
+    """附加审计写失败不能中断原本给用户的安全错误提示。参数：tmp_path隔离目录；返回：None；异常：断言失败。"""
+    from app.schemas.chat import InvalidToolDecision
+
+    async with service_runtime(tmp_path) as (service, deps, _):
+        async def classify(messages, ledger):
+            """产生协议失败。参数：模型契约；返回：无；异常：InvalidToolDecision。"""
+            raise InvalidToolDecision(raw_output="SECRET_DIAGNOSTIC")
+
+        async def save_tool_calls(context, calls):
+            """模拟审计落盘失败。参数：审计契约；返回：无；异常：ConnectionError。"""
+            raise ConnectionError("审计连接不可用")
+
+        deps.model.classify = classify
+        deps.chat.save_tool_calls = save_tool_calls
+        events = await collect(service)
+        assert events[-1].event == "error" and "SECRET_DIAGNOSTIC" not in str(events)
+        assert (await deps.chat.load_turns(1))[0].turn_status == "failed"

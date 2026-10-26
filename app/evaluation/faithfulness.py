@@ -10,12 +10,12 @@ from __future__ import annotations
 import json
 from typing import Annotated, Any, Callable
 
-import anyio
 from langchain_core.messages import HumanMessage, SystemMessage
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.config import settings
 from app.core.llm import get_chat_model
+from app.core.structured import StructuredOutputError, bind_output_tool, collect_tool_output, output_tool, parse_tool_output
 from app.knowledge.answering import EvidenceCitation
 from app.knowledge.schemas import KnowledgeUnavailable
 from app.repositories.faith_cases import FaithCaseDraft, FaithCaseRepository
@@ -55,14 +55,14 @@ class FaithfulnessResult(BaseModel):
 
 _JUDGE_SYSTEM = """你是独立的答案忠实度裁判。只使用下面实际喂给生成模型的证据全集判断，不能使用常识补齐。
 把答案拆成可核对事实，每条写claim、supported、reason、evidence_numbers；supported为JSON布尔。
-严格输出一个JSON对象 {"facts":[{"claim":"完整事实句","supported":true,"reason":"具体证据依据","evidence_numbers":[1]}]}。
+只调用一次submit_faithfulness，参数为 {"facts":[{"claim":"完整事实句","supported":true,"reason":"具体证据依据","evidence_numbers":[1]}]}。
 保证退款到账、未知型号能力、遗漏否定条件导致的相反结论等若无证据必须supported=false；证据外的话术不是新依据。
-只引用输入已有n。没有事实的拒答facts=[]；真实有事实答案不得省略全部事实。禁止Markdown围栏、工具申请或额外字段。
+只引用输入已有n。没有事实的拒答facts=[]；真实有事实答案不得省略全部事实。禁止自由文本、Markdown围栏、其他工具调用或额外字段。
 """
 
 
 class FaithfulnessJudge:
-    """有界严格 JSON 模型裁判，保留全集证据，传输/输出失败明确上抛。"""
+    """通过强制控制工具提交逐事实结论的有界裁判，保留全集证据，失败明确上抛。"""
 
     def __init__(self, client_factory: Callable[..., Any] = get_chat_model, *, model_name: str | None = None) -> None:
         """保存裁判工厂。参数：client_factory 项目模型工厂、model_name 可选真实模型名；返回：None；异常：无。"""
@@ -74,48 +74,22 @@ class FaithfulnessJudge:
 
         参数：query 当前评估原问；answer 已生成完整答案；citations 实际模型证据全集，不含ground-truth或策略名称。
         返回：FaithfulnessDecision，尚需服务端核验引用后统计/写表。
-        异常：FaithfulnessError，输入/输出超限或非法JSON；上游网络异常；取消关闭流。
+        异常：FaithfulnessError，输入/输出超限或控制调用非法；上游网络异常；取消关闭流。
         """
         payload = json.dumps({"query": query, "answer": answer, "citations": [item.model_dump() for item in citations]}, ensure_ascii=False)
-        if len(payload) > 65000:
+        name = "submit_faithfulness"
+        tool = output_tool(FaithfulnessDecision, name)
+        # 沿用65000字符上限，并计入新增的工具定义和固定提示，证据全集不能被截短。
+        if len(payload) + len(_JUDGE_SYSTEM) + len(json.dumps([tool], ensure_ascii=False)) > 65000:
             raise FaithfulnessError("裁判输入超出完整证据预算，不能截掉证据")
         model = self.factory(streaming=True, temperature=0.0, model=self.model_name, max_tokens=4096)
-        stream = model.astream([SystemMessage(content=_JUDGE_SYSTEM), HumanMessage(content=payload)])
-        parts = []
-        size = 0
+        messages = [SystemMessage(content=_JUDGE_SYSTEM), HumanMessage(content=payload)]
         try:
-            async for chunk in stream:
-                if getattr(chunk, "tool_calls", None) or getattr(chunk, "invalid_tool_calls", None) or getattr(chunk, "tool_call_chunks", None):
-                    raise FaithfulnessError("裁判返回工具申请")
-                content = chunk.content
-                if not isinstance(content, str):
-                    content = "".join(item if isinstance(item, str) else item["text"]
-                        for item in content if isinstance(item, str) or (isinstance(item, dict) and item.get("type") == "text"))
-                parts.append(content)
-                size += len(content)
-                if size > 20000:
-                    raise FaithfulnessError("裁判输出超长")
-        finally:
-            with anyio.CancelScope(shield=True):
-                await stream.aclose()
-
-        def unique(pairs):
-            """拒绝JSON重复字段。参数：键值对；返回：字典；异常：ValueError。"""
-            values = {}
-            for key, value in pairs:
-                if key in values:
-                    raise ValueError("裁判JSON重复字段")
-                values[key] = value
-            return values
-
-        def finite(value):
-            """拒绝非有限数。参数：非法常量；返回：不返回；异常：ValueError。"""
-            raise ValueError("裁判JSON非有限数")
-
-        try:
-            return FaithfulnessDecision.model_validate(json.loads("".join(parts), object_pairs_hook=unique, parse_constant=finite))
-        except (ValueError, TypeError, ValidationError) as error:
-            raise FaithfulnessError("裁判返回不合法JSON/字段") from error
+            gathered = await collect_tool_output(bind_output_tool(model, tool), messages, max_chars=20000)
+            return parse_tool_output(gathered, FaithfulnessDecision, name)
+        except StructuredOutputError as error:
+            # 协议失败不能成为空事实或满分，业务层只接收合法的逐事实结论。
+            raise FaithfulnessError("裁判未提交合法结构化结果") from error
 
 
 class FaithfulnessService:

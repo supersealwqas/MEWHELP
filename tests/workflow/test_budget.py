@@ -69,7 +69,7 @@ def test_fact_growth_stops_before_decision_and_keeps_existing_ledger():
     assert ledger.snapshot()["model_calls"] == 1
 
 
-@pytest.mark.parametrize("stage,limit", [("classify",128),("rewrite",2048),("decide",2048),("answer",4096)])
+@pytest.mark.parametrize("stage,limit", [("classify",4096),("rewrite",2048),("decide",2048),("answer",4096)])
 def test_request_and_output_limits_are_enforced(stage, limit):
     """超完整输入或单次输出上限未停止时失败。参数：stage 阶段、limit 输出上限；返回：None；异常：断言失败。"""
     from app.core.model_budget import BudgetLedger, WorkflowBudgetExceeded

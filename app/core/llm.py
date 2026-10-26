@@ -16,6 +16,7 @@ from pydantic import ValidationError
 
 from app.config import settings
 from app.core.prompts import ANSWER_NUDGE
+from app.core.structured import StructuredOutputError, bind_output_tool, collect_tool_output, output_tool, parse_tool_output
 from app.knowledge.answering import KnowledgeAnswer, KnowledgeAnswerError
 from app.schemas.chat import InvalidToolDecision
 
@@ -122,52 +123,26 @@ class ChatModelAdapter:
         return decision_message(gathered)
 
     async def answer_knowledge(self, messages) -> KnowledgeAnswer:
-        """有界聚合知识答案 JSON，严格校验 useful，不依赖网关 json_schema 支持。
+        """通过唯一强制控制工具提交知识答案，严格校验 useful。
 
         参数：messages 为完整本轮证据、稳定 n 及自评规则，不能携带未编号新证据。
         返回：KnowledgeAnswer，尚需服务端回核编号再发布。
-        异常：KnowledgeAnswerError，空/超长/重复键/非法 JSON 或工具申请；网络错误原样传播；取消关闭流。
+        异常：KnowledgeAnswerError，空/超长/非法参数或非指定控制调用；网络错误原样传播；取消关闭流。
         """
+        from app.core.memory import _estimate_message_tokens, _estimate_token_units
+
+        name = "submit_knowledge_answer"
+        tool = output_tool(KnowledgeAnswer, name)
+        # 上游历史裁剪之后还要计算实际结果工具，完整事实超限时不得预算外发送。
+        if _estimate_message_tokens(messages) + _estimate_token_units([tool]) > settings.request_token_budget:
+            raise KnowledgeAnswerError("知识自评完整输入超过请求预算")
         model = get_chat_model(streaming=True, temperature=0.0, max_tokens=4096)
-        parts = []
-        size = 0
-        stream = model.astream(messages)
         try:
-            async for chunk in stream:
-                if chunk.tool_calls or chunk.invalid_tool_calls or getattr(chunk, "tool_call_chunks", None):
-                    raise KnowledgeAnswerError("知识自评不能输出工具申请")
-                if isinstance(chunk.content, str):
-                    content = chunk.content
-                else:
-                    content = "".join(block if isinstance(block, str) else block["text"]
-                        for block in chunk.content if isinstance(block, str) or
-                        (isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str)))
-                size += len(content)
-                if size > 20000:
-                    raise KnowledgeAnswerError("知识自评输出超过长度上限")
-                parts.append(content)
-        finally:
-            with anyio.CancelScope(shield=True):
-                await stream.aclose()
-
-        def unique_object(pairs):
-            """拒绝JSON重复字段。参数：字段列表；返回：字典；异常：ValueError，重复键。"""
-            result = {}
-            for key, value in pairs:
-                if key in result:
-                    raise ValueError("JSON重复键")
-                result[key] = value
-            return result
-
-        def reject_number(value):
-            """拒绝NaN/Infinity。参数：异常数值文本；返回：不返回；异常：ValueError。"""
-            raise ValueError("JSON非有限数值")
-
-        try:
-            payload = json.loads("".join(parts), object_pairs_hook=unique_object, parse_constant=reject_number)
-            return KnowledgeAnswer.model_validate(payload)
-        except (ValueError, TypeError, ValidationError) as error:
-            raise KnowledgeAnswerError("知识自评返回不合法JSON或字段") from error
+            gathered = await collect_tool_output(bind_output_tool(model, tool), messages, max_chars=20000)
+            return parse_tool_output(gathered, KnowledgeAnswer, name)
+        except StructuredOutputError as error:
+            # 协议错误保持原业务错误类型，不能伪造useful=false触发证据不足入池。
+            raise KnowledgeAnswerError("知识自评未提交合法结构化结果") from error
 
     async def stream_answer(self, messages):
         """生成最终文本。

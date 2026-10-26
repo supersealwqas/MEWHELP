@@ -27,7 +27,7 @@ def resolve_reference(query: str) -> str:
 
 
 def route_by_intent(state: ConversationState) -> str:
-    """将State内本轮意图映射到固定出口，可直接作为条件边回调。
+    """按意图及是否需要知识证据映射到固定出口，可直接作为条件边回调。
 
     参数：state为包含intent的工作流字典，不接受直接字符串或模型指定节点名。
     返回：str，knowledge/business/complaint/chitchat之一。
@@ -36,8 +36,16 @@ def route_by_intent(state: ConversationState) -> str:
     if not isinstance(state, dict):
         raise ValueError("意图路由必须接收State字典")
     # 不去空白、不猜分类；分类失败不能悄悄变成闲聊或知识兜底。
-    intent = IntentResult.model_validate({"intent": state.get("intent")}).intent
-    return _INTENT_ROUTES[intent]
+    result = IntentResult.model_validate({"intent": state.get("intent"),
+                                         "knowledge_query": state.get("knowledge_query")})
+    route = _INTENT_ROUTES[result.intent]
+    if result.knowledge_query is not None:
+        # 混合问题即使标签是订单/物流，也要先提供政策证据，再由Agent补齐业务事实。
+        return "knowledge"
+    if route == "knowledge" and result.knowledge_query is None:
+        # 原问超限仍须进入知识输入检查，不能借由分类空问题绕过既有业务限制。
+        return "knowledge" if knowledge_input_stop_reason(state.get("raw_query", "")) else "business"
+    return route
 
 
 def knowledge_input_stop_reason(query: str) -> Literal["input_limit"] | None:

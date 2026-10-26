@@ -8,6 +8,8 @@ from app.schemas.tools import ToolContext, ToolResult
 
 Intent = Literal["物流", "订单", "商品咨询", "退款退货", "售后", "投诉", "闲聊"]
 ActionKind = Literal["handoff", "create_ticket"]
+# 模型把JSON空值写成文字时的稳定集合；仅完全匹配才还原，含这些词的正常问题不受影响。
+_NULL_PLACEHOLDERS = frozenset({"null", "none", "nil", "undefined"})
 
 
 class HistoryDelta(BaseModel):
@@ -18,10 +20,34 @@ class HistoryDelta(BaseModel):
 
 
 class IntentResult(BaseModel):
-    """仅保存分类结果，禁止模型补充解释或创造路由。"""
+    """保存意图及独立知识问题；空问题表示依赖已有事实或澄清，不能生成新政策。"""
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
     intent: Intent = Field(description="本轮主诉求所属的七类固定意图")
+    knowledge_query: str | None = Field(min_length=1, max_length=2000,
+        description="需要知识政策时填写结合历史的完整独立问题，保留当前条件；仅查具体业务事实或澄清含义时必须为真正null，不能使用字符串null或省略字段")
+
+    @field_validator("knowledge_query", mode="before")
+    @classmethod
+    def normalize_null_placeholder(cls, value):
+        """把模型常见的空值字面量还原为JSON空值。
+
+        参数：value为模型提交的原始字段值，可能是真正None或描述空值的字符串。
+        返回：None表示无需检索，或原样返回其余字符串。
+        异常：无；非字符串非None的值留给后续类型校验报错。
+        """
+        # 模型反复把JSON null写成文字"null"，靠提示词重试无法稳定纠正，此处确定性还原而不改变语义。
+        if isinstance(value, str) and value.strip().lower() in _NULL_PLACEHOLDERS:
+            return None
+        return value
+
+    @model_validator(mode="after")
+    def validate_knowledge_query(self) -> "IntentResult":
+        """拒绝空白及固定回复意图夹带检索。参数：无；返回：自身，不归一化输入；异常：ValueError，问题无效或与意图矛盾。"""
+        if self.knowledge_query is not None:
+            if not self.knowledge_query.strip() or self.intent in {"投诉", "闲聊"}:
+                raise ValueError("知识问题必须非空白，投诉和闲聊不携带知识检索")
+        return self
 
 
 class AgentDecision(BaseModel):

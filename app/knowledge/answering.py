@@ -289,11 +289,11 @@ def decide_answer(result: KnowledgeAnswer, citations: list[EvidenceCitation]) ->
     return result.answer, None
 
 
-KNOWLEDGE_ANSWER_HANDOFF = "本轮工具查询阶段已经结束，不能再次申请或模拟任何工具调用。现在只对query字段中的原始问题进行知识有用性自评，依据前面本轮完整工具事实，仅输出规定的JSON对象；不要输出其他文字。"
+KNOWLEDGE_ANSWER_HANDOFF = "本轮业务查询阶段已经结束，不能再次申请或模拟业务查询、写入操作。现在只对query字段中的原始问题进行知识有用性自评，依据前面本轮完整工具事实，仅调用一次submit_knowledge_answer提交规定字段；不要输出自由文本。"
 
 
 def knowledge_answer_handoff(query: str) -> dict[str, str]:
-    """明确结束工具阶段并按原文重申本轮问题，避免无工具定义请求继续申请工具。
+    """明确结束业务工具阶段并重申原问，转入唯一的知识自评控制调用。
 
     参数：query 为非空的本轮真实问题，保留空白、型号、否定词与时间条件，不改写。
     返回：dict[str, str]，包含可信阶段指令和原始query，调用者将其计入完整请求预算。
@@ -306,8 +306,8 @@ def knowledge_answer_handoff(query: str) -> dict[str, str]:
 
 
 KNOWLEDGE_ANSWER_RULES = """
-当前进行知识生成和有用性自评。只输出一个JSON对象，不输出Markdown围栏、工具申请或JSON之外的文字。
-格式：{"useful":true/false,"reason":"证据不足的简短原因，可答时为空","answer":"仅依据本轮证据的回答","citation_numbers":[1,2]}
+当前进行知识生成和有用性自评。只调用一次submit_knowledge_answer，不输出自由文本或Markdown围栏，不申请业务工具。
+调用参数：{"useful":true/false,"reason":"证据不足的简短原因，可答时为空","answer":"仅依据本轮证据的回答","citation_numbers":[1,2]}
 useful必须是JSON布尔。先检查最后用户问题需要的条件是否由本轮完整hits支持，历史FAQ、常识和之前助手文本不能补证据。
 证据不足时useful=false，answer为空、citation_numbers为空，不猜测费用、型号功能、退款到账等事实。
 可答时useful=true，用hits中的n作为角标[n]，citation_numbers只列答案实际引用编号，不得使用未出现的n。

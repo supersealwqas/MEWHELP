@@ -33,13 +33,13 @@ def get_extractor() -> Runnable:
         pydantic.ValidationError: 模型客户端参数不合法时抛出。
         ValueError: 结构化输出参数不受模型客户端支持时抛出。
     """
-    # 保留已验证的网关兼容参数，避免重命名后恢复成不兼容的默认调用方式。
+    # 使用函数调用结构化协议；由LangChain强制指定结果工具，不能退回auto自由文本。
     # 单次提取显式限制输出额度，足够容纳工单JSON并避免无界生成。
     model = get_chat_model(temperature=0.0, streaming=True, max_tokens=1024)
     structured_model = model.with_structured_output(
         AfterSalesTicket,
         method="function_calling",
-        tool_choice="auto",
+        strict=True,
     )
     return EXTRACT_PROMPT | structured_model
 

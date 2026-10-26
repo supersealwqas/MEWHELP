@@ -77,14 +77,21 @@ class HybridKnowledgeSearch:
         self.query_rewriter = query_rewriter
 
     async def _prepare(self, query: str, *, policy: bool = False, subquery_split: bool = True,
-                       source_query: str | None = None, budget: BudgetLedger | None = None) -> PreparedQuery:
-        """一次准备整次查询。参数：query 关键词或原问、policy 退款、subquery_split 拆句、source_query 原问、budget 请求独占账本；返回：准备结果；异常：预算/改写/校验错误。"""
+                       source_query: str | None = None, budget: BudgetLedger | None = None,
+                       history: str = "") -> PreparedQuery:
+        """一次准备整次查询。
+
+        参数：query 关键词或原问、policy 退款、subquery_split 拆句、source_query 原问、budget 请求独占账本、
+            history 可信历史用户/工具文本，仅用于判断改写是否编造事实。
+        返回：准备结果；异常：预算/改写/校验错误。
+        """
         raw = source_query if source_query is not None else query
         if self.query_rewriter is None:
             # 未注入只供底层兼容；正式运行时在装配处强制提供改写器。
             return prepare_query(query, policy=policy, subquery_split=subquery_split)
         options = {"budget": budget} if budget is not None else {}
-        rewrite = await self.query_rewriter.rewrite(raw, keyword=query if source_query is not None else None, **options)
+        rewrite = await self.query_rewriter.rewrite(raw, keyword=query if source_query is not None else None,
+                                                   context=history, **options)
         return prepare_query(raw, policy=policy, subquery_split=subquery_split, rewrite=rewrite)
 
     def _validate_query(self, query: str) -> None:
@@ -153,11 +160,13 @@ class HybridKnowledgeSearch:
 
     async def retrieve(self, query: str, *, top_k: int | None = None,
                        subquery_split: bool | None = None, filters: dict | None = None,
-                       source_query: str | None = None, budget: BudgetLedger | None = None) -> list[RankedChunk]:
+                       source_query: str | None = None, budget: BudgetLedger | None = None,
+                       history: str = "") -> list[RankedChunk]:
         """逐子句跑完整链路，轮转合并去重后最终截到 Top-K。
 
         参数：query 当前原话；top_k None 使用 config.rerank_top_k=10，显式值 1–recall_top_k；
-            subquery_split None 使用配置默认 True，False 只检索完整原话；filters 为权威元数据筛选；source_query 为可信原问；budget 请求独占账本。
+            subquery_split None 使用配置默认 True，False 只检索完整原话；filters 为权威元数据筛选；
+            source_query 为可信原问；budget 请求独占账本；history 可信历史用户/工具文本，用于校验改写未编造事实。
         返回：list[RankedChunk]，普通路径最多 Top-K；N 个子句会分别调用 N 次重排。
         异常：ValueError，参数非法；检索/模型/权威存储异常；取消直接传播。
         """
@@ -168,7 +177,8 @@ class HybridKnowledgeSearch:
         split = self.config.subquery_split if subquery_split is None else subquery_split
         if type(split) is not bool:
             raise ValueError("subquery_split 必须为布尔值")
-        prepared = await self._prepare(query, subquery_split=split, source_query=source_query, budget=budget)
+        prepared = await self._prepare(query, subquery_split=split, source_query=source_query, budget=budget,
+                                      history=history)
         normalized = _validated_filters(filters)
         scope = await self._filter_scope(normalized) if normalized else None
         return await self._retrieve_group(prepared.groups[0], prepared, selected, scope)
@@ -212,15 +222,17 @@ class HybridKnowledgeSearch:
         return faq_rows(ranked)
 
     async def retrieve_policy(self, query: str, *, filters: dict | None = None,
-                              budget: BudgetLedger | None = None) -> list[RankedChunk]:
+                              budget: BudgetLedger | None = None, history: str = "") -> list[RankedChunk]:
         """退款政策三查询分别检索并按 chunk id 去重，合并后不再截为十条。
 
-        参数：query 当前退款问题，原话保留到三条扩展中；filters 可选元数据筛选；budget 请求独占账本。
+        参数：query 当前退款问题，原话保留到三条扩展中；filters 可选元数据筛选；
+            budget 请求独占账本；history 可信历史用户/工具文本，用于校验改写未编造事实。
         返回：list[RankedChunk]，默认最多 30 个原 chunk，保留查询顺序。
         异常：ValueError，参数/输入限制；检索、模型或存储异常。
         """
         self._validate_query(query)
-        prepared = await self._prepare(query, policy=True, subquery_split=self.config.subquery_split, budget=budget)
+        prepared = await self._prepare(query, policy=True, subquery_split=self.config.subquery_split,
+                                       budget=budget, history=history)
         normalized = _validated_filters(filters)
         scope = await self._filter_scope(normalized) if normalized else None
         merged: dict[int, RankedChunk] = {}

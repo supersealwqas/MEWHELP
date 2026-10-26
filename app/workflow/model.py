@@ -1,45 +1,80 @@
-"""受预算限制的工作流模型边界：内部 JSON/完整工具申请与无工具最终正文真流式分离。"""
+"""受预算限制的工作流模型边界：严格业务/终止控制工具与无工具最终正文真流式分离。"""
 
+import json
 from contextlib import aclosing
+from copy import deepcopy
 from typing import AsyncIterator
 
 import anyio
 from langchain_core.messages import HumanMessage, SystemMessage, convert_to_messages
+from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import ValidationError
 
 from app.config import settings
-from app.core.llm import decision_message, get_chat_model, strict_json_object
+from app.core.llm import decision_message, get_chat_model
 from app.core.memory import _estimate_message_tokens, _estimate_token_units
-from app.core.model_budget import BudgetLedger
+from app.core.model_budget import OUTPUT_LIMITS, BudgetLedger, WorkflowBudgetExceeded
 from app.core.prompts import ANSWER_NUDGE
+from app.core.structured import StructuredOutputError, bind_output_tool, output_chunk_size, output_tool, parse_tool_output
+from app.knowledge.query_rewrite import QueryRewrite, QueryRewriteError, validate_rewrite
 from app.schemas.chat import InvalidToolDecision
 from app.schemas.workflow import AgentDecision, IntentResult
-from app.workflow.prompts import ANSWER_PROMPT, DECISION_PROMPT, INTENT_PROMPT
+from app.workflow.prompts import ANSWER_PROMPT, DECISION_NUDGE, DECISION_PROMPT, INTENT_NUDGE, INTENT_PROMPT
 
 READ_ONLY_NAMES = frozenset({"query_order", "query_logistics", "query_product"})
+_CONTROL_NAME = "submit_decision"
+_CONTROL_SCHEMA = {"type": "function", "function": {
+    "name": _CONTROL_NAME,
+    "description": "提交内部终止决定：已有事实足够时回答，缺必要信息时追问；不执行业务操作。",
+    "strict": True,
+    "parameters": {"type": "object", "additionalProperties": False,
+        "properties": {
+            "kind": {"type": "string", "enum": ["answer", "clarify"], "description": "回答或追问"},
+            "suggested_actions": {"type": "array", "maxItems": 2,
+                "items": {"type": "string", "enum": ["handoff", "create_ticket"]},
+                "description": "最多两个不重复的建议动作；没有建议时为空数组"}},
+        "required": ["kind", "suggested_actions"]}}}
 
 
 class WorkflowOutputError(ValueError):
     """模型输出截断、拒绝、超长或无有效正文，不能作为正常完成发布。"""
 
 
-def parse_intent(raw: str) -> IntentResult:
-    """严格解析七意图 JSON。参数：raw 完整原文；返回：IntentResult；异常：InvalidToolDecision，不修复或猜测。"""
-    try:
-        return IntentResult.model_validate(strict_json_object(raw))
-    except (ValueError, TypeError, ValidationError) as error:
-        raise InvalidToolDecision() from error
+def intent_tool_schema() -> dict:
+    """生成分类绑定与完整输入预算共用的结果工具。参数：无；返回：严格submit_intent定义；异常：schema转换错误。"""
+    return output_tool(IntentResult, "submit_intent")
 
 
-def parse_decision(raw: str) -> AgentDecision:
-    """严格解析无工具终止 JSON。参数：raw 完整原文；返回：AgentDecision；异常：InvalidToolDecision，结构不精确。"""
+def decision_tool_schemas(tools: list) -> list[dict]:
+    """生成决策绑定及预算共用的严格公开工具定义。
+
+    参数：tools既有只读业务工具列表，名称必须唯一且属于允许集合。
+    返回：list[dict]，业务schema后追加独立的submit_decision控制schema。
+    异常：InvalidToolDecision，包含写工具、未知工具或重复名称；schema转换错误原样传播。
+    """
+    if any(tool.name not in READ_ONLY_NAMES or "write" in (tool.tags or []) for tool in tools):
+        raise InvalidToolDecision()
+    if len({tool.name for tool in tools}) != len(tools):
+        raise InvalidToolDecision()
+    # SDK只公开业务参数，不暴露注入的身份；控制工具只用于协议，不加入业务注册表。
+    return [*[convert_to_openai_tool(tool, strict=True) for tool in tools], deepcopy(_CONTROL_SCHEMA)]
+
+
+def _parse_terminal_decision(payload: dict) -> AgentDecision:
+    """严格校验唯一控制调用的终止参数。
+
+    参数：payload已完成JSON解析的submit_decision参数，只允许kind和suggested_actions。
+    返回：AgentDecision，回答或追问且无业务工具申请。
+    异常：InvalidToolDecision，字段或取值非法，携带有界的参数JSON诊断。
+    """
+    category = "shape"
     try:
-        payload = strict_json_object(raw)
         if set(payload) != {"kind", "suggested_actions"} or payload["kind"] not in ("answer", "clarify"):
             raise ValueError("终止决定必须精确包含 kind 和 suggested_actions")
+        category = "schema"
         return AgentDecision.model_validate(payload)
     except (ValueError, TypeError, ValidationError) as error:
-        raise InvalidToolDecision() from error
+        raise InvalidToolDecision(raw_output=json.dumps(payload, ensure_ascii=False), validation_category=category) from error
 
 
 def _text(chunk) -> str:
@@ -81,7 +116,7 @@ class WorkflowModelAdapter:
         try:
             async for chunk in stream:
                 gathered = chunk if gathered is None else gathered + chunk
-                size += len(_text(chunk))
+                size += output_chunk_size(chunk)
                 if size > 20000:
                     raise WorkflowOutputError("内部模型输出超过长度上限")
         finally:
@@ -95,56 +130,139 @@ class WorkflowModelAdapter:
         return gathered
 
     async def classify(self, messages: list, ledger: BudgetLedger) -> IntentResult:
-        """分类当前主诉求并保留历史上下文。参数：messages 完整分类输入、ledger 独占账本；返回：IntentResult；异常：预算/协议/网络错误。"""
+        """分类当前主诉求；结构错误最多补救一次，派生问法失真则按原问安全回退。
+
+        参数：messages完整分类输入与历史；ledger独占账本，补救计入总次数与输入预算。
+        返回：IntentResult，只接受submit_intent合法参数；引用校验失败时使用完整原问并保留诊断，
+            超2000字符则保留有界结果交由既有input_limit分支阻止检索。
+        异常：InvalidToolDecision，两次结构不合法或缺少可信原问；预算、异常终止、网络与取消原样传播。
+        """
         prepared = [SystemMessage(content=INTENT_PROMPT), *convert_to_messages(messages)]
-        ledger.reserve("classify", _estimate_message_tokens(prepared), 128)
-        gathered = await self._gather(prepared, self._model(128), ledger, "classify")
-        if _has_calls(gathered):
-            raise InvalidToolDecision(tool_call_chunks=gathered.tool_call_chunks)
-        _check_finish(gathered.response_metadata.get("finish_reason"))
-        return parse_intent(_text(gathered))
+        tool = intent_tool_schema()
+        output_limit = OUTPUT_LIMITS["classify"]
+        for attempt in range(2):
+            # 不回灌失败原文；只能重做只读分类，不执行模型误吐出的业务申请。
+            current = prepared if attempt == 0 else [*prepared, SystemMessage(content=INTENT_NUDGE)]
+            try:
+                ledger.reserve("classify", _estimate_message_tokens(current) + _estimate_token_units([tool]), output_limit)
+            except WorkflowBudgetExceeded as error:
+                if attempt:
+                    error.audit_record = {"type": "invalid_tool_decision", "classification_budget": ledger.snapshot()}
+                raise
+            gathered = await self._gather(current, bind_output_tool(self._model(output_limit), tool), ledger, "classify")
+            _check_finish(gathered.response_metadata.get("finish_reason"), tools=_has_calls(gathered))
+            try:
+                result = parse_tool_output(gathered, IntentResult, "submit_intent")
+                if result.knowledge_query is not None:
+                    users = [message for message in prepared if message.type == "human"]
+                    original_query = _text(users[-1]) if users else ""
+                    if not original_query.strip():
+                        raise QueryRewriteError("缺少用户原问，无法校验或回退知识问题")
+                    # 新独立问法不能抹掉原问型号/数字；只允许从用户历史或可信工具结果补全，助手散文不作事实来源。
+                    history = [message.content for message in prepared if message.type in {"human", "tool"}]
+                    validate_rewrite(original_query,
+                        QueryRewrite(standard_query=result.knowledge_query, synonyms=[]),
+                        context=json.dumps(history, ensure_ascii=False))
+                return result
+            except (StructuredOutputError, QueryRewriteError) as error:
+                invalid = InvalidToolDecision(tool_call_chunks=gathered.tool_call_chunks,
+                    raw_output=_text(gathered), validation_category=(
+                        "intent_reference" if isinstance(error, QueryRewriteError) else "intent_structure"))
+                if isinstance(error, QueryRewriteError) and original_query.strip():
+                    if len(original_query) <= 2000:
+                        # 分类本身已通过严格解析；丢弃失真的派生问法，不再请求模型或改动原话。
+                        result = IntentResult(intent=result.intent, knowledge_query=original_query)
+                        invalid.audit_record["query_fallback"] = "original_query"
+                    else:
+                        # 有界问法仅维持知识路由；真实图先检查完整原问，以input_limit结束而不检索。
+                        invalid.audit_record["query_fallback"] = "input_limit"
+                    ledger.record_failure("classify", invalid.audit_record)
+                    return result
+                ledger.record_failure("classify", invalid.audit_record)
+                if attempt or isinstance(error, QueryRewriteError):
+                    # 图抛错不会提交局部State，最终异常须携带已有诊断和用量供服务单独落库。
+                    invalid.audit_record["classification_budget"] = ledger.snapshot()
+                    raise invalid from error
 
     async def decide(self, messages: list, tools: list, ledger: BudgetLedger) -> AgentDecision:
-        """汇总并校验只读申请或终止 JSON。参数：messages 完整事实、tools 既有只读工具、ledger 独占账本；返回：AgentDecision；异常：预算/协议/网络错误。"""
-        if any(tool.name not in READ_ONLY_NAMES or "write" in (tool.tags or []) for tool in tools):
-            raise InvalidToolDecision()
+        """仅接受业务工具或唯一终止控制工具，缺控制调用或其参数非法时有限纠正。
+
+        参数：messages完整事实、tools既有只读工具、ledger独占账本。
+        返回：AgentDecision，纠正轮只能回答或追问，不能再申请工具。
+        异常：预算/协议/网络错误及取消；坏业务批次、非法ID和异常结束不触发纠正。
+        """
+        schemas = decision_tool_schemas(tools)
         available = {tool.name: tool for tool in tools}
-        if len(available) != len(tools):
-            raise InvalidToolDecision()
-        schemas = [{"type":"function", "function":{"name":tool.name, "description":tool.description,
-                    "parameters":tool.tool_call_schema.model_json_schema()}} for tool in tools]
         converted = convert_to_messages(messages)
         prepared = [SystemMessage(content=DECISION_PROMPT), *converted]
-        input_units = _estimate_message_tokens(prepared) + (_estimate_token_units(schemas) if schemas else 0)
         answer_messages = [SystemMessage(content=ANSWER_PROMPT), *converted]
         retry_messages = [*answer_messages, HumanMessage(content=ANSWER_NUDGE)]
-        # 未来正文仅检查剩余额度；工具结果增加后下一步再次核对，不重复扣账。
-        ledger.ensure_capacity([("decide", input_units, 2048),
-            ("answer", _estimate_message_tokens(answer_messages), 4096),
-            ("answer", _estimate_message_tokens(retry_messages), 4096)])
-        ledger.reserve("decide", input_units, 2048)
-        model = self._model(2048)
-        gathered = await self._gather(prepared, model.bind_tools(schemas, tool_choice="auto") if schemas else model,
-                                      ledger, "decide")
-        _check_finish(gathered.response_metadata.get("finish_reason"), tools=_has_calls(gathered))
-        message = decision_message(gathered)
-        if message.invalid_tool_calls:
-            raise InvalidToolDecision(invalid_tool_calls=message.invalid_tool_calls)
-        if not message.tool_calls:
-            return parse_decision(_text(message))
-        calls, seen = [], set()
+        for attempt in range(2):
+            # 原失败文本只留诊断；固定system提示不会取代最近一条用户诉求或裁掉已知事实。
+            current = prepared if attempt == 0 else [*prepared, SystemMessage(content=DECISION_NUDGE)]
+            bound_schemas = schemas if attempt == 0 else schemas[-1:]
+            input_units = _estimate_message_tokens(current) + _estimate_token_units(bound_schemas)
+            # 每次真实请求都保留两次正文余量；纠正提示也计入完整输入，不能预算外重试。
+            ledger.ensure_capacity([("decide", input_units, 2048),
+                ("answer", _estimate_message_tokens(answer_messages), 4096),
+                ("answer", _estimate_message_tokens(retry_messages), 4096)])
+            ledger.reserve("decide", input_units, 2048)
+            model = self._model(2048)
+            choice = "required" if attempt == 0 else {"type": "function", "function": {"name": _CONTROL_NAME}}
+            bound = model.bind_tools(bound_schemas, tool_choice=choice, parallel_tool_calls=False)
+            gathered = await self._gather(current, bound, ledger, "decide")
+            _check_finish(gathered.response_metadata.get("finish_reason"), tools=_has_calls(gathered))
+            try:
+                message = decision_message(gathered)
+            except InvalidToolDecision:
+                chunks = getattr(gathered, "tool_call_chunks", None) or []
+                control = chunks[0] if len(chunks) == 1 else {}
+                # 只重试身份明确的单个控制分片；不修补JSON，也不把业务或混合坏批次带入纠正。
+                if (attempt == 0 and control.get("name") == _CONTROL_NAME
+                        and isinstance(control.get("id"), str) and control["id"].strip()):
+                    continue
+                raise
+            if message.invalid_tool_calls:
+                raise InvalidToolDecision(invalid_tool_calls=message.invalid_tool_calls)
+            if not message.tool_calls:
+                # 自由文本即使恰好是旧版合法JSON也不能成为终止决定或最终正文。
+                if attempt:
+                    raise InvalidToolDecision(raw_output=_text(message), validation_category="missing_control_tool")
+                continue
+            calls, seen = message.tool_calls, set()
+            try:
+                for call in calls:
+                    call_id, name = call.get("id"), call.get("name")
+                    if (not isinstance(call_id, str) or not call_id.strip() or call_id in seen
+                            or name not in {*available, _CONTROL_NAME}):
+                        raise ValueError("工具名称或 ID 非法")
+                    seen.add(call_id)
+                terminal = any(call["name"] == _CONTROL_NAME for call in calls)
+                if terminal and len(calls) != 1:
+                    raise ValueError("终止控制调用不能混入业务批次或重复提交")
+                if attempt and not terminal:
+                    raise ValueError("纠正轮只能提交终止控制调用")
+            except (ValueError, TypeError) as error:
+                # 先核验整个批次，任何混合、非法ID或未知工具都不能部分执行或进入纠正。
+                raise InvalidToolDecision(tool_calls=calls) from error
+            if terminal:
+                try:
+                    return _parse_terminal_decision(calls[0]["args"])
+                except InvalidToolDecision:
+                    if attempt:
+                        raise
+                    continue
+            break
+        validated_calls = []
         try:
             for call in message.tool_calls:
                 call_id, name, args = call.get("id"), call.get("name"), call.get("args")
-                if not isinstance(call_id, str) or not call_id.strip() or call_id in seen or name not in available:
-                    raise ValueError("工具名称或 ID 非法")
                 schema = available[name].tool_call_schema
                 if not isinstance(args, dict) or set(args) - set(schema.model_fields):
                     raise ValueError("工具参数包含未公开字段")
                 validated = schema.model_validate(args, strict=True).model_dump()
-                calls.append({"id":call_id, "name":name, "args":validated})
-                seen.add(call_id)
-            return AgentDecision(kind="tools", tool_calls=calls)
+                validated_calls.append({"id":call_id, "name":name, "args":validated})
+            return AgentDecision(kind="tools", tool_calls=validated_calls)
         except (ValueError, TypeError, ValidationError) as error:
             raise InvalidToolDecision(tool_calls=message.tool_calls) from error
 

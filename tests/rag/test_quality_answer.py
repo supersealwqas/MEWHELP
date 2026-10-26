@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 
 import pytest
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
@@ -11,25 +12,40 @@ from app.schemas.chat import ChatRequest
 from tests.chat_fakes import make_chat_service
 from tests.rag.test_retrieval import _chunk, _search
 from app.repositories.support import SupportRepository
+from tests.workflow.test_model import sdk_runtime, call_response, text_response
 
 
 class ResponseModel:
-    """仅替换上游模型流，保留真实适配器的 JSON 聚合与关闭。"""
+    """仅替换上游模型流，保留真实适配器的工具参数聚合与关闭。"""
 
     def __init__(self, frames: list) -> None:
         """保存响应。参数：frames 模型流分片；返回：None；异常：无。"""
         self.frames = frames
         self.closed = False
 
+    def bind_tools(self, tools, **kwargs):
+        """返回受控流边界。参数：tools公开定义、kwargs绑定参数；返回：自身；异常：无。"""
+        return self
+
     async def astream(self, messages):
         """产生外部模型输出。参数：实际提示；返回：异步分片；异常：预设网络异常。"""
         try:
             for frame in self.frames:
-                if isinstance(frame, Exception):
+                if isinstance(frame, BaseException):
                     raise frame
                 yield frame
         finally:
             self.closed = True
+
+
+def knowledge_frames(raw: str) -> list[AIMessageChunk]:
+    """构造跨分片的知识控制参数。参数：raw原始参数JSON；返回：含结束原因的工具分片；异常：无。"""
+    split = len(raw) // 2
+    return [AIMessageChunk(content="", tool_call_chunks=[
+        {"name": "submit_knowledge_answer", "args": raw[:split], "id": "knowledge-1", "index": 0}]),
+        AIMessageChunk(content="", tool_call_chunks=[
+            {"name": None, "args": raw[split:], "id": None, "index": 0}],
+            response_metadata={"finish_reason": "tool_calls"})]
 
 
 async def test_knowledge_generation_handoff_preserves_raw_query_and_completes_refusal(monkeypatch) -> None:
@@ -45,13 +61,13 @@ async def test_knowledge_generation_handoff_preserves_raw_query_and_completes_re
     raw = '  MH-W99水箱容量是多少？\n不能用MH-W20代替。  '
 
     class EndingAwareGateway(ResponseModel):
-        """模拟无工具定义请求以工具结果结束时空输出、明确新任务后正常自评的网关。"""
+        """模拟需明确交接原问才正常提交知识自评的网关。"""
 
         async def astream(self, messages):
             """响应真实请求末帧。参数：messages 实际输入；返回：模型流；异常：原测试异常。"""
             ending = json.loads(messages[-1].content)
             if isinstance(messages[-1], HumanMessage) and ending.get("query") == raw and ending.get("instruction"):
-                self.frames = [AIMessageChunk(content='{"useful":false,"reason":"无该型号原文","answer":"","citation_numbers":[]}')]
+                self.frames = knowledge_frames('{"useful":false,"reason":"无该型号原文","answer":"","citation_numbers":[]}')
             async for chunk in super().astream(messages):
                 yield chunk
 
@@ -82,12 +98,11 @@ async def test_adapter_network_error_is_not_converted_to_refusal(monkeypatch) ->
     assert upstream.closed
 
 
-async def test_adapter_strict_json_self_check_and_closes_stream(monkeypatch) -> None:
-    """useful 正常布尔与完整 JSON 分片须聚合，资源立即关闭。参数：替换器；返回：None；异常：断言失败。"""
+async def test_adapter_strict_tool_self_check_and_closes_stream(monkeypatch) -> None:
+    """useful 正常布尔与完整工具参数分片须聚合，资源立即关闭。参数：替换器；返回：None；异常：断言失败。"""
     from app.core import llm
 
-    upstream = ResponseModel([AIMessageChunk(content='{"useful":false,"reason":"证据不足",'),
-                              AIMessageChunk(content='"answer":"","citation_numbers":[]}')])
+    upstream = ResponseModel(knowledge_frames('{"useful":false,"reason":"证据不足","answer":"","citation_numbers":[]}'))
     monkeypatch.setattr(llm, "get_chat_model", lambda **kwargs: upstream)
     result = await llm.ChatModelAdapter().answer_knowledge([HumanMessage(content="能退吗")])
     assert result.useful is False and result.reason == "证据不足" and upstream.closed
@@ -106,11 +121,83 @@ async def test_adapter_rejects_malformed_self_check_without_coercion(monkeypatch
     from app.core import llm
     from app.knowledge.answering import KnowledgeAnswerError
 
-    upstream = ResponseModel([AIMessageChunk(content=payload)])
+    upstream = ResponseModel(knowledge_frames(payload))
     monkeypatch.setattr(llm, "get_chat_model", lambda **kwargs: upstream)
     with pytest.raises(KnowledgeAnswerError):
         await llm.ChatModelAdapter().answer_knowledge([])
     assert upstream.closed
+
+
+@pytest.mark.parametrize("useful", [True, False])
+async def test_knowledge_self_check_requires_strict_named_tool_on_sdk(sdk_runtime, monkeypatch, useful):
+    """知识自评仍依赖自由文本或丢失useful/引用字段时失败。参数：HTTP夹具、替换器、证据是否充分；返回：None；异常：断言失败。"""
+    from app.core import llm
+
+    payload = {"useful": useful, "reason": "" if useful else "证据不足",
+        "answer": "退款条件见[1]" if useful else "", "citation_numbers": [1] if useful else []}
+    sdk_runtime.responses.append(call_response("submit_knowledge_answer", json.dumps(payload)))
+    monkeypatch.setattr(llm, "get_chat_model", sdk_runtime.factory)
+    result = await llm.ChatModelAdapter().answer_knowledge([HumanMessage(content="退款条件？")])
+
+    assert result.model_dump() == payload and len(sdk_runtime.requests) == 1
+    request = sdk_runtime.requests[0]
+    assert request["tool_choice"] == {"type": "function", "function": {"name": "submit_knowledge_answer"}}
+    assert request["parallel_tool_calls"] is False
+    function = request["tools"][0]["function"]
+    assert len(request["tools"]) == 1 and function["strict"] is True
+    assert function["parameters"]["additionalProperties"] is False
+    assert set(function["parameters"]["required"]) == {"useful", "reason", "answer", "citation_numbers"}
+
+
+async def test_knowledge_self_check_rejects_valid_free_text_json(sdk_runtime, monkeypatch):
+    """自由文本即使恰好符合知识结构也不能被当成工具提交。参数：HTTP夹具、替换器；返回：None；异常：断言失败。"""
+    from app.core import llm
+    from app.knowledge.answering import KnowledgeAnswerError
+
+    sdk_runtime.responses.append(text_response('{"useful":false,"reason":"不足","answer":"","citation_numbers":[]}'))
+    monkeypatch.setattr(llm, "get_chat_model", sdk_runtime.factory)
+    with pytest.raises(KnowledgeAnswerError):
+        await llm.ChatModelAdapter().answer_knowledge([])
+    assert len(sdk_runtime.requests) == 1
+
+
+@pytest.mark.parametrize("frames,error", [
+    ([*knowledge_frames(json.dumps({"useful": False, "reason": "证" * 20001, "answer": "", "citation_numbers": []}, ensure_ascii=False)),
+        RuntimeError("超长之后不能继续读取")], "length"),
+    ([asyncio.CancelledError()], "cancel"),
+])
+async def test_knowledge_tool_output_limit_and_cancellation_close_stream(monkeypatch, frames, error):
+    """超长工具参数或取消遗漏流关闭时失败。参数：替换器、外部响应、错误类型；返回：None；异常：断言失败。"""
+    from app.core import llm
+    from app.knowledge.answering import KnowledgeAnswerError
+
+    upstream = ResponseModel(frames)
+    monkeypatch.setattr(llm, "get_chat_model", lambda **kwargs: upstream)
+    with pytest.raises(asyncio.CancelledError if error == "cancel" else KnowledgeAnswerError):
+        await llm.ChatModelAdapter().answer_knowledge([])
+    assert upstream.closed
+
+
+async def test_knowledge_input_budget_includes_tool_schema_before_model_request(monkeypatch):
+    """旧服务只给消息预留额度时，新增控制schema不能预算外发包。参数：替换器；返回：None；异常：断言失败。"""
+    from app.core import llm
+    from app.core.memory import _estimate_message_tokens
+    from app.knowledge.answering import KnowledgeAnswerError
+
+    messages = [HumanMessage(content="退款条件？")]
+    message_units = _estimate_message_tokens(messages)
+    monkeypatch.setattr(llm, "settings", llm.settings.model_copy(update={"request_token_budget": message_units + 1}))
+    requests = []
+
+    def factory(**kwargs):
+        """记录不应发生的模型请求准备。参数：kwargs模型选项；返回：合法控制流；异常：无。"""
+        requests.append(kwargs)
+        return ResponseModel(knowledge_frames('{"useful":false,"reason":"不足","answer":"","citation_numbers":[]}'))
+
+    monkeypatch.setattr(llm, "get_chat_model", factory)
+    with pytest.raises(KnowledgeAnswerError):
+        await llm.ChatModelAdapter().answer_knowledge(messages)
+    assert requests == []
 
 
 async def test_adapter_rejects_tool_call_in_self_check(monkeypatch) -> None:

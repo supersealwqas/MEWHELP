@@ -14,7 +14,9 @@ from app.repositories.chat import PersistenceUncertain
 from app.schemas.chat import InvalidToolDecision
 from app.schemas.history import StoredTurn
 from app.schemas.tools import ToolContext, ToolResult
-from app.tools.registry import build_agent_registry
+from app.tools.registry import build_agent_registry, build_registry
+from app.workflow.citations import CitationStreamFilter
+from app.workflow.model import decision_tool_schemas
 from app.workflow.prompts import ANSWER_PROMPT, DECISION_PROMPT
 from app.workflow.state import ConversationState
 
@@ -26,7 +28,7 @@ _STOP_TEXT = {
     "decision_limit": "本轮处理步骤已达到上限，请补充或拆分问题后继续。",
     "tool_call_limit": "本轮查询次数已达到上限，请分开查询剩余问题。",
     "duplicate_tool_call": "本轮已查询过相同信息，未重复查询。请补充需要继续处理的问题。",
-    "invalid_decision": "本轮查询申请不完整，暂时无法继续，请补充有效信息后重试。",
+    "invalid_decision": "抱歉，本次回复生成失败，请重试。",
     "tool_failed": "本轮查询未能完成，请稍后重试或选择人工客服协助。",
 }
 
@@ -69,6 +71,7 @@ def _signature(call: dict) -> str:
 def build_agent_graph(deps: "WorkflowDependencies"):
     """编译共享State的无独立saver子图。参数：deps实例依赖；返回：CompiledStateGraph；异常：编译错误。"""
     registry = build_agent_registry()
+    citation_tool_names = {tool.name for tool in build_registry().all()} | {"submit_intent", "submit_decision"}
 
     async def decision(state: ConversationState) -> ConversationState:
         """执行有界内部决定，不发布内部JSON。参数：state当前事实；返回：申请或终止更新；异常：模型/审计错误。"""
@@ -77,7 +80,8 @@ def build_agent_graph(deps: "WorkflowDependencies"):
             return stopped_state("decision_limit", ledger)
         try:
             tools = registry.all()
-            messages = model_messages(state, deps.settings, DECISION_PROMPT, tools)
+            # 结束决策也使用工具协议；历史裁剪须计入与模型实际绑定一致的完整定义。
+            messages = model_messages(state, deps.settings, DECISION_PROMPT, decision_tool_schemas(tools))
             # 先检查最少的调用/输出余量；适配器还按完整输入执行精确保守占额检查。
             ledger.ensure_capacity([("decide", 0, 2048), ("answer", 0, 4096), ("answer", 0, 4096)])
             selected = await deps.model.decide(messages, tools, ledger)
@@ -167,10 +171,19 @@ def build_agent_graph(deps: "WorkflowDependencies"):
                 {"role": "system", "content": action_text}]}
             messages = model_messages(answer_state, deps.settings, ANSWER_PROMPT)
             parts = []
+            citations = CitationStreamFilter({item["n"] for item in state["evidence"]},
+                citation_tool_names)
             async with aclosing(deps.model.stream_answer(messages, ledger)) as stream:
                 async for delta in stream:
-                    parts.append(delta)
-                    writer({"event": "delta", "data": {"delta": delta}})
+                    visible = citations.feed(delta)
+                    if visible:
+                        parts.append(visible)
+                        writer({"event": "delta", "data": {"delta": visible}})
+            # 尾部仍需判定单独角标；发布与落库始终累计同一份过滤后正文。
+            tail = citations.feed("", final=True)
+            if tail:
+                parts.append(tail)
+                writer({"event": "delta", "data": {"delta": tail}})
         except (WorkflowBudgetExceeded, ContextBudgetExceeded):
             update = stopped_state("budget_exceeded", ledger)
             writer({"event": "delta", "data": {"delta": update["answer"]}})

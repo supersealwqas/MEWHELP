@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
+import asyncio
+import json
 
 import pytest
 from sqlalchemy.dialects import mysql
 from langchain_core.messages import AIMessageChunk
 
 from app.knowledge.answering import EvidenceCitation
+from tests.workflow.test_model import sdk_runtime, call_response, text_response
 
 
 class RecordingSession:
@@ -184,16 +187,22 @@ async def test_judge_adapter_aggregates_strict_output_with_full_evidence() -> No
     from app.evaluation.faithfulness import FaithfulnessJudge
 
     class Model:
-        """替代外部模型流，保留 JSON 解析逻辑。"""
+        """替代外部模型流，保留工具参数校验逻辑。"""
 
         closed = False
         inputs = []
 
+        def bind_tools(self, tools, **kwargs):
+            """提供受控绑定流。参数：tools工具定义、kwargs绑定参数；返回：自身；异常：无。"""
+            return self
+
         async def astream(self, messages):
-            """提供裁判JSON。参数：实际输入；返回：分片；异常：无。"""
+            """提供裁判工具参数。参数：实际输入；返回：分片；异常：无。"""
             self.inputs.append(messages)
             try:
-                yield AIMessageChunk(content='{"facts":[{"claim":"两天到账","supported":false,"reason":"没有依据","evidence_numbers":[]}]}')
+                yield AIMessageChunk(content="", tool_call_chunks=[{"name": "submit_faithfulness", "id": "judge-1", "index": 0,
+                    "args": '{"facts":[{"claim":"两天到账","supported":false,"reason":"没有依据","evidence_numbers":[]}]}'}],
+                    response_metadata={"finish_reason": "tool_calls"})
             finally:
                 self.closed = True
 
@@ -201,7 +210,6 @@ async def test_judge_adapter_aggregates_strict_output_with_full_evidence() -> No
     judge = FaithfulnessJudge(lambda **kwargs: model, model_name="judge-test")
     result = await judge.judge("退款时间", "两天到账[1]", [_citation(1), _citation(2)])
     assert not result.facts[0].supported and model.closed
-    import json
     payload = json.loads(model.inputs[0][1].content)
     assert len(payload["citations"]) == 2 and payload["citations"][-1]["chunk_id"] == 2
 
@@ -219,12 +227,103 @@ async def test_judge_adapter_rejects_bad_json_and_types(payload: str) -> None:
     class Model:
         """非法上游输出边界。"""
 
+        def bind_tools(self, tools, **kwargs):
+            """提供受控绑定流。参数：tools工具定义、kwargs绑定参数；返回：自身；异常：无。"""
+            return self
+
         async def astream(self, messages):
-            """返回非法JSON。参数：输入；返回：分片；异常：无。"""
-            yield AIMessageChunk(content=payload)
+            """返回非法工具参数。参数：输入；返回：分片；异常：无。"""
+            yield AIMessageChunk(content="", tool_call_chunks=[
+                {"name": "submit_faithfulness", "args": payload, "id": "judge-1", "index": 0}],
+                response_metadata={"finish_reason": "tool_calls"})
 
     with pytest.raises(FaithfulnessError):
         await FaithfulnessJudge(lambda **kwargs: Model(), model_name="judge-test").judge("问题", "答案", [_citation()])
+
+
+async def test_faithfulness_judge_uses_strict_named_tool_and_complete_evidence(sdk_runtime):
+    """裁判没有强制工具输出或漏传实际证据时失败。参数：HTTP夹具；返回：None；异常：断言失败。"""
+    from app.evaluation.faithfulness import FaithfulnessJudge
+
+    payload = {"facts": [{"claim": "两天到账", "supported": False, "reason": "证据未给承诺", "evidence_numbers": []}]}
+    sdk_runtime.responses.append(call_response("submit_faithfulness", json.dumps(payload)))
+
+    def factory(**kwargs):
+        """将显式裁判模型名交给受控SDK。参数：kwargs模型选项；返回：真实模型客户端；异常：配置错误。"""
+        assert kwargs.pop("model") == "judge-test"
+        return sdk_runtime.factory(**kwargs)
+
+    result = await FaithfulnessJudge(factory, model_name="judge-test").judge("退款多久到账", "两天到账", [_citation(1), _citation(2)])
+    assert result.model_dump() == payload and len(sdk_runtime.requests) == 1
+    request = sdk_runtime.requests[0]
+    assert request["tool_choice"] == {"type": "function", "function": {"name": "submit_faithfulness"}}
+    assert request["parallel_tool_calls"] is False
+    function = request["tools"][0]["function"]
+    assert len(request["tools"]) == 1 and function["strict"] is True
+    assert function["parameters"]["additionalProperties"] is False
+    assert function["parameters"]["required"] == ["facts"]
+    sent = json.loads(request["messages"][1]["content"])
+    assert [item["n"] for item in sent["citations"]] == [1, 2]
+    assert "ground_truth" not in sent and "strategy" not in sent
+
+
+async def test_faithfulness_judge_rejects_valid_free_text_json(sdk_runtime):
+    """裁判把合法自由文本JSON当成结构化提交时失败。参数：HTTP夹具；返回：None；异常：断言失败。"""
+    from app.evaluation.faithfulness import FaithfulnessJudge, FaithfulnessError
+
+    sdk_runtime.responses.append(text_response('{"facts":[]}'))
+
+    def factory(**kwargs):
+        """保留真实SDK并移除夹具内已固定的模型名。参数：kwargs模型选项；返回：模型客户端；异常：配置错误。"""
+        kwargs.pop("model")
+        return sdk_runtime.factory(**kwargs)
+
+    with pytest.raises(FaithfulnessError):
+        await FaithfulnessJudge(factory, model_name="judge-test").judge("问题", "答案", [_citation()])
+    assert len(sdk_runtime.requests) == 1
+
+
+async def test_faithfulness_input_limit_includes_control_schema_before_model_request():
+    """只够正文的临界输入遗漏工具定义仍发模型请求时失败。参数：无；返回：None；异常：断言失败。"""
+    from app.evaluation.faithfulness import FaithfulnessJudge, FaithfulnessError
+    from tests.rag.test_quality_answer import ResponseModel
+
+    citations = [_citation()]
+    base = json.dumps({"query": "问题", "answer": "", "citations": [item.model_dump() for item in citations]}, ensure_ascii=False)
+    answer = "答" * (64999 - len(base))
+    calls = []
+
+    def factory(**kwargs):
+        """记录本不该发生的模型构造。参数：kwargs模型选项；返回：外部模型流；异常：无。"""
+        calls.append(kwargs)
+        return ResponseModel([AIMessageChunk(content='{"facts":[]}')])
+
+    with pytest.raises(FaithfulnessError):
+        await FaithfulnessJudge(factory).judge("问题", answer, citations)
+    assert calls == []
+
+
+@pytest.mark.parametrize("failure", ["length", "network", "cancel"])
+async def test_faithfulness_tool_stream_limits_and_errors_close_without_false_result(failure):
+    """裁判超长参数继续读取、网络故障或取消被吞掉时失败。参数：故障类型；返回：None；异常：断言失败。"""
+    from app.evaluation.faithfulness import FaithfulnessJudge, FaithfulnessError
+    from tests.rag.test_quality_answer import ResponseModel
+
+    if failure == "length":
+        raw = json.dumps({"facts": [{"claim": "事实", "supported": False,
+            "reason": "证" * 20001, "evidence_numbers": []}]}, ensure_ascii=False)
+        frames = [AIMessageChunk(content="", tool_call_chunks=[
+            {"name": "submit_faithfulness", "args": raw, "id": "judge-1", "index": 0}]),
+            RuntimeError("超长之后不能继续读取")]
+        expected = FaithfulnessError
+    elif failure == "network":
+        frames, expected = [ConnectionError("裁判网络中断")], ConnectionError
+    else:
+        frames, expected = [asyncio.CancelledError()], asyncio.CancelledError
+    upstream = ResponseModel(frames)
+    with pytest.raises(expected):
+        await FaithfulnessJudge(lambda **kwargs: upstream).judge("问题", "答案", [_citation()])
+    assert upstream.closed
 
 
 async def test_true_answer_empty_judge_facts_is_error_not_full_score() -> None:

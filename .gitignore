@@ -26,6 +26,9 @@ build/
 # 代理与验证过程的临时工作目录（日志、探针、一次性 diff），9MB 级且可重建
 /.tmp/
 
+# 可视化 brainstorm 的临时示意、进程记录与本地访问密钥，不入库
+/.superpowers/brainstorm/
+
 # 评估/真实运行产物目录（reports/ 下逐次运行的 cases.jsonl、summary 等）
 # 只保留生成规则与文档；结果按运行时间戳产生，不入库
 /reports/

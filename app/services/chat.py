@@ -12,6 +12,7 @@ import anyio
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.callbacks import BaseCallbackHandler
 from app.core.memory import ContextBudgetExceeded, assemble_turns, prepare_messages, valid_tool_calls
+from app.core.model_budget import WorkflowBudgetExceeded, budget_summary
 from app.core.prompts import ANSWER_NUDGE, ANSWER_SYSTEM, CUSTOMER_SERVICE_SYSTEM, TOOL_DECISION_SYSTEM
 from app.knowledge.answering import (
     KNOWLEDGE_ANSWER_RULES, business_facts_summary, collect_citations, decide_answer, has_knowledge_call,
@@ -486,7 +487,7 @@ class _WorkflowTrace(BaseCallbackHandler):
                     checkpoint_thread_id(context.get("conversation_id")), state.get("intent"),
                     {key: gate.get(key) for key in ("passed", "max_score", "threshold")},
                     [call.get("name") for call in state.get("pending_calls", [])], state.get("decision_count"),
-                    state.get("budget"), elapsed * 1000, state.get("stop_reason"), error)
+                    budget_summary(state.get("budget")), elapsed * 1000, state.get("stop_reason"), error)
 
     def on_chain_start(self, serialized, inputs, *, run_id, **kwargs):
         """记录语义节点进入。参数：框架回调和运行ID；返回：None；异常：无。"""
@@ -591,8 +592,9 @@ class ChatService:
             async with self.guard.hold(request.session_id):
                 try:
                     from app.workflow.prompts import INTENT_PROMPT
+                    from app.workflow.model import intent_tool_schema
                     prepare_messages([], [HumanMessage(content=request.message)], self.settings.token_budget,
-                        system_text=INTENT_PROMPT, request_max_tokens=self.settings.request_token_budget)
+                        system_text=INTENT_PROMPT, tools=[intent_tool_schema()], request_max_tokens=self.settings.request_token_budget)
                     context = await self.chat.start_turn(context, request.message)
                     started = True
                     config = {"configurable": {"thread_id": checkpoint_thread_id(context.conversation_id)}}
@@ -621,6 +623,13 @@ class ChatService:
                     terminal = "failed"
                     logger.warning("客服工作流失败 turn=%s thread=%s type=%s", context.turn_id,
                                    checkpoint_thread_id(context.conversation_id), type(error).__name__)
+                    if isinstance(error, (InvalidToolDecision, WorkflowBudgetExceeded)) and error.audit_record:
+                        # 分类等图外终止也保留诊断；此记录不具有可执行工具申请的形状。
+                        try:
+                            await self.chat.save_tool_calls(context, [error.audit_record])
+                        except Exception as audit_error:
+                            # 附加诊断保存失败不应吞掉用户可见错误，原finally仍负责标记终态。
+                            logger.warning("模型诊断保存失败 turn=%s type=%s", context.turn_id, type(audit_error).__name__)
                     yield ChatEvent(event="error", data={"error": LegacyChatService._error_message(error), "retry_safe": True})
                 finally:
                     # 关闭图会取消其模型/工具任务；屏蔽ASGI取消域直到上游和短事务真正退出。
