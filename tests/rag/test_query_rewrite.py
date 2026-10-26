@@ -277,3 +277,176 @@ async def test_rewrite_tool_argument_length_is_bounded(rewrite_sdk):
     with pytest.raises(QueryRewriteError):
         await QueryRewriter(rewrite_sdk.factory).rewrite("如何清洗")
     assert len(rewrite_sdk.requests) == 1
+
+
+async def test_query_expander_simple_and_core_queries(rewrite_sdk):
+    """扩写器在简单FAQ返回单条标准问法，核心多条件返回三条不重复查询并计入expand账本。
+
+    参数：rewrite_sdk 离线HTTP与真实ChatOpenAI夹具。
+    返回：None。
+    异常：AssertionError，工具定义、账本记录或返回条数不符合契约。
+    """
+    from app.core.memory import _estimate_message_tokens, _estimate_token_units
+    from app.core.model_budget import BudgetLedger
+    from app.knowledge.query_rewrite import QueryExpander
+
+    rewrite_sdk.responses.append(
+        rewrite_response('{"queries":["退货运费由谁承担"]}', name="submit_expanded_queries")
+    )
+    simple_ledger = BudgetLedger()
+    expander = QueryExpander(rewrite_sdk.factory)
+    simple = await expander.expand("订单1001退货运费谁出 已签收", simple_query="退货运费由谁承担", budget=simple_ledger)
+    assert simple.queries == ["退货运费由谁承担"]
+    assert len(rewrite_sdk.requests) == 1
+    first_req = rewrite_sdk.requests[0]
+    assert json.loads(first_req["messages"][1]["content"]) == {
+        "query": "订单1001退货运费谁出 已签收",
+        "simple_query": "退货运费由谁承担",
+    }
+    assert first_req["tool_choice"] == {"type": "function", "function": {"name": "submit_expanded_queries"}}
+    assert first_req["parallel_tool_calls"] is False
+    schema = first_req["tools"][0]["function"]
+    assert schema["name"] == "submit_expanded_queries" and schema["strict"] is True
+    assert set(schema["parameters"]["required"]) == {"queries"}
+    actual_messages = [
+        SystemMessage(content=first_req["messages"][0]["content"]),
+        HumanMessage(content=first_req["messages"][1]["content"]),
+    ]
+    record = simple_ledger.snapshot()["records"][0]
+    assert record["stage"] == "expand"
+    assert record["input_units"] == _estimate_message_tokens(actual_messages) + _estimate_token_units(first_req["tools"])
+    assert record["output_limit"] == first_req["max_completion_tokens"] == 2048
+    assert simple_ledger.snapshot()["actual_tokens"] == 120
+
+    core_queries = ["已签收商品退货申请条件与时限", "已签收拆封商品退货限制与除外情形", "退货办理流程与运费承担规则"]
+    rewrite_sdk.responses.append(
+        rewrite_response(json.dumps({"queries": core_queries}, ensure_ascii=False), name="submit_expanded_queries")
+    )
+    core_ledger = BudgetLedger()
+    core = await expander.expand("订单1001的猫砂盆拆封了还能退吗 已签收", simple_query="拆封猫砂盆能否退货", budget=core_ledger)
+    assert core.queries == core_queries
+    assert core_ledger.snapshot()["model_calls"] == 1
+
+
+@pytest.mark.parametrize(
+    "payload,error",
+    [
+        (None, OSError("network down")),
+        ('{"queries":[]}', None),
+        ('{"queries":["单条1","单条2"]}', None),
+        ('{"queries":["重复","重复","重复"]}', None),
+        ('{"queries":["  "]}', None),
+        ('{"queries":["合法","extra":1]}', None),
+    ],
+)
+async def test_query_expander_network_and_parse_failures_fallback_and_preserve_budget(payload, error):
+    """扩写网络或结构解析失败时回退为[query]并保留账本占额与失败诊断。
+
+    参数：payload 模型工具参数字符串；error 模拟的网络异常。
+    返回：None。
+    异常：AssertionError，未回退为单条种子或账本丢失。
+    """
+    from app.core.model_budget import BudgetLedger
+    from app.knowledge.query_rewrite import QueryExpander
+
+    chunks = None
+    if payload is not None:
+        chunks = [
+            AIMessageChunk(
+                content="",
+                tool_call_chunks=[{"name": "submit_expanded_queries", "args": payload, "id": "exp-1", "index": 0}],
+                response_metadata={"finish_reason": "tool_calls"},
+            )
+        ]
+    model = RewriteModel(chunks, error=error)
+    ledger = BudgetLedger()
+    query = "订单1001的猫砂盆能退吗 已签收"
+    failed_expansion = await QueryExpander(model.factory).expand(query, simple_query="猫砂盆能否退货", budget=ledger)
+    assert failed_expansion.queries == [query]
+    assert len(model.inputs) == 1 and model.closed
+    snap = ledger.snapshot()
+    assert snap["model_calls"] == 1 and snap["records"][0]["stage"] == "expand"
+    assert snap["records"][0].get("failure") is not None
+
+
+async def test_expansion_validation_failure_uses_seed_once():
+    """扩写内容校验失败仅回退一次[query]且保留账本，直接向检索层注入非法prepared_queries必须抛错。
+
+    参数：无。
+    返回：None。
+    异常：AssertionError，发生多次模型调用、账本丢失或检索层放行非法查询。
+    """
+    from app.core.model_budget import BudgetLedger
+    from app.knowledge.query_rewrite import QueryExpander, QueryRewriteError
+
+    bad_queries = ["订单1002退货条件", "MH-W99退货限制", "退货运费规则"]
+    chunks = [
+        AIMessageChunk(
+            content="",
+            tool_call_chunks=[
+                {
+                    "name": "submit_expanded_queries",
+                    "args": json.dumps({"queries": bad_queries}, ensure_ascii=False),
+                    "id": "exp-bad",
+                    "index": 0,
+                }
+            ],
+            response_metadata={"finish_reason": "tool_calls"},
+        )
+    ]
+    model = RewriteModel(chunks)
+    ledger = BudgetLedger()
+    query = "订单1001能退货吗 已签收"
+    failed_expansion = await QueryExpander(model.factory).expand(query, simple_query="订单1001退货条件", budget=ledger)
+    assert failed_expansion.queries == [query]
+    assert len(model.inputs) == 1
+    snap = ledger.snapshot()
+    assert snap["model_calls"] == 1 and snap["records"][0]["stage"] == "expand"
+    assert snap["records"][0].get("failure") is not None
+
+    search, encoder, index, reranker = _search([_chunk(1)])
+    rewriter_model = RewriteModel()
+    search.query_rewriter = QueryExpander(rewriter_model.factory)
+    with pytest.raises(QueryRewriteError):
+        await search.retrieve_policy(query, prepared_queries=bad_queries)
+    assert len(rewriter_model.inputs) == 0
+    assert not encoder.inputs and not index.calls and not reranker.calls
+
+
+async def test_query_expander_propagates_cancel_budget_and_invalid_seed():
+    """取消信号、工作流预算耗尽与非法种子不得伪装为扩写回退。
+
+    参数：无。
+    返回：None。
+    异常：AssertionError，控制信号或输入边界被吞掉。
+    """
+    from app.core.model_budget import BudgetLedger, WorkflowBudgetExceeded
+    from app.knowledge.query_rewrite import QueryExpander, QueryRewriteError
+
+    model = RewriteModel()
+    with pytest.raises(QueryRewriteError):
+        await QueryExpander(model.factory).expand("   ", simple_query="退货条件")
+    with pytest.raises(QueryRewriteError):
+        await QueryExpander(model.factory).expand("退" * 2001, simple_query="退货条件")
+    with pytest.raises(QueryRewriteError):
+        await QueryExpander(model.factory).expand("订单1001退货", simple_query="退" * 2001)
+    with pytest.raises(QueryRewriteError):
+        await QueryExpander(model.factory, request_budget=1).expand("订单1001退货", simple_query="退货条件")
+    assert not model.inputs
+
+    exhausted = BudgetLedger(max_model_calls=1)
+    exhausted.reserve("understand", 10, 100)
+    with pytest.raises(WorkflowBudgetExceeded):
+        await QueryExpander(model.factory).expand("订单1001退货", simple_query="退货条件", budget=exhausted)
+    assert not model.inputs
+
+    waiting = RewriteModel(wait=True)
+    budget = BudgetLedger()
+    task = asyncio.create_task(
+        QueryExpander(waiting.factory).expand("订单1001退货", simple_query="退货条件", budget=budget)
+    )
+    await waiting.started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert waiting.closed and budget.snapshot()["model_calls"] == 1

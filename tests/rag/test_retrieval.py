@@ -211,3 +211,142 @@ def test_retrieval_configuration_rejects_invalid_values(field: str, value) -> No
     """配置参数不能接受无效数量/分数。参数：字段/值；返回：None；异常：断言失败。"""
     with pytest.raises(ValidationError):
         make_settings(**{field: value})
+
+
+def test_merge_ranked_chunks_picks_highest_score_and_stable_tie_order() -> None:
+    """跨查询合并按chunk ID保留最高rerank分，同分按chunk ID升序排列。
+
+    参数：无。
+    返回：None。
+    异常：AssertionError，未保留后次更高分或同分排序不稳定。
+    """
+    from app.knowledge.rerank import RankedChunk
+    from app.knowledge.retrieval import merge_ranked_chunks
+
+    groups = [
+        [RankedChunk(chunk=_chunk(7), score=0.4), RankedChunk(chunk=_chunk(3), score=0.6)],
+        [RankedChunk(chunk=_chunk(7), score=0.9)],
+    ]
+    merged = merge_ranked_chunks(groups)
+    assert [item.chunk.id for item in merged] == [7, 3]
+    assert merged[0].score == 0.9  # chunk 7 的后次结果高于首次 0.4
+
+    ties = [
+        [RankedChunk(chunk=_chunk(5), score=0.8)],
+        [RankedChunk(chunk=_chunk(2), score=0.8)],
+    ]
+    assert [item.chunk.id for item in merge_ranked_chunks(ties)] == [2, 5]
+
+
+async def test_prepared_queries_skip_rewriter_and_fixed_expansion_with_best_score_merge() -> None:
+    """传入prepared_queries时不触发旧改写或固定退款扩写，且重复chunk取最高分并继续校验权威回读。
+
+    参数：无。
+    返回：None。
+    异常：AssertionError，触发了旧改写、保留了旧首条低分或权威回读异常被吞。
+    """
+    from app.knowledge.query_rewrite import QueryRewriter
+    from app.knowledge.rerank import RankedChunk
+    from tests.rag.test_query_rewrite import RewriteModel
+
+    chunks = [_chunk(3), _chunk(7)]
+    groups = {
+        "已签收商品退货条件": [7, 3],
+        "拆封商品退货限制": [7],
+        "退货运费承担规则": [3],
+    }
+    search, _, index, reranker = _search(chunks, groups=groups)
+    rewriter_model = RewriteModel()
+    search.query_rewriter = QueryRewriter(rewriter_model.factory)
+
+    async def rank(query, candidates, *, top_n):
+        """对不同查询返回不同相关度以验证后次高分覆盖首次低分。参数：查询/候选/上限；返回：排名；异常：无。"""
+        if query == "已签收商品退货条件":
+            return [
+                RankedChunk(chunk=next(c for c in candidates if c.id == 3), score=0.6),
+                RankedChunk(chunk=next(c for c in candidates if c.id == 7), score=0.4),
+            ][:top_n]
+        if query == "拆封商品退货限制":
+            return [RankedChunk(chunk=next(c for c in candidates if c.id == 7), score=0.9)][:top_n]
+        return [RankedChunk(chunk=next(c for c in candidates if c.id == 3), score=0.5)][:top_n]
+
+    reranker.rank = rank
+    prepared_list = ["已签收商品退货条件", "拆封商品退货限制", "退货运费承担规则"]
+    merged = await search.retrieve_policy(
+        "订单1001的猫砂盆拆封了能退吗 已签收",
+        prepared_queries=prepared_list,
+    )
+    rewrite_call_count = len(rewriter_model.inputs)
+    assert rewrite_call_count == 0
+    assert [call[0] for call in index.calls] == prepared_list
+    assert [item.chunk.id for item in merged] == [7, 3]
+    assert merged[0].score == 0.9
+
+    # 权威原文回读失配时继续抛错，不伪装成空命中。
+    search.store._snapshots[7] = chunks[1].model_copy(update={"is_active": False})
+    search.store._snapshots[3] = chunks[0].model_copy(update={"is_active": False})
+    with pytest.raises(KnowledgeSearchUnavailable):
+        await search.retrieve_policy(
+            "订单1001的猫砂盆拆封了能退吗 已签收",
+            prepared_queries=prepared_list,
+        )
+
+
+async def test_prepared_queries_still_validated() -> None:
+    """prepared_queries仍执行逐条确定性校验且不借用history放行旧订单，任一条非法时零外部调用。
+
+    参数：无。
+    返回：None。
+    异常：AssertionError，放行了历史订单1002或触发了编码/召回/重排调用。
+    """
+    from app.knowledge.query_rewrite import QueryRewriter, QueryRewriteError
+    from tests.rag.test_query_rewrite import RewriteModel
+
+    search, encoder, index, reranker = _search([_chunk(1), _chunk(2)])
+    rewriter_model = RewriteModel()
+    search.query_rewriter = QueryRewriter(rewriter_model.factory)
+
+    # 1. 当前1001、历史1002，候选仅1002或“1001和1002”均拒绝（即使传入history也不得放行）
+    for illegal_candidate in [["订单1002退货条件"], ["订单1001和1002退货条件"]]:
+        with pytest.raises(QueryRewriteError):
+            await search.retrieve_policy(
+                "订单1001能退货吗 已签收",
+                history="此前讨论过订单1002",
+                prepared_queries=illegal_candidate,
+            )
+
+    # 2. 通用运费原问候选夹带历史1002也拒绝
+    with pytest.raises(QueryRewriteError):
+        await search.retrieve(
+            "运费怎么算",
+            history="此前讨论过订单1002",
+            prepared_queries=["订单1002运费怎么算"],
+        )
+
+    # 3. 三条中只有第三条非法时，encoder/index/reranker全部零调用
+    with pytest.raises(QueryRewriteError):
+        await search.retrieve_policy(
+            "订单1001能退货吗 已签收",
+            history="此前讨论过订单1002",
+            prepared_queries=["已签收退货申请条件", "退货运费承担规则", "订单1002退货时限"],
+        )
+    assert not encoder.inputs and not index.calls and not reranker.calls
+    assert len(rewriter_model.inputs) == 0
+
+    # 4. 合法查询通过且rewrite_call_count为零；超长、空列表或两条查询明确拒绝不裁短；真空库返回正常空列表
+    for bad_shape in [[], ["查询1", "查询2"], ["退" * 2001]]:
+        with pytest.raises(QueryRewriteError):
+            await search.retrieve("运费怎么算", prepared_queries=bad_shape)
+    assert not encoder.inputs and not index.calls and not reranker.calls
+
+    empty_search, _, _, _ = _search([])
+    assert await empty_search.retrieve_policy("运费怎么算", prepared_queries=["运费规则"]) == []
+
+    valid_hits = await search.retrieve(
+        "运费怎么算",
+        history="此前讨论过订单1002",
+        prepared_queries=["订单运费与包邮门槛规则"],
+    )
+    rewrite_call_count = len(rewriter_model.inputs)
+    assert rewrite_call_count == 0
+    assert len(valid_hits) == 2 and encoder.inputs == ["订单运费与包邮门槛规则"]

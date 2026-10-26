@@ -1,7 +1,7 @@
-"""参考检索链路：两路各 50、RRF 50、每子句独立重排后轮转去重。
+"""参考检索链路：两路各 50、RRF 50、每子句独立重排后轮转去重或按最高分合并。
 
-普通入口最后最多 10 条，最高重排分低于 0.3 时 FAQ 正常空结果；退款政策
-三条扩展各检索一次，按主键去重后保留全部，默认最多 30。所有答案正文必须
+普通入口最后最多 10 条，最高重排分低于 0.3 时 FAQ 正常空结果；退款与售后政策
+支持已准备查询按 chunk ID 取最高分降序合并（最多 30 条）及旧入口兼容。所有答案正文必须
 从 MySQL 权威回读，索引/模型故障绝不伪装成未命中。
 """
 
@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.config import Settings
 from app.knowledge.contracts import KnowledgeEncoder
 from app.knowledge.limits import valid_dense_vector
-from app.knowledge.query_rewrite import QueryRewrite, QueryRewriter, validate_rewrite
+from app.knowledge.query_rewrite import QueryRewrite, QueryRewriter, validate_prepared_queries, validate_rewrite
 from app.knowledge.rerank import RankedChunk, RerankUnavailable
 from app.knowledge.schemas import ChunkSnapshot
 from app.knowledge.search import KnowledgeSearchUnavailable
@@ -60,6 +60,22 @@ def expand_policy_queries(query: str) -> list[str]:
     return [raw, f"{raw} 退款申请条件及流程", f"{raw} 退款处理时限及退换货运费承担"]
 
 
+def merge_ranked_chunks(groups: list[list[RankedChunk]]) -> list[RankedChunk]:
+    """跨查询组按 chunk ID 保留最高重排分，并按分数降序、同分主键升序排列。
+
+    参数：groups 多条查询各自返回的 RankedChunk 列表。
+    返回：list[RankedChunk]，去重后按 (-score, chunk.id) 排序的权威结果列表。
+    异常：无。
+    """
+    strongest: dict[int, RankedChunk] = {}
+    for group in groups:
+        for item in group:
+            existing = strongest.get(item.chunk.id)
+            if existing is None or item.score > existing.score:
+                strongest[item.chunk.id] = item
+    return sorted(strongest.values(), key=lambda item: (-item.score, item.chunk.id))
+
+
 def faq_rows(ranked: list[RankedChunk]) -> list[dict]:
     """映射模型可读权威结果。参数：ranked 为已校验排名；返回：原 FAQ 四字段列表；异常：无。"""
     return [{"id": item.chunk.id, "question": item.chunk.text.questions,
@@ -78,14 +94,20 @@ class HybridKnowledgeSearch:
 
     async def _prepare(self, query: str, *, policy: bool = False, subquery_split: bool = True,
                        source_query: str | None = None, budget: BudgetLedger | None = None,
-                       history: str = "") -> PreparedQuery:
-        """一次准备整次查询。
+                       history: str = "", prepared_queries: list[str] | None = None) -> PreparedQuery:
+        """一次准备整次查询；显式传入 prepared_queries 时只跳过旧改写与固定扩写，保留逐条确定性校验。
 
         参数：query 关键词或原问、policy 退款、subquery_split 拆句、source_query 原问、budget 请求独占账本、
-            history 可信历史用户/工具文本，仅用于判断改写是否编造事实。
+            history 可信历史用户/工具文本（仅旧路径使用）、prepared_queries 已准备的1条或3条查询。
         返回：准备结果；异常：预算/改写/校验错误。
         """
         raw = source_query if source_query is not None else query
+        if prepared_queries is not None:
+            # 编码/召回前先做整组确定性校验，且不向prepared分支传递history。
+            validate_prepared_queries(raw, prepared_queries)
+            cleaned = [item.strip() for item in prepared_queries]
+            groups = [split_clauses(item) if subquery_split else [item] for item in cleaned]
+            return PreparedQuery(raw=raw, policy=policy, groups=groups)
         if self.query_rewriter is None:
             # 未注入只供底层兼容；正式运行时在装配处强制提供改写器。
             return prepare_query(query, policy=policy, subquery_split=subquery_split)
@@ -161,26 +183,32 @@ class HybridKnowledgeSearch:
     async def retrieve(self, query: str, *, top_k: int | None = None,
                        subquery_split: bool | None = None, filters: dict | None = None,
                        source_query: str | None = None, budget: BudgetLedger | None = None,
-                       history: str = "") -> list[RankedChunk]:
-        """逐子句跑完整链路，轮转合并去重后最终截到 Top-K。
+                       history: str = "", prepared_queries: list[str] | None = None) -> list[RankedChunk]:
+        """逐子句跑完整链路，轮转合并或按已准备查询最高分合并后截到 Top-K。
 
-        参数：query 当前原话；top_k None 使用 config.rerank_top_k=10，显式值 1–recall_top_k；
-            subquery_split None 使用配置默认 True，False 只检索完整原话；filters 为权威元数据筛选；
-            source_query 为可信原问；budget 请求独占账本；history 可信历史用户/工具文本，用于校验改写未编造事实。
+        参数：query 当前原话或已验证完整问；top_k None 使用 config.rerank_top_k=10，显式值 1–recall_top_k；
+            subquery_split None 使用配置默认 True，False 只检索完整查询；filters 为权威元数据筛选；
+            source_query 为可信原问；budget 请求独占账本；history 可信历史用户/工具文本（仅旧路径使用）；
+            prepared_queries 可选已准备的 1 条或 3 条查询，传入时跳过旧改写模型并按最高分合并。
         返回：list[RankedChunk]，普通路径最多 Top-K；N 个子句会分别调用 N 次重排。
         异常：ValueError，参数非法；检索/模型/权威存储异常；取消直接传播。
         """
         self._validate_query(query)
+        if source_query is not None:
+            self._validate_query(source_query)
         selected = self.config.rerank_top_k if top_k is None else top_k
         if type(selected) is not int or not 1 <= selected <= self.config.recall_top_k:
             raise ValueError("top_k 必须为 1–recall_top_k 的整数，零值不表示默认值")
         split = self.config.subquery_split if subquery_split is None else subquery_split
         if type(split) is not bool:
             raise ValueError("subquery_split 必须为布尔值")
-        prepared = await self._prepare(query, subquery_split=split, source_query=source_query, budget=budget,
-                                      history=history)
         normalized = _validated_filters(filters)
+        prepared = await self._prepare(query, subquery_split=split, source_query=source_query, budget=budget,
+                                       history=history, prepared_queries=prepared_queries)
         scope = await self._filter_scope(normalized) if normalized else None
+        if prepared_queries is not None:
+            groups = [await self._retrieve_group(group, prepared, selected, scope) for group in prepared.groups]
+            return merge_ranked_chunks(groups)[:selected]
         return await self._retrieve_group(prepared.groups[0], prepared, selected, scope)
 
     async def _retrieve_group(self, queries: list[str], prepared: PreparedQuery, selected: int,
@@ -222,19 +250,25 @@ class HybridKnowledgeSearch:
         return faq_rows(ranked)
 
     async def retrieve_policy(self, query: str, *, filters: dict | None = None,
-                              budget: BudgetLedger | None = None, history: str = "") -> list[RankedChunk]:
-        """退款政策三查询分别检索并按 chunk id 去重，合并后不再截为十条。
+                              budget: BudgetLedger | None = None, history: str = "",
+                              prepared_queries: list[str] | None = None) -> list[RankedChunk]:
+        """退款与售后政策多查询检索并按 chunk id 去重，默认最多 30 条。
 
-        参数：query 当前退款问题，原话保留到三条扩展中；filters 可选元数据筛选；
-            budget 请求独占账本；history 可信历史用户/工具文本，用于校验改写未编造事实。
-        返回：list[RankedChunk]，默认最多 30 个原 chunk，保留查询顺序。
+        参数：query 当前退款问题或含已核实状态的种子；filters 可选元数据筛选；
+            budget 请求独占账本；history 可信历史用户/工具文本（仅旧路径使用）；
+            prepared_queries 可选已准备的 1 条或 3 条查询，传入时按 chunk ID 取最高分降序合并。
+        返回：list[RankedChunk]，默认最多 30 个原 chunk。
         异常：ValueError，参数/输入限制；检索、模型或存储异常。
         """
         self._validate_query(query)
-        prepared = await self._prepare(query, policy=True, subquery_split=self.config.subquery_split,
-                                       budget=budget, history=history)
         normalized = _validated_filters(filters)
+        prepared = await self._prepare(query, policy=True, subquery_split=self.config.subquery_split,
+                                       budget=budget, history=history, prepared_queries=prepared_queries)
         scope = await self._filter_scope(normalized) if normalized else None
+        if prepared_queries is not None:
+            groups = [await self._retrieve_group(group, prepared, self.config.rerank_top_k, scope)
+                      for group in prepared.groups]
+            return merge_ranked_chunks(groups)[:self.config.rerank_top_k * 3]
         merged: dict[int, RankedChunk] = {}
         for group in prepared.groups:
             for item in await self._retrieve_group(group, prepared, self.config.rerank_top_k, scope):
