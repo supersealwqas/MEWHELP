@@ -69,7 +69,8 @@ def test_fact_growth_stops_before_decision_and_keeps_existing_ledger():
     assert ledger.snapshot()["model_calls"] == 1
 
 
-@pytest.mark.parametrize("stage,limit", [("classify",4096),("rewrite",2048),("decide",2048),("answer",4096)])
+@pytest.mark.parametrize("stage,limit", [("understand",2048),("classify",4096),("expand",2048),
+    ("rewrite",2048),("decide",2048),("answer",4096)])
 def test_request_and_output_limits_are_enforced(stage, limit):
     """超完整输入或单次输出上限未停止时失败。参数：stage 阶段、limit 输出上限；返回：None；异常：断言失败。"""
     from app.core.model_budget import BudgetLedger, WorkflowBudgetExceeded
@@ -95,3 +96,19 @@ def test_answer_attempts_and_decision_limits_survive_restore():
         ledger.reserve("answer", 20, 4096)
     with pytest.raises(WorkflowBudgetExceeded):
         BudgetLedger.from_snapshot(ledger.snapshot()).reserve("answer", 20, 4096)
+
+
+@pytest.mark.parametrize("stage,limit", [("understand", 2048), ("classify", 4096), ("expand", 2048)])
+def test_understanding_classification_expansion_once_after_restore(stage, limit):
+    """恢复账本后重复优化/分类调用绕过单轮上限时失败。参数：阶段和输出上限；返回：None；异常：断言失败。"""
+    from app.core.model_budget import BudgetLedger, WorkflowBudgetExceeded
+
+    ledger = BudgetLedger()
+    ledger.reserve(stage, 100, limit)
+    ledger.record_usage(stage, None, "tool_calls")
+    ledger.record_failure(stage, {"type": "protocol_failure"})
+    snapshot = ledger.snapshot()
+    restored = BudgetLedger.from_snapshot(snapshot)
+    with pytest.raises(WorkflowBudgetExceeded):
+        restored.reserve(stage, 100, limit)
+    assert restored.snapshot() == snapshot

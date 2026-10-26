@@ -1,16 +1,19 @@
-"""工作流纯规则：原话透传、七意图四出口、输入上限、证据闸与固定回复。"""
+"""工作流纯规则：可信理解、八意图五出口、输入上限、证据闸与固定回复。"""
 
+import json
 import math
+import re
 from typing import Literal
 
 from app.knowledge.answering import EvidenceCitation, FIXED_KNOWLEDGE_REFUSAL
 from app.knowledge.rerank import RankedChunk
-from app.schemas.workflow import GateDecision, IntentResult, RetrievalLowConfidence
+from app.knowledge.query_rewrite import QueryRewrite, QueryRewriteError, validate_rewrite
+from app.schemas.workflow import GateDecision, IntentResult, RetrievalLowConfidence, UnderstandingResult
 from app.workflow.state import ConversationState
 
 _INTENT_ROUTES = {
-    "物流": "business", "订单": "business", "售后": "business",
-    "商品咨询": "knowledge", "退款退货": "knowledge",
+    "物流": "business", "订单": "business", "售后": "order_policy",
+    "商品咨询": "knowledge", "退款退货": "order_policy", "其他": "business",
     "投诉": "complaint", "闲聊": "chitchat",
 }
 _FIXED_REPLIES = {
@@ -27,25 +30,121 @@ def resolve_reference(query: str) -> str:
 
 
 def route_by_intent(state: ConversationState) -> str:
-    """按意图及是否需要知识证据映射到固定出口，可直接作为条件边回调。
+    """只根据八类意图映射固定出口，忽略旧检查点的派生问法。
 
-    参数：state为包含intent的工作流字典，不接受直接字符串或模型指定节点名。
-    返回：str，knowledge/business/complaint/chitchat之一。
-    异常：ValueError（包含Pydantic校验错误），State形态、缺失意图或未知枚举非法。
+    参数：state包含intent的工作流字典，不能由模型指定节点。
+    返回：knowledge/business/complaint/chitchat/order_policy之一。
+    异常：ValueError，State形态、缺失意图或未知枚举非法。
     """
     if not isinstance(state, dict):
         raise ValueError("意图路由必须接收State字典")
-    # 不去空白、不猜分类；分类失败不能悄悄变成闲聊或知识兜底。
-    result = IntentResult.model_validate({"intent": state.get("intent"),
-                                         "knowledge_query": state.get("knowledge_query")})
-    route = _INTENT_ROUTES[result.intent]
-    if result.knowledge_query is not None:
-        # 混合问题即使标签是订单/物流，也要先提供政策证据，再由Agent补齐业务事实。
-        return "knowledge"
-    if route == "knowledge" and result.knowledge_query is None:
-        # 原问超限仍须进入知识输入检查，不能借由分类空问题绕过既有业务限制。
-        return "knowledge" if knowledge_input_stop_reason(state.get("raw_query", "")) else "business"
-    return route
+    result = IntentResult.model_validate({"intent": state.get("intent"), "confidence": 0.0})
+    return _INTENT_ROUTES[result.intent]
+
+
+# 完整字母前缀与数字视作一个候选，避免A-1001被截成1001；用途/归属仍由fetch_order确定。
+_ORDER_CANDIDATE = re.compile(r"(?<![A-Za-z0-9_-])(?:[A-Za-z]+(?:-[A-Za-z]+)*-?)?\d{4,}[A-Za-z0-9-]*(?![A-Za-z0-9_-])")
+
+
+def original_understanding(raw_query: str) -> UnderstandingResult:
+    """构造不修改原字符的理解回退。参数：raw_query合法1–4000字原话；返回：空订单的透传结果；异常：字段校验错误。"""
+    return UnderstandingResult(resolved_query=raw_query, standard_query=raw_query,
+                               needs_resolution=False, order_id=None)
+
+
+def _trusted_history(history_turns: list[dict]) -> tuple[str, set[str], set[str]]:
+    """提取可信历史、最近一轮订单候选与已知商品名，助手正文不作事实来源。
+
+    参数：history_turns服务端读取的整轮历史；仅用户原话及成功工具data参与事实校验。
+    返回：历史文本、最近含订单的一轮完整候选集合、成功工具给出的商品名称集合。
+    异常：无；畸形或失败工具结果不提升为可信事实。
+    """
+    parts, latest_orders, products = [], set(), set()
+    for turn in history_turns:
+        orders = set()
+        for message in turn.get("messages", []):
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            if message.get("role") == "user":
+                parts.append(content)
+                orders.update(_ORDER_CANDIDATE.findall(content))
+            elif message.get("role") == "tool":
+                try:
+                    result = json.loads(content)
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(result, dict) or result.get("ok") is not True or not isinstance(result.get("data"), dict):
+                    continue
+                data = result["data"]
+                parts.append(json.dumps(data, ensure_ascii=False))
+                # 物流号也可能很长，历史工具只把明确order_id字段作为订单候选。
+                if isinstance(data.get("order_id"), str):
+                    orders.add(data["order_id"])
+                if isinstance(data.get("product_name"), str) and data["product_name"]:
+                    products.add(data["product_name"])
+        selection = turn.get("order_selection")
+        if isinstance(selection, dict) and selection.get("status") == "accepted":
+            selected = selection.get("accepted_order_id")
+            if isinstance(selected, str) and selected:
+                parts.append(selected)
+                orders.add(selected)
+        if orders:
+            latest_orders = orders
+    return "\n".join(parts), latest_orders, products
+
+
+def validate_understanding(raw_query: str, result: UnderstandingResult,
+                           history_turns: list[dict]) -> UnderstandingResult:
+    """核对一次理解的来源，非法组合整体回退，不进行关键词意图分类或额外模型修复。
+
+    参数：raw_query完整用户原话；result严格模型结果；history_turns当前会话的可信整轮历史。
+    返回：可信UnderstandingResult；无需消解时完整问强制原样，来源失真则四字段整体透传。
+    异常：原问不满足UnderstandingResult基本契约时抛校验错误；语义是否需消解由Prompt及真实评估验证。
+    """
+    return _understanding_outcome(raw_query, result, history_turns)[0]
+
+
+def _understanding_outcome(raw_query: str, result: UnderstandingResult,
+                           history_turns: list[dict]) -> tuple[UnderstandingResult, bool]:
+    """复用唯一来源校验并标记真实回退，区别正常空白恢复和来源失真。
+
+    参数：raw_query原话、result严格候选、history_turns可信历史。
+    返回：理解结果和是否因来源失真回退的布尔值，供模型边界准确记录失败。
+    异常：原问契约非法时抛字段校验错误。
+    """
+    fallback = original_understanding(raw_query)
+    history, recent_orders, products = _trusted_history(history_turns)
+    current_orders = set(_ORDER_CANDIDATE.findall(raw_query))
+    allowed_orders = current_orders or (recent_orders if result.needs_resolution else set())
+    source = history if result.needs_resolution else ""
+    try:
+        for candidate in (result.resolved_query, result.standard_query):
+            # UnderstandingResult已做严格类型与4000字校验；这里只复用事实护栏，
+            # 不借QueryRewrite的2000字检索限制裁短合法原话，检索节点稍后独立停止。
+            rewrite = QueryRewrite.model_construct(standard_query=candidate, synonyms=[])
+            validate_rewrite(raw_query, rewrite, context=source)
+            candidate_orders = set(_ORDER_CANDIDATE.findall(candidate))
+            if (current_orders or result.needs_resolution) and not candidate_orders.issubset(allowed_orders):
+                # 同时约束完整问和标准问，不能靠order_id=null绕过最近对象保护。
+                raise QueryRewriteError("理解引入了当前或最近明确对象之外的旧编号")
+            if not result.needs_resolution and any(name in candidate and name not in raw_query for name in products):
+                raise QueryRewriteError("无需消解的问题不能绑定历史商品")
+        if result.order_id is not None:
+            if len(allowed_orders) != 1 or result.order_id not in allowed_orders:
+                raise QueryRewriteError("订单候选没有唯一可信来源")
+            if result.needs_resolution and result.order_id not in set(_ORDER_CANDIDATE.findall(result.resolved_query)):
+                raise QueryRewriteError("具体订单指代必须在完整问题中保留全号")
+        # 无订单字段也不能在完整问里悄悄替用户从并列对象中选一个。
+        if result.needs_resolution and len(allowed_orders) > 1:
+            for candidate in (result.resolved_query, result.standard_query):
+                selected = set(_ORDER_CANDIDATE.findall(candidate)) & allowed_orders
+                if selected and selected != allowed_orders:
+                    raise QueryRewriteError("多个订单对象不能任意选择")
+    except QueryRewriteError:
+        return fallback, True
+    normalized = result if result.needs_resolution else result.model_copy(update={"resolved_query": raw_query})
+    return normalized, False
 
 
 def knowledge_input_stop_reason(query: str) -> Literal["input_limit"] | None:

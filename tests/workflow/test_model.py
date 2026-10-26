@@ -13,138 +13,59 @@ from app.schemas.chat import InvalidToolDecision
 from app.tools.business import query_order, query_logistics, query_product, create_ticket
 
 
-@pytest.mark.parametrize("raw", ['{"intent":"物流"', '{"intent":"物流","intent":"订单"}',
-    '{"intent":NaN}', '{"intent":"物流","reason":"猜测"}', '[]', '{"intent":"未知"}',
-    '```json\n{"intent":"物流"}\n```', '{"intent":"商品咨询"}',
-    '{"intent":"商品咨询","knowledge_query":" "}',
-    '{"intent":"闲聊","knowledge_query":"退款政策"}'])
-async def test_intent_tool_never_repairs_or_guesses(sdk_runtime, raw):
-    """损坏工具参数或未知意图被默认映射时失败。参数：HTTP夹具、raw参数；返回：None；异常：断言失败。"""
+@pytest.mark.parametrize("raw", ['{"intent":"物流"', '{"intent":"物流","intent":"订单","confidence":0.8}',
+    '{"intent":"物流","confidence":NaN}', '{"intent":"物流","confidence":0.8,"reason":"猜测"}',
+    '[]', '{"intent":"未知","confidence":0.9}', '{"intent":"物流"}',
+    '{"intent":"商品咨询","knowledge_query":null,"confidence":0.8}'])
+async def test_invalid_intent_falls_back_without_retry(sdk_runtime, raw):
+    """坏分类若重试、抛成业务失败或绕过严格工具则失败。参数：SDK边界、raw坏参数；返回：None；异常：断言失败。"""
     from app.core.model_budget import BudgetLedger
     from app.workflow.model import WorkflowModelAdapter
 
-    sdk_runtime.responses.extend([call_response("submit_intent", raw), call_response("submit_intent", raw)])
-    with pytest.raises(InvalidToolDecision) as failure:
-        await WorkflowModelAdapter(model_factory=sdk_runtime.factory).classify([], BudgetLedger())
-    assert failure.value.audit_record["classification_budget"]["model_calls"] == 2
+    sdk_runtime.responses.append(call_response("submit_intent", raw, usage=True))
+    ledger = BudgetLedger()
+    result = await WorkflowModelAdapter(model_factory=sdk_runtime.factory).classify([], ledger)
+    assert result.model_dump() == {"intent": "其他", "confidence": 0.0}
+    assert len(sdk_runtime.requests) == ledger.snapshot()["model_calls"] == 1
+    assert ledger.snapshot()["actual_tokens"] == 112
+    assert ledger.snapshot()["records"][0]["failure"]["type"] == "invalid_tool_decision"
 
 
 async def test_intent_rejects_even_valid_text_json(sdk_runtime):
-    """网关返回正文JSON时不能当成有效分类。参数：HTTP夹具；返回：None；异常：断言失败。"""
+    """自由正文JSON被当工具结果时失败。参数：SDK边界；返回：None；异常：断言失败。"""
     from app.core.model_budget import BudgetLedger
     from app.workflow.model import WorkflowModelAdapter
 
-    sdk_runtime.responses.extend([text_response('{"intent":"物流"}'), text_response('{"intent":"物流"}')])
-    with pytest.raises(InvalidToolDecision):
-        await WorkflowModelAdapter(model_factory=sdk_runtime.factory).classify([], BudgetLedger())
-    assert len(sdk_runtime.requests) == 2
-
-
-@pytest.mark.parametrize("bad_response", [
-    "invalid_enum", "missing_tool", "wrong_tool", "broken_arguments",
-])
-async def test_classification_recovers_once_through_only_the_forced_result_tool(sdk_runtime, bad_response):
-    """分类格式偶发错误不能直接终止正常追问，补救也不能接受正文JSON或执行业务工具。
-
-    参数：sdk_runtime真实SDK的HTTP替身；bad_response首次失败类型。
-    返回：None，核对补救结果、原问题历史、强制工具、完整预算和失败原文。
-    异常：AssertionError，错误结果被当作分类、发生额外工具或丢失审计。
-    """
-    from app.core.model_budget import BudgetLedger
-    from app.workflow.model import WorkflowModelAdapter
-
-    first = {"invalid_enum": call_response("submit_intent", '{"intent":"未知"}'),
-             "missing_tool": text_response('{"intent":"物流"}'),
-             "wrong_tool": call_response("query_order", '{"order_id":"1001"}'),
-             "broken_arguments": call_response("submit_intent", '{"intent":')}[bad_response]
-    sdk_runtime.responses.extend([first, intent_response("订单", usage=True)])
-    history = [{"role": "user", "content": "查询1001"}, {"role": "assistant", "content": "1001是猫粮。"},
-               {"role": "user", "content": "他是什么物品？从哪里到哪里"}]
+    sdk_runtime.responses.append(text_response('{"intent":"物流","confidence":0.9}'))
     ledger = BudgetLedger()
-    result = await WorkflowModelAdapter(model_factory=sdk_runtime.factory).classify(history, ledger)
-    assert result.intent == "订单"
-    assert len(sdk_runtime.requests) == 2
-    for request in sdk_runtime.requests:
-        assert request["messages"][1:4] == history
-        assert [tool["function"]["name"] for tool in request["tools"]] == ["submit_intent"]
-        assert request["tool_choice"] == {"type": "function", "function": {"name": "submit_intent"}}
-        assert request["parallel_tool_calls"] is False
-    records = ledger.snapshot()["records"]
-    assert [record["stage"] for record in records] == ["classify", "classify"]
-    assert records[0]["failure"]["type"] == "invalid_tool_decision"
-    assert records[1]["input_units"] > records[0]["input_units"]
-    assert "failure" not in records[1]
-
-
-async def test_classification_recovery_respects_remaining_budget(sdk_runtime):
-    """分类补救不能绕过每轮请求上限。参数：sdk_runtime网络替身；返回：None；异常：断言失败。"""
-    from app.core.model_budget import BudgetLedger, WorkflowBudgetExceeded
-    from app.workflow.model import WorkflowModelAdapter
-
-    ledger = BudgetLedger(max_model_calls=1)
-    sdk_runtime.responses.append(text_response("无效分类"))
-    with pytest.raises(WorkflowBudgetExceeded) as failure:
-        await WorkflowModelAdapter(model_factory=sdk_runtime.factory).classify([], ledger)
+    result = await WorkflowModelAdapter(model_factory=sdk_runtime.factory).classify([], ledger)
+    assert result.intent == "其他" and result.confidence == 0.0
     assert len(sdk_runtime.requests) == 1
-    assert ledger.snapshot()["records"][0]["failure"]["terminal_decision"]["raw_output"] == "无效分类"
-    assert failure.value.audit_record["classification_budget"]["records"][0]["failure"]["terminal_decision"]["raw_output"] == "无效分类"
+    assert ledger.snapshot()["records"][0]["failure"]["terminal_decision"]["raw_output"]
 
 
-async def test_classification_accepts_string_null_without_retry(sdk_runtime):
-    """字符串null被当成知识问题、拒绕或额外请求模型时失败。参数：真实SDK夹具；返回：None；异常：断言失败。"""
+@pytest.mark.parametrize("value", [True, False, float("nan"), float("inf"), -0.1, 1.1, "0.9"])
+def test_invalid_confidence_bool_nan_extra_fields(value):
+    """非有限值、布尔强转或额外字段破坏八类输出时失败。参数：value非法分数；返回：None；异常：断言失败。"""
+    from pydantic import ValidationError
+    from app.schemas.workflow import IntentResult
+
+    with pytest.raises(ValidationError):
+        IntentResult(intent="物流", confidence=value)
+    with pytest.raises(ValidationError):
+        IntentResult(intent="物流", confidence=0.9, knowledge_query=None)
+    assert IntentResult(intent="其他", confidence=0).model_dump() == {"intent": "其他", "confidence": 0.0}
+
+
+async def test_classification_failure_keeps_last_available_call(sdk_runtime):
+    """最后一次分类协议失败不能再占额补救。参数：SDK边界；返回：None；异常：断言失败。"""
     from app.core.model_budget import BudgetLedger
     from app.workflow.model import WorkflowModelAdapter
 
-    # 模型反复把JSON空值写成文字"null"，靠提示词重试无法稳定纠正；应在严格schema层确定性还原为None。
-    sdk_runtime.responses.append(intent_response("商品咨询", knowledge_query="null", usage=True))
-    ledger = BudgetLedger()
-    result = await WorkflowModelAdapter(model_factory=sdk_runtime.factory).classify(
-        [{"role": "user", "content": "它是什么商品？"}], ledger)
-    assert result.knowledge_query is None and len(sdk_runtime.requests) == 1
-    assert "failure" not in ledger.snapshot()["records"][0]
-    assert ledger.snapshot()["actual_tokens"] == 112
-
-
-async def test_classification_normalizes_any_null_placeholder_spelling(sdk_runtime):
-    """其他空值写法（None/nil/带空白）未被同样还原时失败。参数：真实SDK夹具；返回：None；异常：断言失败。"""
-    from app.core.model_budget import BudgetLedger
-    from app.workflow.model import WorkflowModelAdapter
-
-    sdk_runtime.responses.extend([intent_response("商品咨询", knowledge_query=" none ", usage=True),
-        intent_response("订单", knowledge_query="NULL", usage=True)])
-    adapter = WorkflowModelAdapter(model_factory=sdk_runtime.factory)
-    first = await adapter.classify([{"role": "user", "content": "它是什么商品？"}], BudgetLedger())
-    second = await adapter.classify([{"role": "user", "content": "1001订单是什么"}], BudgetLedger())
-    assert first.knowledge_query is None and second.knowledge_query is None
-    assert len(sdk_runtime.requests) == 2
-
-
-async def test_classification_two_string_null_outputs_no_longer_fail(sdk_runtime):
-    """两个字符串null仍导致整轮失败时失败（回归：曾导致 conv119 连续两轮 failed）。
-
-    参数：真实SDK夹具；返回：None。异常：断言失败，还原失效或发生额外重试。
-    """
-    from app.core.model_budget import BudgetLedger
-    from app.workflow.model import WorkflowModelAdapter
-
-    sdk_runtime.responses.append(intent_response("商品咨询", knowledge_query="null", usage=True))
-    ledger = BudgetLedger()
-    result = await WorkflowModelAdapter(model_factory=sdk_runtime.factory).classify(
-        [{"role": "user", "content": "1001订单是什么"}], ledger)
-    assert result.knowledge_query is None and len(sdk_runtime.requests) == 1
-    assert "failure" not in ledger.snapshot()["records"][0]
-
-
-async def test_classification_keeps_normal_query_containing_null(sdk_runtime):
-    """正常问题包含null时误当整段空值占位拒绝或篡改则失败。参数：真实SDK夹具；返回：None；异常：断言失败。"""
-    from app.core.model_budget import BudgetLedger
-    from app.workflow.model import WorkflowModelAdapter
-
-    query = "商品说明中null字段是什么意思？"
-    sdk_runtime.responses.append(intent_response("商品咨询", knowledge_query=query))
-    result = await WorkflowModelAdapter(model_factory=sdk_runtime.factory).classify(
-        [{"role": "user", "content": query}], BudgetLedger())
-    assert result.knowledge_query == query and len(sdk_runtime.requests) == 1
+    sdk_runtime.responses.append(text_response("无效分类"))
+    ledger = BudgetLedger(max_model_calls=1)
+    result = await WorkflowModelAdapter(model_factory=sdk_runtime.factory).classify([], ledger)
+    assert result.intent == "其他" and ledger.snapshot()["model_calls"] == 1
 
 
 def sse(delta=None, *, finish=None, usage=None, tail=False):
@@ -178,9 +99,16 @@ def terminal_response(kind="answer", actions=None, *, usage=False):
     return call_response("submit_decision", json.dumps({"kind": kind, "suggested_actions": actions or []}), usage=usage)
 
 
-def intent_response(intent="订单", *, usage=False, knowledge_query=None):
-    """构造分类工具响应。参数：intent意图、usage用量尾块、knowledge_query独立知识问法；返回：SSE列表；异常：无。"""
-    return call_response("submit_intent", json.dumps({"intent": intent, "knowledge_query": knowledge_query}, ensure_ascii=False), usage=usage)
+def intent_response(intent="订单", *, usage=False, confidence=0.96):
+    """构造分类工具响应。参数：intent意图、usage用量尾块、confidence有限分数；返回：SSE列表；异常：无。"""
+    return call_response("submit_intent", json.dumps({"intent": intent, "confidence": confidence}, ensure_ascii=False), usage=usage)
+
+
+def understanding_response(query, *, standard=None, needs_resolution=False, order_id=None, usage=False):
+    """构造完整理解工具响应。参数：query完整问、standard标准问、消解标志、订单候选、用量；返回：SSE列表；异常：无。"""
+    return call_response("submit_understanding", json.dumps({"resolved_query": query,
+        "standard_query": query if standard is None else standard, "needs_resolution": needs_resolution,
+        "order_id": order_id}, ensure_ascii=False), usage=usage)
 
 
 @pytest.fixture
@@ -204,7 +132,7 @@ async def sdk_runtime():
         def factory(**kwargs):
             """使用真实客户端和外部假网络。参数：kwargs 适配器配置；返回：ChatOpenAI；异常：配置错误。"""
             options.append(kwargs)
-            return ChatOpenAI(base_url="http://offline.invalid/v1", api_key="offline", model="test-model",
+            return ChatOpenAI(base_url="http://offline.invalid/v1", api_key="offline", model=kwargs.pop("model", "test-model"),
                               http_async_client=client, **kwargs)
         yield SimpleNamespace(factory=factory, requests=requests, responses=responses, options=options)
 
@@ -234,49 +162,48 @@ async def test_classify_counts_usage_tail_and_keeps_full_history(sdk_runtime):
         _estimate_message_tokens(convert_to_messages(rt.requests[0]["messages"])) + _estimate_token_units(rt.requests[0]["tools"]))
 
 
-async def test_contextual_knowledge_query_survives_sdk_and_classification_budget(sdk_runtime):
-    """独立知识问法被截断、丢字段或未计输出预算时失败。参数：sdk_runtime真实SDK边界；返回：None；异常：断言失败。"""
+async def test_understanding_and_classification_use_distinct_strict_tools(sdk_runtime):
+    """理解与分类混用工具、预算或模型配置时失败。参数：SDK边界；返回：None；异常：断言失败。"""
     from app.core.model_budget import BudgetLedger
     from app.workflow.model import WorkflowModelAdapter
 
-    question = "不是质量问题，签收8天后能否换货？" + "请保留当前条件。" * 100
-    sdk_runtime.responses.append(intent_response("退款退货", knowledge_query=question))
+    raw = "  订单1001现在是什么状态？  "
+    sdk_runtime.responses.extend([understanding_response(raw, order_id="1001", usage=True),
+                                  intent_response("订单", confidence=0.92, usage=True)])
+    ledger, adapter = BudgetLedger(), WorkflowModelAdapter(model_factory=sdk_runtime.factory, intent_model="intent-test")
+    understood = await adapter.understand([{"role": "user", "content": raw}], ledger)
+    result = await adapter.classify([{"role": "user", "content": understood.resolved_query}], ledger)
+    assert result.model_dump() == {"intent": "订单", "confidence": 0.92}
+    assert [r["stage"] for r in ledger.snapshot()["records"]] == ["understand", "classify"]
+    assert ledger.snapshot()["actual_tokens"] == 224
+    for request, tool in zip(sdk_runtime.requests, ["submit_understanding", "submit_intent"]):
+        assert request["tool_choice"] == {"type": "function", "function": {"name": tool}}
+        assert [item["function"]["name"] for item in request["tools"]] == [tool]
+        assert request["parallel_tool_calls"] is False and request["tools"][0]["function"]["strict"] is True
+    assert sdk_runtime.requests[0]["model"] == "test-model"
+    assert sdk_runtime.requests[1]["model"] == "intent-test"
+    assert [r["max_completion_tokens"] for r in sdk_runtime.requests] == [2048, 4096]
+
+
+async def test_understanding_order_id_required_but_nullable(sdk_runtime):
+    """可空订单漏字段被默认补齐或重试时失败。参数：SDK边界；返回：None；异常：断言失败。"""
+    from app.core.model_budget import BudgetLedger
+    from app.workflow.model import WorkflowModelAdapter, understanding_tool_schema
+
+    raw = "  运费怎么算？  "
+    sdk_runtime.responses.extend([understanding_response(raw), call_response("submit_understanding",
+        json.dumps({"resolved_query": "变动原问", "standard_query": "变动检索问", "needs_resolution": False}))])
+    adapter = WorkflowModelAdapter(model_factory=sdk_runtime.factory)
+    first = await adapter.understand([{"role": "user", "content": raw}], BudgetLedger())
     ledger = BudgetLedger()
-    result = await WorkflowModelAdapter(model_factory=sdk_runtime.factory).classify(
-        [{"role": "user", "content": "不是质量问题，8天了还能换吗？"}], ledger)
-    assert result.knowledge_query == question
-    request = sdk_runtime.requests[0]
-    assert "knowledge_query" in request["tools"][0]["function"]["parameters"]["required"]
-    assert ledger.snapshot()["records"][0]["output_limit"] == request["max_completion_tokens"] == 4096
-
-
-@pytest.mark.parametrize("query,history,resolved", [
-    ("MH-X99支持整机水洗吗？", [], "MH-W60支持整机水洗吗？"),
-    ("1002包邮吗", [{"role": "user", "content": "1001订单"}], "1001订单包邮吗"),
-    ("包邮吗", [], "1001订单包邮吗"),
-])
-async def test_classification_cannot_replace_or_invent_query_identifiers(sdk_runtime, query, history, resolved):
-    """错误派生编号不能进入检索，应退回完整原问。参数：脚本及问法；返回：None；异常：断言失败。"""
-    from app.core.model_budget import BudgetLedger
-    from app.workflow.model import WorkflowModelAdapter
-
-    sdk_runtime.responses.append(intent_response("商品咨询", knowledge_query=resolved))
-    result = await WorkflowModelAdapter(model_factory=sdk_runtime.factory).classify(
-        [*history, {"role": "user", "content": query}], BudgetLedger())
-    assert result.knowledge_query == query
-    assert len(sdk_runtime.requests) == 1
-
-
-async def test_classification_can_complete_an_order_reference_from_user_history(sdk_runtime):
-    """合法历史订单号补全不得因原问没有数字被拒绝。参数：SDK边界；返回：None；异常：断言失败。"""
-    from app.core.model_budget import BudgetLedger
-    from app.workflow.model import WorkflowModelAdapter
-
-    sdk_runtime.responses.append(intent_response("商品咨询", knowledge_query="1001订单的包邮规则"))
-    result = await WorkflowModelAdapter(model_factory=sdk_runtime.factory).classify([
-        {"role": "user", "content": "1001订单到哪里了"},
-        {"role": "assistant", "content": "已发货。"}, {"role": "user", "content": "包邮吗"}], BudgetLedger())
-    assert result.knowledge_query == "1001订单的包邮规则"
+    second = await adapter.understand([{"role": "user", "content": raw}], ledger)
+    assert first.order_id is None
+    assert second.resolved_query == second.standard_query == raw and second.order_id is None
+    assert ledger.snapshot()["model_calls"] == 1 and ledger.snapshot()["reserved_units"] > 0
+    assert ledger.snapshot()["records"][0]["failure"]["missing_fields"] == ["order_id"]
+    schema = understanding_tool_schema()["function"]["parameters"]
+    assert set(schema["required"]) == {"resolved_query", "standard_query", "needs_resolution", "order_id"}
+    assert "default" not in schema["properties"]["order_id"]
 
 
 @pytest.mark.parametrize("name,raw,duplicate", [("query_order",'{"order_id":"1001"',False),
@@ -315,7 +242,7 @@ async def test_valid_tool_decision_preserves_raw_metadata_and_no_hidden_schema(s
     assert "stream_options" not in request
 
 
-@pytest.mark.parametrize("stage", ["classify","decide","answer"])
+@pytest.mark.parametrize("stage", ["decide","answer"])
 async def test_length_finish_is_never_normal_completion(sdk_runtime, stage):
     """SDK 返回 length 却当正常完成时失败。参数：网络夹具、阶段；返回：None；异常：断言失败。"""
     from app.core.model_budget import BudgetLedger

@@ -1,4 +1,4 @@
-"""CH05 工作流严格契约：七类意图、工具/终止决策、前置证据闸和服务端动作建议快照。"""
+"""工作流严格契约：一次理解、八类意图、工具/终止决策、前置证据闸和服务端动作快照。"""
 
 from typing import Literal
 
@@ -6,10 +6,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from app.schemas.history import StoredTurn
 from app.schemas.tools import ToolContext, ToolResult
 
-Intent = Literal["物流", "订单", "商品咨询", "退款退货", "售后", "投诉", "闲聊"]
+Intent = Literal["物流", "订单", "商品咨询", "退款退货", "售后", "投诉", "闲聊", "其他"]
 ActionKind = Literal["handoff", "create_ticket"]
-# 模型把JSON空值写成文字时的稳定集合；仅完全匹配才还原，含这些词的正常问题不受影响。
-_NULL_PLACEHOLDERS = frozenset({"null", "none", "nil", "undefined"})
 
 
 class HistoryDelta(BaseModel):
@@ -19,35 +17,30 @@ class HistoryDelta(BaseModel):
     last_message_id: int = Field(ge=0, description="本次已扫描消息的最大主键，不因排除当前轮倒退")
 
 
-class IntentResult(BaseModel):
-    """保存意图及独立知识问题；空问题表示依赖已有事实或澄清，不能生成新政策。"""
+class UnderstandingResult(BaseModel):
+    """一次理解的扁平结果；完整问题和标准问法分开，订单候选仍须由业务节点验本人归属。"""
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
-    intent: Intent = Field(description="本轮主诉求所属的七类固定意图")
-    knowledge_query: str | None = Field(min_length=1, max_length=2000,
-        description="需要知识政策时填写结合历史的完整独立问题，保留当前条件；仅查具体业务事实或澄清含义时必须为真正null，不能使用字符串null或省略字段")
+    resolved_query: str = Field(min_length=1, max_length=4000, description="指代补全后的完整问题；无需消解时保留原话")
+    standard_query: str = Field(min_length=1, max_length=4000, description="本次理解产生的标准检索问法；失败回退完整原话，检索上限另行检查")
+    needs_resolution: bool = Field(description="当前原话是否需要当前会话历史才能明确对象或业务")
+    order_id: str | None = Field(min_length=1, max_length=64, description="来自可信输入的完整订单候选；没有或歧义时必须显式JSON null，不得省略")
 
-    @field_validator("knowledge_query", mode="before")
+    @field_validator("resolved_query", "standard_query", "order_id")
     @classmethod
-    def normalize_null_placeholder(cls, value):
-        """把模型常见的空值字面量还原为JSON空值。
-
-        参数：value为模型提交的原始字段值，可能是真正None或描述空值的字符串。
-        返回：None表示无需检索，或原样返回其余字符串。
-        异常：无；非字符串非None的值留给后续类型校验报错。
-        """
-        # 模型反复把JSON null写成文字"null"，靠提示词重试无法稳定纠正，此处确定性还原而不改变语义。
-        if isinstance(value, str) and value.strip().lower() in _NULL_PLACEHOLDERS:
-            return None
+    def reject_blank(cls, value: str | None) -> str | None:
+        """拒绝空白但不改原字符。参数：value已通过类型/长度校验的字段；返回：原值；异常：ValueError，纯空白。"""
+        if value is not None and not value.strip():
+            raise ValueError("理解结果不能只有空白")
         return value
 
-    @model_validator(mode="after")
-    def validate_knowledge_query(self) -> "IntentResult":
-        """拒绝空白及固定回复意图夹带检索。参数：无；返回：自身，不归一化输入；异常：ValueError，问题无效或与意图矛盾。"""
-        if self.knowledge_query is not None:
-            if not self.knowledge_query.strip() or self.intent in {"投诉", "闲聊"}:
-                raise ValueError("知识问题必须非空白，投诉和闲聊不携带知识检索")
-        return self
+
+class IntentResult(BaseModel):
+    """严格八类意图与有限置信度；不承载检索问题、动作或模型升级策略。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    intent: Intent = Field(description="本轮主诉求所属的八类固定意图")
+    confidence: float = Field(ge=0, le=1, allow_inf_nan=False, description="模型自报的0–1有限置信度，仅记录评估，不是已校准准确率")
 
 
 class AgentDecision(BaseModel):

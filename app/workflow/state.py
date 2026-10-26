@@ -18,13 +18,18 @@ class ConversationState(TypedDict, total=False):
 
     context: dict  # ToolContext的JSON快照，身份只由服务端提供。
     raw_query: str  # 当前用户完整原话，保留首尾空白。
-    resolved_query: str  # 指代节点完成后的透传原话，未执行时为空。
+    resolved_query: str  # 一次理解补全的完整问题，未执行时为空。
+    standard_query: str  # 同次理解的标准问法；优化失败保留完整原句。
+    order_id: str | None  # 可信输入中的完整订单候选，执行前仍须校验本人归属。
+    order_data: dict | None  # 本轮成功核实的订单事实，未查询时为空。
+    expanded_queries: list[str]  # 本轮政策检索的一条或三条扩写查询。
+    selection_action: dict | None  # 当前原轮的服务端订单选择动作，未等待时为空。
     history_turns: list[dict]  # 既有StoredTurn字典列表，按原格式和历史预算使用。
     audit_cursor: int  # 已对账消息主键，零表示尚未导入历史。
     messages: list[dict]  # 本轮模型与工具消息的可序列化字典列表。
-    intent: Intent | None  # 当前轮的严格七类意图，分类前为空。
-    knowledge_query: str | None  # 分类工具补全的独立知识问题；空值不检索，仅按已有事实回答或澄清。
-    route: Literal["knowledge", "business", "complaint", "chitchat"] | None  # 固定四出口。
+    intent: Intent | None  # 当前轮的严格八类意图，分类前为空。
+    intent_confidence: float | None  # 分类自报有限分数，仅用于记录与评估。
+    route: Literal["knowledge", "business", "complaint", "chitchat", "order_policy"] | None  # 原四出口加订单政策出口。
     evidence: list[dict]  # 本轮完整EvidenceCitation字典，编号保持稳定。
     evidence_scores: list[float]  # 本轮全部归一化重排分，与权威证据同源。
     gate: dict | None  # GateDecision的JSON快照，未执行证据闸时为空。
@@ -55,9 +60,10 @@ def new_turn_state(context: ToolContext, history_turns: list[dict], audit_cursor
         raise ValueError("历史审计游标必须为非负整数")
     # 新input必须显式覆盖每个字段，防止同thread的旧checkpoint残留运行数据。
     return {
-        "context": context.model_dump(mode="json"), "raw_query": query, "resolved_query": "",
+        "context": context.model_dump(mode="json"), "raw_query": query, "resolved_query": "", "standard_query": "",
+        "order_id": None, "order_data": None, "expanded_queries": [], "selection_action": None,
         "history_turns": deepcopy(history_turns), "audit_cursor": audit_cursor, "messages": [],
-        "intent": None, "knowledge_query": None, "route": None, "evidence": [], "evidence_scores": [], "gate": None,
+        "intent": None, "intent_confidence": None, "route": None, "evidence": [], "evidence_scores": [], "gate": None,
         "pending_calls": [], "seen_call_ids": [], "seen_call_signatures": [],
         "tool_count": 0, "decision_count": 0, "budget": BudgetLedger().snapshot(),
         "suggested_kinds": [], "suggested_actions": [], "answer": "", "stop_reason": None,

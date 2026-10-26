@@ -3,7 +3,8 @@
 from collections import Counter
 from copy import deepcopy
 
-OUTPUT_LIMITS = {"classify": 4096, "rewrite": 2048, "decide": 2048, "answer": 4096}
+OUTPUT_LIMITS = {"understand": 2048, "classify": 4096, "expand": 2048,
+                 "rewrite": 2048, "decide": 2048, "answer": 4096}
 
 
 def budget_summary(snapshot: dict | None) -> dict | None:
@@ -60,7 +61,8 @@ class BudgetLedger:
             reserved += (input_units + output_limit) * 2
         if (sum(counts.values()) > self._limits["max_model_calls"]
                 or counts["decide"] > self._limits["max_decisions"] or counts["answer"] > 2
-                or counts["classify"] > 2 or counts["rewrite"] > 1
+                or counts["classify"] > 1 or counts["understand"] > 1
+                or counts["expand"] > 1 or counts["rewrite"] > 1
                 or reserved > self._limits["total_token_budget"]):
             raise WorkflowBudgetExceeded("本轮模型调用次数或总预算不足")
 

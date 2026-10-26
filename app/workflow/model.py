@@ -16,10 +16,10 @@ from app.core.memory import _estimate_message_tokens, _estimate_token_units
 from app.core.model_budget import OUTPUT_LIMITS, BudgetLedger, WorkflowBudgetExceeded
 from app.core.prompts import ANSWER_NUDGE
 from app.core.structured import StructuredOutputError, bind_output_tool, output_chunk_size, output_tool, parse_tool_output
-from app.knowledge.query_rewrite import QueryRewrite, QueryRewriteError, validate_rewrite
 from app.schemas.chat import InvalidToolDecision
-from app.schemas.workflow import AgentDecision, IntentResult
-from app.workflow.prompts import ANSWER_PROMPT, DECISION_NUDGE, DECISION_PROMPT, INTENT_NUDGE, INTENT_PROMPT
+from app.schemas.workflow import AgentDecision, IntentResult, UnderstandingResult
+from app.workflow.prompts import ANSWER_PROMPT, DECISION_NUDGE, DECISION_PROMPT, INTENT_PROMPT, UNDERSTANDING_PROMPT
+from app.workflow.routing import _understanding_outcome, original_understanding
 
 READ_ONLY_NAMES = frozenset({"query_order", "query_logistics", "query_product"})
 _CONTROL_NAME = "submit_decision"
@@ -38,6 +38,11 @@ _CONTROL_SCHEMA = {"type": "function", "function": {
 
 class WorkflowOutputError(ValueError):
     """模型输出截断、拒绝、超长或无有效正文，不能作为正常完成发布。"""
+
+
+def understanding_tool_schema() -> dict:
+    """生成理解绑定与预算共用的严格工具。参数：无；返回：submit_understanding定义；异常：schema转换错误。"""
+    return output_tool(UnderstandingResult, "submit_understanding")
 
 
 def intent_tool_schema() -> dict:
@@ -99,15 +104,18 @@ def _check_finish(reason: str | None, *, tools: bool = False) -> None:
 class WorkflowModelAdapter:
     """不保存单轮账本的模型适配器；每个调用显式接收请求独占 ledger。"""
 
-    def __init__(self, *, model_factory=None, stream_usage: bool | None = None) -> None:
-        """参数：model_factory 外部模型边界，stream_usage 显式覆盖计量开关；返回：None；异常：无。"""
+    def __init__(self, *, model_factory=None, stream_usage: bool | None = None,
+                 intent_model: str | None = None) -> None:
+        """参数：model_factory外部模型边界、stream_usage计量开关、intent_model分类模型覆盖；返回：None；异常：无。"""
         self._factory = model_factory or get_chat_model
         self._stream_usage = settings.workflow_stream_usage if stream_usage is None else stream_usage
+        self._intent_model = settings.intent_model if intent_model is None else intent_model
 
-    def _model(self, output_limit: int):
-        """创建有界请求模型。参数：output_limit 单次输出上限；返回：ChatOpenAI 兼容对象；异常：配置错误。"""
+    def _model(self, output_limit: int, *, model_name: str | None = None):
+        """创建有界请求模型。参数：output_limit输出上限、model_name可选分类模型；返回：兼容聊天模型；异常：配置错误。"""
+        options = {"model": model_name} if model_name is not None else {}
         return self._factory(streaming=True, temperature=0.0, max_tokens=output_limit,
-                             max_retries=1, request_timeout=60.0, stream_usage=self._stream_usage)
+                             max_retries=1, request_timeout=60.0, stream_usage=self._stream_usage, **options)
 
     async def _gather(self, messages: list, model, ledger: BudgetLedger, stage: str):
         """内部聚合并记录全部 usage/终止原因，不向用户输出。参数：messages/model 输入依赖、ledger/stage 本次账本；返回：完整分片；异常：模型/取消/超长错误。"""
@@ -129,60 +137,92 @@ class WorkflowModelAdapter:
             raise WorkflowOutputError("模型未返回有效决策")
         return gathered
 
-    async def classify(self, messages: list, ledger: BudgetLedger) -> IntentResult:
-        """分类当前主诉求；结构错误最多补救一次，派生问法失真则按原问安全回退。
+    @staticmethod
+    def _failure(gathered, category: str, error: Exception | None = None) -> dict:
+        """构造有界内部诊断，避免把网络异常原文带到日志或用户。
 
-        参数：messages完整分类输入与历史；ledger独占账本，补救计入总次数与输入预算。
-        返回：IntentResult，只接受submit_intent合法参数；引用校验失败时使用完整原问并保留诊断，
-            超2000字符则保留有界结果交由既有input_limit分支阻止检索。
-        异常：InvalidToolDecision，两次结构不合法或缺少可信原问；预算、异常终止、网络与取消原样传播。
+        参数：gathered可为空的原始分片、category校验类别、error原异常。
+        返回：独立审计字典，协议缺字段额外列missing_fields。
+        异常：无主动业务异常。
+        """
+        invalid = InvalidToolDecision(
+            tool_call_chunks=getattr(gathered, "tool_call_chunks", None),
+            raw_output=_text(gathered) if gathered is not None else "",
+            validation_category=category)
+        diagnostic = invalid.audit_record
+        if error is not None:
+            diagnostic["error_type"] = type(error).__name__
+            cause = error
+            while cause is not None:
+                if isinstance(cause, ValidationError):
+                    missing = [str(row["loc"][0]) for row in cause.errors()
+                               if row["type"] == "missing" and row["loc"]]
+                    if missing:
+                        diagnostic["missing_fields"] = sorted(set(missing))
+                    break
+                cause = cause.__cause__
+        return diagnostic
+
+    async def understand(self, messages: list, ledger: BudgetLedger) -> UnderstandingResult:
+        """一次工具调用完成指代与标准问法；优化故障整体透传，控制信号保持原义。
+
+        参数：messages当前原问结尾的完整会话消息；ledger本轮独占账本。
+        返回：严格理解结果；任何调用/解析/来源失败返回完整原问且记录已消耗预算。
+        异常：ValueError，无合法当前用户原问；WorkflowBudgetExceeded或取消原样传播。
+        """
+        converted = convert_to_messages(messages)
+        users = [index for index, message in enumerate(converted) if message.type == "human"]
+        if not users:
+            raise ValueError("理解必须包含当前用户原问")
+        current_index = users[-1]
+        raw_query = _text(converted[current_index])
+        fallback = original_understanding(raw_query)
+        history_turns = []
+        for message in converted[:current_index]:
+            if message.type == "human" or not history_turns:
+                history_turns.append({"messages": []})
+            history_turns[-1]["messages"].append({"role": "user" if message.type == "human" else message.type,
+                                                   "content": _text(message)})
+        prepared = [SystemMessage(content=UNDERSTANDING_PROMPT), *converted]
+        tool, output_limit = understanding_tool_schema(), OUTPUT_LIMITS["understand"]
+        ledger.reserve("understand", _estimate_message_tokens(prepared) + _estimate_token_units([tool]), output_limit)
+        gathered = None
+        try:
+            gathered = await self._gather(prepared, bind_output_tool(self._model(output_limit), tool), ledger, "understand")
+            result = parse_tool_output(gathered, UnderstandingResult, "submit_understanding")
+            validated, source_failed = _understanding_outcome(raw_query, result, history_turns)
+            if source_failed:
+                diagnostic = self._failure(gathered, "understanding_reference")
+                diagnostic["query_fallback"] = "original_query"
+                ledger.record_failure("understand", diagnostic)
+            return validated
+        except WorkflowBudgetExceeded:
+            # 预算是控制状态，不能被理解优化回退吞掉；取消继承BaseException也自然传播。
+            raise
+        except Exception as error:
+            diagnostic = self._failure(gathered, "understanding_structure", error)
+            diagnostic["query_fallback"] = "original_query"
+            ledger.record_failure("understand", diagnostic)
+            return fallback
+
+    async def classify(self, messages: list, ledger: BudgetLedger) -> IntentResult:
+        """用独立单模型分类一次，协议失败归其他并保留失败账本，不发起补救。
+
+        参数：messages完整分类输入与历史；ledger独占账本。
+        返回：严格intent/confidence；解析、枚举、数值或输出协议失败为其他/0。
+        异常：WorkflowBudgetExceeded、网络/配置错误及取消原样传播，不能伪装为模型分类。
         """
         prepared = [SystemMessage(content=INTENT_PROMPT), *convert_to_messages(messages)]
-        tool = intent_tool_schema()
-        output_limit = OUTPUT_LIMITS["classify"]
-        for attempt in range(2):
-            # 不回灌失败原文；只能重做只读分类，不执行模型误吐出的业务申请。
-            current = prepared if attempt == 0 else [*prepared, SystemMessage(content=INTENT_NUDGE)]
-            try:
-                ledger.reserve("classify", _estimate_message_tokens(current) + _estimate_token_units([tool]), output_limit)
-            except WorkflowBudgetExceeded as error:
-                if attempt:
-                    error.audit_record = {"type": "invalid_tool_decision", "classification_budget": ledger.snapshot()}
-                raise
-            gathered = await self._gather(current, bind_output_tool(self._model(output_limit), tool), ledger, "classify")
-            _check_finish(gathered.response_metadata.get("finish_reason"), tools=_has_calls(gathered))
-            try:
-                result = parse_tool_output(gathered, IntentResult, "submit_intent")
-                if result.knowledge_query is not None:
-                    users = [message for message in prepared if message.type == "human"]
-                    original_query = _text(users[-1]) if users else ""
-                    if not original_query.strip():
-                        raise QueryRewriteError("缺少用户原问，无法校验或回退知识问题")
-                    # 新独立问法不能抹掉原问型号/数字；只允许从用户历史或可信工具结果补全，助手散文不作事实来源。
-                    history = [message.content for message in prepared if message.type in {"human", "tool"}]
-                    validate_rewrite(original_query,
-                        QueryRewrite(standard_query=result.knowledge_query, synonyms=[]),
-                        context=json.dumps(history, ensure_ascii=False))
-                return result
-            except (StructuredOutputError, QueryRewriteError) as error:
-                invalid = InvalidToolDecision(tool_call_chunks=gathered.tool_call_chunks,
-                    raw_output=_text(gathered), validation_category=(
-                        "intent_reference" if isinstance(error, QueryRewriteError) else "intent_structure"))
-                if isinstance(error, QueryRewriteError) and original_query.strip():
-                    if len(original_query) <= 2000:
-                        # 分类本身已通过严格解析；丢弃失真的派生问法，不再请求模型或改动原话。
-                        result = IntentResult(intent=result.intent, knowledge_query=original_query)
-                        invalid.audit_record["query_fallback"] = "original_query"
-                    else:
-                        # 有界问法仅维持知识路由；真实图先检查完整原问，以input_limit结束而不检索。
-                        invalid.audit_record["query_fallback"] = "input_limit"
-                    ledger.record_failure("classify", invalid.audit_record)
-                    return result
-                ledger.record_failure("classify", invalid.audit_record)
-                if attempt or isinstance(error, QueryRewriteError):
-                    # 图抛错不会提交局部State，最终异常须携带已有诊断和用量供服务单独落库。
-                    invalid.audit_record["classification_budget"] = ledger.snapshot()
-                    raise invalid from error
+        tool, output_limit = intent_tool_schema(), OUTPUT_LIMITS["classify"]
+        ledger.reserve("classify", _estimate_message_tokens(prepared) + _estimate_token_units([tool]), output_limit)
+        gathered = None
+        try:
+            gathered = await self._gather(prepared,
+                bind_output_tool(self._model(output_limit, model_name=self._intent_model), tool), ledger, "classify")
+            return parse_tool_output(gathered, IntentResult, "submit_intent")
+        except (StructuredOutputError, WorkflowOutputError) as error:
+            ledger.record_failure("classify", self._failure(gathered, "intent_structure", error))
+            return IntentResult(intent="其他", confidence=0.0)
 
     async def decide(self, messages: list, tools: list, ledger: BudgetLedger) -> AgentDecision:
         """仅接受业务工具或唯一终止控制工具，缺控制调用或其参数非法时有限纠正。

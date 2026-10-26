@@ -24,7 +24,8 @@ def test_new_turn_replaces_every_runtime_field_and_retains_history():
     ]}]
     previous = new_turn_state(_context("查物流", "prior"), history, 11)
     previous.update(resolved_query="旧问题", messages=[{"role": "tool", "content": "旧事实"}],
-                    intent="物流", knowledge_query="旧检索问题", route="business", evidence=[{"chunk_id": 9}], evidence_scores=[0.9],
+                    intent="物流", standard_query="旧检索问题", intent_confidence=0.9, order_id="1001",
+                    order_data={"order_id": "1001"}, expanded_queries=["旧扩写"], selection_action={"action_id": "old"}, route="business", evidence=[{"chunk_id": 9}], evidence_scores=[0.9],
                     gate={"passed": True}, pending_calls=[{"id": "old-call"}], seen_call_ids=["old-call"],
                     seen_call_signatures=["old-signature"], tool_count=4, decision_count=5,
                     suggested_kinds=["handoff"], suggested_actions=[{"action_id": "old-action"}],
@@ -39,7 +40,8 @@ def test_new_turn_replaces_every_runtime_field_and_retains_history():
         "context": {"conversation_id": 42, "session_id": "session", "user_id": "user",
                     "turn_id": "new-turn", "tool_call_id": "", "user_message": "1001"},
         "raw_query": "1001", "resolved_query": "", "history_turns": history, "audit_cursor": 13,
-        "messages": [], "intent": None, "knowledge_query": None, "route": None, "evidence": [], "evidence_scores": [],
+        "messages": [], "intent": None, "standard_query": "", "intent_confidence": None,
+        "order_id": None, "order_data": None, "expanded_queries": [], "selection_action": None, "route": None, "evidence": [], "evidence_scores": [],
         "gate": None, "pending_calls": [], "seen_call_ids": [], "seen_call_signatures": [],
         "tool_count": 0, "decision_count": 0, "suggested_kinds": [], "suggested_actions": [],
         "answer": "", "stop_reason": None, "completion_metadata": {},
@@ -96,3 +98,15 @@ def test_state_rejects_invalid_audit_cursor(cursor):
 
     with pytest.raises(ValueError):
         new_turn_state(_context(), [], cursor)
+
+
+def test_new_turn_clears_selection_and_order():
+    """新轮继承旧选单、订单或置信度时失败。参数：无；返回：None；异常：断言失败。"""
+    from app.workflow.state import new_turn_state
+
+    old = {"order_id": "1001", "order_data": {"order_id": "1001"}, "selection_action": {"action_id": "old"},
+           "expanded_queries": ["旧查询"], "standard_query": "旧问", "intent_confidence": 0.99}
+    merged = {**old, **new_turn_state(_context("新的问题"), [], 0)}
+    assert merged["order_id"] is merged["order_data"] is merged["selection_action"] is None
+    assert merged["intent_confidence"] is None and merged["standard_query"] == ""
+    assert merged["expanded_queries"] == []
