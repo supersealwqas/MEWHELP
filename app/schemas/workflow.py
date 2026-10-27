@@ -10,6 +10,90 @@ Intent = Literal["物流", "订单", "商品咨询", "退款退货", "售后", "
 ActionKind = Literal["handoff", "create_ticket"]
 
 
+class OrderSelectionConflict(ValueError):
+    """旧选单动作已取消或相同键更换订单，必须返回409而不是重新开轮。"""
+
+
+class OwnedOrder(BaseModel):
+    """订单卡片的最小只读快照，不含其他用户或支付数据。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    order_id: str = Field(min_length=1, max_length=64, description="本人完整订单主键")
+    product_name: str = Field(min_length=1, description="商品名称")
+    status: str = Field(min_length=1, description="订单当前状态")
+
+
+class OrderSelectionAction(BaseModel):
+    """官方interrupt持久化的稳定选单卡片。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    type: Literal["select_order"] = Field(default="select_order", description="固定选单事件类型")
+    action_id: str = Field(min_length=36, max_length=36, description="按会话/原轮生成的UUIDv5")
+    source_turn_id: str = Field(min_length=1, max_length=36, description="等待中的原问轮次")
+    orders: list[OwnedOrder] = Field(min_length=1, description="只包含当前用户的可选订单")
+
+    @model_validator(mode="after")
+    def validate_action(self):
+        """验证稳定键及订单唯一性。参数：无；返回：自身；异常：ValueError，结构非法。"""
+        from uuid import UUID
+        identifier = UUID(self.action_id)
+        if identifier.version != 5 or str(identifier) != self.action_id or len({row.order_id for row in self.orders}) != len(self.orders):
+            raise ValueError("选单动作键或订单列表非法")
+        return self
+
+
+class OrderSelection(BaseModel):
+    """客户端只能确认原卡片中的订单，不能覆盖检查点或预算。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    session_id: str = Field(min_length=1, max_length=64, description="来源会话标识")
+    user_id: str = Field(min_length=1, max_length=64, description="来源用户标识")
+    source_turn_id: str = Field(min_length=1, max_length=36, description="原问轮次")
+    action_id: str = Field(min_length=36, max_length=36, description="服务端生成的选单键")
+    order_id: str = Field(min_length=1, max_length=64, description="选中的本人完整订单号")
+
+    @field_validator("session_id", "user_id", "source_turn_id", "order_id")
+    @classmethod
+    def normalize_nonblank(cls, value):
+        """统一身份及订单空白规则。参数：value字符串；返回：去首尾空白值；异常：ValueError，空白。"""
+        if not value.strip():
+            raise ValueError("选单标识不能为空")
+        return value.strip()
+
+    @field_validator("action_id")
+    @classmethod
+    def validate_identifier(cls, value):
+        """只接受规范UUIDv5。参数：value动作键；返回：原值；异常：ValueError，非法键。"""
+        from uuid import UUID
+        identifier = UUID(value)
+        if identifier.version != 5 or str(identifier) != value:
+            raise ValueError("选单键必须为规范UUIDv5")
+        return value
+
+
+class AcceptedOrderSelection(BaseModel):
+    """已提交的原轮选单结果，由仓储构造供同轮Command使用。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    context: ToolContext = Field(description="经会话/来源核验的原轮上下文")
+    action: OrderSelectionAction = Field(description="保存的原选单卡片")
+    accepted_order_id: str = Field(description="首次接受后不可改变的订单号")
+    turn_status: str = Field(description="原轮当前持久化状态")
+
+
+class CurrentActions(BaseModel):
+    """刷新页面时回读的原轮状态，数据库快照优先于客户端旧卡片。"""
+
+    model_config = ConfigDict(extra="forbid")
+    source_turn_id: str | None = Field(default=None, description="最近问答原轮，没有则为空")
+    turn_status: str | None = Field(default=None, description="原轮保存状态")
+    order_selection: OrderSelectionAction | None = Field(default=None, description="保存的原选单快照")
+    accepted_order_id: str | None = Field(default=None, description="首次接受的订单号")
+    answer: str | None = Field(default=None, description="已保存完成正文")
+    completion_metadata: dict | None = Field(default=None, description="已保存完成元数据")
+    resume_required: bool = Field(default=False, description="已接受但仍停在匹配interrupt，需要原键继续")
+
+
 class HistoryDelta(BaseModel):
     """从消息游标定位的完整受影响轮次，终态刷新不要求产生新消息。"""
 

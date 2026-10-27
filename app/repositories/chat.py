@@ -2,6 +2,7 @@
 
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
+from uuid import NAMESPACE_URL, uuid5
 from app.knowledge.answering import EvidenceCitation, FIXED_KNOWLEDGE_REFUSAL, SelfCheckFailure
 from app.knowledge.sources import answer_metadata, verified_source_revision
 from app.models.knowledge import KnowledgeChunk
@@ -9,7 +10,35 @@ from app.models.rag_quality import LowConfidenceQuestion
 from app.models.customer_service import Conversation, Message
 from app.schemas.history import StoredMessage, StoredTurn
 from app.schemas.tools import ToolContext, ToolResult
-from app.schemas.workflow import HistoryDelta, RetrievalLowConfidence, SuggestedAction
+from app.schemas.workflow import HistoryDelta, RetrievalLowConfidence, SuggestedAction, OrderSelectionAction
+
+
+async def owned_source(session, session_id: str, user_id: str, turn_id: str | None = None, *, lock=False):
+    """读取本人来源用户行，锁定时先定位主键避免范围间隙锁。
+
+    参数：session短事务、session_id/user_id身份、turn_id可选原轮、lock是否行锁。
+    返回：会话与用户消息二元组，缺失为(None,None)；异常：数据库错误。
+    """
+    conversation = await session.scalar(select(Conversation).where(Conversation.session_id == session_id, Conversation.user_id == user_id))
+    if conversation is None:
+        return None, None
+    statement = select(Message.id).where(Message.conversation_id == conversation.id, Message.role == "user")
+    if turn_id is not None:
+        statement = statement.where(Message.turn_id == turn_id)
+    else:
+        # 独立工单确认轮不能替代最近问答的选单/退款来源。
+        statement = statement.where(Message.rag_metadata["ticket_action"].as_string().is_(None))
+    source_id = await session.scalar(statement.order_by(Message.id.desc()).limit(1))
+    if source_id is None:
+        return conversation, None
+    query = select(Message).where(Message.id == source_id)
+    return conversation, await session.scalar(query.with_for_update() if lock else query)
+
+
+def source_context(conversation, source) -> ToolContext:
+    """从不可变来源构造上下文。参数：conversation会话行、source用户行；返回：ToolContext；异常：字段校验错误。"""
+    return ToolContext(conversation_id=conversation.id, session_id=conversation.session_id, user_id=conversation.user_id,
+                       turn_id=source.turn_id, user_message=source.content)
 
 
 def result_query(context: ToolContext):
@@ -82,6 +111,8 @@ class ChatRepository:
         turns: dict[str, StoredTurn] = {}
         for row in rows:
             turn = turns.setdefault(row.turn_id, StoredTurn(turn_id=row.turn_id, turn_status=row.turn_status))
+            if row.role == "user" and isinstance(row.rag_metadata, dict):
+                turn.order_selection = row.rag_metadata.get("order_selection")
             turn.messages.append(StoredMessage(role=row.role, content=row.content or "",
                                               tool_calls=row.tool_calls, tool_call_id=row.tool_call_id))
         return list(turns.values())
@@ -111,9 +142,75 @@ class ChatRepository:
         turns: dict[str, StoredTurn] = {}
         for row in rows:
             turn = turns.setdefault(row.turn_id, StoredTurn(turn_id=row.turn_id, turn_status=row.turn_status))
+            if row.role == "user" and isinstance(row.rag_metadata, dict):
+                turn.order_selection = row.rag_metadata.get("order_selection")
             turn.messages.append(StoredMessage(role=row.role, content=row.content or "",
                                               tool_calls=row.tool_calls, tool_call_id=row.tool_call_id))
         return HistoryDelta(turns=list(turns.values()), last_message_id=last_id)
+
+    async def get_turn_context(self, session_id: str, user_id: str, turn_id: str) -> ToolContext | None:
+        """读取本人原轮。参数：会话/用户/原轮标识；返回：可信上下文或None；异常：数据库错误。"""
+        async with self.factory() as session:
+            conversation, source = await owned_source(session, session_id, user_id, turn_id)
+            return source_context(conversation, source) if source is not None else None
+
+    async def get_workflow_turn(self, session_id: str, user_id: str, turn_id: str | None = None) -> dict | None:
+        """只读返回原问状态和完成快照。参数：身份及可选原轮；返回：内部可信字典或None；异常：ValueError跨身份、数据库错误。"""
+        async with self.factory() as session:
+            conversation, source = await owned_source(session, session_id, user_id, turn_id)
+            if conversation is None:
+                if await session.scalar(select(Conversation.id).where(Conversation.session_id == session_id)) is not None:
+                    raise ValueError("会话身份不匹配")
+                return None
+            if source is None:
+                return None
+            answer = await session.scalar(select(Message).where(Message.conversation_id == conversation.id,
+                Message.turn_id == source.turn_id, Message.role == "assistant", Message.tool_calls.is_(None),
+                Message.turn_status == "completed").order_by(Message.id.desc()).limit(1))
+            return {"context": source_context(conversation, source), "turn_status": source.turn_status,
+                    "order_selection": (source.rag_metadata or {}).get("order_selection"),
+                    "answer": answer.content if answer is not None else None,
+                    "completion_metadata": answer.rag_metadata if answer is not None else None}
+
+    async def save_order_wait(self, context: ToolContext, action: OrderSelectionAction) -> None:
+        """将匹配的原轮保存为等待，绝不倒退已接受或完成状态。
+
+        参数：context可信原轮；action官方检查点选单快照。
+        返回：None；同等待快照重复保存不新增。异常：PersistenceUncertain，身份/快照/状态冲突；数据库错误。
+        """
+        from app.tools.business import list_user_orders
+        expected_id = str(uuid5(NAMESPACE_URL, f"mewhelp:ch06:{context.conversation_id}:{context.turn_id}:select_order"))
+        payload = action.model_dump(mode="json")
+        if action.source_turn_id != context.turn_id or action.action_id != expected_id or payload["orders"] != list_user_orders(context.user_id):
+            raise PersistenceUncertain("等待动作与可信来源不一致")
+        async with self.factory.begin() as session:
+            conversation, source = await owned_source(session, context.session_id, context.user_id, context.turn_id, lock=True)
+            if source is None or source_context(conversation, source) != context:
+                raise PersistenceUncertain("等待原轮不存在")
+            metadata = dict(source.rag_metadata or {})
+            saved = metadata.get("order_selection")
+            waiting = {**payload, "status": "awaiting_input", "accepted_order_id": None}
+            if source.turn_status not in {"running", "awaiting_input"} or (saved is not None and saved != waiting):
+                raise PersistenceUncertain("旧等待不能覆盖已改变的动作")
+            metadata["order_selection"] = waiting
+            source.rag_metadata = metadata
+            await session.execute(update(Message).where(Message.conversation_id == context.conversation_id,
+                Message.turn_id == context.turn_id).values(turn_status="awaiting_input"))
+
+    async def cancel_order_wait(self, session_id: str, user_id: str) -> None:
+        """新问在持有会话锁时取消尚未接受的旧等待。参数：会话与用户；返回：None；异常：数据库错误。"""
+        async with self.factory.begin() as session:
+            conversation, source = await owned_source(session, session_id, user_id, lock=True)
+            if source is None or source.turn_status != "awaiting_input":
+                return
+            metadata = dict(source.rag_metadata or {})
+            saved = metadata.get("order_selection")
+            if not isinstance(saved, dict) or saved.get("status") != "awaiting_input":
+                raise PersistenceUncertain("等待状态与动作不一致")
+            metadata["order_selection"] = {**saved, "status": "cancelled"}
+            source.rag_metadata = metadata
+            await session.execute(update(Message).where(Message.conversation_id == conversation.id,
+                Message.turn_id == source.turn_id, Message.turn_status == "awaiting_input").values(turn_status="cancelled"))
 
     async def save_tool_calls(self, context: ToolContext, calls: list[dict], *, deduplicate: bool = False) -> None:
         """执行前保存完整申请，确定性节点可按键防重。

@@ -32,7 +32,7 @@ class Message(Base):
         Index("idx_message_turn", "conversation_id", "turn_id"),
         UniqueConstraint("conversation_id", "turn_id", "tool_call_id", name="uq_tool_result"),
         CheckConstraint("(role = 'tool' AND tool_call_id IS NOT NULL AND tool_call_id <> '') OR (role <> 'tool' AND tool_call_id IS NULL)", name="ck_tool_call_role"),
-        CheckConstraint("turn_status IN ('running','completed','failed','cancelled')", name="ck_turn_status"),
+        CheckConstraint("turn_status IN ('running','awaiting_input','completed','failed','cancelled')", name="ck_turn_status"),
         {**TABLE_OPTIONS, "comment": "会话消息流水"},
     )
     id: Mapped[int] = mapped_column(BIGINT(unsigned=True), primary_key=True, autoincrement=True, comment="消息主键")

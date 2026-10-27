@@ -3,13 +3,14 @@
 from uuid import NAMESPACE_URL, uuid5
 
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.models.customer_service import Conversation, Message, Ticket
-from app.repositories.chat import PersistenceUncertain
+from app.repositories.chat import PersistenceUncertain, owned_source, source_context
 from app.repositories.support import ticket_number
 from app.schemas.tools import TicketArgs, ToolContext, ToolResult
-from app.schemas.workflow import PreparedTicketAction, SuggestedAction, TicketConfirmation, TicketReceipt
+from app.schemas.workflow import (PreparedTicketAction, SuggestedAction, TicketConfirmation, TicketReceipt,
+                                 OrderSelection, OrderSelectionAction, AcceptedOrderSelection, OrderSelectionConflict)
 
 
 class ActionNotFound(ValueError):
@@ -26,6 +27,39 @@ class ActionRepository:
     def __init__(self, session_factory):
         """保存短事务工厂。参数：session_factory异步会话工厂；返回：None；异常：无。"""
         self.factory = session_factory
+
+    async def accept_order_selection(self, request: OrderSelection) -> AcceptedOrderSelection:
+        """来源行锁内接受原选单，仅首次选择可改变状态。
+
+        参数：request严格身份/原轮/动作/订单请求；返回：已保存的原轮选单结果。
+        异常：ActionNotFound，身份/动作/归属不符；OrderSelectionConflict，旧卡或同键换单；数据库错误。
+        """
+        from app.tools.business import owns_order
+        async with self.factory.begin() as session:
+            conversation, source = await owned_source(session, request.session_id, request.user_id, request.source_turn_id, lock=True)
+            saved = (source.rag_metadata or {}).get("order_selection") if source is not None else None
+            if not isinstance(saved, dict) or saved.get("action_id") != request.action_id:
+                raise ActionNotFound("选单不存在")
+            try:
+                action = OrderSelectionAction.model_validate({key: saved[key] for key in ("type", "action_id", "source_turn_id", "orders")})
+            except (KeyError, ValueError) as error:
+                raise ActionNotFound("选单快照非法") from error
+            context = source_context(conversation, source)
+            expected_id = str(uuid5(NAMESPACE_URL, f"mewhelp:ch06:{context.conversation_id}:{context.turn_id}:select_order"))
+            if (action.action_id != expected_id or action.source_turn_id != context.turn_id
+                    or request.order_id not in {item.order_id for item in action.orders}
+                    or not owns_order(request.user_id, request.order_id)):
+                raise ActionNotFound("所选订单不存在")
+            if saved.get("status") == "accepted":
+                if saved.get("accepted_order_id") != request.order_id:
+                    raise OrderSelectionConflict("同一动作不能改选其他订单")
+                return AcceptedOrderSelection(context=context, action=action, accepted_order_id=request.order_id, turn_status=source.turn_status)
+            if saved.get("status") != "awaiting_input" or source.turn_status != "awaiting_input":
+                raise OrderSelectionConflict("这张选单卡已失效")
+            source.rag_metadata = {**(source.rag_metadata or {}), "order_selection": {**saved, "status": "accepted", "accepted_order_id": request.order_id}}
+            await session.execute(update(Message).where(Message.conversation_id == conversation.id,
+                Message.turn_id == source.turn_id).values(turn_status="running"))
+            return AcceptedOrderSelection(context=context, action=action, accepted_order_id=request.order_id, turn_status="running")
 
     async def _trusted_action(self, session, request: TicketConfirmation) -> PreparedTicketAction:
         """先验归属再锁来源、读取建议。参数：session短事务、request确认；返回：可信派生动作；异常：ActionNotFound/InvalidTicketArguments/数据库错误。"""
