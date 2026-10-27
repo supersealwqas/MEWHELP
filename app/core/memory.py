@@ -11,7 +11,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langchain_core.tools import BaseTool
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from app.core.context_budget import ContextBudgetExceeded, TokenEstimator
-from app.schemas.history import StoredTurn
+from app.schemas.history import StoredMessage, StoredTurn
 
 
 class SessionStore:
@@ -136,6 +136,13 @@ def valid_tool_calls(calls: list[dict]) -> bool:
     return len(ids) == len(set(ids))
 
 
+def _message_identity(row: StoredMessage, turn: StoredTurn) -> dict:
+    """附加可信消息身份。参数：row原始消息、turn所属轮；返回：消息构造参数；异常：无。"""
+    if row.id is None:
+        return {}
+    return {"id": f"db:{row.id}", "additional_kwargs": {"db_message_id": row.id, "turn_id": turn.turn_id}}
+
+
 def assemble_turns(turns: list[StoredTurn]) -> list[list[BaseMessage]]:
     """按申请区段恢复各轮已提交事实，保留中断批次中的可信结果。
 
@@ -151,7 +158,7 @@ def assemble_turns(turns: list[StoredTurn]) -> list[list[BaseMessage]]:
         seen_ids: set[str] = set()
         for index, row in enumerate(turn.messages):
             if row.role == "user":
-                group.append(HumanMessage(content=row.content))
+                group.append(HumanMessage(content=row.content, **_message_identity(row, turn)))
             elif row.role == "assistant" and row.tool_calls:
                 calls = row.tool_calls
                 if not valid_tool_calls(calls):
@@ -173,11 +180,12 @@ def assemble_turns(turns: list[StoredTurn]) -> list[list[BaseMessage]]:
                 # 只丢弃缺失或重复结果的调用，已唯一配对的工单事实必须保留。
                 paired_calls = [call for call in calls if result_counts[call["id"]] == 1]
                 if paired_calls:
-                    group.append(AIMessage(content="", tool_calls=paired_calls))
+                    group.append(AIMessage(content=row.content, tool_calls=paired_calls, **_message_identity(row, turn)))
                     by_id = {m.tool_call_id: m for m in results}
-                    group.extend(ToolMessage(content=by_id[c["id"]].content, tool_call_id=c["id"]) for c in paired_calls)
+                    group.extend(ToolMessage(content=by_id[c["id"]].content, tool_call_id=c["id"],
+                                             **_message_identity(by_id[c["id"]], turn)) for c in paired_calls)
             elif row.role == "assistant" and row.content and turn.turn_status == "completed":
-                group.append(AIMessage(content=row.content))
+                group.append(AIMessage(content=row.content, **_message_identity(row, turn)))
         if group and turn.turn_status in {"cancelled", "failed"}:
             group.append(AIMessage(content="上一轮回答未完成；以上工具结果是已保存的事实，请勿重复提交已创建的工单。"))
         if group:

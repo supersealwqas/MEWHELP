@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 class StoredMessage(BaseModel):
     """一条已提交的消息及原始工具关联。"""
+    id: int | None = Field(default=None, gt=0, strict=True, description="消息数据库主键；旧测试可空，在线分层必须提供真实ID")
     role: Literal["user", "assistant", "tool"] = Field(description="持久化消息角色")
     content: str = Field(description="消息内容或工具结果 JSON")
     tool_calls: list[dict] | None = Field(default=None, description="模型申请列表")
