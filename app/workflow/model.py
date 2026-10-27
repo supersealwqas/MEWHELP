@@ -19,7 +19,7 @@ from app.core.structured import StructuredOutputError, bind_output_tool, output_
 from app.schemas.chat import InvalidToolDecision
 from app.schemas.workflow import AgentDecision, IntentResult, UnderstandingResult
 from app.workflow.prompts import ANSWER_PROMPT, DECISION_NUDGE, DECISION_PROMPT, INTENT_PROMPT, UNDERSTANDING_PROMPT
-from app.workflow.routing import _understanding_outcome, original_understanding
+from app.workflow.routing import _understanding_outcome, original_understanding, _trusted_history, _ORDER_CANDIDATE
 
 READ_ONLY_NAMES = frozenset({"query_order", "query_logistics", "query_product"})
 _CONTROL_NAME = "submit_decision"
@@ -183,7 +183,16 @@ class WorkflowModelAdapter:
                 history_turns.append({"messages": []})
             history_turns[-1]["messages"].append({"role": "user" if message.type == "human" else message.type,
                                                    "content": _text(message)})
-        prepared = [SystemMessage(content=UNDERSTANDING_PROMPT), *converted]
+        trusted_text, _, _ = _trusted_history(history_turns)
+        trusted_numbers = set(_ORDER_CANDIDATE.findall(trusted_text + "\n" + raw_query))
+        safe_messages = []
+        for message in converted:
+            if message.type == "ai" and isinstance(message.content, str):
+                # 助手正文只提供主题；未被用户或成功工具证实的编号不进入理解上下文。
+                safe_content = _ORDER_CANDIDATE.sub(lambda match: match.group() if match.group() in trusted_numbers else "[未核实编号]", message.content)
+                message = message.model_copy(update={"content":safe_content})
+            safe_messages.append(message)
+        prepared = [SystemMessage(content=UNDERSTANDING_PROMPT), *safe_messages]
         tool, output_limit = understanding_tool_schema(), OUTPUT_LIMITS["understand"]
         ledger.reserve("understand", _estimate_message_tokens(prepared) + _estimate_token_units([tool]), output_limit)
         gathered = None

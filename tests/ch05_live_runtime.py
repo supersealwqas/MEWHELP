@@ -20,7 +20,7 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 ROOT = Path(__file__).resolve().parents[1]
 CASE_PATH = ROOT / "tests/fixtures/ch05/agent_cases.json"
 LOCK_NAME = "mewhelp:ch04:live:exclusive"
-ROOT_NODES = {"resolve_reference", "classify_intent", "retrieve_knowledge", "confidence_check",
+ROOT_NODES = {"resolve_reference", "classify_intent", "retrieve_knowledge", "confidence_check", "fetch_order", "retrieve_policy",
               "main_agent", "complaint_reply", "chitchat_reply", "fallback_reply", "log_turn"}
 
 
@@ -55,7 +55,7 @@ def inspect_turn(expected: dict, row: dict) -> dict:
     state, events = row.get("state", {}), row.get("events", [])
     answer = "".join(event.get("data", {}).get("delta", "") for event in events if event["event"] == "delta")
     checks = {"intent": state.get("intent") == expected["intent"],
-        "raw_query": state.get("raw_query") == state.get("resolved_query") == expected["query"],
+        "raw_query": state.get("raw_query") == expected["query"],
         "node_order": row.get("nodes") == ["resolve_reference", "classify_intent", *expected["nodes"], "log_turn"],
         "tool_sequence": row.get("tools") == expected["tools"],
         "completed": [e["event"] for e in events][-2:] == ["answer_metadata", "done"]
@@ -107,6 +107,10 @@ def validate_cleanup(entry: dict, snapshot: dict) -> None:
         raise ValueError("存在未登记问题池，拒绝清理")
     if any(row["conversation_id"] != entry["id"] or row["ticket_no"] not in entry["ticket_numbers"] for row in snapshot["tickets"]):
         raise ValueError("存在未登记工单，拒绝清理")
+    if any(row["conversation_id"] != entry["id"] or row["refund_no"] not in entry.get("refund_numbers", [])
+           or row["source_turn_id"] not in entry["turn_ids"] or row["user_id"] != entry["user_id"]
+           for row in snapshot.get("refunds", [])):
+        raise ValueError("存在未登记或身份冲突的退款申请，拒绝清理")
 
 
 def collect_tool_audit(messages: list) -> dict:
@@ -159,19 +163,20 @@ async def guard_database(factory, owner: int, entries: list[dict]) -> None:
 
 
 async def snapshot(factory, entry: dict | None = None) -> dict:
-    """读取四表计数或精确会话数据。参数：会话工厂/可选登记；返回：安全JSON；异常：数据库错误。"""
+    """读取五表计数或精确会话数据。参数：会话工厂/可选登记；返回：安全JSON；异常：数据库错误。"""
     from sqlalchemy import func, select
-    from app.models.customer_service import Conversation, Message, Ticket
+    from app.models.customer_service import Conversation, Message, Ticket, RefundApplication
     from app.models.rag_quality import LowConfidenceQuestion
     async with factory() as session:
         if entry is None:
             return {model.__tablename__: await session.scalar(select(func.count()).select_from(model))
-                    for model in (Conversation, Message, Ticket, LowConfidenceQuestion)}
+                    for model in (Conversation, Message, Ticket, RefundApplication, LowConfidenceQuestion)}
         conversation = await session.get(Conversation, entry["id"])
         result = {"conversation": {key: getattr(conversation, key) for key in ("id", "session_id", "user_id", "status")} if conversation else None}
         for key, model, fields in [("messages", Message, ("id", "turn_id", "role", "content", "tool_calls", "tool_call_id", "turn_status", "rag_metadata")),
             ("pool_rows", LowConfidenceQuestion, ("id", "conversation_id", "raw_question", "source", "reason")),
-            ("tickets", Ticket, ("ticket_no", "conversation_id", "description", "ticket_type", "status"))]:
+            ("tickets", Ticket, ("ticket_no", "conversation_id", "description", "ticket_type", "status")),
+            ("refunds", RefundApplication, ("refund_no", "action_id", "conversation_id", "source_turn_id", "user_id", "order_id", "reason_code", "original_question", "status"))]:
             rows = (await session.scalars(select(model).where(model.conversation_id == entry["id"]))).all()
             result[key] = [{field: getattr(row, field) for field in fields} for row in rows]
         result["messages"].sort(key=lambda row: row["id"])
@@ -197,11 +202,13 @@ async def verify_corpus_identity(runtime) -> dict:
             "operation": "read_only_reuse", "initialized": False, "synchronized": False}
 
 
-async def register_session(factory, entries: list, report_dir: Path) -> dict:
+async def register_session(factory, entries: list, report_dir: Path, *, prefix="ch05-live-") -> dict:
     """创建前核对随机会话不存在并先登记。参数：工厂/清单/报告；返回：本次条目；异常：冲突/数据库错误。"""
     from sqlalchemy import select
     from app.models.customer_service import Conversation
-    entry = {"session_id": "ch05-live-" + uuid4().hex, "user_id": "demo-user", "turn_ids": [], "pool_ids": [], "ticket_numbers": []}
+    if prefix not in {"ch05-live-", "web-"}:
+        raise ValueError("验收会话前缀非法")
+    entry = {"session_id": prefix + uuid4().hex, "user_id": "demo-user", "turn_ids": [], "pool_ids": [], "ticket_numbers": [], "refund_numbers": []}
     async with factory.begin() as session:
         if await session.scalar(select(Conversation.id).where(Conversation.session_id == entry["session_id"])) is not None:
             raise ValueError("随机会话已存在")
@@ -221,15 +228,16 @@ async def register_children(factory, entry: dict, entries: list, report_dir: Pat
         raise ValueError("本次会话出现未登记轮次")
     entry["pool_ids"] = [row["id"] for row in data["pool_rows"]]
     entry["ticket_numbers"] = [row["ticket_no"] for row in data["tickets"]]
+    entry["refund_numbers"] = [row["refund_no"] for row in data["refunds"]]
     validate_cleanup(entry, data)
     write_json(report_dir / "manifest.json", entries)
     return data
 
 
 async def cleanup(factory, owner: int, entries: list, report_dir: Path, before: dict) -> dict:
-    """先验证清单，再在事务内按四表精确条件清理。参数：本次资源/清单/报告/基线；返回：前后证据；异常：冲突停止。"""
+    """先验证清单，再在事务内按五表精确条件清理。参数：本次资源/清单/报告/基线；返回：前后证据；异常：冲突停止。"""
     from sqlalchemy import delete, select
-    from app.models.customer_service import Conversation, Message, Ticket
+    from app.models.customer_service import Conversation, Message, Ticket, RefundApplication
     from app.models.rag_quality import LowConfidenceQuestion
     await guard_database(factory, owner, entries)
     last = await snapshot(factory)
@@ -246,6 +254,7 @@ async def cleanup(factory, owner: int, entries: list, report_dir: Path, before: 
             validate_cleanup(entry, observed)
             await session.execute(delete(LowConfidenceQuestion).where(LowConfidenceQuestion.conversation_id == entry["id"], LowConfidenceQuestion.id.in_(entry["pool_ids"])))
             await session.execute(delete(Ticket).where(Ticket.conversation_id == entry["id"], Ticket.ticket_no.in_(entry["ticket_numbers"])))
+            await session.execute(delete(RefundApplication).where(RefundApplication.conversation_id == entry["id"], RefundApplication.refund_no.in_(entry["refund_numbers"])))
             await session.execute(delete(Message).where(Message.conversation_id == entry["id"], Message.turn_id.in_(entry["turn_ids"])))
             # 未登记的子记录不会被扩大删除；外键会阻止误删会话。
             await session.execute(delete(Conversation).where(Conversation.id == entry["id"], Conversation.session_id == entry["session_id"], Conversation.user_id == entry["user_id"]))
@@ -253,7 +262,7 @@ async def cleanup(factory, owner: int, entries: list, report_dir: Path, before: 
     result = {"before": before, "before_cleanup": last, "after": after, "restored": before == after}
     write_json(report_dir / "cleanup.json", result)
     if before != after:
-        raise ValueError("四表总数未恢复，保留证据")
+        raise ValueError("五表总数未恢复，保留证据")
     return result
 
 
@@ -267,7 +276,11 @@ class RecordingChat:
 
     def bind_tools(self, tools, **kwargs):
         """原样绑定只读定义。参数：工具定义及选项；返回：透明包装；异常：模型配置错误。"""
-        return RecordingChat(self.model.bind_tools(tools, **kwargs), self.records, self.stage, tools, turn_id=self.turn_id)
+        names = {tool.get("function", tool).get("name") for tool in tools if isinstance(tool, dict)}
+        stages = {"submit_understanding":"understand", "submit_intent":"classify", "submit_expanded_queries":"expand", "submit_decision":"decide"}
+        stage = next((stage for name, stage in stages.items() if name in names),
+                     "decide" if names & {"query_order", "query_logistics", "query_product"} else self.stage)
+        return RecordingChat(self.model.bind_tools(tools, **kwargs), self.records, stage, tools, turn_id=self.turn_id)
 
     async def astream(self, messages):
         """采集真实流，取消时关闭同一上游。参数：消息；返回：原分片；异常：网络/取消透传。"""
@@ -280,7 +293,7 @@ class RecordingChat:
             async with aclosing(self.model.astream(messages)) as stream:
                 async for chunk in stream:
                     gathered = chunk if gathered is None else gathered + chunk
-                    row["chunks"].append({"clock": time.monotonic(), "content": chunk.content})
+                    row["chunks"].append({"clock": time.monotonic(), **chunk.model_dump(mode="json")})
                     yield chunk
         except BaseException as error:
             row["error_type"] = type(error).__name__
@@ -310,7 +323,7 @@ def make_trace(entries: list, report_dir: Path):
             if name not in ROOT_NODES | {"decision", "tools", "answer"} or not isinstance(inputs, dict):
                 return
             context = inputs.get("context", {})
-            if name == "resolve_reference":
+            if context.get("turn_id"):
                 self.current_turn = context.get("turn_id")
                 entry = next((row for row in entries if row["id"] == context.get("conversation_id") and row["session_id"] == context.get("session_id")), None)
                 if entry is None:
@@ -358,7 +371,7 @@ async def live_runtime(config, factory, entries: list, report_dir: Path):
 
     def model_factory(*, evaluation_stage=None, **options):
         """显式注入同一模型配置和已管理HTTP客户端。参数：阶段/模型选项；返回：透明真实模型；异常：配置错误。"""
-        stage = evaluation_stage or {128: "classify", 2048: "decide", 4096: "answer"}.get(options.get("max_tokens"), "unknown")
+        stage = evaluation_stage or "answer"
         return RecordingChat(llm.get_chat_model(http_client=sync_http, http_async_client=async_http, **options), records, stage,
                              turn_id=trace.current_turn)
 
@@ -419,10 +432,10 @@ async def fault_boundary(runtime, enabled: bool):
         tool.coroutine = original
 
 
-async def sample_turn(runtime, url: str, expected: dict, entry: dict, entries: list, report_dir: Path, *, inject=False, stop=False) -> dict:
+async def sample_turn(runtime, url: str, expected: dict, entry: dict, entries: list, report_dir: Path, *, inject=False, stop=False,
+                      endpoint="/api/chat", payload=None, inspect=True) -> dict:
     """真实TCP收流并保存对应数据库/SQLite/模型证据。参数：资源/标注/会话/报告及故障或停止开关；返回：观察；异常：持久化核验错误。"""
     import httpx
-    from tests.ch03_live_runtime import parse_frame
     # 保留旧轮对象及其后续关闭证据；绝不通过下一轮clear隐藏仍存活的旧模型。
     preexisting = [row for row in runtime.models if not row["closed"]]
     runtime.retrievals.clear()
@@ -433,13 +446,13 @@ async def sample_turn(runtime, url: str, expected: dict, entry: dict, entries: l
     async with fault_boundary(runtime, inject) as attempts:
         try:
             async with httpx.AsyncClient(timeout=300, trust_env=False) as client:
-                async with client.stream("POST", url + "/api/chat", json={"session_id": entry["session_id"], "user_id": entry["user_id"], "message": expected["query"]}) as response:
+                async with client.stream("POST", url + endpoint, json=payload or {"session_id": entry["session_id"], "user_id": entry["user_id"], "message": expected["query"]}) as response:
                     row["http_status"] = response.status_code
                     async for line in response.aiter_lines():
                         if line:
                             lines.append(line)
                         elif lines:
-                            event = parse_frame(lines, time.monotonic() - started)
+                            event = parse_workflow_frame(lines, time.monotonic() - started)
                             event["received_at"] = time.monotonic()
                             row["events"].append(event)
                             lines = []
@@ -460,7 +473,7 @@ async def sample_turn(runtime, url: str, expected: dict, entry: dict, entries: l
     models = json.loads(json.dumps([model for model in runtime.models if model["turn_id"] == turn_id], ensure_ascii=False))
     trace = [event for event in runtime.trace.events if event["turn_id"] == turn_id]
     # 先保存原始证据，后续判定器即使出错也不会丢掉模型输出和真实审计。
-    write_json(report_dir / f"raw-turn-{turn_id}.json", {**row, "state": state, "models": models,
+    write_json(report_dir / f"raw-turn-{turn_id}-{uuid4().hex[:8]}.json", {**row, "state": state, "models": models,
         "trace": trace, "database": data})
     audit = collect_tool_audit(messages)
     row["failures"].extend(audit["failures"])
@@ -481,7 +494,7 @@ async def sample_turn(runtime, url: str, expected: dict, entry: dict, entries: l
         models=models, decisions=decisions, retrievals=list(runtime.retrievals), messages=messages,
         tools=audit["tools"], invalid_tool_decisions=audit["invalid_tool_decisions"],
         tool_results=[json.loads(message["content"]) for message in messages if message["role"] == "tool"],
-        pool_rows=data["pool_rows"], tickets=data["tickets"], elapsed_seconds=time.monotonic() - started,
+        pool_rows=data["pool_rows"], tickets=data["tickets"], refunds=data["refunds"], elapsed_seconds=time.monotonic() - started,
         active_model_streams=sum(not model["closed"] for model in models), active_graph_nodes=len(runtime.trace.active))
     if inject and row["fault_attempts"] != runtime.service.settings.tool_max_retries + 1:
         row["failures"].append("fault_retry_count")
@@ -492,7 +505,16 @@ async def sample_turn(runtime, url: str, expected: dict, entry: dict, entries: l
             "guard_released": entry["session_id"] not in runtime.service.guard._active}
         row["failures"].extend(name for name, passed in row["checks"].items() if not passed)
         return row
-    return inspect_turn(expected, row)
+    return inspect_turn(expected, row) if inspect else row
+
+
+def parse_workflow_frame(lines: list[str], elapsed: float) -> dict:
+    """补充CH06安全阶段和动作帧，旧事件仍复用解析器。参数：帧行/耗时；返回：事件；异常：非法JSON。"""
+    from tests.ch03_live_runtime import parse_frame
+    name = next((line[6:].strip() for line in lines if line.startswith("event:")), "message")
+    if name in {"workflow_stage", "select_order", "action_status"}:
+        return {"event":name, "data":json.loads("\n".join(line[5:].removeprefix(" ") for line in lines if line.startswith("data:"))), "elapsed_seconds":elapsed}
+    return parse_frame(lines, elapsed)
 
 
 def append_result(report_dir: Path, summary: dict, row: dict) -> None:

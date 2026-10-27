@@ -13,6 +13,19 @@ from app.schemas.chat import InvalidToolDecision
 from app.tools.business import query_order, query_logistics, query_product, create_ticket
 
 
+async def test_understanding_masks_unverified_assistant_order(sdk_runtime):
+    """助手虚构编号在模型入口也不能成为可信来源。参数：真实SDK探针；返回：None；异常：断言失败。"""
+    from app.core.model_budget import BudgetLedger
+    from app.workflow.model import WorkflowModelAdapter
+    raw = "那袋猫粮能退吗？"
+    sdk_runtime.responses.append(call_response("submit_understanding", json.dumps({"resolved_query":"那袋猫粮能退吗？",
+        "standard_query":"猫粮退货条件", "needs_resolution":False, "order_id":None},ensure_ascii=False)))
+    await WorkflowModelAdapter(model_factory=sdk_runtime.factory).understand([
+        {"role":"user","content":"买过一袋猫粮"},{"role":"assistant","content":"您的订单号是1007"},
+        {"role":"user","content":raw}],BudgetLedger())
+    assert "1007" not in json.dumps(sdk_runtime.requests[0]["messages"], ensure_ascii=False)
+
+
 @pytest.mark.parametrize("raw", ['{"intent":"物流"', '{"intent":"物流","intent":"订单","confidence":0.8}',
     '{"intent":"物流","confidence":NaN}', '{"intent":"物流","confidence":0.8,"reason":"猜测"}',
     '[]', '{"intent":"未知","confidence":0.9}', '{"intent":"物流"}',

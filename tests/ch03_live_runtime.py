@@ -170,7 +170,10 @@ async def tcp_server(runtime):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.bind(("127.0.0.1", 0))
     address = sock.getsockname()
-    server = uvicorn.Server(uvicorn.Config(create_app(factory), lifespan="on", log_level="warning", access_log=False,
+    application = create_app(factory)
+    if getattr(runtime, "configure_test_app", None) is not None:
+        runtime.configure_test_app(application)
+    server = uvicorn.Server(uvicorn.Config(application, lifespan="on", log_level="warning", access_log=False,
                                          timeout_graceful_shutdown=15))
     task = asyncio.create_task(server.serve(sockets=[sock]))
     try:

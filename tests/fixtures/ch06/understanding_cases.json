@@ -1,0 +1,401 @@
+[
+  {
+    "id": "U01",
+    "kind": "understand",
+    "mandatory": true,
+    "history": [
+      {
+        "role": "user",
+        "content": "帮我查询订单1001的商品和订单状态。"
+      },
+      {
+        "role": "tool",
+        "name": "query_order",
+        "content": {
+          "order_id": "1001",
+          "product": "猫粮",
+          "status": "已发货"
+        },
+        "trusted": true
+      },
+      {
+        "role": "assistant",
+        "content": "订单1001是猫粮，当前已发货。"
+      }
+    ],
+    "query": "  发往新疆的普通订单一般怎么收邮费？  ",
+    "expected": {
+      "intent": "商品咨询",
+      "order_id": null,
+      "needs_resolution": false,
+      "preserve_raw": true,
+      "forbidden_in_queries": [
+        "1001",
+        "猫粮"
+      ],
+      "preserve_semantics": [
+        "新疆",
+        "通用规则"
+      ],
+      "query_count": 1,
+      "expansion_calls": 0
+    }
+  },
+  {
+    "id": "U02",
+    "kind": "understand",
+    "mandatory": true,
+    "history": [
+      {
+        "role": "user",
+        "content": "帮我查询订单1001的商品和订单状态。"
+      },
+      {
+        "role": "tool",
+        "name": "query_order",
+        "content": {
+          "order_id": "1001",
+          "product": "猫粮",
+          "status": "已发货"
+        },
+        "trusted": true
+      },
+      {
+        "role": "assistant",
+        "content": "订单1001是猫粮，当前已发货。"
+      }
+    ],
+    "query": "那一笔的东西还没拆封，退得了吗？",
+    "expected": {
+      "intent": "退款退货",
+      "order_id": "1001",
+      "needs_resolution": true,
+      "preserve_raw": false,
+      "resolved_contains": [
+        "1001"
+      ],
+      "resolved_any": [
+        "退货",
+        "退款",
+        "退"
+      ],
+      "preserve_semantics": [
+        "未拆封"
+      ],
+      "forbidden_in_queries": [
+        "1002"
+      ],
+      "query_count": 3
+    }
+  },
+  {
+    "id": "U03",
+    "kind": "understand",
+    "mandatory": true,
+    "history": [
+      {
+        "role": "user",
+        "content": "帮我查询订单1001的商品和订单状态。"
+      },
+      {
+        "role": "tool",
+        "name": "query_order",
+        "content": {
+          "order_id": "1001",
+          "product": "猫粮",
+          "status": "已发货"
+        },
+        "trusted": true
+      },
+      {
+        "role": "assistant",
+        "content": "订单1001是猫粮，当前已发货。"
+      }
+    ],
+    "query": "一般办理退货时，邮费应该由哪方承担？",
+    "expected": {
+      "intent": "商品咨询",
+      "order_id": null,
+      "needs_resolution": false,
+      "preserve_raw": true,
+      "forbidden_in_queries": [
+        "1001",
+        "猫粮"
+      ],
+      "query_count": 1,
+      "expansion_calls": 0
+    }
+  },
+  {
+    "id": "U04",
+    "kind": "understand",
+    "mandatory": true,
+    "history": [
+      {
+        "role": "user",
+        "content": "帮我查询订单1001的商品和订单状态。"
+      },
+      {
+        "role": "tool",
+        "name": "query_order",
+        "content": {
+          "order_id": "1001",
+          "product": "猫粮",
+          "status": "已发货"
+        },
+        "trusted": true
+      },
+      {
+        "role": "assistant",
+        "content": "订单1001是猫粮，当前已发货。"
+      }
+    ],
+    "query": "不要查之前那笔了，帮我确认订单1002能否退款。",
+    "expected": {
+      "intent": "退款退货",
+      "order_id": "1002",
+      "needs_resolution": false,
+      "preserve_raw": true,
+      "forbidden_in_queries": [
+        "1001"
+      ],
+      "query_count": 3
+    }
+  },
+  {
+    "id": "U05",
+    "kind": "understand",
+    "mandatory": true,
+    "history": [
+      {
+        "role": "user",
+        "content": "查看订单1001和订单1002的订单信息。"
+      },
+      {
+        "role": "tool",
+        "name": "query_order",
+        "content": {
+          "order_id": "1001",
+          "product": "猫粮",
+          "status": "已发货"
+        },
+        "trusted": true
+      },
+      {
+        "role": "tool",
+        "name": "query_order",
+        "content": {
+          "order_id": "1002",
+          "product": "猫粮",
+          "status": "已签收"
+        },
+        "trusted": true
+      },
+      {
+        "role": "assistant",
+        "content": "两笔订单的商品都是猫粮。"
+      }
+    ],
+    "query": "其中一笔想退货，我还没说是哪笔。",
+    "expected": {
+      "intent": "退款退货",
+      "order_id": null,
+      "preserve_raw": false,
+      "allowed_order_ids_in_queries": [
+        "1001",
+        "1002"
+      ],
+      "select_order": true,
+      "preserve_semantics": [
+        "未明确选定对象，不得猜选"
+      ]
+    }
+  },
+  {
+    "id": "U06",
+    "kind": "understand",
+    "mandatory": true,
+    "history": [
+      {
+        "role": "user",
+        "content": "我买过一袋猫粮。"
+      },
+      {
+        "role": "assistant",
+        "content": "您之前那笔订单号是1007。"
+      }
+    ],
+    "query": "那袋猫粮我想退掉，可以吗？",
+    "expected": {
+      "intent": "退款退货",
+      "order_id": null,
+      "preserve_raw": false,
+      "forbidden_in_queries": [
+        "1007"
+      ],
+      "select_order": true,
+      "preserve_semantics": [
+        "助手单方面报出的订单号不是可信订单来源"
+      ]
+    }
+  },
+  {
+    "id": "U07",
+    "kind": "understand",
+    "mandatory": true,
+    "history": [
+      {
+        "role": "user",
+        "content": "帮我查询订单1001的商品和订单状态。"
+      },
+      {
+        "role": "tool",
+        "name": "query_order",
+        "content": {
+          "order_id": "1001",
+          "product": "猫粮",
+          "status": "已发货"
+        },
+        "trusted": true
+      },
+      {
+        "role": "assistant",
+        "content": "订单1001是猫粮，当前已发货。"
+      }
+    ],
+    "query": "我问的是订单A-1001，外包装破了，能申请退款吗？",
+    "expected": {
+      "intent": "退款退货",
+      "order_id": "A-1001",
+      "needs_resolution": false,
+      "preserve_raw": true,
+      "required_in_queries": [
+        "A-1001"
+      ],
+      "forbidden_standalone_order_ids": [
+        "1001"
+      ],
+      "query_count": 3
+    }
+  },
+  {
+    "id": "U08",
+    "kind": "understand",
+    "mandatory": true,
+    "history": [],
+    "query": "我要退快递单号1001对应的东西，1001是运单号，不是订单号。",
+    "expected": {
+      "intent": "退款退货",
+      "order_id": null,
+      "needs_resolution": false,
+      "preserve_raw": true,
+      "select_order": true,
+      "never_query_order_ids": [
+        "1001"
+      ],
+      "preserve_semantics": [
+        "1001的用途是快递单号，即使与本人订单同值也不得查单"
+      ]
+    }
+  },
+  {
+    "id": "U09",
+    "kind": "expand",
+    "mandatory": true,
+    "query": "订单1002的猫粮尚未拆封但外包装破损，我想确认退货资格、所需凭证和寄回邮费。 已签收",
+    "simple_query": "订单1002的未拆封猫粮外包装破损，退货条件、凭证及寄回运费如何规定？",
+    "expected": {
+      "query_count": 3,
+      "distinct_queries": true,
+      "preserve_semantics": [
+        "未拆封",
+        "外包装破损",
+        "退货资格、凭证和寄回费用三类检索侧重点"
+      ],
+      "forbidden_semantics": [
+        "把未拆封改成已拆封",
+        "编造签收时间",
+        "断言已批准退款",
+        "编造退货时限数值"
+      ],
+      "allowed_numeric_tokens": [
+        "1002"
+      ],
+      "forbidden_new_order_ids": true
+    }
+  },
+  {
+    "id": "U10",
+    "kind": "expand",
+    "mandatory": true,
+    "query": "订单1003的饮水机水泵不转，我不要退款，想了解保修资格、寄修凭证和维修运费。 已签收",
+    "simple_query": "订单1003饮水机水泵故障，申请保修维修需要什么资格与凭证、运费由谁承担？",
+    "expected": {
+      "query_count": 3,
+      "distinct_queries": true,
+      "preserve_semantics": [
+        "维修保修",
+        "不是退款",
+        "资格、凭证和寄修费用三类侧重点"
+      ],
+      "forbidden_semantics": [
+        "转成退款申请",
+        "编造故障原因",
+        "编造购买或签收日期",
+        "断言仍在保修期"
+      ],
+      "allowed_numeric_tokens": [
+        "1003"
+      ],
+      "forbidden_new_order_ids": true
+    }
+  },
+  {
+    "id": "U11",
+    "kind": "expand",
+    "mandatory": true,
+    "query": "订单1001申请退货时，寄回地址在哪查看？ 已发货",
+    "simple_query": "订单1001的退货寄回地址在哪里查看？",
+    "expected": {
+      "query_count": 1,
+      "single_query_equals_simple_query": true,
+      "distinct_queries": true,
+      "preserve_semantics": [
+        "只问地址查看入口"
+      ],
+      "forbidden_semantics": [
+        "编造具体退货地址",
+        "增加退款到账时间"
+      ],
+      "allowed_numeric_tokens": [
+        "1001"
+      ]
+    }
+  },
+  {
+    "id": "U12",
+    "kind": "expand",
+    "mandatory": true,
+    "query": "订单1002的猫粮没拆封，我不清楚具体签收日期，想了解现在能否退货以及需要核对哪些条件。 已签收",
+    "simple_query": "订单1002未拆封猫粮的签收日期未知，如何核对退货资格和申请条件？",
+    "expected": {
+      "query_count": 3,
+      "distinct_queries": true,
+      "preserve_semantics": [
+        "未拆封",
+        "签收日期未知",
+        "当前仅核对条件"
+      ],
+      "forbidden_semantics": [
+        "将下单时间当签收时间",
+        "新增具体签收日期",
+        "断言未超过退货期限",
+        "断言一定能退"
+      ],
+      "allowed_numeric_tokens": [
+        "1002"
+      ],
+      "forbidden_new_order_ids": true
+    }
+  }
+]

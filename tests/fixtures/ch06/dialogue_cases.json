@@ -1,0 +1,507 @@
+[
+  {
+    "id": "D01",
+    "mandatory": true,
+    "title": "物流、退款、物流连续切换",
+    "user_id": "demo-user",
+    "turns": [
+      {
+        "id": "D01-T1",
+        "query": "我想知道订单1001的包裹目前送到哪里。",
+        "expected": {
+          "intent": "物流",
+          "order_id": "1001",
+          "preserve_raw": true
+        }
+      },
+      {
+        "id": "D01-T2",
+        "query": "这笔订单里的猫粮不想要了，还能退吗？",
+        "expected": {
+          "intent": "退款退货",
+          "order_id": "1001",
+          "preserve_raw": false,
+          "needs_resolution": true,
+          "resolved_contains": [
+            "1001"
+          ],
+          "resolved_any": [
+            "退货",
+            "退款",
+            "退"
+          ]
+        },
+        "workflow": {
+          "query_count": 3,
+          "order_before_policy": true,
+          "ask_refund_reason": false
+        }
+      },
+      {
+        "id": "D01-T3",
+        "query": "退款先放一下，我还是想查刚才那笔的配送进度。",
+        "expected": {
+          "intent": "物流",
+          "order_id": "1001",
+          "preserve_raw": false,
+          "needs_resolution": true,
+          "resolved_contains": [
+            "1001"
+          ],
+          "resolved_any": [
+            "物流",
+            "配送",
+            "运输"
+          ]
+        }
+      },
+      {
+        "id": "D01-T4",
+        "query": "现在改看订单1002的商品明细。",
+        "expected": {
+          "intent": "订单",
+          "order_id": "1002",
+          "preserve_raw": true,
+          "forbidden_order_ids": [
+            "1001"
+          ]
+        }
+      },
+      {
+        "id": "D01-T5",
+        "query": "查完了，谢谢你的帮助。",
+        "expected": {
+          "intent": "闲聊",
+          "order_id": null,
+          "preserve_raw": true
+        }
+      }
+    ]
+  },
+  {
+    "id": "D02",
+    "mandatory": true,
+    "title": "它呢沿用最近明确业务和对象",
+    "user_id": "demo-user",
+    "turns": [
+      {
+        "id": "D02-T1",
+        "query": "请查询订单1001最新的运输进度。",
+        "expected": {
+          "intent": "物流",
+          "order_id": "1001",
+          "preserve_raw": true
+        }
+      },
+      {
+        "id": "D02-T2",
+        "query": "再看订单1002，查询的也是运输进度。",
+        "expected": {
+          "intent": "物流",
+          "order_id": "1002",
+          "preserve_raw": true,
+          "forbidden_order_ids": [
+            "1001"
+          ]
+        }
+      },
+      {
+        "id": "D02-T3",
+        "query": "它呢？",
+        "expected": {
+          "intent": "物流",
+          "order_id": "1002",
+          "preserve_raw": false,
+          "needs_resolution": true,
+          "resolved_contains": [
+            "1002"
+          ],
+          "resolved_any": [
+            "物流",
+            "运输",
+            "配送"
+          ],
+          "forbidden_order_ids": [
+            "1001"
+          ]
+        }
+      },
+      {
+        "id": "D02-T4",
+        "query": "换个问题，订单1001的猫粮还没打开，可以退掉吗？",
+        "expected": {
+          "intent": "退款退货",
+          "order_id": "1001",
+          "preserve_raw": true,
+          "forbidden_order_ids": [
+            "1002"
+          ],
+          "preserve_semantics": [
+            "未拆封"
+          ]
+        },
+        "workflow": {
+          "query_count": 3,
+          "ask_refund_reason": false
+        }
+      },
+      {
+        "id": "D02-T5",
+        "query": "退货先不考虑，它如果少配件能补发吗？",
+        "expected": {
+          "intent": "售后",
+          "order_id": "1001",
+          "preserve_raw": false,
+          "needs_resolution": true,
+          "resolved_contains": [
+            "1001"
+          ],
+          "resolved_any": [
+            "补发"
+          ],
+          "preserve_semantics": [
+            "缺件是假设，不能改成已经核实缺件"
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "id": "D03",
+    "mandatory": true,
+    "title": "聊过具体订单后通用政策不得绑旧订单",
+    "user_id": "demo-user",
+    "turns": [
+      {
+        "id": "D03-T1",
+        "query": "订单1001里面的商品叫什么、数量是多少？",
+        "expected": {
+          "intent": "订单",
+          "order_id": "1001",
+          "preserve_raw": true
+        }
+      },
+      {
+        "id": "D03-T2",
+        "query": "店里邮寄费用按什么标准计算？",
+        "expected": {
+          "intent": "商品咨询",
+          "order_id": null,
+          "preserve_raw": true,
+          "needs_resolution": false,
+          "forbidden_in_queries": [
+            "1001",
+            "猫粮"
+          ]
+        },
+        "workflow": {
+          "query_count": 1,
+          "expansion_calls": 0,
+          "fetch_order": false,
+          "select_order": false
+        }
+      },
+      {
+        "id": "D03-T3",
+        "query": "不说具体订单，退货寄回的邮费通常怎么分摊？",
+        "expected": {
+          "intent": "商品咨询",
+          "order_id": null,
+          "preserve_raw": true,
+          "needs_resolution": false,
+          "forbidden_in_queries": [
+            "1001",
+            "猫粮"
+          ]
+        },
+        "workflow": {
+          "query_count": 1,
+          "expansion_calls": 0,
+          "fetch_order": false,
+          "select_order": false
+        }
+      },
+      {
+        "id": "D03-T4",
+        "query": "商品付款时分期有哪些方式可以选？",
+        "expected": {
+          "intent": "商品咨询",
+          "order_id": null,
+          "preserve_raw": true,
+          "needs_resolution": false,
+          "forbidden_in_queries": [
+            "1001",
+            "猫粮"
+          ]
+        },
+        "workflow": {
+          "query_count": 1,
+          "expansion_calls": 0,
+          "fetch_order": false,
+          "select_order": false
+        }
+      },
+      {
+        "id": "D03-T5",
+        "query": "回到具体订单，我想退订单1002。",
+        "expected": {
+          "intent": "退款退货",
+          "order_id": "1002",
+          "preserve_raw": true,
+          "forbidden_order_ids": [
+            "1001"
+          ]
+        },
+        "workflow": {
+          "order_before_policy": true
+        }
+      }
+    ]
+  },
+  {
+    "id": "D04",
+    "mandatory": true,
+    "title": "当前新号优先以及多个订单不猜测",
+    "user_id": "demo-user",
+    "turns": [
+      {
+        "id": "D04-T1",
+        "query": "请确认订单1001现在是什么订单状态。",
+        "expected": {
+          "intent": "订单",
+          "order_id": "1001",
+          "preserve_raw": true
+        }
+      },
+      {
+        "id": "D04-T2",
+        "query": "改查订单1002的商品总价，不查1001了。",
+        "expected": {
+          "intent": "订单",
+          "order_id": "1002",
+          "preserve_raw": true,
+          "needs_resolution": false,
+          "order_selection_reason": "当前明确选择1002，1001仅为被否定对象"
+        }
+      },
+      {
+        "id": "D04-T3",
+        "query": "这笔想办理退货的话可以吗？",
+        "expected": {
+          "intent": "退款退货",
+          "order_id": "1002",
+          "preserve_raw": false,
+          "needs_resolution": true,
+          "resolved_contains": [
+            "1002"
+          ],
+          "resolved_any": [
+            "退货",
+            "退"
+          ],
+          "forbidden_order_ids": [
+            "1001"
+          ]
+        }
+      },
+      {
+        "id": "D04-T4",
+        "query": "订单1001和1002我都买过猫粮，这个我想退掉。",
+        "expected": {
+          "intent": "退款退货",
+          "order_id": null,
+          "preserve_raw": true,
+          "needs_resolution": false,
+          "preserve_semantics": [
+            "两个候选均存在，未明确指向其中一个"
+          ]
+        },
+        "workflow": {
+          "expected_terminal": "awaiting_input",
+          "select_order": true
+        },
+        "selection": {
+          "order_id": "1002",
+          "same_turn": true,
+          "same_thread": true,
+          "no_reclassification": true
+        }
+      },
+      {
+        "id": "D04-T5",
+        "query": "先不继续退货，我现在只想看订单1001的订单金额。",
+        "expected": {
+          "intent": "订单",
+          "order_id": "1001",
+          "preserve_raw": true,
+          "forbidden_order_ids": [
+            "1002"
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "id": "D05",
+    "mandatory": true,
+    "title": "问候、否定投诉、明确换话题和其他",
+    "user_id": "demo-user",
+    "turns": [
+      {
+        "id": "D05-T1",
+        "query": "早上好，帮我看看订单1001的快递到哪里了。",
+        "expected": {
+          "intent": "物流",
+          "order_id": "1001",
+          "preserve_raw": true
+        }
+      },
+      {
+        "id": "D05-T2",
+        "query": "我不是来投诉的，订单1001少了一袋猫粮，我想申请补发。",
+        "expected": {
+          "intent": "售后",
+          "order_id": "1001",
+          "preserve_raw": true,
+          "preserve_semantics": [
+            "否定投诉",
+            "申请补发"
+          ]
+        }
+      },
+      {
+        "id": "D05-T3",
+        "query": "补发先放一边，客服反复推脱，我要投诉这种服务。",
+        "expected": {
+          "intent": "投诉",
+          "order_id": null,
+          "preserve_raw": true
+        }
+      },
+      {
+        "id": "D05-T4",
+        "query": "另外，请帮我证明一道微积分定理。",
+        "expected": {
+          "intent": "其他",
+          "order_id": null,
+          "preserve_raw": true
+        }
+      },
+      {
+        "id": "D05-T5",
+        "query": "知道服务范围了，感谢你的说明。",
+        "expected": {
+          "intent": "闲聊",
+          "order_id": null,
+          "preserve_raw": true
+        }
+      }
+    ]
+  },
+  {
+    "id": "D06",
+    "mandatory": true,
+    "title": "缺号与非本人订单选单后同轮恢复",
+    "user_id": "demo-user",
+    "turns": [
+      {
+        "id": "D06-T1",
+        "query": "上次买的那袋猫粮我想退掉，能不能办理？",
+        "expected": {
+          "intent": "退款退货",
+          "order_id": null,
+          "preserve_raw": true,
+          "needs_resolution": false
+        },
+        "workflow": {
+          "expected_terminal": "awaiting_input",
+          "select_order": true
+        },
+        "selection": {
+          "order_id": "1001",
+          "same_turn": true,
+          "same_thread": true,
+          "no_reclassification": true,
+          "preserve_budget_prefix": true
+        },
+        "after_resume": {
+          "expected_order_id": "1001",
+          "expected_terminal": "completed",
+          "order_before_policy": true,
+          "ask_refund_reason": false
+        },
+        "refund_submission": {
+          "reason_code": "wrong_purchase",
+          "expected_status": "待处理",
+          "duplicate_same_receipt": true
+        }
+      },
+      {
+        "id": "D06-T2",
+        "query": "刚才我选的那笔订单，包裹运输到哪里了？",
+        "expected": {
+          "intent": "物流",
+          "order_id": "1001",
+          "preserve_raw": false,
+          "needs_resolution": true,
+          "resolved_contains": [
+            "1001"
+          ],
+          "resolved_any": [
+            "物流",
+            "运输",
+            "配送"
+          ]
+        }
+      },
+      {
+        "id": "D06-T3",
+        "query": "订单2003我想退款。",
+        "expected": {
+          "intent": "退款退货",
+          "order_id": "2003",
+          "preserve_raw": true
+        },
+        "workflow": {
+          "expected_terminal": "awaiting_input",
+          "select_order": true,
+          "never_query_order_ids": [
+            "2003"
+          ]
+        },
+        "selection": {
+          "order_id": "1002",
+          "same_turn": true,
+          "same_thread": true,
+          "no_reclassification": true
+        },
+        "after_resume": {
+          "expected_order_id": "1002",
+          "expected_terminal": "completed"
+        }
+      },
+      {
+        "id": "D06-T4",
+        "query": "换个话题，饮水机的过滤棉平常如何清洁？",
+        "expected": {
+          "intent": "商品咨询",
+          "order_id": null,
+          "preserve_raw": true,
+          "needs_resolution": false,
+          "forbidden_in_queries": [
+            "1001",
+            "1002",
+            "2003",
+            "猫粮"
+          ]
+        },
+        "workflow": {
+          "query_count": 1,
+          "expansion_calls": 0,
+          "fetch_order": false,
+          "select_order": false
+        }
+      }
+    ]
+  }
+]

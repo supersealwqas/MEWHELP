@@ -9,6 +9,105 @@ from types import SimpleNamespace
 import pytest
 
 
+@pytest.mark.asyncio
+async def test_recording_chat_preserves_bound_tool_protocol():
+    """取证按工具名分阶段且保留原始分片。参数：无；返回：None；异常：断言失败。"""
+    from langchain_core.messages import AIMessageChunk, HumanMessage
+    from tests.ch05_live_runtime import RecordingChat
+    calls, rows = [], []
+
+    class Model:
+        """不联网的协议探针，检查包装器没有更改工具约束。"""
+        def bind_tools(self, tools, **kwargs):
+            """记录原绑定参数。参数：工具和选项；返回：自身；异常：无。"""
+            calls.append((tools, kwargs))
+            return self
+
+        async def astream(self, messages):
+            """发出带计量的原工具片。参数：消息；返回：分片；异常：无。"""
+            yield AIMessageChunk(content="", tool_call_chunks=[{"name":"submit_intent", "args":"{}", "id":"x", "index":0}],
+                response_metadata={"finish_reason":"tool_calls"}, usage_metadata={"input_tokens":1,"output_tokens":2,"total_tokens":3})
+
+    schema = [{"type":"function", "function":{"name":"submit_intent"}}]
+    model = RecordingChat(Model(), rows, "answer").bind_tools(schema, tool_choice="required", strict=True)
+    async for _ in model.astream([HumanMessage(content="你好")]):
+        pass
+    assert calls == [(schema, {"tool_choice":"required", "strict":True})]
+    assert rows[0]["stage"] == "classify"
+    assert rows[0]["chunks"][0]["tool_call_chunks"][0]["args"] == "{}"
+    assert rows[0]["chunks"][0]["response_metadata"]["finish_reason"] == "tool_calls"
+    assert rows[0]["chunks"][0]["usage_metadata"]["total_tokens"] == 3
+
+
+def test_confidence_report_separates_fallbacks():
+    """回退零分不得混进原始分布。参数：无；返回：None；异常：断言失败。"""
+    from tests.eval_ch06_prompts import confidence_report
+    data, report = confidence_report([
+        {"id":"ok","raw_classification_valid":True,"correct":True,"confidence":.8},
+        {"id":"bad","raw_classification_valid":True,"correct":False,"confidence":.95,"expected_intent":"订单","predicted_intent":"物流"},
+        {"id":"fallback","raw_classification_valid":False,"correct":False,"confidence":0},
+    ])
+    assert "错判样本的 confidence 分布" in report
+    assert data["valid_correct"] == data["valid_wrong"] == data["fallbacks"] == 1
+    assert data["wrong_min"] == data["wrong_median"] == data["wrong_max"] == .95
+    assert data["wrong_buckets"] == [0, 0, 0, 1]
+    assert data["high_confidence_errors"][0]["predicted_intent"] == "物流"
+
+
+def test_confidence_report_handles_no_errors():
+    """无错判不能伪造校准结论或零分统计。参数：无；返回：None；异常：断言失败。"""
+    from tests.eval_ch06_prompts import confidence_report
+    data, report = confidence_report([])
+    assert "错判样本的 confidence 分布" in report and "本次无错判样本" in report
+    assert data["wrong_min"] is data["wrong_median"] is data["wrong_max"] is None
+
+
+def test_cleanup_manifest_rejects_foreign_refund():
+    """新增退款表清理仍须逐条登记身份。参数：无；返回：None；异常：断言失败。"""
+    from tests.ch05_live_runtime import validate_cleanup
+    entry = {"id":7,"session_id":"s","user_id":"demo-user","turn_ids":["t"],"pool_ids":[],"ticket_numbers":[],"refund_numbers":["RF1"]}
+    data = {"conversation":{"id":7,"session_id":"s","user_id":"demo-user"},"messages":[{"turn_id":"t"}],"pool_rows":[],"tickets":[],
+        "refunds":[{"refund_no":"RF1","conversation_id":8,"source_turn_id":"t","user_id":"demo-user"}]}
+    with pytest.raises(ValueError, match="退款"):
+        validate_cleanup(entry, data)
+
+
+def test_judge_accepts_delivery_progress_synonyms():
+    """同义的送达位置不能被词表误判。参数：无；返回：None；异常：断言失败。"""
+    from tests.eval_ch06_prompts import inspect_understanding
+    assert inspect_understanding("查刚才那笔配送进度", {"resolved_any":["物流","配送","运输"]},
+        {"resolved_query":"订单1001的包裹目前送到哪里", "standard_query":"订单配送进度"}) == []
+
+
+def test_live_judge_reads_resolution_flag_from_model_evidence():
+    """needs_resolution不在State契约内，须读取真实模型取证。参数：无；返回：None；异常：断言失败。"""
+    from langchain_core.messages import AIMessageChunk
+    from tests.verify_ch06_live import judge
+    raw = {"resolved_query":"订单1001物流进度", "standard_query":"订单1001物流进度", "order_id":"1001", "needs_resolution":True}
+    output = AIMessageChunk(content="",tool_call_chunks=[{"name":"submit_understanding","args":json.dumps(raw),"id":"u","index":0}],
+        response_metadata={"finish_reason":"tool_calls"}).model_dump(mode="json")
+    row = {"state":{key:value for key,value in raw.items() if key != "needs_resolution"},"events":[{"event":"answer_metadata"},{"event":"done"}],
+        "failures":[],"http_status":200,"models":[{"stage":"understand","output":output}],"active_model_streams":0,"active_graph_nodes":0}
+    row["state"].update(raw_query="它呢",intent="物流",completion_metadata={"status":"completed"})
+    assert judge(row,{"query":"它呢","expected":{"intent":"物流","needs_resolution":True,"order_id":"1001"}})["failures"] == []
+
+
+def test_explicit_excluded_order_is_not_ambiguous():
+    """明确排除旧号后当前和下一轮均只选择新号；真正并列仍不得任选。参数：无；返回：None；异常：断言失败。"""
+    from app.schemas.workflow import UnderstandingResult
+    from app.workflow.routing import _understanding_outcome, order_candidate
+    raw = "改查订单1002的商品总价，不查1001了。"
+    result = UnderstandingResult(resolved_query=raw, standard_query="订单1002商品总价", needs_resolution=False, order_id="1002")
+    validated, fallback = _understanding_outcome(raw,result,[])
+    assert not fallback and validated.order_id == "1002"
+    assert order_candidate({"raw_query":raw,"order_id":"1002"},[{"order_id":"1001"},{"order_id":"1002"}]) == "1002"
+    followup = UnderstandingResult(resolved_query="订单1002能退货吗？", standard_query="订单1002退货条件", needs_resolution=True, order_id="1002")
+    validated, fallback = _understanding_outcome("这笔能退吗？",followup,[{"messages":[{"role":"user","content":raw}]}])
+    assert not fallback and validated.order_id == "1002"
+    ambiguous = "订单1001和1002，其中一笔想退货。"
+    assert order_candidate({"raw_query":ambiguous,"order_id":"1002"},[{"order_id":"1001"},{"order_id":"1002"}]) is None
+
+
 def test_agent_cli_refuses_without_test_before_loading_env(tmp_path):
     """缺test必须在读取环境/创建报告前拒绝。参数：tmp_path隔离目录；返回：None；异常：断言失败。"""
     target = tmp_path / "report"

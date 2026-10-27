@@ -1,0 +1,322 @@
+[
+  {
+    "id": "I01",
+    "history": [],
+    "query": "麻烦查一下订单1001的包裹现在走到哪个配送环节了。",
+    "expected_intent": "物流",
+    "mandatory": false,
+    "tags": [
+      "订单号查物流"
+    ]
+  },
+  {
+    "id": "I02",
+    "history": [],
+    "query": "顺丰单号SF213502378238最近的一条运输记录是什么？",
+    "expected_intent": "物流",
+    "mandatory": true,
+    "tags": [
+      "前缀快递号"
+    ]
+  },
+  {
+    "id": "I03",
+    "history": [],
+    "query": "快递单号213502378238已经两天没动了，能查运输进度吗？",
+    "expected_intent": "物流",
+    "mandatory": true,
+    "tags": [
+      "纯数字快递号"
+    ]
+  },
+  {
+    "id": "I04",
+    "history": [],
+    "query": "下午好，帮我看订单1002的快递有没有到配送站。",
+    "expected_intent": "物流",
+    "mandatory": true,
+    "tags": [
+      "问候夹带业务"
+    ]
+  },
+  {
+    "id": "I05",
+    "history": [],
+    "query": "请核对订单1001里买了哪些东西、分别买了几件。",
+    "expected_intent": "订单",
+    "mandatory": false,
+    "tags": [
+      "订单明细"
+    ]
+  },
+  {
+    "id": "I06",
+    "history": [],
+    "query": "我想确认订单1002的商品总金额。",
+    "expected_intent": "订单",
+    "mandatory": false,
+    "tags": [
+      "订单金额"
+    ]
+  },
+  {
+    "id": "I07",
+    "history": [],
+    "query": "订单A-1001目前处于什么状态？",
+    "expected_intent": "订单",
+    "mandatory": true,
+    "tags": [
+      "完整前缀订单号"
+    ]
+  },
+  {
+    "id": "I08",
+    "history": [],
+    "query": "订单1003已经安排发货了吗？",
+    "expected_intent": "订单",
+    "mandatory": false,
+    "tags": [
+      "订单是否发货"
+    ]
+  },
+  {
+    "id": "I09",
+    "history": [],
+    "query": "MH-W20饮水机的水箱一次能装多少水？",
+    "expected_intent": "商品咨询",
+    "mandatory": false,
+    "tags": [
+      "商品参数"
+    ]
+  },
+  {
+    "id": "I10",
+    "history": [],
+    "query": "店里寄送商品的邮费是按什么标准收取的？",
+    "expected_intent": "商品咨询",
+    "mandatory": true,
+    "tags": [
+      "通用运费"
+    ]
+  },
+  {
+    "id": "I11",
+    "history": [],
+    "query": "不针对某一单，我想了解退货时寄回邮费的通用规定。",
+    "expected_intent": "商品咨询",
+    "mandatory": true,
+    "tags": [
+      "通用退货规则"
+    ]
+  },
+  {
+    "id": "I12",
+    "history": [],
+    "query": "买饮水机时，可以选择哪些分期付款渠道？",
+    "expected_intent": "商品咨询",
+    "mandatory": false,
+    "tags": [
+      "通用支付规则"
+    ]
+  },
+  {
+    "id": "I13",
+    "history": [],
+    "query": "订单1001的猫粮我不想保留了，能办理退货退款吗？",
+    "expected_intent": "退款退货",
+    "mandatory": false,
+    "tags": [
+      "具体订单退款"
+    ]
+  },
+  {
+    "id": "I14",
+    "history": [],
+    "query": "刚买到的那袋猫粮还没拆，我想退掉，可以办理吗？",
+    "expected_intent": "退款退货",
+    "mandatory": true,
+    "tags": [
+      "缺号退款选单"
+    ]
+  },
+  {
+    "id": "I15",
+    "history": [],
+    "query": "订单A-1001的商品包装有破损，我要申请退款。",
+    "expected_intent": "退款退货",
+    "mandatory": true,
+    "tags": [
+      "前缀订单退款"
+    ]
+  },
+  {
+    "id": "I16",
+    "history": [],
+    "query": "这次买的尺寸不合适，我要退货拿回货款，不是换货。",
+    "expected_intent": "退款退货",
+    "mandatory": false,
+    "tags": [
+      "退款与换货边界"
+    ]
+  },
+  {
+    "id": "I17",
+    "history": [],
+    "query": "订单1002收到的配件缺了一包螺丝，请帮我补发。",
+    "expected_intent": "售后",
+    "mandatory": false,
+    "tags": [
+      "补发"
+    ]
+  },
+  {
+    "id": "I18",
+    "history": [],
+    "query": "不是投诉，我是想问订单1001的设备坏了怎么送修。",
+    "expected_intent": "售后",
+    "mandatory": true,
+    "tags": [
+      "否定投诉"
+    ]
+  },
+  {
+    "id": "I19",
+    "history": [],
+    "query": "订单1003买错规格了，我想换同款另一个规格，不退款。",
+    "expected_intent": "售后",
+    "mandatory": true,
+    "tags": [
+      "换货归售后"
+    ]
+  },
+  {
+    "id": "I20",
+    "history": [],
+    "query": "买来的饮水机水泵不转了，我想申请保修维修。",
+    "expected_intent": "售后",
+    "mandatory": false,
+    "tags": [
+      "保修"
+    ]
+  },
+  {
+    "id": "I21",
+    "history": [],
+    "query": "你们客服一直用相同的话敷衍，我要正式投诉。",
+    "expected_intent": "投诉",
+    "mandatory": false,
+    "tags": [
+      "客服不满"
+    ]
+  },
+  {
+    "id": "I22",
+    "history": [],
+    "query": "配送员把东西扔在门外还说送达，我要求负责人解释。",
+    "expected_intent": "投诉",
+    "mandatory": false,
+    "tags": [
+      "追责"
+    ]
+  },
+  {
+    "id": "I23",
+    "history": [],
+    "query": "问题报了好几次没人处理，我非常不满，必须给个说法。",
+    "expected_intent": "投诉",
+    "mandatory": false,
+    "tags": [
+      "情绪与追责"
+    ]
+  },
+  {
+    "id": "I24",
+    "history": [],
+    "query": "我不接受这种推卸责任的处理方式，要投诉这次服务。",
+    "expected_intent": "投诉",
+    "mandatory": false,
+    "tags": [
+      "否定对象识别"
+    ]
+  },
+  {
+    "id": "I25",
+    "history": [],
+    "query": "早呀，小猫客服！",
+    "expected_intent": "闲聊",
+    "mandatory": false,
+    "tags": [
+      "问候"
+    ]
+  },
+  {
+    "id": "I26",
+    "history": [],
+    "query": "好的，多谢你的耐心解答。",
+    "expected_intent": "闲聊",
+    "mandatory": false,
+    "tags": [
+      "感谢"
+    ]
+  },
+  {
+    "id": "I27",
+    "history": [],
+    "query": "你有自己的昵称吗？",
+    "expected_intent": "闲聊",
+    "mandatory": false,
+    "tags": [
+      "身份闲谈"
+    ]
+  },
+  {
+    "id": "I28",
+    "history": [],
+    "query": "祝你今天也开开心心。",
+    "expected_intent": "闲聊",
+    "mandatory": false,
+    "tags": [
+      "无业务寒暄"
+    ]
+  },
+  {
+    "id": "I29",
+    "history": [],
+    "query": "请给我算一下这个微积分题。",
+    "expected_intent": "其他",
+    "mandatory": true,
+    "tags": [
+      "服务范围外"
+    ]
+  },
+  {
+    "id": "I30",
+    "history": [],
+    "query": "我说不上来要查什么，先帮我弄一下。",
+    "expected_intent": "其他",
+    "mandatory": true,
+    "tags": [
+      "诉求不明"
+    ]
+  },
+  {
+    "id": "I31",
+    "history": [],
+    "query": "水泵坏了，请直接帮我创建一个工单跟进。",
+    "expected_intent": "其他",
+    "mandatory": true,
+    "tags": [
+      "明确建单优先"
+    ]
+  },
+  {
+    "id": "I32",
+    "history": [],
+    "query": "我想由人工客服继续接待，请提供转人工选项。",
+    "expected_intent": "其他",
+    "mandatory": true,
+    "tags": [
+      "明确转人工"
+    ]
+  }
+]

@@ -46,6 +46,19 @@ def route_by_intent(state: ConversationState) -> str:
 _ORDER_CANDIDATE = re.compile(r"(?<![A-Za-z0-9_-])(?:[A-Za-z]+(?:-[A-Za-z]+)*-?)?\d{4,}[A-Za-z0-9-]*(?![A-Za-z0-9_-])")
 
 
+def _active_order_tokens(query: str) -> list:
+    """排除明确否定查询的编号，其余并列号仍保持歧义。参数：完整原话；返回：编号匹配；异常：无。"""
+    tokens = []
+    for token in _ORDER_CANDIDATE.finditer(query):
+        before, after = query[:token.start()], query[token.end():]
+        # 只识别紧贴编号的明确排除语句，不把“不退款”等业务否定误当排除对象。
+        excluded = re.search(r"(?:不查|别查|不看|不要查|不要看|不是|排除)\s*(?:订单(?:号)?\s*)?$", before)
+        excluded = excluded or re.match(r"\s*(?:这笔)?(?:不查|别查|不看)(?:了|吧|[，。！？,!?]|$)", after)
+        if not excluded:
+            tokens.append(token)
+    return tokens
+
+
 def order_candidate(state: ConversationState, orders: list[dict]) -> str | None:
     """核对完整编号和用途，不能把物流号或数字后缀作为订单。
 
@@ -54,7 +67,7 @@ def order_candidate(state: ConversationState, orders: list[dict]) -> str | None:
     异常：无；候选只是线索，执行前仍需重新校验归属。
     """
     raw = state["raw_query"]
-    tokens = list(_ORDER_CANDIDATE.finditer(raw))
+    tokens = _active_order_tokens(raw)
     identifiers = {item.group() for item in tokens}
     owned = {row["order_id"] for row in orders}
     candidate = state.get("order_id")
@@ -97,7 +110,7 @@ def _trusted_history(history_turns: list[dict]) -> tuple[str, set[str], set[str]
                 continue
             if message.get("role") == "user":
                 parts.append(content)
-                orders.update(_ORDER_CANDIDATE.findall(content))
+                orders.update(token.group() for token in _active_order_tokens(content))
             elif message.get("role") == "tool":
                 try:
                     result = json.loads(content)
@@ -145,6 +158,8 @@ def _understanding_outcome(raw_query: str, result: UnderstandingResult,
     fallback = original_understanding(raw_query)
     history, recent_orders, products = _trusted_history(history_turns)
     current_orders = set(_ORDER_CANDIDATE.findall(raw_query))
+    # 原文中被排除的号仍允许逐字符保留，但不能参与本轮唯一对象判断。
+    selectable_orders = {token.group() for token in _active_order_tokens(raw_query)} if current_orders else (recent_orders if result.needs_resolution else set())
     allowed_orders = current_orders or (recent_orders if result.needs_resolution else set())
     source = history if result.needs_resolution else ""
     try:
@@ -160,12 +175,12 @@ def _understanding_outcome(raw_query: str, result: UnderstandingResult,
             if not result.needs_resolution and any(name in candidate and name not in raw_query for name in products):
                 raise QueryRewriteError("无需消解的问题不能绑定历史商品")
         if result.order_id is not None:
-            if len(allowed_orders) != 1 or result.order_id not in allowed_orders:
+            if len(selectable_orders) != 1 or result.order_id not in selectable_orders:
                 raise QueryRewriteError("订单候选没有唯一可信来源")
             if result.needs_resolution and result.order_id not in set(_ORDER_CANDIDATE.findall(result.resolved_query)):
                 raise QueryRewriteError("具体订单指代必须在完整问题中保留全号")
         # 无订单字段也不能在完整问里悄悄替用户从并列对象中选一个。
-        if result.needs_resolution and len(allowed_orders) > 1:
+        if result.needs_resolution and len(selectable_orders) > 1:
             for candidate in (result.resolved_query, result.standard_query):
                 selected = set(_ORDER_CANDIDATE.findall(candidate)) & allowed_orders
                 if selected and selected != allowed_orders:
