@@ -78,9 +78,17 @@ def judge(row: dict, expected: dict, *, waiting=False) -> dict:
                 failures.append("order_before_policy")
             if any(model["stage"] == "decide" for model in row["models"]):
                 failures.append("policy_entered_decide")
+            if "query_count" in expected["expected"] and len(state.get("expanded_queries", [])) != expected["expected"]["query_count"]:
+                failures.append("policy_query_count")
         if state.get("intent") == "商品咨询":
             if state.get("expanded_queries") != [state.get("standard_query")] or any(model["stage"] == "expand" for model in row["models"]):
                 failures.append("ordinary_single_query")
+        if state.get("route") == "business" and state.get("resolved_query") != state.get("raw_query"):
+            # 只核对State会漏掉“理解已补全、业务模型仍收到代词”的断链，直接检查实际模型输入。
+            models = [model for model in row["models"] if model["stage"] in ("decide", "answer")]
+            if not models or any(next((message["content"] for message in reversed(model["inputs"])
+                if message["type"] == "human"), None) != state["resolved_query"] for model in models):
+                failures.append("business_resolved_query_not_consumed")
     if any(record.get("failure") for record in state.get("budget", {}).get("records", [])):
         failures.append("model_protocol_or_reference_fallback")
     if row["active_model_streams"] or row["active_graph_nodes"]:
@@ -134,7 +142,7 @@ async def run(args, config, summary) -> int:
     entries = []
     cases = json.loads((ROOT / "tests/fixtures/ch06/dialogue_cases.json").read_text(encoding="utf-8"))
     write_json(args.report_dir / "frozen-cases.json", cases)
-    waiting_item = {"id":"S4-wait", "query":"我买的东西想退货，帮我看一下可以吗？", "expected":{"intent":"退款退货","order_id":None,"preserve_raw":True}}
+    waiting_item = {"id":"S4-wait", "query":"我买的东西想退货，帮我看一下可以吗？", "expected":{"intent":"退款退货","order_id":None,"preserve_raw":True,"query_count":3}}
     try:
         async with resource_lock(config, prepare=False) as locked:
             owner = await locked.scalar(text("SELECT IS_USED_LOCK(:name)"), {"name":LOCK_NAME})

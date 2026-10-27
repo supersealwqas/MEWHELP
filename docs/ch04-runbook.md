@@ -9,7 +9,7 @@
 - Python 3.12、uv、MySQL 8.4、Milvus 2.6.22，客户端 PyMilvus 2.6.17。
 - 编码使用本地 BGE-M3，重排使用本地 `bge-reranker-large`；独立工作区应配置两个模型的绝对路径，不复制模型或密钥到 Git。
 - 应用库沿用本地 `.env`；CH04 测试库固定 `mewhelp_ch04_test`，评估库固定 `mewhelp_ch04_eval`。测试和评估不能使用 `mewhelp`、`mewhelp_test` 或 `mewhelp_ch03_test`。
-- `app.db.init_db` 只负责原四张业务表；质量表使用独立元数据和显式迁移，不随旧业务初始化/测试重置处理。
+- `app.db.init_db` 只负责业务表（CH06 新增退款申请后共五张）；质量表使用独立元数据和显式迁移，不随业务初始化/测试重置处理。已有应用库升级 CH06 应使用增量迁移，见 [CH06 运行说明](ch06-runbook.md)。
 - 此版本仍为单实例、单 worker 的本地演示，订单/商品/物流为可复现演示数据，工单保存到本地数据库。
 
 ## 已有应用的核心升级顺序

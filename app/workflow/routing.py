@@ -44,17 +44,34 @@ def route_by_intent(state: ConversationState) -> str:
 
 # 完整字母前缀与数字视作一个候选，避免A-1001被截成1001；用途/归属仍由fetch_order确定。
 _ORDER_CANDIDATE = re.compile(r"(?<![A-Za-z0-9_-])(?:[A-Za-z]+(?:-[A-Za-z]+)*-?)?\d{4,}[A-Za-z0-9-]*(?![A-Za-z0-9_-])")
+_NON_ORDER_LABEL = r"(?:快递(?:单号|号)?|运单(?:号)?|物流(?:单号|号)?|金额|价格|单价|总价|实付|运费|邮费|日期|年份)"
+
+
+def _non_order_purpose(query: str, token: re.Match) -> bool:
+    """识别原话中明确的金额、日期或物流用途，不依赖模型候选。
+
+    参数：query完整原话；token完整编号匹配，不能只检查数字后缀。
+    返回：bool，明确非订单用途时为True；异常：无。
+    """
+    before, after = query[:token.start()], query[token.end():]
+    labelled_before = re.search(_NON_ORDER_LABEL + r"\s*(?:是|为)?\s*[:：]?\s*$", before)
+    # 后置声明允许“我的/本次退货的”等修饰词，但不能跨分句、括号或另一数字借用用途标签。
+    labelled_after = re.match(r"\s*(?:(?:[，,]\s*)?(?:是|为|这是|这个是)\s*|[（(]\s*)"
+                              r"[^，,。！？!?；;（）()\n\d]*" + _NON_ORDER_LABEL, after)
+    quantity = re.match(r"\s*(?:\.\d+)?\s*(?:万元|元|块钱?|人民币|美元|年|月|日)", after)
+    currency = re.search(r"[￥¥$]\s*$", before)
+    return bool(labelled_before or labelled_after or quantity or currency)
 
 
 def _active_order_tokens(query: str) -> list:
-    """排除明确否定查询的编号，其余并列号仍保持歧义。参数：完整原话；返回：编号匹配；异常：无。"""
+    """排除明确否定查询或非订单用途的编号，其余并列号仍保持歧义。参数：完整原话；返回：编号匹配；异常：无。"""
     tokens = []
     for token in _ORDER_CANDIDATE.finditer(query):
         before, after = query[:token.start()], query[token.end():]
         # 只识别紧贴编号的明确排除语句，不把“不退款”等业务否定误当排除对象。
         excluded = re.search(r"(?:不查|别查|不看|不要查|不要看|不是|排除)\s*(?:订单(?:号)?\s*)?$", before)
         excluded = excluded or re.match(r"\s*(?:这笔)?(?:不查|别查|不看)(?:了|吧|[，。！？,!?]|$)", after)
-        if not excluded:
+        if not excluded and not _non_order_purpose(query, token):
             tokens.append(token)
     return tokens
 
@@ -75,9 +92,6 @@ def order_candidate(state: ConversationState, orders: list[dict]) -> str | None:
         return None
     if tokens:
         token = tokens[0]
-        # 紧邻的物流用途声明优先于模型给出的订单字段。
-        if re.search(r"(?:快递(?:单号)?|运单号|物流单号)\s*[:：]?\s*$", raw[:token.start()]):
-            return None
         identifier = token.group()
         if candidate is not None and candidate != identifier:
             return None
@@ -85,6 +99,9 @@ def order_candidate(state: ConversationState, orders: list[dict]) -> str | None:
         if not identifier.isdigit() and candidate != identifier:
             return None
         return identifier if identifier in owned else None
+    # 原话明确排除的值不能经模型order_id重新进入；仅没有编号时允许可信历史消解候选。
+    if _ORDER_CANDIDATE.search(raw):
+        return None
     return candidate if candidate in owned else None
 
 

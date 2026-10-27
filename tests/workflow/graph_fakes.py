@@ -86,8 +86,8 @@ class StrictSearch:
     async def retrieve(self, query, *, budget, prepared_queries=None, history=""):
         """参数：query原问、budget独占账本；返回：排名；异常：脚本故障。"""
         return self._take("retrieve", query, budget)
-    async def retrieve_policy(self, query, *, budget, prepared_queries=None, history=""):
-        """参数：query原问、budget独占账本；返回：排名；异常：脚本故障。"""
+    async def retrieve_policy(self, query, *, budget, prepared_queries=None, history="", filters=None):
+        """参数：query原问、budget独占账本、filters来源范围；返回：排名；异常：脚本故障。"""
         return self._take("retrieve_policy", query, budget)
     def _take(self, kind, query, budget):
         """参数：kind入口、query原問、budget账本；返回：排名；异常：脚本故障。"""

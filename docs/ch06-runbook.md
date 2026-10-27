@@ -52,27 +52,27 @@ uv run python -m tests.verify_ch06_live --test --env-file D:/AI/my_AI_project/ME
 
 需要浏览器取证时，在真实流程命令后增加 `--browser`。完成自动场景后读取报告中的 `browser-ready.json`，使用 Codex 内置浏览器打开 `bootstrap_url`，它只给本次测试页面预置已登记的随机会话。验收工具条可显式延迟一次真实响应或插入未知事件；不会替代模型或修改业务结果。点击保存证据后，核对页面与报告，再在该报告目录写 `browser-finish.json`（包含 `failures` 数组）结束服务并触发精确清理。这些辅助路由只挂在测试应用的随机本机端口，生产应用没有这些入口。
 
-## 本次证据（2026-10-27）
+## 修复后证据（2026-10-27）
 
-- [单轮分类：32/32](../reports/ch06-intent-20261027-run1/report.md)
-- [多轮对话：29/29](../reports/ch06-dialogue-20261027-run3/report.md)
-- [理解与扩写：12/12](../reports/ch06-understanding-20261027-run3/report.md)
-- [最终真实流程记录](../reports/ch06-live-20261027-run3/summary.json)
-- [浏览器11项核对](../reports/ch06-live-20261027-run3/browser-finish.json)：等待刷新、同轮/同气泡、防重复、回执刷新、旧卡片不复活及未知事件均通过。
-- [等待卡片截图](../reports/ch06-live-20261027-run3/browser-waiting.png)、[退款待处理截图](../reports/ch06-live-20261027-run3/browser-refund.png)、[旧帧释放后新回答截图](../reports/ch06-live-20261027-run3/browser-late-frame.png)。
-- [最终自行审查](superpowers/reviews/2026-10-27-ch06-final-self-review.md)，按用户要求未派代理。
+- [单轮分类：31/32，达到既定门槛](../reports/ch06-intent-20261027-merge-fix3/report.md)
+- [多轮对话：29/29](../reports/ch06-dialogue-20261027-merge-fix4/report.md)
+- [理解与扩写：12/12](../reports/ch06-understanding-20261027-merge-fix4/report.md)
+- [最终真实流程记录](../reports/ch06-live-20261027-merge-fix4/summary.json)
+- [浏览器13项核对](../reports/ch06-live-20261027-merge-fix4/browser-finish.json)：快递用途选单、原轮恢复、防重复、回执刷新、旧卡片不复活及未知事件均通过。
+- [等待卡片截图](../reports/ch06-live-20261027-merge-fix4/browser-waiting.png)、[退款待处理回执](../reports/ch06-live-20261027-merge-fix4/browser-receipt-visible.png)、[页面最终状态](../reports/ch06-live-20261027-merge-fix4/browser-final-state.txt)。
+- [修复后复审](superpowers/reviews/2026-10-27-ch06-merge-fix-review.md)，本次续接与复审按用户要求未派代理。
 
-最终相关后端回归 **620 passed**，前端 **71 passed**，显式选择MySQL标记的真实事务测试 **6 passed**。完整流程 **15/15**（包含浏览器一组11项核对），测试创建的6个会话、53条消息、2份退款申请均已按登记身份清理，五表计数恢复运行前基线，未改应用数据。验证日志保存在最终报告的 `verification/` 目录。
+修复后全量默认后端回归 **1656 passed、44 skipped、31 deselected**，全部前端 **109 passed**，显式选择MySQL标记的真实事务测试 **6 passed**。完整流程 **15/15**（包含浏览器一组13项核对），测试创建的6个会话、50条消息、2份退款申请均已按登记身份清理，五表计数恢复运行前基线，未改应用数据。验证日志保存在 `reports/ch06-live-20261027-merge-fix4/verification/`。
 
 ```bash
 export PYTEST_DEBUG_TEMPROOT=D:/AI/my_AI_project/MEWHELP/.superpowers/sdd/2026-10-27-ch06-router/pytest-temp-root
-uv run pytest -q tests/workflow tests/rag/test_query_rewrite.py tests/rag/test_retrieval.py tests/test_order_ownership.py tests/test_chat_api.py tests/test_multi_tool_chat.py
-node --test tests/frontend/chat-api.test.mjs tests/frontend/actions.test.mjs
+uv run --no-sync --offline pytest -q
+node --test tests/frontend/*.test.mjs
 uv run pytest -q -m mysql tests/integration/test_ch06_actions.py
 ```
 
-早期失败报告保留在对应 run1/run2 目录。修复包括：明确排除旧编号时只保留新候选、追问同时补足对象与业务、屏蔽助手独自编出的编号、验收器接受同义表达及正确读取理解标记。三套最终输出已逐条复核，不仅依赖词表。
+早期失败报告保留在对应 run1/run2 与 merge-fix1/2/3 目录。修复包括：排除金额日期和物流用途、限定退款政策来源、同步评估历史、把完整问题传给业务决策和回答、核心适用性三条扩写、按最近相关轮处理简短追问。原冻结答案未改；[源码指纹核对](../reports/ch06-live-20261027-merge-fix4/source-binding.json)说明每套证据与最终实现的对应关系。
 
-每份分类报告均有“错判样本的 confidence 分布”；解析回退的零分单列。本次最终无错判样本，不能据此声称 confidence 已校准，也未启用模型升级。
+每份分类报告均有“错判样本的 confidence 分布”；解析回退的零分单列。单轮I12把“分期付款渠道”误判为订单，confidence=0.95；31/32达到≥95%的原定门槛，但仍保留该错判。多轮29/29和理解专项12/12通过，不代表 confidence 已校准，也未启用模型升级。
 
 代码保留在本地 `codex/ch06-router` 分支，尚未合并、推送或部署。自审另记录一个非阻断显示细节：个别模型回答会生成非数字引用标签，可后续统一；本次不将其计作政策来源。

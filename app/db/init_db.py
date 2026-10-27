@@ -30,9 +30,9 @@ async def initialize_database(test: bool = False, *, reset: bool = False) -> Non
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="显式创建四张表并补充演示数据")
+    parser = argparse.ArgumentParser(description="显式创建五张业务表并补充演示数据，不包含质量台账")
     parser.add_argument("--test", action="store_true", help="仅初始化 mewhelp_test")
     parser.add_argument("--reset", action="store_true", help="仅在 --test 下重建测试表；请先停止测试库服务")
     arguments = parser.parse_args()
     asyncio.run(initialize_database(arguments.test, reset=arguments.reset))
-    print("四张表和演示数据初始化完成。")
+    print("五张业务表和演示数据初始化完成。")

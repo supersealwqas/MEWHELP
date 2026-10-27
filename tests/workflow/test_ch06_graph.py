@@ -27,6 +27,32 @@ def order_result(order_id="1001"):
     return ToolResult.success({"order_id": order_id, "product": "猫粮", "status": "已签收", "created_at": "2026-01-01"})
 
 
+@pytest.mark.parametrize("stage", ["decide", "answer"])
+async def test_business_followup_uses_resolved_question_after_history_trim(tmp_path, stage):
+    """理解后的完整问题必须到达业务模型，即使旧历史被整轮裁剪，原始输入仍保留。
+
+    参数：tmp_path独立检查点；stage检查决策或回答入口。
+    返回：None；异常：断言失败。
+    """
+    from app.schemas.workflow import AgentDecision
+    resolved = "订单1002的包裹运输到哪里了？"
+    understood = UnderstandingResult(resolved_query=resolved, standard_query="订单1002物流进度",
+                                     needs_resolution=True, order_id="1002")
+    deps = dependencies(intents=["物流"], understandings=[understood],
+                        decisions=[AgentDecision(kind="clarify")], answers=[["已明确查询订单1002的物流。"]])
+    initial = owned_turn("它呢？")
+    initial["history_turns"] = [{"turn_id": "old", "turn_status": "completed", "messages": [
+        {"role": "user", "content": "查询订单1002的物流。" + "旧内容" * 12000},
+        {"role": "assistant", "content": "包裹运输中。"}]}]
+    async with workflow_runtime(deps, tmp_path / "resolved-business.sqlite") as graph:
+        state = await graph.ainvoke(initial, {"configurable": {"thread_id": "test"}})
+    observed = next(row for row in deps.model.inputs if row["stage"] == stage)
+    assert [message["content"] for message in observed["messages"] if message["role"] == "user"] == [resolved]
+    assert state["raw_query"] == state["context"]["user_message"] == "它呢？"
+    assert state["messages"][0] == {"role": "user", "content": "它呢？"}
+    assert [row["stage"] for row in deps.model.inputs] == ["understand", "classify", "decide", "answer"]
+
+
 @pytest.mark.parametrize("intent", ["退款退货", "售后"])
 async def test_order_precedes_policy_and_answer_without_agent_decision(tmp_path, intent):
     """政策必须先核实订单且直接回答。参数：tmp_path隔离目录、intent政策类；返回：None；异常：断言失败。"""
@@ -46,6 +72,17 @@ async def test_order_precedes_policy_and_answer_without_agent_decision(tmp_path,
     ("我要退货", None), ("订单9999退款", "9999"), ("订单2003退款", "2003"),
     ("SF213502378238退款", "213502378238"), ("213502378238退款", "213502378238"),
     ("快递单号1001退款", "1001"), ("运单号1001退款", "1001"),
+    ("退款金额是1001元，想问能不能退", None),
+    ("退款金额是1001元，想问能不能退", "1001"),
+    ("1001是快递单号，我想退货", None),
+    ("1001是快递单号，我想退货", "1001"),
+    ("1001是我的快递单号，我想退货", None),
+    ("1001是我的快递单号，我想退货", "1001"),
+    ("1001是本次退货的物流单号，我想退货", None),
+    ("1001（我的快递单号）对应的东西想退", None),
+    ("1001是实际支付金额，我想退款", None),
+    ("运单号是1001，我想退款", "1001"),
+    ("我在1001年买的，想退货", None),
     ("订单1001和1002退款", "1001"), ("A-1001退款", "1001"),
 ])
 async def test_tracking_number_never_used_as_order_id(tmp_path, query, candidate):
@@ -59,6 +96,21 @@ async def test_tracking_number_never_used_as_order_id(tmp_path, query, candidate
     assert "2003" not in {row["order_id"] for row in action["orders"]}
     assert not deps.executor.calls and not deps.chat.calls and not deps.search.calls
     assert [row["stage"] for row in deps.model.inputs] == ["understand", "classify"]
+
+
+@pytest.mark.parametrize("query", ["1001退款", "订单1001能退吗", "订单1001实付1002元，能退吗",
+                                  "订单1001是我买的，运费1002元，能退吗"])
+async def test_explicit_order_with_non_order_numbers_can_be_queried(tmp_path, query):
+    """排除金额不能误伤明确订单，金额也不能制造多订单歧义。
+
+    参数：tmp_path隔离保存器；query含明确订单与可选金额。
+    返回：None；异常：断言失败。
+    """
+    deps = dependencies(intents=["退款退货"], results=[order_result()], ranked=[ranked()], answers=[["请核实签收时间。"]])
+    async with workflow_runtime(deps, tmp_path / "explicit.sqlite") as graph:
+        state = await graph.ainvoke(owned_turn(query), {"configurable": {"thread_id": "test"}})
+    assert "__interrupt__" not in state
+    assert state["order_id"] == "1001" and deps.executor.calls[0]["args"] == {"order_id": "1001"}
 
 
 async def test_selection_resume_keeps_turn_and_budget_and_rechecks_owner(tmp_path):
@@ -132,3 +184,40 @@ async def test_policy_answer_uses_current_facts_without_old_assistant_claims(tmp
     assert "肯定已批准退款" not in answer_input and "低分政策" not in answer_input
     assert "created_at" in answer_input and "签收" in answer_input and "原因" in answer_input
     assert state["evidence"] == [] and deps.chat.finished[0]["low_confidence"] is None
+
+
+@pytest.mark.parametrize("intent", ["退款退货", "售后"])
+@pytest.mark.parametrize("scope_case", ["mixed", "empty", "ignored"])
+async def test_order_policy_enforces_document_scope(tmp_path, intent, scope_case):
+    """实际根图和检索编排必须过滤非政策来源，空范围不放宽，索引越界时报错。
+
+    参数：tmp_path独立保存器；intent订单政策意图；scope_case混合语料/空范围/索引忽略过滤。
+    返回：None；异常：断言失败。
+    """
+    from app.knowledge.retrieval import HybridKnowledgeSearch
+    from app.knowledge.search import KnowledgeSearchUnavailable
+    from tests.knowledge.fakes import FakeEncoder, MemoryKnowledgeStore, make_settings
+    from tests.rag.test_online_filters import FilterIndex
+    from tests.rag.test_retrieval import _chunk, RerankBoundary
+
+    sources = ["doc:returns-policy.md", "doc:after-sales-manual.md", "doc:billing-shipping.md", "doc:member-benefits.md"]
+    allowed = [_chunk(index).model_copy(update={"source_key": source}) for index, source in enumerate(sources, 1)]
+    outside = _chunk(5).model_copy(update={"source_key": "doc:product-specs.md", "content_type": "manual"})
+    chunks = [outside] if scope_case == "empty" else [*allowed, outside]
+    index = FilterIndex(chunks, ignore_filter=scope_case == "ignored")
+    search = HybridKnowledgeSearch(MemoryKnowledgeStore(snapshots=chunks), FakeEncoder(),
+                                   index, RerankBoundary({5: 0.99}), make_settings())
+    deps = dependencies(intents=[intent], results=[order_result()], answers=[["需核对适用条件。"]])
+    deps.search = search
+    async with workflow_runtime(deps, tmp_path / "policy-scope.sqlite") as graph:
+        if scope_case == "ignored":
+            with pytest.raises(KnowledgeSearchUnavailable, match="范围"):
+                await graph.ainvoke(owned_turn("订单1001能退吗"), {"configurable": {"thread_id": "test"}})
+            assert not deps.chat.finished
+            return
+        state = await graph.ainvoke(owned_turn("订单1001能退吗"), {"configurable": {"thread_id": "test"}})
+    if scope_case == "empty":
+        assert state["evidence"] == [] and index.calls == []
+    else:
+        assert {item["source_key"] for item in state["evidence"]} == set(sources)
+        assert index.filters == [[1, 2, 3, 4]]

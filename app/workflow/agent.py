@@ -69,6 +69,18 @@ def _signature(call: dict) -> str:
     return json.dumps([call["name"], args], sort_keys=True, ensure_ascii=False, allow_nan=False)
 
 
+def resolved_agent_messages(state: ConversationState) -> list[dict]:
+    """给业务决策和回答传完整任务，同时保留原State中的用户原话和工具配对。
+
+    参数：state含已校验resolved_query及本轮消息，第一条为当前用户输入。
+    返回：仅在模型输入副本中替换本轮用户消息的列表；历史和工具结果不改。
+    异常：KeyError，State缺少必需字段。
+    """
+    # 不把完整问写回消息审计；下游继续接收同一组完整工具事实。
+    return [{**message, "content": state["resolved_query"]} if index == 0 and message["role"] == "user" else message
+            for index, message in enumerate(state["messages"])]
+
+
 def policy_answer_messages(state: ConversationState) -> list[dict]:
     """构造本轮受限政策事实，历史助手推断不得参与回答。
 
@@ -98,7 +110,8 @@ def build_agent_graph(deps: "WorkflowDependencies"):
         try:
             tools = registry.all()
             # 结束决策也使用工具协议；历史裁剪须计入与模型实际绑定一致的完整定义。
-            messages = model_messages(state, deps.settings, DECISION_PROMPT, decision_tool_schemas(tools))
+            current = {**state, "messages": resolved_agent_messages(state)}
+            messages = model_messages(current, deps.settings, DECISION_PROMPT, decision_tool_schemas(tools))
             # 先检查最少的调用/输出余量；适配器还按完整输入执行精确保守占额检查。
             ledger.ensure_capacity([("decide", 0, 2048), ("answer", 0, 4096), ("answer", 0, 4096)])
             selected = await deps.model.decide(messages, tools, ledger)
@@ -185,7 +198,7 @@ def build_agent_graph(deps: "WorkflowDependencies"):
             action_text = ("本轮回复后可用按钮的操作说明如下：\n" +
                            "\n".join(instructions[kind] for kind in state["suggested_kinds"])) if state["suggested_kinds"] else "本轮回复后没有可操作的按钮，请按已有事实回答或追问。"
             # 正文模型只需要中文按钮语义；不传内部字段、枚举、身份或动作ID。完整说明仍先过原预算。
-            answer_state = {**state, "messages": [*state["messages"],
+            answer_state = {**state, "messages": [*resolved_agent_messages(state),
                 {"role": "system", "content": action_text}]}
             if state.get("route") == "order_policy":
                 answer_state = {**state, "history_turns": [], "messages": policy_answer_messages(state)}

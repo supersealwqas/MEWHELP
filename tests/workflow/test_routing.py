@@ -200,3 +200,16 @@ def test_routes_ignore_legacy_checkpoint_knowledge_query(query):
 
     assert route_by_intent({"intent": "订单", "knowledge_query": query}) == "business"
     assert route_by_intent({"intent": "商品咨询", "knowledge_query": query}) == "knowledge"
+
+
+@pytest.mark.parametrize("raw", ["金额1001", "1001元退款", "1001是物流单号", "2026年买的", "价格￥1001.50",
+                                 "1001是我的快递单号", "1001（我的快递单号）"])
+def test_non_order_numbers_cannot_become_current_or_historical_order(raw):
+    """用途排除同时保护本轮查询和下轮可信对象。
+
+    参数：raw含金额、日期或物流用途的数字；返回：None；异常：断言失败。
+    """
+    from app.workflow.routing import order_candidate, _trusted_history
+    orders = [{"order_id": "1001"}, {"order_id": "2026"}]
+    assert order_candidate({"raw_query": raw, "order_id": None}, orders) is None
+    assert _trusted_history([{"messages": [{"role": "user", "content": raw}]}])[1] == set()

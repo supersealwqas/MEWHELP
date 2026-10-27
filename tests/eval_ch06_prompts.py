@@ -72,6 +72,22 @@ def history_messages(history: list[dict]) -> list[dict]:
     return messages
 
 
+def evaluation_messages(history: list[dict], query: str, config, prompt: str, tools: list) -> list[dict]:
+    """复用线上整轮组装和预算裁剪，评估不另造分类消息路径。
+
+    参数：history已剔除标注的标准历史消息；query当前原问或完整问；config本次配置；prompt/tools阶段协议。
+    返回：与根图同规则的SDK消息；异常：历史校验错误或当前输入超预算。
+    """
+    from app.workflow.agent import model_messages
+    turns = []
+    for message in history:
+        if message["role"] == "user" or not turns:
+            turns.append({"turn_id": f"evaluation-{len(turns)}", "turn_status": "completed", "messages": []})
+        turns[-1]["messages"].append(message)
+    return model_messages({"history_turns": turns, "messages": [{"role": "user", "content": query}]},
+                          config, prompt, tools)
+
+
 def inspect_understanding(query: str, expected: dict, result: dict) -> list[str]:
     """核对显式语义边界；不将词表检查冒充全部语义审查。参数：原问/标注/预测；返回：失败项；异常：无。"""
     failures = []
@@ -115,9 +131,14 @@ def raw_result(records: list[dict], stage: str):
 async def evaluate_case(case: dict, history: list[dict], factory) -> dict:
     """使用真实适配器运行一个标注；expected始终留在判定侧。参数：标注/输入历史/模型工厂；返回：证据；异常：文件错误。"""
     from app.core.model_budget import BudgetLedger
-    from app.workflow.model import WorkflowModelAdapter
+    from app.config import settings
+    from app.workflow.model import WorkflowModelAdapter, understanding_tool_schema, intent_tool_schema
+    from app.workflow.prompts import UNDERSTANDING_PROMPT, INTENT_PROMPT
     from app.knowledge.query_rewrite import QueryExpander
-    ledger, records = BudgetLedger(), []
+    ledger = BudgetLedger(max_model_calls=settings.workflow_max_model_calls,
+        total_token_budget=settings.workflow_total_token_budget, max_decisions=settings.workflow_max_decisions,
+        request_token_budget=settings.request_token_budget)
+    records = []
 
     def record_factory(**options):
         """为本例绑定透明记录。参数：模型选项；返回：包装；异常：模型配置错误。"""
@@ -140,14 +161,16 @@ async def evaluate_case(case: dict, history: list[dict], factory) -> dict:
                 row["failures"].append("invented_numbers")
         else:
             adapter = WorkflowModelAdapter(model_factory=record_factory)
-            # 分类仅消费本轮完整问，与根图接口一致；历史只交给一次理解阶段。
+            # 与根图一致：理解读取原问，分类读取完整问，两阶段均独立组装和裁剪历史。
             understood = None
             if "expected" in case:
-                understood = await adapter.understand([*history, {"role":"user", "content":case["query"]}], ledger)
+                understood = await adapter.understand(evaluation_messages(history, case["query"], settings,
+                    UNDERSTANDING_PROMPT, [understanding_tool_schema()]), ledger)
                 row["understanding"] = understood.model_dump(mode="json")
                 row["raw_understanding"] = raw_result(records, "understand")
                 row["failures"].extend(inspect_understanding(case["query"], expected, row["understanding"]))
-            intent = await adapter.classify([{"role":"user", "content":understood.resolved_query if understood else case["query"]}], ledger)
+            intent = await adapter.classify(evaluation_messages(history,
+                understood.resolved_query if understood else case["query"], settings, INTENT_PROMPT, [intent_tool_schema()]), ledger)
             original = raw_result(records, "classify")
             row.update(predicted_intent=intent.intent, confidence=intent.confidence,
                 raw_classification=original, raw_classification_valid=original is not None, intent_correct=intent.intent == expected["intent"])
@@ -175,7 +198,9 @@ async def evaluate(args) -> int:
         raise ValueError("CH06评估固定gemini-3.5-flash-lite")
     cases, fingerprint = load_cases(args.suite)
     args.report_dir.mkdir(parents=True, exist_ok=False)
-    source_files = [ROOT / "app/workflow/prompts.py", ROOT / "app/workflow/routing.py", ROOT / "app/knowledge/query_rewrite.py"]
+    source_files = [ROOT / name for name in ("app/workflow/prompts.py", "app/workflow/routing.py", "app/knowledge/query_rewrite.py",
+        "app/workflow/agent.py", "app/workflow/graph.py", "app/workflow/model.py", "app/core/memory.py",
+        "app/schemas/history.py", "tests/eval_ch06_prompts.py")]
     summary = {"suite":args.suite,"real_model":True,"model":settings.chat_model,"case_sha256":fingerprint,
         "started_at":datetime.now(timezone.utc).isoformat(), "source_sha256":{p.relative_to(ROOT).as_posix():hashlib.sha256(p.read_bytes()).hexdigest() for p in source_files}}
     write_json(args.report_dir / "frozen-cases.json", cases)

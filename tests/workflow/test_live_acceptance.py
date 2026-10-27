@@ -7,6 +7,31 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+from tests.workflow.test_model import sdk_runtime, understanding_response, intent_response
+
+
+@pytest.mark.parametrize("large_old_turn", [False, True])
+async def test_prompt_evaluation_preserves_recent_history_and_trims_whole_turns(sdk_runtime, large_old_turn):
+    """真实SDK发包必须保留近期分类历史，并按线上预算整轮裁剪旧历史。
+
+    参数：sdk_runtime仅替换外部HTTP；large_old_turn是否添加超预算旧轮。
+    返回：None；异常：断言失败。
+    """
+    from tests.eval_ch06_prompts import evaluate_case
+    recent = [{"role": "user", "content": "我想投诉你们的服务"},
+              {"role": "assistant", "content": "抱歉给您带来不好的体验。"}]
+    history = ([{"role": "user", "content": "旧话" * 12000},
+                {"role": "assistant", "content": "旧回复"}] if large_old_turn else []) + recent
+    query = "运费怎么算"
+    sdk_runtime.responses.extend([understanding_response(query), intent_response("商品咨询")])
+    row = await evaluate_case({"id": "history-contract", "query": query,
+                               "expected": {"intent": "商品咨询", "order_id": None, "preserve_raw": True}},
+                              history, sdk_runtime.factory)
+    assert row["correct"], (row["failures"], row["error_type"])
+    expected_messages = [*recent, {"role": "user", "content": query}]
+    assert len(sdk_runtime.requests) == 2
+    assert sdk_runtime.requests[0]["messages"][1:] == expected_messages
+    assert sdk_runtime.requests[1]["messages"][1:] == expected_messages
 
 
 @pytest.mark.asyncio
@@ -92,6 +117,23 @@ def test_live_judge_reads_resolution_flag_from_model_evidence():
     assert judge(row,{"query":"它呢","expected":{"intent":"物流","needs_resolution":True,"order_id":"1001"}})["failures"] == []
 
 
+@pytest.mark.parametrize("current", ["它呢？", "订单1002的物流进度"])
+def test_live_judge_checks_resolved_question_reaches_business_models(current):
+    """意图正确不足以通过，业务决策和回答实际输入必须携带完整问题。
+
+    参数：current模拟真实模型输入中的本轮用户消息；返回：None；异常：断言失败。
+    """
+    from tests.verify_ch06_live import judge
+    resolved = "订单1002的物流进度"
+    row = {"state": {"raw_query": "它呢？", "resolved_query": resolved, "standard_query": resolved,
+        "intent": "物流", "route": "business", "order_id": "1002", "completion_metadata": {"status": "completed"}},
+        "events": [{"event": "answer_metadata"}, {"event": "done"}], "failures": [], "http_status": 200,
+        "models": [{"stage": stage, "inputs": [{"type": "human", "content": current}]} for stage in ("decide", "answer")],
+        "active_model_streams": 0, "active_graph_nodes": 0}
+    failures = judge(row, {"query": "它呢？", "expected": {"intent": "物流", "order_id": "1002"}})["failures"]
+    assert ("business_resolved_query_not_consumed" in failures) == (current != resolved)
+
+
 def test_explicit_excluded_order_is_not_ambiguous():
     """明确排除旧号后当前和下一轮均只选择新号；真正并列仍不得任选。参数：无；返回：None；异常：断言失败。"""
     from app.schemas.workflow import UnderstandingResult
@@ -106,6 +148,23 @@ def test_explicit_excluded_order_is_not_ambiguous():
     assert not fallback and validated.order_id == "1002"
     ambiguous = "订单1001和1002，其中一笔想退货。"
     assert order_candidate({"raw_query":ambiguous,"order_id":"1002"},[{"order_id":"1001"},{"order_id":"1002"}]) is None
+
+
+@pytest.mark.parametrize("expected_count,actual_count", [(3, 1), (3, 3), (1, 1), (1, 3)])
+def test_live_judge_enforces_core_and_faq_query_counts(expected_count, actual_count):
+    """核心适用性三查询与单事实FAQ单查询必须进入真实验收门禁。
+
+    参数：expected_count标注条数；actual_count真实扩写条数；返回：None；异常：断言失败。
+    """
+    from tests.verify_ch06_live import judge
+    row = {"state": {"raw_query": "能退吗", "resolved_query": "能退吗", "standard_query": "能退吗",
+        "intent": "退款退货", "route": "order_policy", "expanded_queries": [f"侧重点{i}" for i in range(actual_count)],
+        "completion_metadata": {"status": "completed"}},
+        "events": [{"event": "answer_metadata"}, {"event": "done"}], "failures": [], "http_status": 200,
+        "nodes": ["fetch_order", "retrieve_policy", "main_agent"], "models": [],
+        "active_model_streams": 0, "active_graph_nodes": 0}
+    failures = judge(row, {"query": "能退吗", "expected": {"intent": "退款退货", "query_count": expected_count}})["failures"]
+    assert ("policy_query_count" in failures) == (actual_count != expected_count)
 
 
 def test_agent_cli_refuses_without_test_before_loading_env(tmp_path):

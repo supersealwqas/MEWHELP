@@ -5,26 +5,43 @@ import pytest
 from fastapi.testclient import TestClient
 
 
-def test_lifespan_recovery_failure_blocks_startup(monkeypatch):
-    """恢复失败不能接受聊天，仍须释放连接。参数：替换器；返回：None；异常：断言失败。"""
+def test_lifespan_recovery_failure_blocks_startup(monkeypatch, tmp_path, offline_settings):
+    """新对账路径读取失败不能接受聊天，仍关闭保存器及外部资源。参数：替换器/隔离目录/配置；返回：None；异常：断言失败。"""
     from app import main
     from app.repositories.chat import ChatRepository
     disposed = []
     class Engine:
         """记录资源生命周期的外部边界。"""
+        url = "mysql+asyncmy://test/isolated"
+
+        def __init__(self, name):
+            """标记被关闭的资源。参数：name测试资源名；返回：None；异常：无。"""
+            self.name = name
+
         async def dispose(self):
             """记录关闭。参数：无；返回：None；异常：无。"""
-            disposed.append(True)
+            disposed.append(self.name)
     async def broken_recovery(self):
         """模拟恢复事务不可用。参数：仓库自身；返回：不返回；异常：ConnectionError。"""
         raise ConnectionError("recovery unavailable")
-    monkeypatch.setattr(main, "create_database", lambda: (Engine(), None), raising=False)
-    monkeypatch.setattr(ChatRepository, "recover_interrupted_turns", broken_recovery)
+    @asynccontextmanager
+    async def search(config, store):
+        """替换模型/索引外部资源，保留真实启动与检查点。参数：配置/仓储；返回：占位资源；异常：原启动错误。"""
+        try:
+            yield object()
+        finally:
+            disposed.append("search")
+
+    offline_settings.workflow_checkpoint_path = str(tmp_path / "startup.sqlite")
+    monkeypatch.setattr(main, "create_database", lambda: (Engine("business"), None))
+    monkeypatch.setattr(main, "create_async_engine", lambda *args, **kwargs: Engine("lease"))
+    monkeypatch.setattr(main, "online_search_runtime", search)
+    monkeypatch.setattr(ChatRepository, "list_pending_workflow_turns", broken_recovery)
     app = main.create_app(runtime_factory=main.database_runtime)
     with pytest.raises(ConnectionError):
         with TestClient(app):
             pytest.fail("恢复失败后不应进入服务状态")
-    assert disposed == [True] and not hasattr(app.state, "chat_service")
+    assert disposed == ["search", "lease", "business"] and not hasattr(app.state, "chat_service")
 
 
 def test_runtime_available_only_within_lifespan():

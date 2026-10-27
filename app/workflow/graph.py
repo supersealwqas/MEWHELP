@@ -29,6 +29,9 @@ from app.workflow.state import ConversationState
 from app.workflow.stages import publish_stage
 
 logger = logging.getLogger(__name__)
+# 订单适用性只采用正式退换货/售后政策及其引用的运费、会员规则；商品规格不进入此分支。
+ORDER_POLICY_SOURCES = ("doc:returns-policy.md", "doc:after-sales-manual.md",
+                        "doc:billing-shipping.md", "doc:member-benefits.md")
 
 
 def _pooled_low_confidence(state: ConversationState):
@@ -150,10 +153,12 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
                     publish_stage(state, "expand", "completed", queries=expanded.queries)
                     prepared_queries = expanded.queries
                     retrieve = deps.search.retrieve_policy
+                    options = {"filters": {"source_key": list(ORDER_POLICY_SOURCES)}}
                 else:
                     query, prepared_queries, retrieve = state["resolved_query"], [state["standard_query"]], deps.search.retrieve
+                    options = {}
                 publish_stage(state, "policy", "running")
-                ranked = await retrieve(query, prepared_queries=prepared_queries, budget=ledger, history="")
+                ranked = await retrieve(query, prepared_queries=prepared_queries, budget=ledger, history="", **options)
         except WorkflowBudgetExceeded:
             return stopped_state("budget_exceeded", ledger)
         citations = citations_from_ranked(ranked)
