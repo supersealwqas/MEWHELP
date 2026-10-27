@@ -34,6 +34,7 @@
               <p class="assistant-subtitle"><span class="status-dot" aria-hidden="true"></span>你的喵购商城智能助手</p>
             </div>
           </div>
+          <button class="button button-secondary" id="refresh-status" type="button">核实处理状态</button>
           <button class="button button-secondary" id="new-chat" type="button" title="使用新的会话编号重新开始，不删除服务端旧历史">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
             新会话
@@ -88,7 +89,7 @@
 
       <footer class="page-footer">
         <span class="session-label">当前会话 <code id="session-id" title="同一页面内的连续提问使用同一个 session_id"></code></span>
-        <span>刷新或新建会话会重新开始；聊天记录与工单会保存在服务端。</span>
+        <span>刷新可恢复本会话的处理状态；点击新会话可重新开始。</span>
       </footer>
     </div>
     <noscript><p class="noscript">聊天页面需要启用 JavaScript；也可以通过 <a href="/docs">接口文档</a>测试后端。</p></noscript>

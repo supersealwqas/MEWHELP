@@ -1,7 +1,159 @@
 /** 完成回复的独立建议按钮：转人工只显示固定话术，建单须经原生弹窗明确确认。 */
-import { confirmTicket, validateSuggestedActions } from "./chat-api.mjs";
+import { confirmTicket, validateSuggestedActions, validateOrderSelection, validateRefundAction,
+  getRefundReasons, submitRefund, getCurrentActions } from "./chat-api.mjs";
 
 const attached = new WeakSet();
+const refundAttached = new WeakSet();
+
+/** 创建纯文本DOM；参数为文档/标签/文本/类名；返回元素；异常：DOM错误。 */
+function textNode(doc, tag, text = "", className = "") {
+  const node = doc.createElement(tag);
+  node.textContent = text;
+  node.className = className;
+  return node;
+}
+
+/** 绑定本人订单选择，回调始终使用冻结身份；参数为容器/身份/卡片/续跑选项；返回禁用控制器；异常：非法快照。 */
+export function attachOrderSelection(container, identity, payload, { onSelect, acceptedOrderId = null, resumeRequired = false } = {}) {
+  const action = validateOrderSelection(payload);
+  const frozenIdentity = Object.freeze({ ...identity });
+  const doc = container.ownerDocument;
+  const card = textNode(doc, "section", "", "order-selection");
+  card.dataset.actionId = action.action_id;
+  card.dataset.sourceTurnId = action.source_turn_id;
+  card.setAttribute("aria-label", "选择本次处理的订单");
+  const title = textNode(doc, "h3", acceptedOrderId ? `已选择订单 ${acceptedOrderId}` : "请选择要处理的订单");
+  const note = textNode(doc, "p", resumeRequired ? "订单已确认，可以继续原来的处理。" : "只显示当前账号的订单。", "action-note");
+  note.setAttribute("role", "status");
+  const choices = textNode(doc, "div", "", "order-options");
+  card.append(title, choices, note);
+  const buttons = [];
+  let disabled = false;
+
+  /** 冻结当前卡片，防止连续点选或新问后旧卡复活；参数为提示；返回void；异常：无。 */
+  function disable(message) {
+    disabled = true;
+    for (const button of buttons) button.disabled = true;
+    if (message) note.textContent = message;
+  }
+
+  for (const order of action.orders.filter((order) => !acceptedOrderId || order.order_id === acceptedOrderId)) {
+    const button = textNode(doc, "button", resumeRequired ? "继续处理" :
+      `${order.product_name} · 订单 ${order.order_id} · ${order.status}`, "button button-secondary order-option");
+    button.type = "button";
+    button.disabled = Boolean(acceptedOrderId && !resumeRequired);
+    buttons.push(button);
+    choices.append(button);
+    button.addEventListener("click", async () => {
+      if (disabled || button.disabled) return;
+      disable("已选择，正在继续处理…");
+      try { await onSelect(frozenIdentity, action, order.order_id); }
+      catch (error) { note.textContent = error.message || "暂时无法继续，请核实当前处理状态。"; }
+    });
+  }
+  container.append(card);
+  return { disable, element: card };
+}
+
+/** 给已完成退款原轮附加原因表单；参数为容器/元数据/网络与忙碌回调；返回void；异常：非法快照。 */
+export function attachRefundAction(container, metadata, { fetchImpl = globalThis.fetch, onBusy = () => {}, receipt = null } = {}) {
+  const action = validateRefundAction(metadata.refund_action, metadata.turn_id);
+  if (!action || refundAttached.has(container)) return;
+  if (metadata.status !== "completed") throw new Error("退款申请必须来源于已完成答复。");
+  const identity = Object.freeze({ session_id: metadata.session_id, user_id: metadata.user_id ?? "demo-user" });
+  const doc = container.ownerDocument;
+  const card = textNode(doc, "section", "", "refund-action");
+  card.dataset.actionId = action.action_id;
+  card.append(textNode(doc, "h3", `订单 ${action.order_id} · 退款申请`),
+    textNode(doc, "p", "提交后将保存为待处理，不代表退款已批准或到账。", "action-note"));
+  const form = textNode(doc, "form", "", "refund-form");
+  const label = textNode(doc, "label", "退款原因");
+  const select = doc.createElement("select");
+  select.required = true;
+  select.disabled = true;
+  select.setAttribute("aria-label", "退款原因");
+  label.append(select);
+  const button = textNode(doc, "button", "正在加载原因…", "button button-primary action-button");
+  button.type = "submit";
+  button.disabled = true;
+  const note = textNode(doc, "p", "", "action-note");
+  note.setAttribute("role", "status");
+  form.append(label, button);
+  card.append(form, note);
+  container.append(card);
+  refundAttached.add(container);
+  let state = "loading";
+  let frozenRequest = null;
+
+  /** 显示真实待处理回执；参数为已校验回执；返回void；异常：无。 */
+  function showReceipt(value) {
+    if (value.action_id !== action.action_id || value.order_id !== action.order_id || value.status !== "待处理" || !/^RF[0-9A-F]{32}$/.test(value.refund_no)) {
+      throw new Error("申请回执与原订单不一致。");
+    }
+    state = "completed";
+    select.disabled = button.disabled = true;
+    button.textContent = "申请已提交";
+    note.textContent = `申请编号 ${value.refund_no} · 待处理`;
+  }
+
+  /** 原因仅从服务端读取，失败后允许重新读取；参数无；返回Promise；异常在本卡片显示。 */
+  async function loadReasons() {
+    try {
+      const reasons = await getRefundReasons(fetchImpl);
+      const placeholder = textNode(doc, "option", "请选择退款原因");
+      placeholder.value = "";
+      select.append(placeholder);
+      for (const reason of reasons) {
+        const option = textNode(doc, "option", reason.label);
+        option.value = reason.code;
+        select.append(option);
+      }
+      state = "ready";
+      select.disabled = false;
+      button.disabled = false;
+      button.textContent = "确认提交申请";
+    } catch (error) {
+      state = "load_failed";
+      button.disabled = false;
+      button.textContent = "重新加载原因";
+      note.textContent = error.message;
+    }
+  }
+  if (receipt) showReceipt(receipt);
+  else void loadReasons();
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (state === "load_failed") { state = "loading"; button.disabled = true; await loadReasons(); return; }
+    if (!["ready", "unknown"].includes(state) || (!frozenRequest && !select.value)) return;
+    const previouslyUnknown = state === "unknown";
+    frozenRequest ??= Object.freeze({ ...identity, action_id: action.action_id, source_turn_id: action.source_turn_id,
+      reason_code: select.value, confirmed: true });
+    state = "submitting";
+    select.disabled = button.disabled = true;
+    button.textContent = "正在提交…";
+    onBusy(true);
+    try {
+      showReceipt(await submitRefund(frozenRequest, fetchImpl));
+    } catch (error) {
+      let current = null;
+      if (error.outcome === "unknown" || previouslyUnknown) {
+        try { current = await getCurrentActions(identity, fetchImpl); } catch { /* 保留原键核实。 */ }
+      }
+      if (current?.refund_receipt?.action_id === action.action_id) showReceipt(current.refund_receipt);
+      else {
+        state = error.outcome === "unknown" || previouslyUnknown ? "unknown" : "ready";
+        note.textContent = error.message;
+        button.textContent = state === "unknown" ? "核实原申请" : "确认提交申请";
+        if (state === "ready") frozenRequest = null;
+      }
+    } finally {
+      button.disabled = state === "completed";
+      select.disabled = state !== "ready";
+      onBusy(false);
+    }
+  });
+}
 
 /**
  * 将已完成的合法建议绑定到原回复，快照不随新消息变化。

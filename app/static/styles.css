@@ -228,6 +228,17 @@ kbd { font: inherit; }
 .action-button { min-height: 44px; min-width: 44px; white-space: normal; }
 .action-button:focus-visible { outline: 2px solid #3c7758; outline-offset: 3px; }
 .action-note { font-size: 12px; line-height: 1.7; color: #566257; margin: 8px 0 0; overflow-wrap: anywhere; }
+.workflow-stage { font-size: 12px; line-height: 1.7; color: #426653; margin: 0 0 10px; overflow-wrap: anywhere; }
+.order-selection, .refund-action { margin-top: 14px; border: 1px solid #ceddcf; border-radius: 12px; padding: 16px; background: #f6faf5; }
+.order-selection h3, .refund-action h3 { margin: 0 0 10px; font-size: 15px; line-height: 1.5; overflow-wrap: anywhere; }
+.order-options { display: grid; gap: 8px; max-height: 320px; overflow-y: auto; }
+.order-option { min-height: 44px; justify-content: flex-start; text-align: left; white-space: normal; line-height: 1.6; }
+.refund-form { display: flex; gap: 12px; align-items: end; flex-wrap: wrap; margin-top: 14px; }
+.refund-form label { display: grid; gap: 6px; flex: 1 1 190px; font-size: 13px; }
+.refund-form select { min-height: 44px; width: 100%; border: 1px solid #b9cdbb; border-radius: 8px; padding: 8px; font: inherit; background: #fff; color: #27382e; }
+.refund-form select:focus-visible, .order-option:focus-visible { outline: 2px solid #3c7758; outline-offset: 3px; }
+.order-option:disabled { opacity: .6; cursor: default; }
+@media (max-width: 540px) { .chat-header { flex-wrap: wrap; gap: 10px; } .order-selection, .refund-action { padding: 12px; } .refund-form .action-button { width: 100%; } }
 .ticket-dialog { width: min(620px, calc(100vw - 32px)); }
 .ticket-form { display: flex; flex-direction: column; min-height: 0; }
 .ticket-question { white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px; border-radius: 10px; background: #f2f5ef; margin: 4px 0 14px; }

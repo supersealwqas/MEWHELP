@@ -1,11 +1,11 @@
 /**
  * MewHelp 聊天界面控制器：管理本页会话、消息气泡、逐字展示及请求状态。
- * 刷新或新建会话会换用新标识；页面不读取密钥、不保存本地聊天记录。
+ * 刷新保留本标签的会话标识并回读服务端动作；页面不读取密钥、不缓存聊天正文。
  */
-import { failurePresentation, streamChat } from "./chat-api.mjs";
+import { failurePresentation, streamWorkflowChat, resumeOrderSelection, getCurrentActions } from "./chat-api.mjs";
 import { renderMarkdown } from "./markdown.mjs";
 import { attachAnswerTools } from "./citations.mjs";
-import { attachSuggestedActions } from "./actions.mjs";
+import { attachSuggestedActions, attachOrderSelection, attachRefundAction } from "./actions.mjs";
 
 const ui = {
   form: document.querySelector("#chat-form"),
@@ -13,6 +13,7 @@ const ui = {
   send: document.querySelector("#send-button"),
   stop: document.querySelector("#stop-button"),
   newChat: document.querySelector("#new-chat"),
+  refreshStatus: document.querySelector("#refresh-status"),
   messages: document.querySelector("#messages"),
   conversation: document.querySelector("#conversation"),
   welcome: document.querySelector("#welcome"),
@@ -25,28 +26,44 @@ let activeController = null;
 let activeRenderer = null;
 let pendingActions = 0;
 let followOutput = true;
+let requestGeneration = 0;
+let activeReply = null;
+const replyByTurn = new Map();
+const orderCards = new Set();
+
+/** 冻结当前身份，异步回调不得读后来的会话；参数无；返回对象；异常无。 */
+function currentIdentity() { return Object.freeze({ session_id: sessionId, user_id: "demo-user" }); }
 
 /**
  * 创建新会话并清空页面，不调用后端删除接口。
  * @returns {void} 更新会话标识、空态和输入框。
  * @throws {Error} 浏览器不支持 Web Crypto 时可能抛出运行环境错误。
  */
-function newConversation() {
+function newConversation({ restore = false } = {}) {
   if (activeController || pendingActions) return;
+  requestGeneration += 1;
   // getRandomValues 兼容非 HTTPS 的局域网测试，不依赖 randomUUID 的安全上下文限制。
   const bytes = crypto.getRandomValues(new Uint8Array(16));
   let randomId = "";
   for (const byte of bytes) randomId += byte.toString(16).padStart(2, "0");
   sessionId = `web-${randomId}`;
+  try {
+    const stored = sessionStorage.getItem("mewhelp.session");
+    if (restore && /^web-[0-9a-f]{32}$/.test(stored ?? "")) sessionId = stored;
+    sessionStorage.setItem("mewhelp.session", sessionId);
+  } catch { /* 隐私模式禁用存储时仍可使用当前页面会话。 */ }
   ui.sessionId.textContent = sessionId.slice(4, 16);
   ui.sessionId.title = `session_id: ${sessionId}`;
   ui.messages.replaceChildren();
+  replyByTurn.clear();
+  orderCards.clear();
   ui.welcome.hidden = false;
   ui.feedback.hidden = true;
   ui.input.value = "";
   ui.status.textContent = "准备好了，开始聊聊吧";
   followOutput = true;
   updateSendState();
+  if (restore) void syncCurrent(null, requestGeneration);
 }
 
 /**
@@ -97,15 +114,21 @@ function appendMessage(role, text) {
   const content = document.createElement("div");
   content.className = role === "assistant" ? "message-content markdown-content" : "message-content";
   content.textContent = text;
-  bubble.append(tools, content);
+  const stage = document.createElement("p");
+  stage.className = "workflow-stage";
+  stage.hidden = true;
+  stage.setAttribute("aria-live", "polite");
+  bubble.append(stage, tools, content);
+  const actions = document.createElement("div");
+  actions.className = "answer-actions";
   const note = document.createElement("p");
   note.className = "message-note";
   note.hidden = true;
-  body.append(author, bubble, note);
+  body.append(author, bubble, actions, note);
   article.append(avatar, body);
   ui.messages.append(article);
   scrollToLatest();
-  return { article, bubble: content, tools, note };
+  return { article, bubble: content, tools, note, stage, actions };
 }
 
 /**
@@ -207,6 +230,7 @@ function updateSendState() {
 function setBusy(busy) {
   ui.input.readOnly = busy || pendingActions > 0;
   ui.newChat.disabled = busy || pendingActions > 0;
+  ui.refreshStatus.disabled = busy || pendingActions > 0;
   ui.stop.hidden = !busy;
   ui.form.setAttribute("aria-busy", String(busy || pendingActions > 0));
   updateSendState();
@@ -252,19 +276,98 @@ function updateToolBadge(badge, tool) {
  */
 async function sendMessage(event) {
   event.preventDefault();
-  const message = ui.input.value.trim();
-  if (activeController || pendingActions || !message) return;
+  const message = ui.input.value;
+  if (activeController || pendingActions || !message.trim()) return;
+  for (const card of orderCards) card.disable("已发出新问题，请以当前处理状态为准。");
   ui.welcome.hidden = true;
   ui.feedback.hidden = true;
   followOutput = true;
   appendMessage("user", message);
   const reply = appendMessage("assistant", "小喵正在思考…");
+  reply.originalMessage = message;
+  ui.input.value = "";
+  await runReply(reply, currentIdentity(), { message });
+}
+
+/** 完成后装配独立动作和引用；参数为原气泡/正文/保存快照/可选回执；返回void；异常：非法元数据。 */
+function presentCompleted(reply, answer, metadata, receipt = null) {
+  if (reply.completed) return;
+  reply.card?.disable("原轮处理已完成。");
+  reply.card?.element.remove();
+  reply.bubble.innerHTML = renderMarkdown(answer);
+  reply.note.hidden = true;
+  reply.completed = true;
+  attachAnswerTools(reply, answer, metadata);
+  const options = { appendMessage, onBusy: (busy) => {
+    pendingActions = Math.max(0, pendingActions + (busy ? 1 : -1));
+    setBusy(Boolean(activeController));
+  } };
+  attachSuggestedActions(reply.actions, metadata, options);
+  attachRefundAction(reply.actions, metadata, { ...options, receipt });
+}
+
+/** 装配原轮选单/继续按钮；参数为原气泡、冻结身份、动作及接受状态；返回void；异常：非法卡片。 */
+function presentSelection(reply, identity, action, acceptedOrderId = null, resumeRequired = false) {
+  reply.card?.disable();
+  reply.card?.element.remove();
+  reply.turnId = action.source_turn_id;
+  reply.article.dataset.sourceTurnId = reply.turnId;
+  replyByTurn.set(reply.turnId, reply);
+  reply.card = attachOrderSelection(reply.actions, identity, action, {
+    acceptedOrderId, resumeRequired, onSelect: async (frozenIdentity, selectedAction, orderId) => {
+      if (activeController || pendingActions || frozenIdentity.session_id !== sessionId) return;
+      await runReply(reply, frozenIdentity, { action: selectedAction, orderId, message: reply.originalMessage });
+    },
+  });
+  orderCards.add(reply.card);
+}
+
+/** 服务端状态优先于缓存卡片，旧请求响应不能污染新问；参数为可选原气泡及代次；返回Promise；异常在当前页面显示。 */
+async function syncCurrent(fallbackReply = null, generation = requestGeneration) {
+  const identity = currentIdentity();
+  try {
+    const current = await getCurrentActions(identity);
+    if (generation !== requestGeneration || identity.session_id !== sessionId || !current.source_turn_id) return;
+    ui.welcome.hidden = true;
+    const reply = replyByTurn.get(current.source_turn_id) ?? fallbackReply ?? appendMessage("assistant", "已恢复上次处理状态。");
+    reply.turnId = current.source_turn_id;
+    reply.article.dataset.sourceTurnId = reply.turnId;
+    replyByTurn.set(reply.turnId, reply);
+    if (current.turn_status === "completed") {
+      presentCompleted(reply, current.answer ?? "", { ...current.completion_metadata, ...identity }, current.refund_receipt);
+      ui.status.textContent = "已恢复完成结果，可以继续提问";
+    } else if (current.turn_status === "awaiting_input" && current.order_selection) {
+      reply.bubble.textContent = "请选择本次要处理的订单。";
+      presentSelection(reply, identity, current.order_selection);
+      ui.status.textContent = "等待选择订单，也可以发送新的问题";
+    } else if (current.resume_required && current.order_selection) {
+      reply.bubble.textContent = "订单已确认，点击继续处理即可接上原来的问题。";
+      presentSelection(reply, identity, current.order_selection, current.accepted_order_id, true);
+      ui.status.textContent = "请继续处理已确认的订单";
+    } else {
+      reply.card?.disable("这张选单卡已失效，请以当前处理状态为准。");
+      reply.note.hidden = false;
+      reply.note.textContent = current.turn_status === "running" ? "原问题正在处理中，可稍后核实状态。" : "上次处理未完成，可重新提问。";
+    }
+  } catch (error) {
+    if (generation === requestGeneration) {
+      ui.feedback.textContent = `暂时无法恢复处理状态：${error.message}`;
+      ui.feedback.hidden = false;
+    }
+  }
+}
+
+/** 新问或原轮续跑共用安全渲染，各回调和finally都核验请求代次；参数为气泡/身份/输入；返回Promise；异常在本气泡处理。 */
+async function runReply(reply, identity, { message, action = null, orderId = null }) {
+  const generation = ++requestGeneration;
+  const isCurrent = () => generation === requestGeneration && identity.session_id === sessionId;
   reply.article.classList.add("is-pending");
+  reply.note.hidden = true;
   const renderer = createTextRenderer(reply.bubble);
   const controller = new AbortController();
   activeController = controller;
   activeRenderer = renderer;
-  ui.input.value = "";
+  activeReply = reply;
   ui.status.textContent = "正在等待小喵回复…";
   setBusy(true);
 
@@ -275,6 +378,7 @@ async function sendMessage(event) {
    * @throws {Error} 无主动抛出的业务异常。
    */
   function onDelta(delta) {
+    if (!isCurrent()) return;
     reply.article.classList.remove("is-pending");
     reply.article.classList.add("is-streaming");
     ui.status.textContent = "小喵正在回复…";
@@ -291,6 +395,7 @@ async function sendMessage(event) {
    * @throws {Error} 无主动抛出的业务异常。
    */
   function onToolStatus(status) {
+    if (!isCurrent()) return;
     toolStatuses.set(status.tool_call_id, status);
     let badge = badges.get(status.tool_call_id);
     if (!badge) {
@@ -310,19 +415,36 @@ async function sendMessage(event) {
   }
 
   try {
-    let metadata = null;
-    const answer = await streamChat({ sessionId, message, signal: controller.signal, onDelta, onToolStatus,
-      onAnswerMetadata: (value) => { metadata = value; } });
+    const handlers = { sessionId: identity.session_id, userId: identity.user_id, message, signal: controller.signal, onDelta, onToolStatus,
+      onStage: (stage) => {
+        if (!isCurrent()) return;
+        reply.turnId = stage.source_turn_id;
+        reply.article.dataset.sourceTurnId = reply.turnId;
+        replyByTurn.set(reply.turnId, reply);
+        reply.stage.hidden = false;
+        reply.stage.textContent = `${stage.label}${stage.status === "running" ? "…" : "完成"}`;
+        if (stage.stage === "understand" && stage.status === "completed" && typeof stage.resolved_query === "string" && stage.resolved_query !== message) {
+          reply.resolvedQuestion = stage.resolved_query;
+        }
+        if (reply.resolvedQuestion) reply.stage.textContent += ` · 理解为：${reply.resolvedQuestion}`;
+      } };
+    const result = action ? await resumeOrderSelection(identity, action, orderId, handlers) : await streamWorkflowChat(handlers);
+    if (!isCurrent()) return;
     await renderer.finish();
-    if (metadata) {
-      attachAnswerTools(reply, answer, metadata);
-      attachSuggestedActions(reply.bubble.parentElement, metadata, { appendMessage, onBusy: (busy) => {
-        pendingActions += busy ? 1 : -1;
-        setBusy(Boolean(activeController));
-      } });
+    if (!isCurrent()) return;
+    if (result.status === "awaiting_input") {
+      reply.bubble.textContent = "请选择本次要处理的订单。";
+      presentSelection(reply, identity, result.action);
+      ui.status.textContent = "等待选择订单，也可以发送新的问题";
+    } else if (result.status === "accepted") {
+      reply.bubble.textContent = "订单已确认，正在核实处理状态…";
+      await syncCurrent(reply, generation);
+    } else {
+      if (result.metadata) presentCompleted(reply, result.answer, result.metadata);
+      ui.status.textContent = "回复完成，可以接着追问";
     }
-    ui.status.textContent = "回复完成，可以接着追问";
   } catch (error) {
+    if (!isCurrent()) return;
     renderer.flush();
     const stopped = controller.signal.aborted;
     const presentation = failurePresentation({ error, stopped, toolStatuses: toolStatuses.values() });
@@ -340,11 +462,14 @@ async function sendMessage(event) {
       ui.feedback.hidden = false;
     }
     // 普通聊天失败可回填；独立建单结果留在原回复的动作状态中。
-    ui.input.value = presentation.restoreMessage ? message : "";
+    ui.input.value = !action && presentation.restoreMessage ? (message ?? "") : "";
+    if (!stopped) await syncCurrent(reply, generation);
   } finally {
+    if (!isCurrent()) return;
     reply.article.classList.remove("is-pending", "is-streaming");
     activeController = null;
     activeRenderer = null;
+    activeReply = null;
     setBusy(false);
     scrollToLatest();
     ui.input.focus({ preventScroll: true });
@@ -359,6 +484,15 @@ async function sendMessage(event) {
 function stopReply() {
   activeController?.abort();
   activeRenderer?.flush();
+  activeReply?.article.classList.remove("is-pending", "is-streaming");
+  if (activeReply) {
+    activeReply.note.textContent = "已停止接收，可核实服务端保存的处理状态。";
+    activeReply.note.hidden = false;
+  }
+  requestGeneration += 1;
+  activeController = activeRenderer = activeReply = null;
+  ui.status.textContent = "已停止接收，可以继续提问";
+  setBusy(false);
 }
 
 /**
@@ -402,7 +536,8 @@ ui.input.addEventListener("input", updateSendState);
 ui.input.addEventListener("keydown", onInputKeyDown);
 ui.stop.addEventListener("click", stopReply);
 ui.newChat.addEventListener("click", newConversation);
+ui.refreshStatus.addEventListener("click", () => { if (!activeController && !pendingActions) void syncCurrent(null, requestGeneration); });
 ui.welcome.addEventListener("click", onSuggestionClick);
 ui.conversation.addEventListener("scroll", onConversationScroll, { passive: true });
 document.addEventListener("visibilitychange", onVisibilityChange);
-newConversation();
+newConversation({ restore: true });
