@@ -122,19 +122,31 @@ def test_clause_split_uses_four_character_minimum(query: str, expected: list[str
     assert split_clauses(query) == expected
 
 
-async def test_explicit_top_k_and_no_split_override_defaults() -> None:
-    """调试 top_k=5 及关闭拆分均须传到底层 rank。参数：无；返回：None；异常：断言失败。"""
-    search, _, index, reranker = _search([_chunk(identifier) for identifier in range(1, 12)])
-    result = await search.retrieve("退货申请条件，退款处理时限", top_k=5, subquery_split=False)
-    assert len(result) == 5 and len(index.calls) == 1 and reranker.calls[0][2] == 5
+@pytest.mark.parametrize("top_k", [5, 20, 50])
+async def test_explicit_top_k_and_no_split_override_defaults(top_k: int) -> None:
+    """旧入口显式大小上限及关闭拆分均须传到底层重排。
+
+    参数：top_k 既有合法范围内的显式结果上限，分别为 5、20、50。
+    返回：None。
+    异常：AssertionError，旧入口被新增十条上限影响或关闭拆句无效。
+    """
+    search, _, index, reranker = _search([_chunk(identifier) for identifier in range(1, 61)])
+    result = await search.retrieve("退货申请条件，退款处理时限", top_k=top_k, subquery_split=False)
+    assert len(result) == top_k and len(index.calls) == 1 and reranker.calls[0][2] == top_k
 
 
 @pytest.mark.parametrize("value", [0, -1, True, 51])
-async def test_invalid_top_k_does_not_issue_retrieval(value) -> None:
-    """非法显式值不能触发任何外部调用。参数：非法条数；返回：None；异常：断言失败。"""
+@pytest.mark.parametrize("prepared_queries", [None, ["退款处理时限"]])
+async def test_invalid_top_k_does_not_issue_retrieval(value, prepared_queries: list[str] | None) -> None:
+    """新旧入口均先拒绝非法显式值，不能通过裁剪上限把非法值变为有效请求。
+
+    参数：value 非法条数，含零、负数、布尔值及超过召回上限的整数；prepared_queries 为旧入口或单条有效查询。
+    返回：None。
+    异常：AssertionError，非法值触发了编码、索引或重排。
+    """
     search, encoder, index, reranker = _search([_chunk(1)])
     with pytest.raises(ValueError):
-        await search.retrieve("退款处理时限", top_k=value)
+        await search.retrieve("退款处理时限", top_k=value, prepared_queries=prepared_queries)
     assert not encoder.inputs and not index.calls and not reranker.calls
 
 
@@ -238,10 +250,11 @@ def test_merge_ranked_chunks_picks_highest_score_and_stable_tie_order() -> None:
     assert [item.chunk.id for item in merge_ranked_chunks(ties)] == [2, 5]
 
 
-async def test_prepared_queries_skip_rewriter_and_fixed_expansion_with_best_score_merge() -> None:
+@pytest.mark.parametrize("entrypoint", ["retrieve", "retrieve_policy"])
+async def test_prepared_queries_skip_rewriter_and_fixed_expansion_with_best_score_merge(entrypoint: str) -> None:
     """传入prepared_queries时不触发旧改写或固定退款扩写，且重复chunk取最高分并继续校验权威回读。
 
-    参数：无。
+    参数：entrypoint 为普通或政策检索入口名称。
     返回：None。
     异常：AssertionError，触发了旧改写、保留了旧首条低分或权威回读异常被吞。
     """
@@ -251,34 +264,42 @@ async def test_prepared_queries_skip_rewriter_and_fixed_expansion_with_best_scor
 
     chunks = [_chunk(3), _chunk(7)]
     groups = {
-        "已签收商品退货条件": [7, 3],
-        "拆封商品退货限制": [7],
-        "退货运费承担规则": [3],
+        "MH-W99未拆封，已签收退货条件": [7, 3],
+        "MH-W99未拆封；退货限制条款": [7],
+        "MH-W99未拆封。退货运费承担规则": [3],
     }
-    search, _, index, reranker = _search(chunks, groups=groups)
+    search, encoder, index, reranker = _search(chunks, groups=groups)
     rewriter_model = RewriteModel()
     search.query_rewriter = QueryRewriter(rewriter_model.factory)
 
     async def rank(query, candidates, *, top_n):
-        """对不同查询返回不同相关度以验证后次高分覆盖首次低分。参数：查询/候选/上限；返回：排名；异常：无。"""
-        if query == "已签收商品退货条件":
+        """对不同完整查询返回不同相关度，验证后次高分覆盖首次低分。
+
+        参数：query 非空完整查询；candidates 已回读的权威候选列表；top_n 正整数结果上限。
+        返回：list[RankedChunk]，不超过 top_n 的候选排名。
+        异常：StopIteration，测试夹具缺少应有的候选主键。
+        """
+        reranker.calls.append((query, [candidate.id for candidate in candidates], top_n))
+        if query == "MH-W99未拆封，已签收退货条件":
             return [
                 RankedChunk(chunk=next(c for c in candidates if c.id == 3), score=0.6),
                 RankedChunk(chunk=next(c for c in candidates if c.id == 7), score=0.4),
             ][:top_n]
-        if query == "拆封商品退货限制":
+        if query == "MH-W99未拆封；退货限制条款":
             return [RankedChunk(chunk=next(c for c in candidates if c.id == 7), score=0.9)][:top_n]
         return [RankedChunk(chunk=next(c for c in candidates if c.id == 3), score=0.5)][:top_n]
 
     reranker.rank = rank
-    prepared_list = ["已签收商品退货条件", "拆封商品退货限制", "退货运费承担规则"]
-    merged = await search.retrieve_policy(
-        "订单1001的猫砂盆拆封了能退吗 已签收",
+    prepared_list = list(groups)
+    merged = await getattr(search, entrypoint)(
+        "订单1001的MH-W99未拆封能退吗 已签收",
         prepared_queries=prepared_list,
     )
     rewrite_call_count = len(rewriter_model.inputs)
     assert rewrite_call_count == 0
+    assert encoder.inputs == prepared_list
     assert [call[0] for call in index.calls] == prepared_list
+    assert [call[0] for call in reranker.calls] == prepared_list
     assert [item.chunk.id for item in merged] == [7, 3]
     assert merged[0].score == 0.9
 
@@ -286,10 +307,83 @@ async def test_prepared_queries_skip_rewriter_and_fixed_expansion_with_best_scor
     search.store._snapshots[7] = chunks[1].model_copy(update={"is_active": False})
     search.store._snapshots[3] = chunks[0].model_copy(update={"is_active": False})
     with pytest.raises(KnowledgeSearchUnavailable):
-        await search.retrieve_policy(
-            "订单1001的猫砂盆拆封了能退吗 已签收",
+        await getattr(search, entrypoint)(
+            "订单1001的MH-W99未拆封能退吗 已签收",
             prepared_queries=prepared_list,
         )
+
+
+@pytest.mark.parametrize("entrypoint", ["retrieve", "retrieve_policy"])
+async def test_single_prepared_query_keeps_punctuation_model_and_status(entrypoint: str) -> None:
+    """单条带标点、型号和状态的 prepared 查询在三个外部边界均完整传递且只调用一次。
+
+    参数：entrypoint 为普通或政策检索入口名称。
+    返回：None。
+    异常：AssertionError，查询被拆开、状态丢失或单条结果突破十条。
+    """
+    query = "MH-W99未拆封，退货运费谁承担"
+    search, encoder, index, reranker = _search(
+        [_chunk(identifier) for identifier in range(1, 21)], rerank_top_k=20
+    )
+    result = await getattr(search, entrypoint)(query, prepared_queries=[query])
+    assert encoder.inputs == [query]
+    assert index.calls == [(query, 50, 50, 50)]
+    assert reranker.calls == [(query, list(range(1, 21)), 10)]
+    assert [item.chunk.id for item in result] == list(range(1, 11))
+
+
+@pytest.mark.parametrize("entrypoint,configured,top_k,per_query,expected_ids", [
+    ("retrieve", 20, None, 10, list(range(60, 50, -1))),
+    ("retrieve", 10, 50, 10, list(range(60, 50, -1))),
+    ("retrieve", 4, None, 4, [60, 59, 58, 57]),
+    ("retrieve", 20, 5, 5, [60, 59, 58, 57, 56]),
+    ("retrieve_policy", 20, None, 10, list(range(60, 50, -1)) + list(range(40, 30, -1)) + list(range(20, 10, -1))),
+    ("retrieve_policy", 4, None, 4, [60, 59, 58, 57, 40, 39, 38, 37, 20, 19, 18, 17]),
+])
+async def test_prepared_limits_preserve_highest_scored_evidence(
+    entrypoint: str, configured: int, top_k: int | None, per_query: int, expected_ids: list[int]
+) -> None:
+    """三条查询每条最多十条，普通最终十条、政策最终三十条，并尊重更小上限和跨查询高分。
+
+    参数：entrypoint 普通或政策入口；configured 合法配置上限；top_k 普通入口显式上限或 None；
+        per_query 每条预期重排数量；expected_ids 按手工标注相关度应保留的主键顺序。
+    返回：None。
+    异常：AssertionError，上限未生效、较小限制失效或高分结果被旧轮转截断。
+    """
+    queries = ["已签收商品退货条件", "商品退货限制条款", "退货运费承担规则"]
+    groups = {queries[0]: list(range(1, 21)), queries[1]: list(range(21, 41)), queries[2]: list(range(41, 61))}
+    search, encoder, index, reranker = _search(
+        [_chunk(identifier) for identifier in range(1, 61)],
+        groups=groups, scores={identifier: identifier / 100 for identifier in range(1, 61)},
+        rerank_top_k=configured,
+    )
+    options = {"top_k": top_k} if entrypoint == "retrieve" else {}
+    result = await getattr(search, entrypoint)("已签收商品退货规则", prepared_queries=queries, **options)
+    assert [item.chunk.id for item in result] == expected_ids
+    assert encoder.inputs == queries and [call[0] for call in index.calls] == queries
+    assert [call[0] for call in reranker.calls] == queries
+    assert [call[2] for call in reranker.calls] == [per_query, per_query, per_query]
+
+
+@pytest.mark.parametrize("entrypoint,expected_count", [("retrieve", 20), ("retrieve_policy", 60)])
+async def test_legacy_configured_large_limits_remain_available(entrypoint: str, expected_count: int) -> None:
+    """prepared_queries=None 的旧入口仍接受大于十条的合法配置。
+
+    参数：entrypoint 普通或政策入口；expected_count 旧入口配置二十条时应返回的总数。
+    返回：None。
+    异常：AssertionError，新分支的上限意外改变旧入口行为。
+    """
+    from app.knowledge.retrieval import expand_policy_queries
+
+    query = "已签收商品退货条件"
+    queries = expand_policy_queries(query) if entrypoint == "retrieve_policy" else [query]
+    groups = {text: list(range(position * 20 + 1, position * 20 + 21)) for position, text in enumerate(queries)}
+    search, _, _, reranker = _search(
+        [_chunk(identifier) for identifier in range(1, 61)], groups=groups, rerank_top_k=20
+    )
+    result = await getattr(search, entrypoint)(query)
+    assert len(result) == expected_count
+    assert [call[2] for call in reranker.calls] == [20] * len(queries)
 
 
 async def test_prepared_queries_still_validated() -> None:

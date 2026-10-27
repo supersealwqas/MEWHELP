@@ -326,6 +326,44 @@ async def test_query_expander_simple_and_core_queries(rewrite_sdk):
     core = await expander.expand("订单1001的猫砂盆拆封了还能退吗 已签收", simple_query="拆封猫砂盆能否退货", budget=core_ledger)
     assert core.queries == core_queries
     assert core_ledger.snapshot()["model_calls"] == 1
+    assert "failure" not in simple_ledger.snapshot()["records"][0]
+    assert "failure" not in core_ledger.snapshot()["records"][0]
+
+
+@pytest.mark.parametrize("single_query", ["取消订单的办理流程", " 退货运费由谁承担 "])
+async def test_query_expander_different_single_query_falls_back_with_usage(rewrite_sdk, single_query: str) -> None:
+    """单条扩写偏离标准问法时仅回退完整种子，保留实际用量和内容失败诊断。
+
+    参数：rewrite_sdk 离线 HTTP 与真实 ChatOpenAI 夹具；single_query 与标准问法不严格相等的模型输出。
+    返回：None。
+    异常：AssertionError，错问法被接受、触发再次调用或账本和失败类型丢失。
+    """
+    from app.core.model_budget import BudgetLedger
+    from app.knowledge.query_rewrite import QueryExpander
+
+    rewrite_sdk.responses.append(
+        rewrite_response(json.dumps({"queries": [single_query]}, ensure_ascii=False), name="submit_expanded_queries")
+    )
+    ledger = BudgetLedger()
+    ledger.reserve("understand", 10, 100)
+    ledger.record_usage("understand", {"total_tokens": 20}, "tool_calls")
+    previous_record = ledger.snapshot()["records"][0]
+    query = "订单1001退货运费谁出 已签收"
+    result = await QueryExpander(rewrite_sdk.factory).expand(
+        query, simple_query="退货运费由谁承担", budget=ledger
+    )
+
+    assert result.queries == [query]
+    assert len(rewrite_sdk.requests) == 1
+    snapshot = ledger.snapshot()
+    assert snapshot["model_calls"] == 2 and snapshot["records"][0] == previous_record
+    assert snapshot["actual_tokens"] == 140
+    record = snapshot["records"][1]
+    assert record["stage"] == "expand" and record["reserved_units"] > 0
+    assert record["usage"]["total_tokens"] == 120 and record["finish_reason"] == "tool_calls"
+    assert record["failure"]["terminal_decision"]["validation_category"] == "expansion_validation"
+    assert record["failure"]["error_type"] == "QueryRewriteError"
+    assert record["failure"]["query_fallback"] == "seed_query"
 
 
 @pytest.mark.parametrize(

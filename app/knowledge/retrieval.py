@@ -27,6 +27,8 @@ if TYPE_CHECKING:
 
 _MIN_CLAUSE = 4
 _MAX_QUERY_CHARACTERS = 2000
+# CH06 已准备查询每条最多保留十块，最多三条政策查询合计不超过三十块。
+_PREPARED_QUERY_TOP_K = 10
 
 
 def split_clauses(query: str) -> list[str]:
@@ -71,8 +73,10 @@ def merge_ranked_chunks(groups: list[list[RankedChunk]]) -> list[RankedChunk]:
     for group in groups:
         for item in group:
             existing = strongest.get(item.chunk.id)
+            # 同一原文可能多次命中，保留最高相关度，避免先遇到的低分覆盖后续证据。
             if existing is None or item.score > existing.score:
                 strongest[item.chunk.id] = item
+    # 分数相同按原文主键固定次序，保证后续引用编号稳定。
     return sorted(strongest.values(), key=lambda item: (-item.score, item.chunk.id))
 
 
@@ -106,7 +110,8 @@ class HybridKnowledgeSearch:
             # 编码/召回前先做整组确定性校验，且不向prepared分支传递history。
             validate_prepared_queries(raw, prepared_queries)
             cleaned = [item.strip() for item in prepared_queries]
-            groups = [split_clauses(item) if subquery_split else [item] for item in cleaned]
+            # 已准备问法的型号、状态与问题必须整体检索，不再按标点拆散条件。
+            groups = [[item] for item in cleaned]
             return PreparedQuery(raw=raw, policy=policy, groups=groups)
         if self.query_rewriter is None:
             # 未注入只供底层兼容；正式运行时在装配处强制提供改写器。
@@ -190,7 +195,7 @@ class HybridKnowledgeSearch:
             subquery_split None 使用配置默认 True，False 只检索完整查询；filters 为权威元数据筛选；
             source_query 为可信原问；budget 请求独占账本；history 可信历史用户/工具文本（仅旧路径使用）；
             prepared_queries 可选已准备的 1 条或 3 条查询，传入时跳过旧改写模型并按最高分合并。
-        返回：list[RankedChunk]，普通路径最多 Top-K；N 个子句会分别调用 N 次重排。
+        返回：list[RankedChunk]，旧路径最多 Top-K；已准备路径最多 min(Top-K, 10)，每条完整查询重排一次。
         异常：ValueError，参数非法；检索/模型/权威存储异常；取消直接传播。
         """
         self._validate_query(query)
@@ -207,7 +212,9 @@ class HybridKnowledgeSearch:
                                        history=history, prepared_queries=prepared_queries)
         scope = await self._filter_scope(normalized) if normalized else None
         if prepared_queries is not None:
-            groups = [await self._retrieve_group(group, prepared, selected, scope) for group in prepared.groups]
+            selected = min(selected, _PREPARED_QUERY_TOP_K)
+            groups = [await self._retrieve_one(group[0], selected, scope) for group in prepared.groups]
+            # 全部查询完成后再按最高分合并裁剪，普通结果最多十块，较小显式上限仍有效。
             return merge_ranked_chunks(groups)[:selected]
         return await self._retrieve_group(prepared.groups[0], prepared, selected, scope)
 
@@ -257,7 +264,7 @@ class HybridKnowledgeSearch:
         参数：query 当前退款问题或含已核实状态的种子；filters 可选元数据筛选；
             budget 请求独占账本；history 可信历史用户/工具文本（仅旧路径使用）；
             prepared_queries 可选已准备的 1 条或 3 条查询，传入时按 chunk ID 取最高分降序合并。
-        返回：list[RankedChunk]，默认最多 30 个原 chunk。
+        返回：list[RankedChunk]，旧路径默认最多 30 个原 chunk；已准备路径每条最多十块、合计最多三十块。
         异常：ValueError，参数/输入限制；检索、模型或存储异常。
         """
         self._validate_query(query)
@@ -266,9 +273,10 @@ class HybridKnowledgeSearch:
                                        budget=budget, history=history, prepared_queries=prepared_queries)
         scope = await self._filter_scope(normalized) if normalized else None
         if prepared_queries is not None:
-            groups = [await self._retrieve_group(group, prepared, self.config.rerank_top_k, scope)
-                      for group in prepared.groups]
-            return merge_ranked_chunks(groups)[:self.config.rerank_top_k * 3]
+            selected = min(self.config.rerank_top_k, _PREPARED_QUERY_TOP_K)
+            groups = [await self._retrieve_one(group[0], selected, scope) for group in prepared.groups]
+            # 每条最多十块，最多三条查询；合并后不超过三十块，并保留更小的配置限制。
+            return merge_ranked_chunks(groups)[:selected * 3]
         merged: dict[int, RankedChunk] = {}
         for group in prepared.groups:
             for item in await self._retrieve_group(group, prepared, self.config.rerank_top_k, scope):

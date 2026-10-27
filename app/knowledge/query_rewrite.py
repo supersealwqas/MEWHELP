@@ -243,7 +243,7 @@ class QueryRewriter:
         """
         if not isinstance(query, str) or not query.strip() or len(query) > 2000:
             raise QueryRewriteError("原问必须为1–2000字符")
-        if keyword is not None and (not isinstance(keyword, str) or not isinstance(keyword, str) or not keyword.strip() or len(keyword) > 100):
+        if keyword is not None and (not isinstance(keyword, str) or not keyword.strip() or len(keyword) > 100):
             raise QueryRewriteError("关键词必须为1–100字符")
         # 方法内导入避免app.core.__init__通过提示词再次导入查询模块。
         from app.core.llm import get_chat_model
@@ -339,6 +339,9 @@ class QueryExpander:
             )
             result = parse_tool_output(gathered, ExpandedQueries, _EXPANSION_TOOL_NAME)
             validate_prepared_queries(query, result.queries)
+            # 简单问题沿用本轮标准问法；模型擅自换题也按内容失败记录并回退完整种子。
+            if len(result.queries) == 1 and result.queries != [simple_query]:
+                raise QueryRewriteError("单条扩写必须采用原标准问法")
             return result
         except WorkflowBudgetExceeded:
             raise
