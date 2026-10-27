@@ -641,9 +641,16 @@ class ChatService:
                 config = {"configurable": {"thread_id": checkpoint_thread_id(row["context"].conversation_id)}}
                 pending = self._waiting_action(await self.graph.aget_state(config), row["context"])
                 resume_required = pending == action
+        metadata = row["completion_metadata"] or {}
+        refund_receipt = None
+        refund_action = metadata.get("refund_action")
+        if refund_action:
+            from app.repositories.actions import ActionRepository
+            refund_receipt = await ActionRepository(self.chat.factory).get_refund_receipt(session_id, user_id, refund_action["action_id"])
         return CurrentActions(source_turn_id=row["context"].turn_id, turn_status=row["turn_status"],
             order_selection=action, accepted_order_id=saved.get("accepted_order_id") if saved else None,
-            answer=row["answer"], completion_metadata=row["completion_metadata"], resume_required=resume_required)
+            answer=row["answer"], completion_metadata=row["completion_metadata"], resume_required=resume_required,
+            refund_action=refund_action, refund_receipt=refund_receipt)
 
     def _public_event(self, payload: dict, context: ToolContext) -> ChatEvent | None:
         """筛选并规范公开事件。参数：payload图custom帧、context原轮；返回：事件或None；异常：无。"""
@@ -796,7 +803,11 @@ class ChatService:
         except ConversationBusy as error:
             try:
                 row = await self.validate_resume(request)
-                if row["order_selection"].get("status") == "accepted":
+                if row["turn_status"] == "completed" and row["answer"] is not None and row["completion_metadata"]:
+                    yield ChatEvent(event="delta", data={"delta": row["answer"]})
+                    yield ChatEvent(event="answer_metadata", data=row["completion_metadata"])
+                    yield ChatEvent(event="done")
+                elif row["order_selection"].get("status") == "accepted":
                     yield ChatEvent(event="action_status", data={"action_id": request.action_id, "source_turn_id": request.source_turn_id, "status": "accepted"})
                 else:
                     yield self._stream_error(error)

@@ -4,12 +4,33 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 from app.api.chat import get_chat_service
 from app.repositories.actions import ActionRepository
-from app.schemas.workflow import TicketConfirmation, TicketReceipt, CurrentActions
-from app.services.actions import TicketActionError, TicketActionService
+from app.schemas.workflow import TicketConfirmation, TicketReceipt, CurrentActions, RefundSubmission, RefundReceipt, REFUND_REASONS
+from app.services.actions import TicketActionError, TicketActionService, RefundActionService
 from app.tools.executor import ToolExecutor
 from app.tools.registry import build_ticket_registry
 
 router = APIRouter(prefix="/api/actions", tags=["actions"])
+
+
+@router.get("/refund-reasons")
+async def refund_reasons() -> list[dict]:
+    """提供唯一退款原因目录。参数：无；返回：代码和中文标签列表；异常：无。"""
+    return [{"code": code, "label": label} for code, label in REFUND_REASONS.items()]
+
+
+def get_refund_action_service(request: Request) -> RefundActionService:
+    """复用聊天仓储及锁。参数：HTTP请求；返回：退款服务；异常：运行时未就绪。"""
+    chat = get_chat_service(request)
+    return RefundActionService(ActionRepository(chat.chat.factory), chat.guard)
+
+
+@router.post("/refunds", response_model=RefundReceipt)
+async def submit_refund(request: RefundSubmission, service: RefundActionService = Depends(get_refund_action_service)) -> RefundReceipt:
+    """显式提交独立本地申请。参数：严格请求/服务；返回：待处理回执；异常：404/409/422/503。"""
+    try:
+        return await service.submit_refund(request)
+    except TicketActionError as error:
+        raise HTTPException(status_code=error.status_code, detail=error.detail) from error
 
 
 @router.get("/current", response_model=CurrentActions)

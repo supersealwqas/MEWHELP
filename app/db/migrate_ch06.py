@@ -1,10 +1,12 @@
-"""CH06显式增量迁移：保留业务行，为选单等待扩充状态约束；默认只预览。"""
+"""CH06显式增量迁移：保留业务行，扩充等待状态并新增独立退款申请表；默认只预览。"""
 
 import argparse
 import asyncio
 from sqlalchemy import inspect, text
+from sqlalchemy.schema import CreateTable
 from app.config import Settings
 from app.db.session import create_database
+from app.models.customer_service import RefundApplication
 
 WAIT_DDL = ("ALTER TABLE messages DROP CHECK ck_turn_status, ADD CONSTRAINT ck_turn_status "
             "CHECK (turn_status IN ('running','awaiting_input','completed','failed','cancelled'))")
@@ -25,6 +27,15 @@ def migrate_connection(connection, *, apply: bool = False) -> list[str]:
     if current is None:
         raise ValueError("缺少ck_turn_status，拒绝猜测数据库结构")
     statements = [] if "awaiting_input" in current else [WAIT_DDL]
+    refund_table = RefundApplication.__table__
+    if not inspector.has_table(refund_table.name):
+        statements.append(str(CreateTable(refund_table).compile(dialect=connection.dialect)))
+    else:
+        columns = {item["name"] for item in inspector.get_columns(refund_table.name)}
+        unique_columns = [set(item["column_names"]) for item in inspector.get_unique_constraints(refund_table.name)]
+        if (columns != set(refund_table.columns.keys()) or {"action_id"} not in unique_columns
+                or inspector.get_pk_constraint(refund_table.name)["constrained_columns"] != ["refund_no"]):
+            raise ValueError("已有refund_applications结构不兼容，请核对后迁移")
     if apply:
         for statement in statements:
             connection.execute(text(statement))

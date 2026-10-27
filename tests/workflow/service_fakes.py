@@ -20,6 +20,7 @@ async def service_runtime(path, **script):
             "CREATE TABLE IF NOT EXISTS conversations (id INTEGER PRIMARY KEY, session_id TEXT UNIQUE, user_id TEXT, status TEXT DEFAULT '进行中', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
             "CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, conversation_id INTEGER, role TEXT, content TEXT, tool_calls JSON, rag_metadata JSON, tool_call_id TEXT, turn_id TEXT, turn_status TEXT DEFAULT 'running', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, UNIQUE(conversation_id, turn_id, tool_call_id))",
             "CREATE TABLE IF NOT EXISTS low_confidence_questions (id INTEGER PRIMARY KEY, conversation_id INTEGER, raw_question TEXT, source TEXT, reason TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
+            "CREATE TABLE IF NOT EXISTS refund_applications (refund_no TEXT PRIMARY KEY, action_id TEXT NOT NULL UNIQUE, conversation_id INTEGER NOT NULL, source_turn_id TEXT NOT NULL, user_id TEXT NOT NULL, order_id TEXT NOT NULL, reason_code TEXT NOT NULL, original_question TEXT NOT NULL, status TEXT DEFAULT '待处理' NOT NULL CHECK(status='待处理'), created_at DATETIME DEFAULT CURRENT_TIMESTAMP)",
         ):
             await connection.exec_driver_sql(ddl)
     factory = async_sessionmaker(engine, expire_on_commit=False)

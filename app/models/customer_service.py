@@ -69,3 +69,22 @@ class Ticket(Base):
     ticket_type: Mapped[str] = mapped_column(Enum("售后", "投诉", "咨询"), comment="工单类型")
     status: Mapped[str] = mapped_column(Enum("待处理", "已处理"), server_default="待处理", comment="处理状态")
     created_at: Mapped[datetime] = mapped_column(DATETIME, server_default=text("CURRENT_TIMESTAMP"), comment="创建时间")
+
+
+class RefundApplication(Base):
+    """独立本地退款申请，一动作仅一份；没有真实退款、审批或到账行为。"""
+
+    __tablename__ = "refund_applications"
+    __table_args__ = (UniqueConstraint("action_id", name="uq_refund_action"),
+        CheckConstraint("status = '待处理'", name="ck_refund_pending"),
+        {**TABLE_OPTIONS, "comment": "本地退款申请，不执行真实退款"})
+    refund_no: Mapped[str] = mapped_column(String(34, collation="utf8mb4_bin"), primary_key=True, comment="RF加稳定UUID摘要的申请号")
+    action_id: Mapped[str] = mapped_column(String(36, collation="utf8mb4_bin"), comment="原问稳定动作键，唯一防重")
+    conversation_id: Mapped[int] = mapped_column(BIGINT(unsigned=True), ForeignKey("conversations.id", name="fk_refunds_conversation"), comment="所属会话")
+    source_turn_id: Mapped[str] = mapped_column(String(36, collation="utf8mb4_bin"), comment="已核实的原问轮次")
+    user_id: Mapped[str] = mapped_column(String(64, collation="utf8mb4_bin"), comment="所属用户")
+    order_id: Mapped[str] = mapped_column(String(64, collation="utf8mb4_bin"), comment="核实的完整订单号")
+    reason_code: Mapped[str] = mapped_column(String(32), comment="固定目录的原因代码")
+    original_question: Mapped[str] = mapped_column(Text, comment="原问完整正文")
+    status: Mapped[str] = mapped_column(String(16), default="待处理", server_default="待处理", comment="仅保存待处理状态")
+    created_at: Mapped[datetime] = mapped_column(DATETIME, server_default=text("CURRENT_TIMESTAMP"), comment="申请保存时间")

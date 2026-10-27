@@ -6,7 +6,7 @@ import logging
 import anyio
 from app.repositories.actions import ActionNotFound, ActionRepository, InvalidTicketArguments
 from app.repositories.chat import PersistenceUncertain
-from app.schemas.workflow import TicketConfirmation, TicketReceipt
+from app.schemas.workflow import TicketConfirmation, TicketReceipt, RefundSubmission, RefundReceipt, OrderSelectionConflict
 from app.services.chat import ConversationBusy, ConversationGuard
 
 logger = logging.getLogger(__name__)
@@ -24,6 +24,29 @@ class TicketActionError(RuntimeError):
 
 async def _ignore_status(status: dict) -> None:
     """确认接口无SSE，消费已有执行器状态。参数：status安全状态帧；返回：None；异常：无。"""
+
+
+class RefundActionService:
+    """独立本地退款申请服务，与聊天/工单共用会话互斥，不运行模型或写退款工具。"""
+
+    def __init__(self, repository: ActionRepository, guard: ConversationGuard):
+        """注入原仓储及同一会话锁。参数：repository动作仓储、guard互斥；返回：None；异常：无。"""
+        self.repository, self.guard = repository, guard
+
+    async def submit_refund(self, request: RefundSubmission) -> RefundReceipt:
+        """确认后保存本地待处理申请。参数：request原键及原因；返回：确定回执；异常：TicketActionError安全HTTP错误或取消。"""
+        try:
+            async with self.guard.hold(request.session_id):
+                return await self.repository.submit_refund(request)
+        except ConversationBusy as error:
+            raise TicketActionError(409, "CONVERSATION_BUSY", "当前会话正在处理，请稍后重试原申请", "not_started") from error
+        except OrderSelectionConflict as error:
+            raise TicketActionError(409, "REFUND_CONFLICT", str(error), "not_started") from error
+        except ActionNotFound as error:
+            raise TicketActionError(404, "ACTION_NOT_FOUND", "退款建议不存在或不属于当前会话", "not_started") from error
+        except Exception as error:
+            logger.warning("refund outcome unknown error=%s", type(error).__name__)
+            raise TicketActionError(503, "REFUND_OUTCOME_UNKNOWN", "暂时无法核实申请结果，请保留原操作查询", "unknown") from error
 
 
 class TicketActionService:

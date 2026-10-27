@@ -81,6 +81,39 @@ class AcceptedOrderSelection(BaseModel):
     turn_status: str = Field(description="原轮当前持久化状态")
 
 
+REFUND_REASONS = {"wrong_purchase": "不想要/买错了", "quality_issue": "商品质量问题",
+                  "not_as_described": "收到商品与描述不符", "wrong_item": "发错商品", "missing_item": "少发漏发",
+                  "shipping_damage": "运输破损", "other": "其他"}
+
+
+class RefundAction(BaseModel):
+    """与完成答案原子保存的独立退款建议，不表示已批准或执行退款。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    action_id: str = Field(min_length=36, max_length=36, description="按原轮生成的退款动作UUIDv5")
+    kind: Literal["submit_refund"] = Field(default="submit_refund", description="固定本地申请动作")
+    source_turn_id: str = Field(min_length=1, max_length=36, description="已核实订单的原问轮次")
+    question: str = Field(min_length=1, max_length=4000, description="完整用户原话")
+    order_id: str = Field(min_length=1, max_length=64, description="服务端核实的本人订单号")
+
+    @field_validator("action_id")
+    @classmethod
+    def validate_identifier(cls, value):
+        """核对规范UUIDv5。参数：value动作键；返回：原值；异常：ValueError，非法键。"""
+        return OrderSelection.validate_identifier(value)
+
+
+class RefundReceipt(BaseModel):
+    """仅确认本地申请已保存，不包含实际退款或到账字段。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    action_id: str = Field(description="申请原动作键")
+    refund_no: str = Field(min_length=34, max_length=34, description="稳定的RF前缀本地申请编号")
+    order_id: str = Field(description="已核实订单")
+    reason_code: str = Field(description="服务端原因目录代码")
+    status: Literal["待处理"] = Field(default="待处理", description="本地申请处理状态，不等于退款成功")
+
+
 class CurrentActions(BaseModel):
     """刷新页面时回读的原轮状态，数据库快照优先于客户端旧卡片。"""
 
@@ -92,6 +125,8 @@ class CurrentActions(BaseModel):
     answer: str | None = Field(default=None, description="已保存完成正文")
     completion_metadata: dict | None = Field(default=None, description="已保存完成元数据")
     resume_required: bool = Field(default=False, description="已接受但仍停在匹配interrupt，需要原键继续")
+    refund_action: RefundAction | None = Field(default=None, description="独立已保存退款申请建议")
+    refund_receipt: RefundReceipt | None = Field(default=None, description="同动作已提交的本地申请回执")
 
 
 class HistoryDelta(BaseModel):
@@ -222,6 +257,20 @@ class TicketConfirmation(BaseModel):
         """阻止数字1被Literal强收为确认。参数：value原始输入；返回：True；异常：ValueError，非真正布尔true。"""
         if value is not True:
             raise ValueError("必须由用户明确确认")
+        return value
+
+
+class RefundSubmission(TicketConfirmation):
+    """仅确认保存建议与固定原因，沿用严格身份和真实布尔确认契约。"""
+
+    reason_code: str = Field(description="必须来自服务端七种固定原因目录")
+
+    @field_validator("reason_code")
+    @classmethod
+    def validate_reason(cls, value):
+        """拒绝客户端编造原因。参数：value原因代码；返回：原值；异常：ValueError，目录外原因。"""
+        if value not in REFUND_REASONS:
+            raise ValueError("请选择有效的退款原因")
         return value
 
 

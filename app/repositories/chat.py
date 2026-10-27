@@ -10,7 +10,7 @@ from app.models.rag_quality import LowConfidenceQuestion
 from app.models.customer_service import Conversation, Message
 from app.schemas.history import StoredMessage, StoredTurn
 from app.schemas.tools import ToolContext, ToolResult
-from app.schemas.workflow import HistoryDelta, RetrievalLowConfidence, SuggestedAction, OrderSelectionAction
+from app.schemas.workflow import HistoryDelta, RetrievalLowConfidence, SuggestedAction, OrderSelectionAction, RefundAction
 
 
 async def owned_source(session, session_id: str, user_id: str, turn_id: str | None = None, *, lock=False):
@@ -39,6 +39,30 @@ def source_context(conversation, source) -> ToolContext:
     """从不可变来源构造上下文。参数：conversation会话行、source用户行；返回：ToolContext；异常：字段校验错误。"""
     return ToolContext(conversation_id=conversation.id, session_id=conversation.session_id, user_id=conversation.user_id,
                        turn_id=source.turn_id, user_message=source.content)
+
+
+async def validate_refund_evidence(session, context: ToolContext, action: RefundAction, workflow_metadata: dict | None) -> None:
+    """核验退款建议必须来自本轮成功订单查询，不采信客户端或模型生成的快照。
+
+    参数：session短事务、context可信原轮、action保存建议、workflow_metadata原轮摘要。
+    返回：None；异常：ValueError，快照/意图/归属/查询事实不匹配；数据库错误。
+    """
+    from app.tools.business import owns_order
+    expected = str(uuid5(NAMESPACE_URL, f"mewhelp:ch06:{context.conversation_id}:{context.turn_id}:submit_refund"))
+    workflow_metadata = workflow_metadata or {}
+    if (action.action_id != expected or action.source_turn_id != context.turn_id or action.question != context.user_message
+            or not owns_order(context.user_id, action.order_id) or workflow_metadata.get("intent") != "退款退货"
+            or workflow_metadata.get("route") != "order_policy" or workflow_metadata.get("order_id") != action.order_id):
+        raise ValueError("退款动作与来源不一致")
+    call_id = f"ch06:order:{context.turn_id}:{action.order_id}"
+    result = await session.scalar(result_query(context.model_copy(update={"tool_call_id": call_id})))
+    fact = ToolResult.model_validate_json(result.content) if result is not None else None
+    calls = (await session.scalars(select(Message).where(Message.conversation_id == context.conversation_id,
+        Message.turn_id == context.turn_id, Message.role == "assistant", Message.tool_calls.is_not(None)))).all()
+    expected_call = {"id": call_id, "name": "query_order", "args": {"order_id": action.order_id}}
+    if (fact is None or not fact.ok or not fact.data or fact.data.get("order_id") != action.order_id
+            or not any(expected_call in row.tool_calls for row in calls)):
+        raise ValueError("退款动作缺少本轮已核实订单事实")
 
 
 def result_query(context: ToolContext):
@@ -270,11 +294,11 @@ class ChatRepository:
                           low_confidence: SelfCheckFailure | RetrievalLowConfidence | None = None,
                           citations: list[EvidenceCitation] | None = None,
                           suggested_actions: list[SuggestedAction] | None = None,
-                          workflow_metadata: dict | None = None) -> dict:
+                          workflow_metadata: dict | None = None, refund_action: RefundAction | None = None) -> dict:
         """原子保存最终回复、完成状态、完整原始引用及可选低证据问题池记录。
 
         参数：context可信身份/原话；content完整回复；low_confidence自评或检索弱证据；citations完整引用；
-            suggested_actions服务端建议快照；workflow_metadata本轮流程摘要，两者均可省略以保留旧调用。
+            suggested_actions服务端工单建议；workflow_metadata本轮流程摘要；refund_action独立本地申请快照，均可省略。
         返回：dict，提交成功后的完成元数据；同轮一致结果重试幂等，不重复原话入池。
         异常：ValueError，正文过长/身份或原话不符；PersistenceUncertain，已完成结果不同；数据库错误。
         """
@@ -292,6 +316,7 @@ class ChatRepository:
         originals = [item.model_dump(mode="json") for item in citations]
         actions = [action.model_dump(mode="json") for action in (suggested_actions or [])]
         low_snapshot = low_confidence.model_dump(mode="json") if low_confidence else None
+        refund_snapshot = refund_action.model_dump(mode="json") if refund_action else None
         async with self.factory.begin() as session:
             # 锁定同一轮最早用户消息，使并发完成互斥，无须给用户DDL增加turn_id字段。
             user = await session.scalar(select(Message).where(
@@ -318,18 +343,23 @@ class ChatRepository:
                             if value is not None or key not in {"source_key", "source_revision"})
                         for original, snapshot in zip(originals, snapshots))
                 same_extra = isinstance(saved, dict) and saved.get("suggested_actions", []) == actions \
-                    and saved.get("workflow") == workflow_metadata and saved.get("low_confidence") == low_snapshot
+                    and saved.get("workflow") == workflow_metadata and saved.get("low_confidence") == low_snapshot \
+                    and saved.get("refund_action") == refund_snapshot
                 if existing is None or existing.content != content or not same_extra or not same:
                     raise PersistenceUncertain("轮次已完成但结果不同，需核查")
                 return existing.rag_metadata
             if user.turn_status != "running":
                 raise PersistenceUncertain("轮次已结束，不能重新提交回复")
+            if refund_action is not None:
+                await validate_refund_evidence(session, context, refund_action, workflow_metadata)
             metadata = answer_metadata(context, await self._complete_sources(session, citations))
             metadata["citation_inputs"] = originals
             if suggested_actions is not None:
                 metadata["suggested_actions"] = actions
             if workflow_metadata is not None:
                 metadata["workflow"] = workflow_metadata
+            if refund_action is not None:
+                metadata["refund_action"] = refund_snapshot
             if low_snapshot is not None:
                 metadata["low_confidence"] = low_snapshot
             session.add(Message(conversation_id=context.conversation_id, turn_id=context.turn_id,

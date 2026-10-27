@@ -18,7 +18,7 @@ from app.knowledge.retrieval import HybridKnowledgeSearch
 from app.knowledge.query_rewrite import QueryExpander
 from app.repositories.chat import ChatRepository
 from app.schemas.tools import ToolContext
-from app.schemas.workflow import GateDecision, SuggestedAction
+from app.schemas.workflow import GateDecision, SuggestedAction, RefundAction
 from app.tools.executor import ToolExecutor
 from app.workflow.agent import build_agent_graph, model_messages, stopped_state
 from app.workflow.model import WorkflowModelAdapter, intent_tool_schema, understanding_tool_schema
@@ -230,12 +230,18 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
         metadata["budget"] = budget_summary(state["budget"])
         metadata.update({"intent_confidence": state.get("intent_confidence"), "resolved_query": state["resolved_query"],
                          "standard_query": state["standard_query"], "order_id": state.get("order_id")})
+        refund_action = None
+        if state["intent"] == "退款退货" and state.get("order_data") and state.get("order_id"):
+            refund_action = RefundAction(action_id=str(uuid5(NAMESPACE_URL,
+                f"mewhelp:ch06:{context.conversation_id}:{context.turn_id}:submit_refund")),
+                source_turn_id=context.turn_id, question=state["raw_query"], order_id=state["order_id"])
         saved = await deps.chat.finish_turn(context, state["answer"], low_confidence=low_confidence,
             citations=[EvidenceCitation.model_validate(item) for item in state["evidence"]],
-            suggested_actions=actions, workflow_metadata=metadata)
+            suggested_actions=actions, workflow_metadata=metadata, refund_action=refund_action)
         logger.info("workflow completed turn=%s reason=%s tools=%s decisions=%s", context.turn_id,
                     state["stop_reason"], state["tool_count"], state["decision_count"])
-        return {"suggested_actions": [action.model_dump(mode="json") for action in actions], "completion_metadata": saved}
+        return {"suggested_actions": [action.model_dump(mode="json") for action in actions], "completion_metadata": saved,
+                "refund_action": refund_action.model_dump(mode="json") if refund_action else None}
 
     def after_retrieval(state: ConversationState) -> str:
         """参数：state检索结局；返回：闸或固定出口；异常：无。"""

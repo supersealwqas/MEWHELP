@@ -2,14 +2,14 @@
 
 import asyncio
 from pathlib import Path
-from uuid import uuid4
+from uuid import uuid4, uuid5, NAMESPACE_URL
 import pytest
 from sqlalchemy import delete, select, text, update
 from sqlalchemy.exc import DBAPIError
 from app.config import Settings
 from app.db.session import create_database
 from app.db.migrate_ch06 import migrate_connection
-from app.models.customer_service import Conversation, Message, Ticket
+from app.models.customer_service import Conversation, Message, Ticket, RefundApplication
 from app.repositories.actions import ActionRepository
 from app.schemas.workflow import OrderSelectionConflict
 from tests.workflow.test_order_wait_state import prepare_wait, selection
@@ -47,6 +47,11 @@ async def ch06_database():
                 assert row.session_id == session_id and row.user_id == "demo-user"
                 turns = set((await session.scalars(select(Message.turn_id).where(Message.conversation_id == registered))).all())
                 assert turns <= {"original"}, "未登记轮次禁止清理"
+                refunds = (await session.scalars(select(RefundApplication).where(RefundApplication.conversation_id == registered))).all()
+                expected_action = str(uuid5(NAMESPACE_URL, f"mewhelp:ch06:{registered}:original:submit_refund"))
+                assert all(row.action_id == expected_action and row.source_turn_id == "original" for row in refunds)
+                await session.execute(delete(RefundApplication).where(RefundApplication.conversation_id == registered,
+                                                                     RefundApplication.action_id == expected_action))
                 await session.execute(delete(Message).where(Message.conversation_id == registered))
                 await session.execute(delete(Conversation).where(Conversation.id == registered))
         await engine.dispose()
@@ -105,3 +110,72 @@ async def test_mysql_accept_rollback_preserves_wait(ch06_database):
         assert row.turn_status == row.rag_metadata["order_selection"]["status"] == "awaiting_input"
     accepted = await ActionRepository(factory).accept_order_selection(selection(ctx, action))
     assert accepted.accepted_order_id == "1001"
+
+
+async def prepare_refund(ch06_database):
+    """保存完整查询配对和退款快照。参数：ch06_database安全夹具；返回：工厂及确认请求；异常：数据库错误。"""
+    from app.schemas.workflow import RefundAction, RefundSubmission
+    from app.schemas.tools import ToolResult
+    factory, chat, ctx, _ = ch06_database
+    call_id = f"ch06:order:{ctx.turn_id}:1001"
+    await chat.save_tool_calls(ctx, [{"id": call_id, "name": "query_order", "args": {"order_id": "1001"}}], deduplicate=True)
+    await chat.save_tool_result(ctx.model_copy(update={"tool_call_id": call_id}), ToolResult.success({"order_id": "1001"}))
+    action = RefundAction(action_id=str(uuid5(NAMESPACE_URL, f"mewhelp:ch06:{ctx.conversation_id}:{ctx.turn_id}:submit_refund")),
+                          source_turn_id=ctx.turn_id, question=ctx.user_message, order_id="1001")
+    await chat.finish_turn(ctx, "本地申请待处理，不代表退款批准", refund_action=action,
+                           workflow_metadata={"intent": "退款退货", "route": "order_policy", "order_id": "1001"})
+    return factory, RefundSubmission(session_id=ctx.session_id, user_id=ctx.user_id,
+        source_turn_id=ctx.turn_id, action_id=action.action_id, reason_code="quality_issue", confirmed=True)
+
+
+async def test_mysql_refund_unique_constraint_and_concurrent_receipt(ch06_database):
+    """真实并发与独立唯一键都只允许一份退款申请。参数：安全夹具；返回：None；异常：断言失败。"""
+    factory, request = await prepare_refund(ch06_database)
+    repo = ActionRepository(factory)
+    first, second = await asyncio.gather(repo.submit_refund(request), repo.submit_refund(request))
+    assert first == second and first.status == "待处理"
+    async with factory() as session:
+        rows = (await session.scalars(select(RefundApplication).where(RefundApplication.action_id == request.action_id))).all()
+        assert len(rows) == 1
+        row = rows[0]
+        assert await session.scalar(select(Ticket.ticket_no).where(Ticket.conversation_id == row.conversation_id)) is None
+        values = {column.name: getattr(row, column.name) for column in RefundApplication.__table__.columns}
+    with pytest.raises(DBAPIError, match="uq_refund_action"):
+        async with factory.begin() as session:
+            session.add(RefundApplication(**{**values, "refund_no": "RF" + "0" * 32}))
+    with pytest.raises(OrderSelectionConflict):
+        await repo.submit_refund(request.model_copy(update={"reason_code": "other"}))
+
+
+@pytest.mark.parametrize("committed", [False, True])
+async def test_mysql_refund_rollback_and_lost_commit_response(ch06_database, committed):
+    """回滚可重试，提交响应丢失回读同编号。参数：安全夹具、committed是否已提交；返回：None；异常：断言失败。"""
+    from contextlib import asynccontextmanager
+    factory, request = await prepare_refund(ch06_database)
+
+    class FaultFactory:
+        """只在写事务提交边界注入故障，回读使用真正新session。"""
+
+        def __call__(self):
+            """参数：无；返回：新session；异常：连接错误。"""
+            return factory()
+
+        @asynccontextmanager
+        async def begin(self):
+            """参数：无；返回：写session；异常：提交前/后ConnectionError。"""
+            async with factory.begin() as session:
+                yield session
+                if not committed:
+                    raise ConnectionError("rollback")
+            raise ConnectionError("commit response lost")
+
+    repo = ActionRepository(FaultFactory())
+    if committed:
+        first = await repo.submit_refund(request)
+        assert first == await ActionRepository(factory).submit_refund(request)
+    else:
+        with pytest.raises(ConnectionError):
+            await repo.submit_refund(request)
+        async with factory() as session:
+            assert await session.scalar(select(RefundApplication).where(RefundApplication.action_id == request.action_id)) is None
+        assert (await ActionRepository(factory).submit_refund(request)).status == "待处理"

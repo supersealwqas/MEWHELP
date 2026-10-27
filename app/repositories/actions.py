@@ -5,12 +5,13 @@ from uuid import NAMESPACE_URL, uuid5
 from pydantic import ValidationError
 from sqlalchemy import select, update
 
-from app.models.customer_service import Conversation, Message, Ticket
-from app.repositories.chat import PersistenceUncertain, owned_source, source_context
+from app.models.customer_service import Conversation, Message, Ticket, RefundApplication
+from app.repositories.chat import PersistenceUncertain, owned_source, source_context, validate_refund_evidence
 from app.repositories.support import ticket_number
 from app.schemas.tools import TicketArgs, ToolContext, ToolResult
 from app.schemas.workflow import (PreparedTicketAction, SuggestedAction, TicketConfirmation, TicketReceipt,
                                  OrderSelection, OrderSelectionAction, AcceptedOrderSelection, OrderSelectionConflict)
+from app.schemas.workflow import RefundAction, RefundSubmission, RefundReceipt
 
 
 class ActionNotFound(ValueError):
@@ -60,6 +61,82 @@ class ActionRepository:
             await session.execute(update(Message).where(Message.conversation_id == conversation.id,
                 Message.turn_id == source.turn_id).values(turn_status="running"))
             return AcceptedOrderSelection(context=context, action=action, accepted_order_id=request.order_id, turn_status="running")
+
+    def _refund_receipt(self, row: RefundApplication) -> RefundReceipt:
+        """从真实申请行构造确定回执。参数：row已提交或将提交行；返回：回执；异常：数据损坏校验错误。"""
+        return RefundReceipt(action_id=row.action_id, refund_no=row.refund_no, order_id=row.order_id,
+                             reason_code=row.reason_code, status=row.status)
+
+    async def get_refund_receipt(self, session_id: str, user_id: str, action_id: str) -> RefundReceipt | None:
+        """独立新事务回读本人申请。参数：会话/用户/动作键；返回：确定回执或None；异常：数据库错误。"""
+        async with self.factory() as session:
+            row = await session.scalar(select(RefundApplication).join(Conversation, Conversation.id == RefundApplication.conversation_id)
+                .where(Conversation.session_id == session_id, Conversation.user_id == user_id,
+                       RefundApplication.user_id == user_id, RefundApplication.action_id == action_id))
+            return self._refund_receipt(row) if row is not None else None
+
+    def _same_refund(self, row, request, conversation) -> RefundReceipt:
+        """已有真实回执优先，禁止同键换身份/来源/原因。参数：申请行/请求/会话；返回：回执；异常：404或409语义异常。"""
+        if row.conversation_id != conversation.id or row.user_id != request.user_id or row.source_turn_id != request.source_turn_id:
+            raise ActionNotFound("申请不存在")
+        if row.reason_code != request.reason_code:
+            raise OrderSelectionConflict("同一申请不能更换原因，已保存原申请")
+        return self._refund_receipt(row)
+
+    async def submit_refund(self, request: RefundSubmission) -> RefundReceipt:
+        """独立事务保存本地申请，唯一动作键防重，响应丢失用新事务核实。
+
+        参数：request仅包含身份、动作和已确认原因。
+        返回：已提交的待处理回执，不表示批准退款。
+        异常：ActionNotFound来源非法；OrderSelectionConflict同键改原因；数据库错误表示结果待核实。
+        """
+        try:
+            async with self.factory.begin() as session:
+                conversation = await session.scalar(select(Conversation).where(Conversation.session_id == request.session_id,
+                                                                             Conversation.user_id == request.user_id))
+                if conversation is None:
+                    raise ActionNotFound("申请来源不存在")
+                existing = await session.scalar(select(RefundApplication).where(RefundApplication.action_id == request.action_id))
+                if existing is not None:
+                    return self._same_refund(existing, request, conversation)
+                source_id = await session.scalar(select(Message.id).where(Message.conversation_id == conversation.id,
+                    Message.turn_id == request.source_turn_id, Message.role == "assistant", Message.tool_calls.is_(None),
+                    Message.turn_status == "completed").order_by(Message.id.desc()).limit(1))
+                if source_id is None:
+                    raise ActionNotFound("申请来源未完成")
+                source = await session.scalar(select(Message).where(Message.id == source_id).with_for_update())
+                # 等待来源锁后再当前读，防止MySQL可重复读遗漏刚提交的同键申请。
+                existing = await session.scalar(select(RefundApplication).where(RefundApplication.action_id == request.action_id).with_for_update())
+                if existing is not None:
+                    return self._same_refund(existing, request, conversation)
+                metadata = source.rag_metadata or {}
+                try:
+                    action = RefundAction.model_validate(metadata.get("refund_action"))
+                    _, user = await owned_source(session, request.session_id, request.user_id, request.source_turn_id)
+                    if user is None or user.turn_status != "completed" or action.action_id != request.action_id:
+                        raise ValueError("来源用户轮不一致")
+                    context = source_context(conversation, user)
+                    await validate_refund_evidence(session, context, action, metadata.get("workflow"))
+                except ValueError as error:
+                    raise ActionNotFound("退款建议未通过来源核验") from error
+                row = RefundApplication(refund_no="RF" + uuid5(NAMESPACE_URL, f"mewhelp:ch06:refund:{action.action_id}").hex.upper(),
+                    action_id=action.action_id, conversation_id=conversation.id, source_turn_id=request.source_turn_id,
+                    user_id=request.user_id, order_id=action.order_id, reason_code=request.reason_code,
+                    original_question=action.question, status="待处理")
+                session.add(row)
+                receipt = self._refund_receipt(row)
+            return receipt
+        except (ActionNotFound, OrderSelectionConflict):
+            raise
+        except Exception:
+            # 失败session已退出/回滚；唯一键冲突或提交响应丢失后只用新事务回读，不重复插入。
+            async with self.factory() as session:
+                conversation = await session.scalar(select(Conversation).where(Conversation.session_id == request.session_id,
+                                                                             Conversation.user_id == request.user_id))
+                existing = await session.scalar(select(RefundApplication).where(RefundApplication.action_id == request.action_id))
+                if conversation is not None and existing is not None:
+                    return self._same_refund(existing, request, conversation)
+            raise
 
     async def _trusted_action(self, session, request: TicketConfirmation) -> PreparedTicketAction:
         """先验归属再锁来源、读取建议。参数：session短事务、request确认；返回：可信派生动作；异常：ActionNotFound/InvalidTicketArguments/数据库错误。"""

@@ -41,6 +41,7 @@ class ConversationState(TypedDict, total=False):
     budget: dict  # 每轮独占的BudgetLedger快照，各节点结束后整体替换。
     suggested_kinds: list[ActionKind]  # 待服务端构造快照的建议类型，不执行动作。
     suggested_actions: list[dict]  # 服务端构造的稳定建议快照，未生成时为空。
+    refund_action: dict | None  # 独立本地退款建议，未经核实或新轮时为空。
     answer: str  # 本轮完整用户可见正文。
     stop_reason: str | None  # 本轮结束原因，尚未结束时为空。
     completion_metadata: dict  # 本轮最终审计与界面元数据。
@@ -66,6 +67,6 @@ def new_turn_state(context: ToolContext, history_turns: list[dict], audit_cursor
         "intent": None, "intent_confidence": None, "route": None, "evidence": [], "evidence_scores": [], "gate": None,
         "pending_calls": [], "seen_call_ids": [], "seen_call_signatures": [],
         "tool_count": 0, "decision_count": 0, "budget": BudgetLedger().snapshot(),
-        "suggested_kinds": [], "suggested_actions": [], "answer": "", "stop_reason": None,
+        "suggested_kinds": [], "suggested_actions": [], "refund_action": None, "answer": "", "stop_reason": None,
         "completion_metadata": {},
     }

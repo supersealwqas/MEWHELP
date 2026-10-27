@@ -77,7 +77,7 @@ class MemoryRepository:
             self._message_added(context.turn_id)
         return self.results[key]
 
-    async def finish_turn(self, context, content, *, low_confidence=None, citations=None, suggested_actions=None, workflow_metadata=None):
+    async def finish_turn(self, context, content, *, low_confidence=None, citations=None, suggested_actions=None, workflow_metadata=None, refund_action=None):
         """模拟原子完成/入池。参数：上下文、回答、失败、引用、建议、流程摘要；返回：元数据；异常：ConnectionError。"""
         from app.knowledge.sources import answer_metadata
         if self.fail_finish:
@@ -95,6 +95,8 @@ class MemoryRepository:
             self.metadata[context.turn_id]["suggested_actions"] = [item.model_dump(mode="json") for item in suggested_actions]
         if workflow_metadata is not None:
             self.metadata[context.turn_id]["workflow"] = workflow_metadata
+        if refund_action is not None:
+            self.metadata[context.turn_id]["refund_action"] = refund_action.model_dump(mode="json")
         return self.metadata[context.turn_id]
 
     async def mark_turn(self, context, status):

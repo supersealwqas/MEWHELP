@@ -29,7 +29,7 @@ def test_new_turn_replaces_every_runtime_field_and_retains_history():
                     gate={"passed": True}, pending_calls=[{"id": "old-call"}], seen_call_ids=["old-call"],
                     seen_call_signatures=["old-signature"], tool_count=4, decision_count=5,
                     suggested_kinds=["handoff"], suggested_actions=[{"action_id": "old-action"}],
-                    answer="旧答案", stop_reason="answer", completion_metadata={"old": True})
+                    refund_action={"action_id": "old-refund"}, answer="旧答案", stop_reason="answer", completion_metadata={"old": True})
     prior_ledger = BudgetLedger.from_snapshot(previous["budget"])
     prior_ledger.reserve("classify", 10, 128)
     previous["budget"] = prior_ledger.snapshot()
@@ -44,7 +44,7 @@ def test_new_turn_replaces_every_runtime_field_and_retains_history():
         "order_id": None, "order_data": None, "expanded_queries": [], "selection_action": None, "route": None, "evidence": [], "evidence_scores": [],
         "gate": None, "pending_calls": [], "seen_call_ids": [], "seen_call_signatures": [],
         "tool_count": 0, "decision_count": 0, "suggested_kinds": [], "suggested_actions": [],
-        "answer": "", "stop_reason": None, "completion_metadata": {},
+        "refund_action": None, "answer": "", "stop_reason": None, "completion_metadata": {},
     }
     budget = merged.pop("budget")
     assert merged == expected

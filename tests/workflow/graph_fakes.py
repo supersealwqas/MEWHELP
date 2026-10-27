@@ -37,7 +37,7 @@ class StrictChat:
         self.results.append((context.tool_call_id, result))
         self.order.append("result")
         return result
-    async def finish_turn(self, context, content, *, low_confidence, citations, suggested_actions, workflow_metadata):
+    async def finish_turn(self, context, content, *, low_confidence, citations, suggested_actions, workflow_metadata, refund_action=None):
         """参数：最终仓储契约的全部字段；返回：完成元数据；异常：断言失败。"""
         assert isinstance(context, ToolContext) and content
         assert {"intent", "route", "stop_reason", "budget", "tool_count", "decision_count"} <= workflow_metadata.keys()
@@ -53,7 +53,8 @@ class StrictChat:
         self.finished.append(record)
         self.order.append("finish")
         return {"turn_id": context.turn_id, "citations": [x.model_dump(mode="json") for x in citations],
-                "suggested_actions": [x.model_dump(mode="json") for x in suggested_actions], "workflow": workflow_metadata}
+                "suggested_actions": [x.model_dump(mode="json") for x in suggested_actions], "workflow": workflow_metadata,
+                "refund_action": refund_action.model_dump(mode="json") if refund_action else None}
 
 class StrictExecutor:
     """只记录被图批准的执行；模拟已有执行器的结果落库和状态回调。"""
