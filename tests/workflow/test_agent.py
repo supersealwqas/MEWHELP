@@ -6,7 +6,7 @@ from app.schemas.workflow import AgentDecision
 from app.schemas.tools import ToolResult
 from app.workflow.graph import build_workflow
 from tests.workflow.graph_fakes import dependencies, turn, call
-from tests.workflow.test_model import sdk_runtime, text_response, call_response, intent_response
+from tests.workflow.test_model import sdk_runtime, text_response, call_response, intent_response, understanding_response
 
 async def test_order_then_logistics_uses_complete_pairs_and_read_only_registry():
     """跳过订单事实、乱序执行或暴露写工具时失败。参数：无；返回：None；异常：断言失败。"""
@@ -19,7 +19,7 @@ async def test_order_then_logistics_uses_complete_pairs_and_read_only_registry()
     assert [t.name for t in build_agent_registry().all()] == ["query_order", "query_logistics", "query_product"]
     assert [t.name for t in build_ticket_registry().all()] == ["create_ticket"]
     assert all({t.name for t in item["tools"]} == {"query_order", "query_logistics", "query_product"} for item in deps.model.inputs if item["stage"] == "decide")
-    for item in deps.model.inputs[2:]:
+    for item in deps.model.inputs[3:]:
         assert "SF1" in json.dumps(item["messages"], ensure_ascii=False)
     assert [m["tool_call_id"] for m in state["messages"] if m["role"] == "tool"] == ["a", "b"]
     assert deps.chat.order == ["calls", "result", "calls", "result", "finish"]
@@ -55,7 +55,7 @@ async def test_order_rejection_skips_remaining_logistics_and_never_calls_model_a
     assert len(deps.executor.calls) == 1
     assert state["answer"] == "没有找到您的这笔订单，请确认订单号或物流单号后重试。"
     assert [r[0] for r in deps.chat.results] == ["a", "b"]
-    assert state["pending_calls"] == [] and len(deps.model.inputs) == 2
+    assert state["pending_calls"] == [] and len(deps.model.inputs) == 3
 
 @pytest.mark.parametrize("result", [ToolResult.failed("TOOL_TIMEOUT", "超时"), ConnectionError("故障")])
 async def test_tool_failure_pairs_unexecuted_remainder(result):
@@ -98,7 +98,7 @@ async def test_decision_limit_stops_before_next_model_request():
     deps = dependencies(workflow_max_decisions=1, decisions=[AgentDecision(kind="tools", tool_calls=[call("a")])],
         results=[ToolResult.success({"status": "已发货"})])
     state = await build_workflow(deps, checkpointer=None).ainvoke(turn())
-    assert state["decision_count"] == 1 and len(deps.model.inputs) == 2
+    assert state["decision_count"] == 1 and len(deps.model.inputs) == 3
     assert state["stop_reason"] == "decision_limit"
 
 async def test_unknown_or_write_tool_is_not_executed():
@@ -112,7 +112,7 @@ async def test_large_tool_fact_stops_without_truncation_or_answer_call():
     fact = "事实" * 10000
     deps = dependencies(decisions=[AgentDecision(kind="tools", tool_calls=[call("a")])], results=[ToolResult.success({"details": fact})])
     state = await build_workflow(deps, checkpointer=None).ainvoke(turn())
-    assert state["stop_reason"] == "budget_exceeded" and len(deps.model.inputs) == 2
+    assert state["stop_reason"] == "budget_exceeded" and len(deps.model.inputs) == 3
     assert fact in state["messages"][-1]["content"]
 
 async def test_fifth_decision_can_answer_after_four_tools():
@@ -121,13 +121,13 @@ async def test_fifth_decision_can_answer_after_four_tools():
         results=[ToolResult.success({"status": "已发货"}) for _ in range(4)], answers=[["已查询完成"]])
     state = await build_workflow(deps, checkpointer=None).ainvoke(turn())
     assert state["decision_count"] == 5 and state["tool_count"] == 4 and state["answer"] == "已查询完成"
-    assert state["budget"]["model_calls"] == 7
+    assert state["budget"]["model_calls"] == 8
 
 
 @pytest.mark.parametrize("actions", [["create_ticket"], ["handoff"], ["handoff", "create_ticket"], []])
 async def test_answer_receives_current_confirmed_suggestion_context(actions):
     """正文只接当前按钮的中文操作语义，不接可被复述的内部字段。参数：actions当前建议；返回：None；异常：断言失败。"""
-    deps = dependencies(intents=["售后"], decisions=[AgentDecision(kind="answer", suggested_actions=actions)], answers=[["请按页面提示确认"]])
+    deps = dependencies(intents=["其他"], decisions=[AgentDecision(kind="answer", suggested_actions=actions)], answers=[["请按页面提示确认"]])
     state = await build_workflow(deps, checkpointer=None).ainvoke(turn("设备故障，请创建售后工单"))
     actual = next(item["messages"] for item in deps.model.inputs if item["stage"] == "answer")
     description = actual[-1]["content"]
@@ -146,7 +146,7 @@ async def test_answer_receives_current_confirmed_suggestion_context(actions):
 
 async def test_answer_action_instructions_cannot_bypass_message_budget():
     """新增按钮说明也必须过现有输入预算，不能预算外加给模型。参数：无；返回：None；异常：断言失败。"""
-    deps = dependencies(token_budget=80, intents=["售后"],
+    deps = dependencies(token_budget=80, intents=["其他"],
         decisions=[AgentDecision(kind="answer", suggested_actions=["create_ticket"])], answers=[["旧路径会越过新增说明预算"]])
     state = await build_workflow(deps, checkpointer=None).ainvoke(turn("请建单"))
     assert state["stop_reason"] == "budget_exceeded"
@@ -182,7 +182,7 @@ async def test_followup_recovers_decision_format_without_losing_order_or_policy(
     invalid_raw = "内部格式失败标记：订单已有金额，请直接作答。"
     answer = f"订单{order_id}的商品金额为{amount}元；普通运费规则见[1]，实际运费还需核对减免。"
     sdk_runtime.responses.extend([
-        intent_response("商品咨询", knowledge_query=f"订单{order_id}的包邮条件与运费规则"),
+        understanding_response(query), intent_response("商品咨询"),
         *([text_response(invalid_raw)] if needs_recovery else []),
         call_response("submit_decision", '{"kind":"answer","suggested_actions":[]}'), text_response(answer),
     ])
@@ -201,9 +201,9 @@ async def test_followup_recovers_decision_format_without_losing_order_or_policy(
     assert completed["raw_query"] == query and completed["tool_count"] == 0
     assert deps.executor.calls == [] and deps.chat.calls == []
     assert not any(event["event"] == "tool_status" for event in events)
-    assert len(sdk_runtime.requests) == 3 + needs_recovery
+    assert len(sdk_runtime.requests) == 4 + needs_recovery
     # 检查真实SDK发出的两次决策与正文输入，而非替身自行生成的期望。
-    for request in sdk_runtime.requests[1:]:
+    for request in sdk_runtime.requests[2:]:
         messages = request["messages"]
         assert any(m["role"] == "user" and m["content"] == query for m in messages)
         assert any(m["role"] == "tool" and json.loads(m["content"])["data"]["order_id"] == order_id
@@ -213,7 +213,7 @@ async def test_followup_recovers_decision_format_without_losing_order_or_policy(
     assert "".join(e["data"]["delta"] for e in events if e["event"] == "delta") == answer
     assert deps.chat.finished[0]["workflow_metadata"]["stop_reason"] == "answer"
     assert [r["stage"] for r in completed["budget"]["records"]] == [
-        "classify", "rewrite", "decide", *(["decide"] if needs_recovery else []), "answer"]
+        "understand", "classify", "decide", *(["decide"] if needs_recovery else []), "answer"]
 
 
 @pytest.mark.parametrize("needs_recovery", [False, True], ids=["direct-control", "recover-missing-control"])
@@ -237,7 +237,7 @@ async def test_followup_recovery_after_order_and_logistics_never_reexecutes_tool
     logistics_call[0]["choices"][0]["delta"]["tool_calls"][0]["id"] = "lookup-logistics"
     answer = "1002的商品是猫粮，从杭州发往乌鲁木齐，目前派送中。"
     sdk_runtime.responses.extend([
-        intent_response("订单"), order_call, logistics_call,
+        understanding_response("1002呢"), intent_response("订单"), order_call, logistics_call,
         *([text_response("内部尚未遵循格式，已有事实足以回答。")] if needs_recovery else []),
         call_response("submit_decision", '{"kind":"answer","suggested_actions":[]}'), text_response(answer),
     ])
@@ -254,9 +254,9 @@ async def test_followup_recovery_after_order_and_logistics_never_reexecutes_tool
     assert [(c["name"], c["args"]) for c in deps.executor.calls] == [
         ("query_order", {"order_id": "1002"}), ("query_logistics", {"tracking_no": "SF2"})]
     assert completed["tool_count"] == 2 and len(deps.chat.results) == 2
-    assert len(sdk_runtime.requests) == 5 + needs_recovery
+    assert len(sdk_runtime.requests) == 6 + needs_recovery
     assert [c["name"] for c in deps.chat.calls] == ["query_order", "query_logistics"]
-    for request in sdk_runtime.requests[3:]:
+    for request in sdk_runtime.requests[4:]:
         facts = [json.loads(m["content"])["data"] for m in request["messages"] if m["role"] == "tool"]
         assert len(facts) == 2
         assert facts[0]["shipping_destination"] == "新疆维吾尔自治区乌鲁木齐市"
@@ -279,7 +279,7 @@ async def test_control_decision_preserves_clarification_and_confirmation_actions
     from app.workflow.model import WorkflowModelAdapter
 
     sdk_runtime.responses.extend([
-        intent_response("订单"),
+        understanding_response(query), intent_response("订单"),
         call_response("submit_decision", json.dumps({"kind": kind, "suggested_actions": actions})),
         text_response(answer),
     ])
@@ -291,7 +291,7 @@ async def test_control_decision_preserves_clarification_and_confirmation_actions
     assert [item["kind"] for item in completed["suggested_actions"]] == actions
     assert all(item["question"] == query for item in completed["suggested_actions"])
     assert deps.executor.calls == deps.chat.calls == deps.chat.results == []
-    assert completed["tool_count"] == 0 and len(sdk_runtime.requests) == 3
+    assert completed["tool_count"] == 0 and len(sdk_runtime.requests) == 4
     assert "submit_decision" not in json.dumps(sdk_runtime.requests[-1]["messages"])
     assert ("创建工单" in sdk_runtime.requests[-1]["messages"][-1]["content"]) == bool(actions)
 

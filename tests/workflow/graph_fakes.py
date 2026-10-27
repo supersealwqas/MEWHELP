@@ -26,10 +26,10 @@ class StrictChat:
     def __init__(self):
         """参数：无；返回：None；异常：无。"""
         self.calls, self.results, self.finished, self.order = [], [], [], []
-    async def save_tool_calls(self, context, calls):
+    async def save_tool_calls(self, context, calls, *, deduplicate=False):
         """参数：可信上下文与申请；返回：None；异常：断言失败。"""
         assert isinstance(context, ToolContext)
-        self.calls.extend(deepcopy(calls))
+        self.calls.extend(deepcopy([call for call in calls if not deduplicate or call not in self.calls]))
         self.order.append("calls")
     async def save_tool_result(self, context, result):
         """参数：可信上下文与结果；返回：ToolResult；异常：断言失败。"""
@@ -81,28 +81,42 @@ class StrictSearch:
     def __init__(self, ranked=(), error=None):
         """参数：ranked权威结果、error可选故障；返回：None；异常：无。"""
         self.ranked, self.error, self.calls = list(ranked), error, []
-    async def retrieve(self, query, *, budget):
+    async def retrieve(self, query, *, budget, prepared_queries=None, history=""):
         """参数：query原问、budget独占账本；返回：排名；异常：脚本故障。"""
         return self._take("retrieve", query, budget)
-    async def retrieve_policy(self, query, *, budget):
+    async def retrieve_policy(self, query, *, budget, prepared_queries=None, history=""):
         """参数：query原问、budget独占账本；返回：排名；异常：脚本故障。"""
         return self._take("retrieve_policy", query, budget)
     def _take(self, kind, query, budget):
         """参数：kind入口、query原問、budget账本；返回：排名；异常：脚本故障。"""
         self.calls.append((kind, query))
-        budget.reserve("rewrite", 100, 2048)
         if self.error:
             raise self.error
         return self.ranked
 
-def dependencies(*, intents=("订单",), decisions=(), answers=(), ranked=(), results=(), **settings):
+class StrictExpander:
+    """明确返回标准问法的离线扩写边界，记录调用并扣除真实阶段预算。"""
+
+    def __init__(self):
+        """建立调用列表。参数：无；返回：None；异常：无。"""
+        self.calls = []
+
+    async def expand(self, query, *, simple_query, budget):
+        """返回单查询。参数：query种子、simple_query标准问法、budget账本；返回：ExpandedQueries；异常：预算错误。"""
+        from app.knowledge.query_rewrite import ExpandedQueries
+        self.calls.append((query, simple_query))
+        budget.reserve("expand", 100, 2048)
+        return ExpandedQueries(queries=[simple_query])
+
+
+def dependencies(*, intents=("订单",), decisions=(), answers=(), ranked=(), results=(), understandings=(), **settings):
     """参数：有限依赖脚本与配置覆盖；返回：WorkflowDependencies；异常：配置校验错误。"""
     chat = StrictChat()
     # 沿用全局夹具的离线快照，避免SDK导入.env污染预算；用例显式覆盖仍参与校验。
     options = {**config.settings.model_dump(), **settings}
-    return WorkflowDependencies(ScriptedWorkflowModel(intents=intents, decisions=decisions, answers=answers),
+    return WorkflowDependencies(ScriptedWorkflowModel(intents=intents, decisions=decisions, answers=answers, understandings=understandings),
         StrictSearch(ranked), StrictExecutor(chat, results), chat,
-        Settings(_env_file=None, **options))
+        Settings(_env_file=None, **options), query_expander=StrictExpander())
 
 def turn(query="查订单1001", *, session="session", turn_id=None):
     """参数：query原问、session会话、turn_id可选轮ID；返回：新轮State；异常：原问错误。"""

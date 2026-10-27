@@ -139,7 +139,9 @@ async def database_runtime():
             executor = ToolExecutor(build_agent_registry(), repository, support, settings.tool_timeout_seconds,
                 settings.tool_max_retries, settings.tool_retry_delay_seconds,
                 knowledge_timeout_seconds=settings.knowledge_timeout_seconds)
-            deps = WorkflowDependencies(WorkflowModelAdapter(), search, executor, repository, settings)
+            from app.knowledge.query_rewrite import QueryExpander
+            deps = WorkflowDependencies(WorkflowModelAdapter(), search, executor, repository, settings,
+                QueryExpander(request_budget=settings.request_token_budget))
             async with workflow_runtime(deps, Path(settings.workflow_checkpoint_path)) as graph:
                 yield ChatService(repository, graph, executor, settings)
     finally:

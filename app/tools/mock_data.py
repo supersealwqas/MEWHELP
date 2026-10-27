@@ -34,6 +34,18 @@ def owns_order(user_id: str, order_id: str | None) -> bool:
     return order_id in _ORDER_OWNERS and _ORDER_OWNERS[order_id] == user_id
 
 
+def list_user_orders(user_id: str) -> list[dict]:
+    """列出本人有限演示订单的选择摘要。
+
+    参数：user_id服务端核实的演示用户标识。
+    返回：list[dict]，仅含order_id、product_name、status，不泄露其他用户订单。
+    异常：无；不访问网络或数据库。
+    """
+    return [{"order_id": identifier, "product_name": order_snapshot(identifier)["product"],
+             "status": order_snapshot(identifier)["status"]}
+            for identifier, owner in _ORDER_OWNERS.items() if owner == user_id]
+
+
 def _mock_order_snapshot(order_id: str) -> tuple[dict, dict]:
     """按订单号生成一致的订单与物流演示快照。
 

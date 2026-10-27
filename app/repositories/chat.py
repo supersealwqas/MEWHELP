@@ -115,9 +115,32 @@ class ChatRepository:
                                               tool_calls=row.tool_calls, tool_call_id=row.tool_call_id))
         return HistoryDelta(turns=list(turns.values()), last_message_id=last_id)
 
-    async def save_tool_calls(self, context: ToolContext, calls: list[dict]) -> None:
-        """执行前保存模型原申请。参数：上下文和申请列表；返回：None；异常：数据库写入失败。"""
+    async def save_tool_calls(self, context: ToolContext, calls: list[dict], *, deduplicate: bool = False) -> None:
+        """执行前保存完整申请，确定性节点可按键防重。
+
+        参数：context可信上下文；calls完整申请；deduplicate是否在来源行锁内按ID校验。
+        返回：None；相同完整申请不新增。
+        异常：PersistenceUncertain，缺来源或相同ID内容冲突；数据库写入错误。
+        """
         async with self.factory.begin() as session:
+            if deduplicate:
+                source = await session.scalar(select(Message).where(Message.conversation_id == context.conversation_id,
+                    Message.turn_id == context.turn_id, Message.role == "user").order_by(Message.id).limit(1).with_for_update())
+                if source is None:
+                    raise PersistenceUncertain("确定性查询缺少来源轮次")
+                rows = (await session.scalars(select(Message).where(Message.conversation_id == context.conversation_id,
+                    Message.turn_id == context.turn_id, Message.tool_calls.is_not(None)))).all()
+                existing = {call["id"]: call for row in rows for call in row.tool_calls if "id" in call}
+                pending = []
+                for call in calls:
+                    if call["id"] in existing and existing[call["id"]] != call:
+                        raise PersistenceUncertain("相同查询调用键的内容不一致")
+                    if call["id"] not in existing:
+                        pending.append(call)
+                        existing[call["id"]] = call
+                calls = pending
+                if not calls:
+                    return
             session.add(Message(conversation_id=context.conversation_id, turn_id=context.turn_id,
                                 role="assistant", content=None, tool_calls=calls))
 

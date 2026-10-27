@@ -341,7 +341,7 @@ async def live_runtime(config, factory, entries: list, report_dir: Path):
     """装配真实CH05所有依赖并统一关闭。参数：显式配置/工厂/清单/报告；返回：运行时；异常：启动错误。"""
     import httpx
     from app.core import llm
-    from app.knowledge.query_rewrite import QueryRewriter
+    from app.knowledge.query_rewrite import QueryRewriter, QueryExpander
     from app.knowledge.runtime import knowledge_storage, online_search_runtime
     from app.repositories.chat import ChatRepository
     from app.repositories.support import SupportRepository
@@ -388,7 +388,8 @@ async def live_runtime(config, factory, entries: list, report_dir: Path):
                 config.tool_timeout_seconds, config.tool_max_retries, config.tool_retry_delay_seconds,
                 knowledge_timeout_seconds=config.knowledge_timeout_seconds)
             model = WorkflowModelAdapter(model_factory=model_factory, stream_usage=config.workflow_stream_usage)
-            deps = WorkflowDependencies(model, search, executor, repository, config)
+            deps = WorkflowDependencies(model, search, executor, repository, config,
+                QueryExpander(model_factory=model_factory, request_budget=config.request_token_budget))
             async with workflow_runtime(deps, Path(config.workflow_checkpoint_path)) as graph:
                 graph = graph.with_config(callbacks=[trace])
                 yield SimpleNamespace(service=ChatService(repository, graph, executor, config), factory=factory,

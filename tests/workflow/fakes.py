@@ -3,16 +3,24 @@
 from collections import deque
 
 from app.core.model_budget import OUTPUT_LIMITS, BudgetLedger
-from app.schemas.workflow import AgentDecision, IntentResult
+from app.schemas.workflow import AgentDecision, IntentResult, UnderstandingResult
 
 
 class ScriptedWorkflowModel:
     """消费有限脚本并保留消息记录；任何额外请求立即失败，不无限返回默认答案。"""
 
-    def __init__(self, *, intents=(), decisions=(), answers=()) -> None:
+    def __init__(self, *, intents=(), decisions=(), answers=(), understandings=()) -> None:
         """参数：intents 意图结果/名称、decisions 严格决策、answers 各次正文块序列；返回：None；异常：无。"""
         self.intents, self.decisions, self.answers = deque(intents), deque(decisions), deque(answers)
         self.inputs: list[dict] = []
+        self.understandings = deque(understandings)
+
+    async def understand(self, messages: list, ledger: BudgetLedger) -> UnderstandingResult:
+        """执行指定理解或明确的原话透传。参数：messages当前消息、ledger账本；返回：理解结果；异常：脚本或预算错误。"""
+        query = next(row["content"] for row in reversed(messages) if row["role"] == "user")
+        script = self.understandings or deque([UnderstandingResult(
+            resolved_query=query, standard_query=query, needs_resolution=False, order_id=None)])
+        return self._take(script, "understand", messages, ledger, OUTPUT_LIMITS["understand"])
 
     def _take(self, script, stage: str, messages: list, ledger: BudgetLedger, output_limit: int):
         """消费一次逻辑请求。参数：script 有限队列、stage/messages 观测输入、ledger/output_limit 计量；返回：脚本项；异常：AssertionError/脚本异常/预算错误。"""
@@ -31,8 +39,7 @@ class ScriptedWorkflowModel:
         result = self._take(self.intents, "classify", messages, ledger, OUTPUT_LIMITS["classify"])
         if not isinstance(result, str):
             return result
-        query = next(row["content"] for row in reversed(messages) if row["role"] == "user")
-        return IntentResult(intent=result, knowledge_query=query if result in {"商品咨询", "退款退货"} and len(query) <= 2000 else None)
+        return IntentResult(intent=result, confidence=0.9)
 
     async def decide(self, messages: list, tools: list, ledger: BudgetLedger) -> AgentDecision:
         """返回脚本内部决定。参数：messages 输入、tools 可见工具、ledger 本轮账本；返回：AgentDecision；异常：脚本/额度错误。"""

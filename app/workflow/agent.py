@@ -19,6 +19,7 @@ from app.workflow.citations import CitationStreamFilter
 from app.workflow.model import decision_tool_schemas
 from app.workflow.prompts import ANSWER_PROMPT, DECISION_PROMPT
 from app.workflow.state import ConversationState
+from app.workflow.stages import publish_stage
 
 if TYPE_CHECKING:
     from app.workflow.graph import WorkflowDependencies
@@ -66,6 +67,22 @@ def _signature(call: dict) -> str:
     """按既有工具去空白规则计算去重键。参数：call严格工具申请；返回：稳定JSON；异常：ValueError，非法JSON数值。"""
     args = {key: value.strip() if isinstance(value, str) else value for key, value in call["args"].items()}
     return json.dumps([call["name"], args], sort_keys=True, ensure_ascii=False, allow_nan=False)
+
+
+def policy_answer_messages(state: ConversationState) -> list[dict]:
+    """构造本轮受限政策事实，历史助手推断不得参与回答。
+
+    参数：state已核实订单、完整问题及已过闸证据。
+    返回：用户原问和事实系统消息列表；无政策时明确限制回答。
+    异常：JSON不可序列化的状态错误。
+    """
+    facts = {"完整问题": state["resolved_query"], "订单事实": state["order_data"], "政策证据": state["evidence"]}
+    rules = ("只依据下面的本轮事实回答。订单创建时间created_at不是签收时间signed_at；缺少签收时间须说明未知。"
+             "不追问退款原因，用户可在后续申请表选择原因。申请仅保存为待处理，不代表批准退款，不承诺到账时间。"
+             "分别说明能确认的事实、政策适用条件和仍缺少的条件；无政策证据时不得宣称可退或不可退。"
+             "仅政策说明可标注提供的引用编号，订单事实不加政策引用。\n")
+    return [{"role": "user", "content": state["raw_query"]},
+            {"role": "system", "content": rules + json.dumps(facts, ensure_ascii=False)}]
 
 
 def build_agent_graph(deps: "WorkflowDependencies"):
@@ -155,6 +172,7 @@ def build_agent_graph(deps: "WorkflowDependencies"):
     async def answer_node(state: ConversationState) -> ConversationState:
         """直接推送最终正文，不等待完整答案才发首帧。参数：state事实；返回：完整正文和账本；异常：正文/网络/取消。"""
         writer = get_stream_writer()
+        publish_stage(state, "answer", "running")
         if state["answer"]:
             writer({"event": "delta", "data": {"delta": state["answer"]}})
             return {"answer": state["answer"]}
@@ -169,6 +187,8 @@ def build_agent_graph(deps: "WorkflowDependencies"):
             # 正文模型只需要中文按钮语义；不传内部字段、枚举、身份或动作ID。完整说明仍先过原预算。
             answer_state = {**state, "messages": [*state["messages"],
                 {"role": "system", "content": action_text}]}
+            if state.get("route") == "order_policy":
+                answer_state = {**state, "history_turns": [], "messages": policy_answer_messages(state)}
             messages = model_messages(answer_state, deps.settings, ANSWER_PROMPT)
             parts = []
             citations = CitationStreamFilter({item["n"] for item in state["evidence"]},
@@ -188,6 +208,7 @@ def build_agent_graph(deps: "WorkflowDependencies"):
             update = stopped_state("budget_exceeded", ledger)
             writer({"event": "delta", "data": {"delta": update["answer"]}})
             return update
+        publish_stage(state, "answer", "completed")
         return {"answer": "".join(parts), "budget": ledger.snapshot()}
 
     def after_decision(state: ConversationState) -> str:
@@ -202,7 +223,7 @@ def build_agent_graph(deps: "WorkflowDependencies"):
     graph.add_node("decision", decision)
     graph.add_node("tools", tools_node)
     graph.add_node("answer", answer_node)
-    graph.add_edge(START, "decision")
+    graph.add_conditional_edges(START, lambda state: "answer" if state.get("route") == "order_policy" else "decision")
     graph.add_conditional_edges("decision", after_decision, {"tools": "tools", "answer": "answer"})
     graph.add_conditional_edges("tools", after_tools, {"decision": "decision", "answer": "answer"})
     graph.add_edge("answer", END)

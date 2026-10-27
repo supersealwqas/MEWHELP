@@ -46,6 +46,35 @@ def route_by_intent(state: ConversationState) -> str:
 _ORDER_CANDIDATE = re.compile(r"(?<![A-Za-z0-9_-])(?:[A-Za-z]+(?:-[A-Za-z]+)*-?)?\d{4,}[A-Za-z0-9-]*(?![A-Za-z0-9_-])")
 
 
+def order_candidate(state: ConversationState, orders: list[dict]) -> str | None:
+    """核对完整编号和用途，不能把物流号或数字后缀作为订单。
+
+    参数：state含原话和理解候选；orders为本人可选订单列表。
+    返回：唯一可信完整订单号，缺失/歧义/用途冲突时None。
+    异常：无；候选只是线索，执行前仍需重新校验归属。
+    """
+    raw = state["raw_query"]
+    tokens = list(_ORDER_CANDIDATE.finditer(raw))
+    identifiers = {item.group() for item in tokens}
+    owned = {row["order_id"] for row in orders}
+    candidate = state.get("order_id")
+    if len(identifiers) > 1:
+        return None
+    if tokens:
+        token = tokens[0]
+        # 紧邻的物流用途声明优先于模型给出的订单字段。
+        if re.search(r"(?:快递(?:单号)?|运单号|物流单号)\s*[:：]?\s*$", raw[:token.start()]):
+            return None
+        identifier = token.group()
+        if candidate is not None and candidate != identifier:
+            return None
+        # 字母前缀必须由理解保留全号；失败时不从局部数字猜测。
+        if not identifier.isdigit() and candidate != identifier:
+            return None
+        return identifier if identifier in owned else None
+    return candidate if candidate in owned else None
+
+
 def original_understanding(raw_query: str) -> UnderstandingResult:
     """构造不修改原字符的理解回退。参数：raw_query合法1–4000字原话；返回：空订单的透传结果；异常：字段校验错误。"""
     return UnderstandingResult(resolved_query=raw_query, standard_query=raw_query,

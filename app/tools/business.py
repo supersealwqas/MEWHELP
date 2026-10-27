@@ -6,7 +6,7 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import InjectedToolArg, tool
 from pydantic import Field
 from app.schemas.tools import CODE_FIELD, ERROR_FIELD, KeywordArgs, KnowledgeQueryArgs, LogisticsArgs, OwnedOrderArgs, RefundPolicyArgs, TicketArgs
-from app.tools.mock_data import NOT_OWNED, logistics_snapshot, order_id_for_tracking_no, order_snapshot, owns_order
+from app.tools.mock_data import NOT_OWNED, list_user_orders, logistics_snapshot, order_id_for_tracking_no, order_snapshot, owns_order
 
 # 写操作标记。写操作会改变外部状态，不能像只读查询那样重试；
 # 由工具自身声明，执行器据此调整重试策略与超时文案。

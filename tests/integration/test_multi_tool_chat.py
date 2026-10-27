@@ -72,12 +72,12 @@ async def isolated_multi_tool_mysql(request: pytest.FixtureRequest):
             from app.tools.registry import build_agent_registry
             from app.workflow.graph import WorkflowDependencies, build_workflow
             from tests.workflow.fakes import ScriptedWorkflowModel
-            from tests.workflow.graph_fakes import StrictSearch
+            from tests.workflow.graph_fakes import StrictSearch, StrictExpander
             chat = ChatRepository(factory)
             model = ScriptedWorkflowModel(intents=["物流"], decisions=[*decisions, AgentDecision(kind="answer")],
                                           answers=[["已按工具结果处理。"]])
             executor = ToolExecutor(build_agent_registry(), chat, SupportRepository(factory))
-            deps = WorkflowDependencies(model, StrictSearch(), executor, chat, config)
+            deps = WorkflowDependencies(model, StrictSearch(), executor, chat, config, StrictExpander())
             # 本例只验证业务MySQL配对；官方文件SQLite重开另由workflow专项与Task8覆盖。
             graph = build_workflow(deps, checkpointer=InMemorySaver())
             return ChatService(chat, graph, executor, config), chat, model

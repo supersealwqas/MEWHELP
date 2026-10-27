@@ -1,7 +1,7 @@
 """真实客服根图的固定路由、知识门闸、建议快照与完成契约测试。"""
 import json
 import pytest
-from app.schemas.workflow import AgentDecision
+from app.schemas.workflow import AgentDecision, UnderstandingResult
 from app.schemas.tools import ToolResult
 from app.workflow.graph import build_workflow
 from tests.workflow.graph_fakes import NodeTrace, dependencies, turn, ranked, call
@@ -19,7 +19,7 @@ async def test_contextual_followup_without_policy_need_reaches_agent(query, prev
     """
     from types import SimpleNamespace
 
-    classification = SimpleNamespace(intent="商品咨询", knowledge_query=None)
+    classification = "订单" if "物品" in query else "其他"
     deps = dependencies(intents=[classification], decisions=[AgentDecision(kind="answer")], answers=[[reply]])
     original = turn(query)
     original["history_turns"] = [{"turn_id": "previous", "turn_status": "completed", "messages": [
@@ -35,25 +35,27 @@ async def test_policy_followup_retrieves_resolved_question_without_replacing_use
     """退货运费追问仍只检索无对象短句，或改写覆盖原话时失败。参数：无；返回：None；异常：断言失败。"""
     from types import SimpleNamespace
 
-    classification = SimpleNamespace(intent="退款退货", knowledge_query="七天无理由退货的运费由谁承担？")
-    deps = dependencies(intents=[classification], ranked=[ranked()],
+    resolved = "七天无理由退货的运费由谁承担？"
+    understanding = UnderstandingResult(resolved_query=resolved, standard_query=resolved, needs_resolution=True, order_id=None)
+    deps = dependencies(intents=["商品咨询"], understandings=[understanding], ranked=[ranked()],
         decisions=[AgentDecision(kind="answer")], answers=[["退回运费由买家承担[1]。"]])
     original = turn("那运费呢？")
     original["history_turns"] = [{"turn_id": "previous", "turn_status": "completed", "messages": [
         {"role": "user", "content": "七天无理由退货有什么要求？"}, {"role": "assistant", "content": "商品需完好。"}]}]
     result = await build_workflow(deps, checkpointer=None).ainvoke(original)
-    assert deps.search.calls == [("retrieve_policy", "七天无理由退货的运费由谁承担？")]
+    assert deps.search.calls == [("retrieve", resolved)]
     assert result["raw_query"] == result["context"]["user_message"] == "那运费呢？"
     assert result["messages"][0] == {"role": "user", "content": "那运费呢？"}
     assert result["gate"]["passed"]
 
 
-@pytest.mark.parametrize("knowledge_query", [None, "退款政策"])
-async def test_classification_cannot_shorten_away_the_original_knowledge_input_limit(knowledge_query):
+@pytest.mark.parametrize("standard_query", ["问" * 2001, "退款政策"])
+async def test_classification_cannot_shorten_away_the_original_knowledge_input_limit(standard_query):
     """分类输出短问或空值不能让超长知识原问绕过输入上限。参数：knowledge_query模型输出；返回：None；异常：断言失败。"""
     from types import SimpleNamespace
 
-    deps = dependencies(intents=[SimpleNamespace(intent="退款退货", knowledge_query=knowledge_query)])
+    deps = dependencies(intents=["退款退货"], understandings=[UnderstandingResult(resolved_query="问" * 2001,
+        standard_query=standard_query, needs_resolution=False, order_id=None)])
     result = await build_workflow(deps, checkpointer=None).ainvoke(turn("问" * 2001))
     assert result["stop_reason"] == "input_limit" and deps.search.calls == []
 
@@ -62,30 +64,34 @@ async def test_order_with_shipping_policy_need_still_retrieves_knowledge():
     """订单标签不能让金额和邮费混合问题漏掉政策半问。参数：无；返回：None；异常：断言失败。"""
     from types import SimpleNamespace
 
-    classification = SimpleNamespace(intent="订单", knowledge_query="1005订单的包邮门槛与运费规则")
+    classification = "商品咨询"
     deps = dependencies(intents=[classification], ranked=[ranked()],
         decisions=[AgentDecision(kind="answer")], answers=[["商品89元，实际运费未知；若实付未满99元且无减免，基础运费6元[1]。"]])
     result = await build_workflow(deps, checkpointer=None).ainvoke(turn("多少钱，需要付邮费吗"))
     assert result["route"] == "knowledge" and result["gate"]["passed"]
-    assert deps.search.calls == [("retrieve", "1005订单的包邮门槛与运费规则")]
+    assert deps.search.calls == [("retrieve", "多少钱，需要付邮费吗")]
 
 @pytest.mark.parametrize("intent,entry", [("商品咨询", "retrieve"), ("退款退货", "retrieve_policy")])
 async def test_knowledge_nodes_precede_agent_and_keep_full_evidence(intent, entry):
     """删检索/闸、混淆退款入口或裁短证据时失败。参数：intent/entry路径；返回：None；异常：断言失败。"""
     evidence = [ranked(number=n, answer=f"第{n}块完整原文") for n in range(1, 31 if intent == "退款退货" else 11)]
-    deps = dependencies(intents=[intent], ranked=evidence, decisions=[AgentDecision(kind="answer")], answers=[["政策[1]"]])
+    deps = dependencies(intents=[intent], ranked=evidence, results=[ToolResult.success({"order_id": "1001", "status": "已签收"})],
+        decisions=[AgentDecision(kind="answer")], answers=[["政策[1]"]])
     trace = NodeTrace()
-    state = await build_workflow(deps, checkpointer=None).ainvoke(turn("  它还能退吗？ "), {"callbacks": [trace]})
-    assert trace.nodes.index("retrieve_knowledge") < trace.nodes.index("confidence_check") < trace.nodes.index("main_agent")
-    assert deps.search.calls == [(entry, "  它还能退吗？ ")]
+    original = turn("订单1001还能退吗？")
+    original["context"]["user_id"] = "demo-user"
+    state = await build_workflow(deps, checkpointer=None).ainvoke(original, {"callbacks": [trace]})
+    retrieval_node = "retrieve_policy" if intent == "退款退货" else "retrieve_knowledge"
+    assert trace.nodes.index(retrieval_node) < trace.nodes.index("confidence_check") < trace.nodes.index("main_agent")
+    assert deps.search.calls == [(entry, original["raw_query"] + (" 已签收" if intent == "退款退货" else ""))]
     assert len(state["evidence"]) == len(evidence)
-    decision_input = deps.model.inputs[1]["messages"]
+    decision_input = deps.model.inputs[-1]["messages"]
     assert all(item.chunk.text.answer in json.dumps(decision_input, ensure_ascii=False) for item in evidence)
     assert deps.chat.finished[0]["low_confidence"] is None
     assert state["completion_metadata"]["turn_id"] == state["context"]["turn_id"]
     json.dumps(state, allow_nan=False)
 
-@pytest.mark.parametrize("intent", ["物流", "订单", "售后"])
+@pytest.mark.parametrize("intent", ["物流", "订单", "其他"])
 async def test_business_routes_skip_retrieval_and_gate(intent):
     """业务被错误地预检索或门闸阻塞时失败。参数：intent业务意图；返回：None；异常：断言失败。"""
     deps = dependencies(intents=[intent], decisions=[AgentDecision(kind="clarify")], answers=[["请给订单号"]])
@@ -94,7 +100,7 @@ async def test_business_routes_skip_retrieval_and_gate(intent):
     assert not {"retrieve_knowledge", "confidence_check"}.intersection(trace.nodes)
     assert state["answer"] == "请给订单号" and deps.search.calls == []
 
-@pytest.mark.parametrize("intent", ["商品咨询", "退款退货"])
+@pytest.mark.parametrize("intent", ["商品咨询"])
 @pytest.mark.parametrize("scores", [[], [0.2]])
 async def test_weak_evidence_finishes_without_main_model_and_records_only_low_confidence(intent, scores):
     """纯知识低证据仍调用Agent或入池原因错误时失败。参数：intent知识意图；scores分数；返回：None；异常：断言失败。"""
@@ -104,12 +110,12 @@ async def test_weak_evidence_finishes_without_main_model_and_records_only_low_co
     assert "main_agent" not in trace.nodes and "log_turn" in trace.nodes
     assert state["stop_reason"] == "retrieval_low_conf"
     assert state["evidence"] == [] and not deps.executor.calls
-    assert [item["stage"] for item in deps.model.inputs] == ["classify"]
+    assert [item["stage"] for item in deps.model.inputs] == ["understand", "classify"]
     assert deps.chat.finished[0]["citations"] == []
     assert deps.chat.finished[0]["low_confidence"].source == "retrieval_low_conf"
 
 
-@pytest.mark.parametrize("intent", ["订单", "物流", "售后"])
+@pytest.mark.parametrize("intent", ["订单", "物流"])
 @pytest.mark.parametrize("scores", [[], [0.04]])
 async def test_weak_policy_evidence_does_not_block_readonly_business_queries(intent, scores):
     """知识需求误判把可以核实的业务问题提前拒答时失败。
@@ -120,7 +126,7 @@ async def test_weak_policy_evidence_does_not_block_readonly_business_queries(int
     from types import SimpleNamespace
 
     query = "1001订单是什么，从哪里到哪里，是什么东西？现在运到哪里了？什么快递运的"
-    classification = SimpleNamespace(intent=intent, knowledge_query="1001订单的商品及物流信息")
+    classification = intent
     deps = dependencies(intents=[classification],
         ranked=[ranked(score, answer="不应被采用的政策原文") for score in scores],
         results=[ToolResult.success({"order_id": "1001", "product": "猫粮", "tracking_no": "SF123",
@@ -132,8 +138,8 @@ async def test_weak_policy_evidence_does_not_block_readonly_business_queries(int
     result = await build_workflow(deps, checkpointer=None).ainvoke(turn(query))
     assert [item["name"] for item in deps.executor.calls] == ["query_order", "query_logistics"]
     assert result["tool_count"] == 2 and result["stop_reason"] == "answer"
-    assert not result["gate"]["passed"] and result["evidence"] == []
-    assert result["evidence_scores"] == scores
+    assert result["gate"] is None and result["evidence"] == []
+    assert result["evidence_scores"] == [] and not deps.search.calls
     inputs = json.dumps([item["messages"] for item in deps.model.inputs[1:]], ensure_ascii=False)
     assert "不应被采用的政策原文" not in inputs
     assert "本轮完整知识证据" not in inputs
@@ -148,7 +154,7 @@ async def test_weak_policy_evidence_keeps_business_history_for_followups():
     """低分恢复丢掉可信历史或将旧政策当作本轮证据时失败。参数：无；返回：None；异常：断言失败。"""
     from types import SimpleNamespace
 
-    deps = dependencies(intents=[SimpleNamespace(intent="订单", knowledge_query="1001的商品与发收地")],
+    deps = dependencies(intents=["订单"],
         ranked=[ranked(0.01, answer="低分无关政策")], decisions=[AgentDecision(kind="answer")],
         answers=[["1001的猫粮从杭州发往宁波。"]])
     original = turn("是什么东西，哪里到哪里")
@@ -160,7 +166,7 @@ async def test_weak_policy_evidence_keeps_business_history_for_followups():
         {"role": "assistant", "content": "1001已发货。"}]}]
     result = await build_workflow(deps, checkpointer=None).ainvoke(original)
     assert result["stop_reason"] == "answer"
-    decision_input = json.dumps(deps.model.inputs[1]["messages"], ensure_ascii=False)
+    decision_input = json.dumps(deps.model.inputs[-1]["messages"], ensure_ascii=False)
     assert "猫粮" in decision_input and "宁波" in decision_input
     assert "低分无关政策" not in decision_input
     assert result["answer"] == "1001的猫粮从杭州发往宁波。"
@@ -177,9 +183,7 @@ async def test_policy_gate_state_does_not_leak_across_high_low_high_checkpoint_t
     from langgraph.checkpoint.memory import InMemorySaver
 
     deps = dependencies(
-        intents=[SimpleNamespace(intent="订单", knowledge_query="1001包邮规则"),
-                 SimpleNamespace(intent="订单", knowledge_query="1001商品与收发地"),
-                 SimpleNamespace(intent="退款退货", knowledge_query="退换货政策")],
+        intents=["商品咨询", "订单", "商品咨询"],
         ranked=[ranked(answer="第一轮仅在证据中出现的规则")],
         results=[ToolResult.success({"order_id": "1001", "product": "猫粮",
                                     "shipping_origin": "杭州", "shipping_destination": "宁波"})],
@@ -200,8 +204,8 @@ async def test_policy_gate_state_does_not_leak_across_high_low_high_checkpoint_t
     second_input = turn("是什么东西，哪里到哪里", turn_id="second")
     second_input["history_turns"] = [first_history]
     second = await graph.ainvoke(second_input, config)
-    assert not second["gate"]["passed"] and second["evidence"] == []
-    assert second["evidence_scores"] == [0.04] and second["stop_reason"] == "answer"
+    assert second["gate"] is None and second["evidence"] == []
+    assert second["evidence_scores"] == [] and second["stop_reason"] == "answer"
     assert second["answer"] == "1001的猫粮从杭州发往宁波。"
     assert len(deps.executor.calls) == 1
     second_model_input = json.dumps(deps.model.inputs[-1]["messages"], ensure_ascii=False)
@@ -268,13 +272,15 @@ async def test_fixed_exits_create_stable_suggestions_without_agent(intent, want)
     assert first["suggested_actions"] == second["suggested_actions"]
     assert all(x["question"] == "  服务很差  " and x["source_turn_id"] == "t" for x in first["suggested_actions"])
     assert all(x["ticket_type"] == ("投诉" if x["kind"] == "create_ticket" else None) for x in first["suggested_actions"])
-    assert [i["stage"] for i in deps.model.inputs] == ["classify", "classify"]
+    assert [i["stage"] for i in deps.model.inputs] == ["understand", "classify", "understand", "classify"]
 
-async def test_refund_can_query_order_after_policy_gate():
-    """退款知识路径禁止后续业务工具时失败。参数：无；返回：None；异常：断言失败。"""
-    deps = dependencies(intents=["退款退货"], ranked=[ranked()], results=[ToolResult.success({"status": "已发货"})],
+async def test_refund_queries_order_before_policy_gate():
+    """退款必须在政策前确定性查询订单。参数：无；返回：None；异常：断言失败。"""
+    deps = dependencies(intents=["退款退货"], ranked=[ranked()], results=[ToolResult.success({"order_id": "1001", "status": "已发货"})],
         decisions=[AgentDecision(kind="tools", tool_calls=[call("1")]), AgentDecision(kind="answer")], answers=[["可以申请[1]"]])
-    state = await build_workflow(deps, checkpointer=None).ainvoke(turn())
+    original = turn()
+    original["context"]["user_id"] = "demo-user"
+    state = await build_workflow(deps, checkpointer=None).ainvoke(original)
     assert [c["name"] for c in deps.executor.calls] == ["query_order"]
     assert state["tool_count"] == 1 and state["gate"]["passed"]
 

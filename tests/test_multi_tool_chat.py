@@ -51,8 +51,8 @@ async def test_order_logistics_chain_uses_current_turn_result():
     events = await run(service)
     assert [event.data["name"] for event in events if event.event == "tool_status"] == [
         "query_order", "query_order", "query_logistics", "query_logistics"]
-    assert [row["stage"] for row in model.inputs] == ["classify", "decide", "decide", "decide", "answer"]
-    previous_result = next(message for message in model.inputs[2]["messages"] if message["role"] == "tool")
+    assert [row["stage"] for row in model.inputs] == ["understand", "classify", "decide", "decide", "decide", "answer"]
+    previous_result = next(message for message in model.inputs[3]["messages"] if message["role"] == "tool")
     assert json.loads(previous_result["content"])["data"]["tracking_no"] == "SF213502378238"
     results = list(repository.results.values())
     assert len(results) == 2 and results[1].data["latest_node"] == "包裹已到达杭州转运中心"
