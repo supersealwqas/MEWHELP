@@ -57,10 +57,25 @@ class Settings(BaseSettings):
     )
     workflow_checkpoint_path: str = Field(default=".data/checkpoints/ch05.sqlite3", min_length=1,
                                           description="CH05 单实例工作流 SQLite checkpoint 文件路径")
-    workflow_max_decisions: int = Field(default=5, ge=1, le=5, description="每轮最多内部决策次数")
+    workflow_max_decisions: int = Field(default=5, ge=1, le=5,
+        validation_alias=AliasChoices("max_agent_steps", "workflow_max_decisions"),
+        description="每轮最多内部决策次数，优先MAX_AGENT_STEPS，兼容WORKFLOW_MAX_DECISIONS")
     workflow_max_model_calls: int = Field(default=9, ge=1, le=9, description="每轮逻辑模型请求总上限，含一次空正文补救")
     workflow_total_token_budget: int = Field(default=240000, gt=0, description="每轮含 SDK 重试预留的保守估算总额，不是精确 Token 账单")
     workflow_stream_usage: bool = Field(default=False, description="显式请求兼容网关流式用量；缺失用量仍记未知")
+
+    # CH07按模型窗口分配历史；旧TOKEN_BUDGET只保留给旧章入口兼容。
+    model_context_window: int = Field(default=131072, gt=0, strict=True, description="应用配置的模型窗口，须根据实际模型校准")
+    max_output_tokens: int = Field(default=4096, gt=0, strict=True, description="单次模型输出预留上限")
+    max_user_input_tokens: int = Field(default=2000, gt=0, strict=True, description="本轮用户消息的估算上限，含协议")
+    tool_result_max_tokens: int = Field(default=1200, gt=0, strict=True, description="单个工具结果模型视图上限，原始落库结果不截断")
+    tool_call_max_tokens: int = Field(default=384, gt=0, strict=True, description="单个工具申请及关联协议的估算预留")
+    context_target_turns: int = Field(default=32, gt=0, strict=True, description="期望保留历史轮数，只用于预算推导，不按轮数触发摘要")
+    context_steady_turn_tokens: int = Field(default=1024, gt=0, strict=True, description="校准后的单轮稳态估算用量")
+    context_evidence_max_tokens: int = Field(default=8192, ge=0, strict=True, description="检索资料预留上限，实际取与窗口1/16的较小值")
+    context_summary_max_tokens: int = Field(default=4096, ge=0, strict=True, description="注入摘要预留上限，实际取与窗口1/24的较小值")
+    context_non_ascii_tokens: float = Field(default=2.0, gt=0, allow_inf_nan=False,
+        description="非ASCII字符估算系数，改变时必须同步重算预算与用量")
 
     # 本章 MySQL 持久化及工具的有限执行配置。
     mysql_host: str = Field(default="127.0.0.1", description="MySQL 主机地址")
@@ -154,7 +169,18 @@ class Settings(BaseSettings):
     rerank_device: str = Field(default="cuda:0", min_length=1, description="显式重排设备，默认 cuda:0，不在异常时切换模型或设备")
     rerank_batch_size: int = Field(default=4, ge=1, le=32, strict=True, description="本地重排推理批次，默认 4，GPU 并发由锁串行")
 
-    @field_validator("recall_top_k", "rerank_top_k", "rerank_batch_size", mode="before")
+    @field_validator("context_non_ascii_tokens", mode="before")
+    @classmethod
+    def validate_context_factor(cls, value: object) -> object:
+        """拒绝布尔系数。参数：value环境或调用值；返回：原值；异常：ValueError，避免True被转为1.0。"""
+        if isinstance(value, bool):
+            raise ValueError("中文估算系数不能是布尔值")
+        return value
+
+    @field_validator("recall_top_k", "rerank_top_k", "rerank_batch_size",
+        "model_context_window", "max_output_tokens", "max_user_input_tokens", "tool_result_max_tokens",
+        "tool_call_max_tokens", "context_target_turns", "context_steady_turn_tokens",
+        "context_evidence_max_tokens", "context_summary_max_tokens", mode="before")
     @classmethod
     def parse_retrieval_integer(cls, value: object) -> object:
         """只将环境中的十进制整数字符串转换为严格限额。

@@ -10,6 +10,7 @@ from collections import Counter
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage, trim_messages
 from langchain_core.tools import BaseTool
 from langchain_core.utils.function_calling import convert_to_openai_tool
+from app.core.context_budget import ContextBudgetExceeded, TokenEstimator
 from app.schemas.history import StoredTurn
 
 
@@ -122,10 +123,6 @@ def trim_history(messages: list[BaseMessage], max_tokens: int = 12000) -> list[B
     return trimmed
 
 
-class ContextBudgetExceeded(ValueError):
-    """当前用户问题与工具事实无法完整放入上下文预算。"""
-
-
 def valid_tool_calls(calls: list[dict]) -> bool:
     """校验可回灌的申请协议。参数：申请列表；返回：是否完整且 ID 唯一、无首尾空白；异常：无。"""
     ids = []
@@ -216,10 +213,7 @@ def _estimate_token_units(value: object) -> int:
     返回：int，ASCII 四字符约一单位、非 ASCII 每字符约两单位，向上取整。
     异常：TypeError 表示输入含不可 JSON 序列化的数据。
     """
-    # 禁止 ASCII 转义，以免把同一中文字符当作六个 ASCII 字符重新计价。
-    serialized = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-    quarter_units = sum(1 if character.isascii() else 8 for character in serialized)
-    return (quarter_units + 3) // 4
+    return TokenEstimator().value_tokens(value)
 
 
 def _estimate_message_tokens(messages: list[BaseMessage]) -> int:
@@ -229,17 +223,7 @@ def _estimate_message_tokens(messages: list[BaseMessage]) -> int:
     返回：int，逐条累加的近似输入单位数，不是模型真实 Token 数。
     异常：TypeError 表示消息正文或工具参数不能 JSON 序列化。
     """
-    total = 0
-    for message in messages:
-        fields = {"role": message.type, "content": message.content}
-        if message.name:
-            fields["name"] = message.name
-        if isinstance(message, AIMessage) and message.tool_calls:
-            fields["tool_calls"] = message.tool_calls
-        if isinstance(message, ToolMessage):
-            fields["tool_call_id"] = message.tool_call_id
-        total += _estimate_token_units(fields)
-    return total
+    return TokenEstimator().message_tokens(messages)
 
 
 def _model_message(message: BaseMessage) -> BaseMessage:
