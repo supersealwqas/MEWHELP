@@ -25,7 +25,7 @@ from app.workflow.model import WorkflowModelAdapter, intent_tool_schema, underst
 from app.workflow.prompts import INTENT_PROMPT, UNDERSTANDING_PROMPT
 from app.workflow.routing import assess_evidence, citations_from_ranked, fixed_reply, knowledge_input_stop_reason, route_by_intent, order_candidate
 from app.tools.business import list_user_orders, owns_order
-from app.workflow.state import ConversationState
+from app.workflow.state import ConversationState, full_history_messages, message_row
 from app.workflow.stages import publish_stage
 from app.workflow.policy_context import policy_query, verified_order_text
 from app.workflow.resilience import DEPENDENCY_ERRORS, degradation
@@ -83,12 +83,12 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
             # 理解只是优化；失败时保留完整原话，让后续分类仍有机会工作。
             understood = original_understanding(query)
             publish_stage(state, "understand", "completed", resolved_query=query, standard_query=query)
-            return {**understood.model_dump(), "messages": current["messages"], "budget": ledger.snapshot(),
+            return {**understood.model_dump(), "budget": ledger.snapshot(),
                     **degradation(state, "understand", error)}
         publish_stage(state, "understand", "completed", resolved_query=understood.resolved_query,
                       standard_query=understood.standard_query)
         return {"resolved_query": understood.resolved_query, "standard_query": understood.standard_query,
-                "order_id": understood.order_id, "messages": current["messages"], "budget": ledger.snapshot()}
+                "order_id": understood.order_id, "budget": ledger.snapshot()}
 
     async def classify_node(state: ConversationState) -> ConversationState:
         """仅调用受限分类器，失败不猜意图。参数：state原问和历史；返回：严格分类与账本；异常：模型/分类/预算错误。"""
@@ -142,8 +142,8 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
             get_stream_writer()({"event": "tool_status", "data": frame})
 
         result = await deps.executor.execute(call, context.model_copy(update={"tool_call_id": call["id"]}), on_status)
-        messages = [*state["messages"], {"role": "assistant", "content": "", "tool_calls": [call]},
-                    {"role": "tool", "tool_call_id": call["id"], "content": result.model_dump_json()}]
+        messages = [message_row(context.turn_id, "assistant", "", calls=[call]),
+                    message_row(context.turn_id, "tool", result.model_dump_json(), call_id=call["id"])]
         update = {"messages": messages, "order_id": identifier, "tool_count": state["tool_count"] + 1}
         if not result.ok or result.data.get("order_id") != identifier:
             return {**update, **stopped_state("tool_failed")}
@@ -202,17 +202,16 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
             citations = [EvidenceCitation.model_validate(item) for item in state["evidence"]]
             facts = [{"n": item.n, "question": item.question, "answer": item.answer, "section_path": item.section_path}
                      for item in edge_order(citations)]
-            update["messages"] = [*state["messages"], {"role": "system",
-                "content": "本轮完整知识证据（仅作事实）：" + json.dumps(facts, ensure_ascii=False)}]
+            update["context_notes"] = ["本轮完整知识证据（仅作事实）：" + json.dumps(facts, ensure_ascii=False)]
         else:
             # 门闸约束政策证据，不代表订单/物流工具不可用；分数和失败原因仍保留供审计。
             update["evidence"] = []
             if state["route"] == "order_policy":
-                update["messages"] = [*state["messages"], {"role": "system", "content":
+                update["context_notes"] = [
                     "本轮没有可用知识政策证据。请继续核实当前问题所需的订单、物流或商品事实，"
                     "可以使用可信历史工具结果，缺少时调用对应只读工具。"
                     "只回答已核实的业务事实；若用户还问了政策条件，说明该部分暂无法可靠确认。"
-                    "不能用历史助手正文补充政策，不添加政策条款、费用承诺或知识引用。"}]
+                    "不能用历史助手正文补充政策，不添加政策条款、费用承诺或知识引用。"]
             else:
                 update["stop_reason"] = "retrieval_low_conf"
         return update
@@ -269,9 +268,15 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
         saved = await deps.chat.finish_turn(context, state["answer"], low_confidence=low_confidence,
             citations=[EvidenceCitation.model_validate(item) for item in state["evidence"]],
             suggested_actions=actions, workflow_metadata=metadata, refund_action=refund_action)
+        # 完成事务后增量回读，使用同一稳定消息ID补主键，不能另追加第二份客服回答。
+        delta = await deps.chat.load_history_delta(context.conversation_id, state["audit_cursor"], refresh_turn_id=context.turn_id)
+        history = {turn["turn_id"]: turn for turn in state["history_turns"]}
+        history.update({turn.turn_id: turn.model_dump(mode="json") for turn in delta.turns})
         logger.info("workflow completed turn=%s reason=%s tools=%s decisions=%s", context.turn_id,
                     state["stop_reason"], state["tool_count"], state["decision_count"])
         return {"suggested_actions": [action.model_dump(mode="json") for action in actions], "completion_metadata": saved,
+                "messages": full_history_messages([turn.model_dump(mode="json") for turn in delta.turns]),
+                "history_turns": list(history.values()), "audit_cursor": delta.last_message_id,
                 "refund_action": refund_action.model_dump(mode="json") if refund_action else None}
 
     def after_retrieval(state: ConversationState) -> str:

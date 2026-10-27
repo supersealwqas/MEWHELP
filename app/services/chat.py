@@ -560,7 +560,8 @@ class ChatService:
         返回：ConversationState，合并后的历史及全部重置的本轮字段。
         异常：数据库/SQLite读取失败；损坏历史校验错误。
         """
-        from app.workflow.state import new_turn_state
+        from app.workflow.state import new_turn_state, full_history_messages
+        from langgraph.types import Overwrite
 
         previous = (await self.graph.aget_state(config)).values
         old_context = previous.get("context")
@@ -573,12 +574,23 @@ class ChatService:
                                config["configurable"]["thread_id"])
             previous, old_context = {}, {}
         refresh = old_context.get("turn_id") if not previous.get("completion_metadata") else None
-        delta = await self.chat.load_history_delta(context.conversation_id, previous.get("audit_cursor", 0),
-            refresh_turn_id=refresh, exclude_turn_id=context.turn_id)
+        migrating = previous.get("context_version") != 7
+        delta = await self.chat.load_history_delta(context.conversation_id, 0 if migrating else previous.get("audit_cursor", 0),
+            refresh_turn_id=refresh)
         merged = {turn["turn_id"]: turn for turn in previous.get("history_turns", [])}
+        if migrating:
+            merged = {}
         for turn in delta.turns:
-            merged[turn.turn_id] = turn.model_dump(mode="json")
-        return new_turn_state(context, list(merged.values()), delta.last_message_id)
+            if turn.turn_id != context.turn_id:
+                merged[turn.turn_id] = turn.model_dump(mode="json")
+        state = new_turn_state(context, list(merged.values()), delta.last_message_id)
+        current = [turn.model_dump(mode="json") for turn in delta.turns if turn.turn_id == context.turn_id]
+        if current:
+            state["messages"] = [*full_history_messages(list(merged.values())), *full_history_messages(current)]
+        if migrating:
+            # 只在旧版或不可信checkpoint上完整重建；后续轮次由add_messages按ID合并。
+            state["messages"] = Overwrite(state["messages"])
+        return state
 
     def _waiting_action(self, snapshot, context: ToolContext) -> OrderSelectionAction | None:
         """核对官方待执行任务的interrupt与可信原轮，普通next不算等待。
@@ -768,7 +780,8 @@ class ChatService:
                         yield ChatEvent(event="done")
                         return
                     config = {"configurable": {"thread_id": checkpoint_thread_id(context.conversation_id)}}
-                    action = self._waiting_action(await self.graph.aget_state(config), context)
+                    waiting_snapshot = await self.graph.aget_state(config)
+                    action = self._waiting_action(waiting_snapshot, context)
                     if action is None:
                         if row["order_selection"].get("status") == "accepted":
                             yield ChatEvent(event="action_status", data={"action_id": request.action_id, "source_turn_id": request.source_turn_id, "status": "accepted"})
@@ -780,7 +793,18 @@ class ChatService:
                     accepted = await ActionRepository(self.chat.factory).accept_order_selection(request)
                     # 提交接受后Command之前若断开，保留accepted/running以便原键继续。
                     outcome.update(started=True, paused=True)
-                    stream = self._run_graph(Command(resume=accepted.accepted_order_id), context, outcome)
+                    migration_update = None
+                    if waiting_snapshot.values.get("context_version") != 7:
+                        from langgraph.types import Overwrite
+                        from app.workflow.state import full_history_messages
+                        delta = await self.chat.load_history_delta(context.conversation_id, 0)
+                        turns = [turn.model_dump(mode="json") for turn in delta.turns]
+                        migration_update = {"messages": Overwrite(full_history_messages(turns)),
+                            "context_version": 7, "current_message_id": f"turn:{context.turn_id}:user",
+                            "history_turns": [turn for turn in turns if turn["turn_id"] != context.turn_id],
+                            "history_context": None, "context_notes": [], "audit_cursor": delta.last_message_id}
+                    # 迁移与原Command.resume一并提交，保持同thread、同interrupt、同动作。
+                    stream = self._run_graph(Command(resume=accepted.accepted_order_id, update=migration_update), context, outcome)
                     try:
                         async for event in stream:
                             # 任何新阶段表示Command已开始处理；此后普通断流沿用取消语义。

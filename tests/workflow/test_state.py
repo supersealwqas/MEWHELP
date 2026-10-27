@@ -41,7 +41,12 @@ def test_new_turn_replaces_every_runtime_field_and_retains_history():
         "context": {"conversation_id": 42, "session_id": "session", "user_id": "user",
                     "turn_id": "new-turn", "tool_call_id": "", "user_message": "1001"},
         "raw_query": "1001", "resolved_query": "", "history_turns": history, "audit_cursor": 13,
-        "messages": [], "intent": None, "standard_query": "", "intent_confidence": None,
+        "messages": [
+            {"id": "turn:prior:user", "role": "user", "content": "查物流", "additional_kwargs": {"turn_id": "prior"}},
+            {"id": "turn:prior:answer", "role": "assistant", "content": "请给订单号", "additional_kwargs": {"turn_id": "prior"}},
+            {"id": "turn:new-turn:user", "role": "user", "content": "1001", "additional_kwargs": {"turn_id": "new-turn"}}],
+        "context_version": 7, "current_message_id": "turn:new-turn:user", "history_context": None, "context_notes": [],
+        "intent": None, "standard_query": "", "intent_confidence": None,
         "order_id": None, "order_data": None, "expanded_queries": [], "selection_action": None, "route": None, "evidence": [], "evidence_scores": [],
         "gate": None, "retrieval_attempted": False, "degradations": [], "pending_calls": [], "seen_call_ids": [], "seen_call_signatures": [],
         "tool_count": 0, "decision_count": 0, "suggested_kinds": [], "suggested_actions": [],

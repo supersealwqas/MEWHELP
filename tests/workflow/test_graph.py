@@ -78,7 +78,8 @@ async def test_other_dependency_boundaries_keep_safe_completion(stage):
     query = "请说明商品的清洁方法"
     state = await build_workflow(deps, checkpointer=None).ainvoke(turn(query))
     assert state["raw_query"] == state["resolved_query"] == query
-    assert state["answer"].strip() and "敏感信息" not in json.dumps(state, ensure_ascii=False)
+    serialized = {**state, "messages": [message.model_dump(mode="json") for message in state["messages"]]}
+    assert state["answer"].strip() and "敏感信息" not in json.dumps(serialized, ensure_ascii=False)
     assert state["degradations"][0]["stage"] == stage
     assert deps.chat.finished[0]["content"] == state["answer"]
 
@@ -136,7 +137,8 @@ async def test_policy_followup_retrieves_resolved_question_without_replacing_use
     result = await build_workflow(deps, checkpointer=None).ainvoke(original)
     assert deps.search.calls == [("retrieve", resolved)]
     assert result["raw_query"] == result["context"]["user_message"] == "那运费呢？"
-    assert result["messages"][0] == {"role": "user", "content": "那运费呢？"}
+    current = next(message for message in result["messages"] if message.id == result["current_message_id"])
+    assert current.type == "human" and current.content == "那运费呢？"
     assert result["gate"]["passed"]
 
 
@@ -184,7 +186,7 @@ async def test_knowledge_nodes_precede_agent_and_keep_full_evidence(intent, entr
     assert all(item.chunk.text.answer in json.dumps(decision_input, ensure_ascii=False) for item in evidence)
     assert deps.chat.finished[0]["low_confidence"] is None
     assert state["completion_metadata"]["turn_id"] == state["context"]["turn_id"]
-    json.dumps(state, allow_nan=False)
+    json.dumps({**state, "messages": [message.model_dump(mode="json") for message in state["messages"]]}, allow_nan=False)
 
 @pytest.mark.parametrize("intent", ["物流", "订单", "其他"])
 async def test_business_routes_skip_retrieval_and_gate(intent):
@@ -291,10 +293,8 @@ async def test_policy_gate_state_does_not_leak_across_high_low_high_checkpoint_t
     assert first["gate"]["passed"] and "[1]" in first["answer"]
     assert deps.chat.finished[0]["low_confidence"] is None
 
-    # 仓储只保存用户、助手和工具消息；本轮注入的system证据不能冒充持久化历史。
-    first_history = {"turn_id": "first", "turn_status": "completed", "messages": [
-        *[message for message in first["messages"] if message["role"] != "system"],
-        {"role": "assistant", "content": first["answer"]}]}
+    # 回灌真实保存的原始流水；完整State已有最终答复，不能重复添加或混入别轮消息。
+    first_history = deps.chat.history["first"].model_dump(mode="json")
     deps.search.ranked = [ranked(0.04, answer="第二轮不得使用的低分规则")]
     second_input = turn("是什么东西，哪里到哪里", turn_id="second")
     second_input["history_turns"] = [first_history]
@@ -311,9 +311,7 @@ async def test_policy_gate_state_does_not_leak_across_high_low_high_checkpoint_t
     assert deps.chat.finished[1]["citations"] == []
     assert deps.chat.finished[1]["low_confidence"] is None
 
-    second_history = {"turn_id": "second", "turn_status": "completed", "messages": [
-        *[message for message in second["messages"] if message["role"] != "system"],
-        {"role": "assistant", "content": second["answer"]}]}
+    second_history = deps.chat.history["second"].model_dump(mode="json")
     deps.search.ranked = [ranked(answer="第三轮独立核实的规则")]
     third_input = turn("退换货政策", turn_id="third")
     third_input["history_turns"] = [first_history, second_history]

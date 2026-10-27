@@ -83,7 +83,8 @@ async def test_business_followup_uses_resolved_question_after_history_trim(tmp_p
     observed = next(row for row in deps.model.inputs if row["stage"] == stage)
     assert [message["content"] for message in observed["messages"] if message["role"] == "user"] == [resolved]
     assert state["raw_query"] == state["context"]["user_message"] == "它呢？"
-    assert state["messages"][0] == {"role": "user", "content": "它呢？"}
+    current = next(message for message in state["messages"] if message.id == state["current_message_id"])
+    assert current.type == "human" and current.content == "它呢？"
     assert [row["stage"] for row in deps.model.inputs] == ["understand", "classify", "decide", "answer"]
 
 

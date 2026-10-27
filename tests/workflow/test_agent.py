@@ -21,7 +21,7 @@ async def test_order_then_logistics_uses_complete_pairs_and_read_only_registry()
     assert all({t.name for t in item["tools"]} == {"query_order", "query_logistics", "query_product"} for item in deps.model.inputs if item["stage"] == "decide")
     for item in deps.model.inputs[3:]:
         assert "SF1" in json.dumps(item["messages"], ensure_ascii=False)
-    assert [m["tool_call_id"] for m in state["messages"] if m["role"] == "tool"] == ["a", "b"]
+    assert [m.tool_call_id for m in state["messages"] if m.type == "tool"] == ["a", "b"]
     assert deps.chat.order == ["calls", "result", "calls", "result", "finish"]
 
 async def test_first_delta_arrives_before_answer_generator_finishes():
@@ -113,7 +113,7 @@ async def test_large_tool_fact_stops_without_truncation_or_answer_call():
     deps = dependencies(decisions=[AgentDecision(kind="tools", tool_calls=[call("a")])], results=[ToolResult.success({"details": fact})])
     state = await build_workflow(deps, checkpointer=None).ainvoke(turn())
     assert state["stop_reason"] == "budget_exceeded" and len(deps.model.inputs) == 3
-    assert fact in state["messages"][-1]["content"]
+    assert any(fact in message.content for message in state["messages"] if message.type == "tool")
 
 async def test_fifth_decision_can_answer_after_four_tools():
     """把四工具上限错当四次决策，提前阻止最终回答时失败。参数：无；返回：None；异常：断言失败。"""

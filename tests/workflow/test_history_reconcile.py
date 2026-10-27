@@ -105,7 +105,7 @@ async def test_next_input_merges_history_without_full_reload_and_understands_100
         assert cursors[0] == 0 and all(cursor > 0 for cursor in cursors[1:])
         state = (await service.graph.aget_state({"configurable": {"thread_id": "mewhelp:ch05:1"}})).values
         assert state["intent"] == "闲聊" and state["pending_calls"] == state["suggested_actions"] == []
-        assert len(state["history_turns"]) == 2
+        assert len(state["history_turns"]) == 3  # 完成阶段已对账当前轮，不再故意让缓存落后一轮。
 
 
 async def test_completed_database_failed_checkpoint_reopens_without_replaying_work(tmp_path, monkeypatch):

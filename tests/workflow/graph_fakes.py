@@ -26,16 +26,36 @@ class StrictChat:
     def __init__(self):
         """参数：无；返回：None；异常：无。"""
         self.calls, self.results, self.finished, self.order = [], [], [], []
+        self.history, self.next_id = {}, 1
+
+    def _record(self, context, role, content, **fields):
+        """记录本例等价原始流水。参数：上下文、角色、正文、工具字段；返回：None；异常：字段错误。"""
+        from app.schemas.history import StoredMessage, StoredTurn
+        if context.turn_id not in self.history:
+            self.history[context.turn_id] = StoredTurn(turn_id=context.turn_id, turn_status="running", messages=[
+                StoredMessage(id=self.next_id, role="user", content=context.user_message)])
+            self.next_id += 1
+        self.history[context.turn_id].messages.append(StoredMessage(id=self.next_id, role=role, content=content, **fields))
+        self.next_id += 1
+
+    async def load_history_delta(self, conversation_id, after_message_id, *, refresh_turn_id=None, exclude_turn_id=None):
+        """模拟已提交轮的增量回读。参数：真实仓储游标契约；返回：独立HistoryDelta；异常：校验失败。"""
+        from app.schemas.workflow import HistoryDelta
+        turns = [turn.model_copy(deep=True) for turn in self.history.values() if turn.turn_id != exclude_turn_id
+                 and (turn.turn_id == refresh_turn_id or any(row.id > after_message_id for row in turn.messages))]
+        return HistoryDelta(turns=turns, last_message_id=max(after_message_id, self.next_id - 1))
     async def save_tool_calls(self, context, calls, *, deduplicate=False):
         """参数：可信上下文与申请；返回：None；异常：断言失败。"""
         assert isinstance(context, ToolContext)
         self.calls.extend(deepcopy([call for call in calls if not deduplicate or call not in self.calls]))
         self.order.append("calls")
+        self._record(context, "assistant", "", tool_calls=deepcopy(calls))
     async def save_tool_result(self, context, result):
         """参数：可信上下文与结果；返回：ToolResult；异常：断言失败。"""
         assert context.tool_call_id and isinstance(result, ToolResult)
         self.results.append((context.tool_call_id, result))
         self.order.append("result")
+        self._record(context, "tool", result.model_dump_json(), tool_call_id=context.tool_call_id)
         return result
     async def finish_turn(self, context, content, *, low_confidence, citations, suggested_actions, workflow_metadata, refund_action=None):
         """参数：最终仓储契约的全部字段；返回：完成元数据；异常：断言失败。"""
@@ -52,6 +72,8 @@ class StrictChat:
                   "citations": citations, "suggested_actions": suggested_actions, "workflow_metadata": workflow_metadata}
         self.finished.append(record)
         self.order.append("finish")
+        self._record(context, "assistant", content)
+        self.history[context.turn_id].turn_status = "completed"
         return {"turn_id": context.turn_id, "citations": [x.model_dump(mode="json") for x in citations],
                 "suggested_actions": [x.model_dump(mode="json") for x in suggested_actions], "workflow": workflow_metadata,
                 "refund_action": refund_action.model_dump(mode="json") if refund_action else None}

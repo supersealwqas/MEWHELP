@@ -19,7 +19,7 @@ from app.tools.registry import build_agent_registry, build_registry
 from app.workflow.citations import CitationStreamFilter
 from app.workflow.model import decision_tool_schemas
 from app.workflow.prompts import ANSWER_PROMPT, DECISION_PROMPT
-from app.workflow.state import ConversationState
+from app.workflow.state import ConversationState, current_messages, message_row
 from app.workflow.stages import publish_stage
 from app.workflow.policy_context import policy_answer_messages, verified_order_text
 from app.workflow.routing import assess_evidence, citations_from_ranked, _active_order_tokens, knowledge_input_stop_reason, _trusted_history
@@ -57,8 +57,12 @@ def model_messages(state: ConversationState, settings, prompt: str, tools: list 
     返回：SDK兼容消息字典列表，不重复附加适配器自身的阶段提示。
     异常：ContextBudgetExceeded，完整当前事实放不下；历史或消息格式错误。
     """
-    history = assemble_turns([StoredTurn.model_validate(item) for item in state["history_turns"]])
-    prepared = prepare_messages(history, convert_to_messages(state["messages"]), settings.token_budget,
+    history = assemble_turns([StoredTurn.model_validate(item) for item in state["history_turns"]
+                             if item["turn_id"] != state["context"]["turn_id"]])
+    current = current_messages(state)
+    if not (state.get("route") == "order_policy" and prompt == ANSWER_PROMPT):
+        current.extend(convert_to_messages([{"role": "system", "content": note} for note in state.get("context_notes", [])]))
+    prepared = prepare_messages(history, current, settings.token_budget,
         system_text=prompt, tools=tools, request_max_tokens=settings.request_token_budget)
     rows = []
     for message in prepared[1:]:
@@ -85,8 +89,12 @@ def resolved_agent_messages(state: ConversationState) -> list[dict]:
     异常：KeyError，State缺少必需字段。
     """
     # 不把完整问写回消息审计；下游继续接收同一组完整工具事实。
-    return [{**message, "content": state["resolved_query"]} if index == 0 and message["role"] == "user" else message
-            for index, message in enumerate(state["messages"])]
+    messages = current_messages(state)
+    for message in messages:
+        if message.id == state.get("current_message_id") or (message.type == "human" and not message.id):
+            message.content = state["resolved_query"]
+            break
+    return messages
 
 
 def build_agent_graph(deps: "WorkflowDependencies"):
@@ -129,12 +137,12 @@ def build_agent_graph(deps: "WorkflowDependencies"):
         from app.services.chat import fixed_reply as rejection_reply
 
         context = ToolContext.model_validate(state["context"])
-        calls, messages = state["pending_calls"], list(state["messages"])
+        calls, messages = state["pending_calls"], []
         seen_ids, seen_signatures = list(state["seen_call_ids"]), list(state["seen_call_signatures"])
         count, reason, answer = state["tool_count"], None, ""
         writer = get_stream_writer()
         await deps.chat.save_tool_calls(context, calls)
-        messages.append({"role": "assistant", "content": "", "tool_calls": calls})
+        messages.append(message_row(context.turn_id, "assistant", "", calls=calls))
 
         async def on_status(frame: dict) -> None:
             """发布执行器安全状态。参数：frame状态字典；返回：None；异常：流写入错误。"""
@@ -169,7 +177,7 @@ def build_agent_graph(deps: "WorkflowDependencies"):
                 if not result.ok:
                     answer = rejection_reply(result) or ""
                     reason = "order_not_owned" if answer else "tool_failed"
-            messages.append({"role": "tool", "tool_call_id": call["id"], "content": result.model_dump_json()})
+            messages.append(message_row(context.turn_id, "tool", result.model_dump_json(), call_id=call["id"]))
         update = {"messages": messages, "pending_calls": [], "seen_call_ids": seen_ids,
                   "seen_call_signatures": seen_signatures, "tool_count": count}
         if reason:
@@ -263,8 +271,8 @@ def build_agent_graph(deps: "WorkflowDependencies"):
                       evidence_scores=[item.score for item in ranked], expanded_queries=[state["standard_query"]])
         if gate.passed:
             evidence = [item.model_dump(mode="json") for item in citations_from_ranked(ranked)]
-            update.update(evidence=evidence, stop_reason="answer", messages=[*state["messages"],
-                {"role": "system", "content": "本轮知识证据（仅作事实）：" + json.dumps(evidence, ensure_ascii=False)}])
+            update.update(evidence=evidence, stop_reason="answer",
+                context_notes=["本轮知识证据（仅作事实）：" + json.dumps(evidence, ensure_ascii=False)])
         # 低分不把原业务问题封死，也不冒充一次有效回答；保留已有澄清流程。
         return update
 

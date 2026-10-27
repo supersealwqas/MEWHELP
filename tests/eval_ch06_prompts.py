@@ -79,13 +79,16 @@ def evaluation_messages(history: list[dict], query: str, config, prompt: str, to
     返回：与根图同规则的SDK消息；异常：历史校验错误或当前输入超预算。
     """
     from app.workflow.agent import model_messages
+    from app.workflow.state import new_turn_state
+    from app.schemas.tools import ToolContext
     turns = []
     for message in history:
         if message["role"] == "user" or not turns:
             turns.append({"turn_id": f"evaluation-{len(turns)}", "turn_status": "completed", "messages": []})
         turns[-1]["messages"].append(message)
-    return model_messages({"history_turns": turns, "messages": [{"role": "user", "content": query}]},
-                          config, prompt, tools)
+    state = new_turn_state(ToolContext(conversation_id=1, session_id="evaluation", user_id="evaluation",
+        turn_id="evaluation-current", user_message=query), turns, 0)
+    return model_messages(state, config, prompt, tools)
 
 
 def inspect_understanding(query: str, expected: dict, result: dict) -> list[str]:
