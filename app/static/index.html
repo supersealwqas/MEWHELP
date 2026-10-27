@@ -25,6 +25,19 @@
         </a>
       </header>
 
+      <div class="chat-layout">
+      <aside class="history-panel" aria-label="历史会话">
+        <details id="history-disclosure" open>
+          <summary>历史会话 <span id="history-count"></span></summary>
+          <div class="history-body">
+            <div class="history-heading"><span>本账号的会话</span><button type="button" id="refresh-conversations" class="history-refresh">刷新</button></div>
+            <div id="conversation-list" role="list" aria-label="可切换的会话"></div>
+            <p id="history-empty" class="history-note">还没有历史会话</p>
+            <p id="history-status" class="history-note" role="status"></p>
+            <button type="button" id="more-conversations" class="button button-secondary" hidden>更早的会话</button>
+          </div>
+        </details>
+      </aside>
       <main class="chat-card" aria-labelledby="chat-title">
         <header class="chat-header">
           <div class="assistant-profile">
@@ -86,10 +99,11 @@
           <p class="capability-note">支持查询订单、商品、物流与商城政策，可创建人工工单，不能直接退款。</p>
         </footer>
       </main>
+      </div>
 
       <footer class="page-footer">
         <span class="session-label">当前会话 <code id="session-id" title="同一页面内的连续提问使用同一个 session_id"></code></span>
-        <span>刷新可恢复本会话的处理状态；点击新会话可重新开始。</span>
+        <span>历史会话可随时切回；新会话不会删除旧记录。</span>
       </footer>
     </div>
     <noscript><p class="noscript">聊天页面需要启用 JavaScript；也可以通过 <a href="/docs">接口文档</a>测试后端。</p></noscript>

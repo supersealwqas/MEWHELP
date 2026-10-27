@@ -6,6 +6,7 @@ import { failurePresentation, streamWorkflowChat, resumeOrderSelection, getCurre
 import { renderMarkdown } from "./markdown.mjs";
 import { attachAnswerTools } from "./citations.mjs";
 import { attachSuggestedActions, attachOrderSelection, attachRefundAction } from "./actions.mjs";
+import { createConversationBrowser } from "./conversations.mjs";
 
 const ui = {
   form: document.querySelector("#chat-form"),
@@ -20,6 +21,13 @@ const ui = {
   status: document.querySelector("#request-status"),
   feedback: document.querySelector("#feedback"),
   sessionId: document.querySelector("#session-id"),
+  historyList: document.querySelector("#conversation-list"),
+  historyEmpty: document.querySelector("#history-empty"),
+  historyStatus: document.querySelector("#history-status"),
+  historyCount: document.querySelector("#history-count"),
+  historyMore: document.querySelector("#more-conversations"),
+  historyRefresh: document.querySelector("#refresh-conversations"),
+  historyDisclosure: document.querySelector("#history-disclosure"),
 };
 let sessionId = "";
 let activeController = null;
@@ -28,8 +36,85 @@ let pendingActions = 0;
 let followOutput = true;
 let requestGeneration = 0;
 let activeReply = null;
+let historyLoading = false;
 const replyByTurn = new Map();
 const orderCards = new Set();
+const conversationBrowser = createConversationBrowser({ onSelect: applyConversation, onChange: paintConversations,
+  onLoading(value) { historyLoading = value; paintControls(Boolean(activeController)); } });
+
+/** 保存当前标识并更新页脚；参数无；返回void；异常：存储禁用时忽略。 */
+function rememberSession() {
+  try { sessionStorage.setItem("mewhelp.session", sessionId); } catch { /* 私密模式仍可聊天。 */ }
+  ui.sessionId.textContent = sessionId.startsWith("web-") ? sessionId.slice(4, 16) : sessionId.slice(0, 12);
+  ui.sessionId.title = `session_id: ${sessionId}`;
+}
+
+/** 按只读快照绘制侧栏，文本不作为HTML；参数浏览状态；返回void；异常：DOM错误。 */
+function paintConversations(state) {
+  ui.historyList.replaceChildren();
+  for (const item of state.items) {
+    const wrapper = document.createElement("div"); wrapper.setAttribute("role", "listitem");
+    const button = document.createElement("button"); button.type = "button"; button.className = "conversation-item";
+    button.disabled = state.busy; button.setAttribute("aria-current", String(item.session_id === sessionId));
+    const preview = document.createElement("span"); preview.className = "conversation-preview";
+    preview.textContent = item.preview || "尚未提问的会话"; button.append(preview);
+    if (item.has_summary) { const badge = document.createElement("span"); badge.className = "conversation-summary"; badge.textContent = "已摘要"; button.append(badge); }
+    button.addEventListener("click", async () => {
+      const generation = requestGeneration;
+      ui.historyStatus.textContent = "正在回载历史…";
+      const loaded = await conversationBrowser.select(item);
+      if (!loaded && generation === requestGeneration && !conversationBrowser.snapshot().loading)
+        ui.historyStatus.textContent = "暂时未能读取历史，当前会话已保留。";
+    });
+    wrapper.append(button); ui.historyList.append(wrapper);
+  }
+  ui.historyCount.textContent = state.items.length ? String(state.items.length) : "";
+  ui.historyEmpty.hidden = Boolean(state.items.length);
+  ui.historyMore.hidden = state.nextBefore === null;
+  ui.historyMore.disabled = state.listing || state.busy;
+  ui.historyRefresh.disabled = state.listing || state.busy;
+}
+
+/** 完整历史到齐后切换；旧快照只恢复正文/引用，可执行动作另查当前状态。参数：会话与原文；返回void；异常：DOM错误。 */
+function applyConversation({ conversation, messages }) {
+  if (activeController || pendingActions) return;
+  requestGeneration++; sessionId = conversation.session_id; rememberSession();
+  ui.messages.replaceChildren(); replyByTurn.clear(); orderCards.clear();
+  ui.welcome.hidden = Boolean(messages.length); ui.feedback.hidden = true; ui.input.value = "";
+  const originals = new Map(), tools = new Map();
+  followOutput = false;
+  for (const row of messages) {
+    if (row.role === "user") { originals.set(row.turn_id, row.content ?? ""); appendMessage("user", row.content ?? ""); }
+    if (row.role === "tool" || row.tool_calls?.length) {
+      if (!tools.has(row.turn_id)) tools.set(row.turn_id, []);
+      tools.get(row.turn_id).push(row.role === "tool" ? row.content ?? "" : JSON.stringify(row.tool_calls, null, 2));
+    }
+    if (row.role !== "assistant" || (!row.content && row.tool_calls?.length)) continue;
+    const reply = appendMessage("assistant", row.content ?? "");
+    reply.turnId = row.turn_id; reply.originalMessage = originals.get(row.turn_id) ?? "";
+    reply.article.dataset.sourceTurnId = row.turn_id; replyByTurn.set(row.turn_id, reply);
+    reply.bubble.innerHTML = renderMarkdown(row.content ?? "");
+    if (row.turn_status === "completed") {
+      const metadata = { ...row.rag_metadata, ...currentIdentity(), turn_id: row.turn_id,
+        citations: Array.isArray(row.rag_metadata?.citations) ? row.rag_metadata.citations : [] };
+      attachAnswerTools(reply, row.content ?? "", metadata);
+      reply.historyTools = true; // 防止随后当前状态回读重复挂引用/反馈；不复活历史业务动作。
+    } else { reply.note.hidden = false; reply.note.textContent = "这轮没有完整结束，可核实处理状态或继续提问。"; }
+  }
+  for (const [turnId, records] of tools) {
+    const reply = replyByTurn.get(turnId);
+    if (!reply) continue;
+    const details = document.createElement("details"); details.className = "history-records";
+    const label = document.createElement("summary"); label.textContent = "查看本轮工具记录";
+    const source = document.createElement("pre"); source.textContent = records.join("\n\n");
+    details.append(label, source); reply.tools.append(details); reply.tools.hidden = false;
+  }
+  followOutput = true; scrollToLatest();
+  ui.status.textContent = "历史已完整回载，可以继续提问"; ui.historyStatus.textContent = "";
+  if (window.matchMedia("(max-width: 860px)").matches) ui.historyDisclosure.open = false;
+  updateSendState();
+  void syncCurrent(null, requestGeneration);
+}
 
 /** 冻结当前身份，异步回调不得读后来的会话；参数无；返回对象；异常无。 */
 function currentIdentity() { return Object.freeze({ session_id: sessionId, user_id: "demo-user" }); }
@@ -49,11 +134,10 @@ function newConversation({ restore = false } = {}) {
   sessionId = `web-${randomId}`;
   try {
     const stored = sessionStorage.getItem("mewhelp.session");
-    if (restore && /^web-[0-9a-f]{32}$/.test(stored ?? "")) sessionId = stored;
-    sessionStorage.setItem("mewhelp.session", sessionId);
+    if (restore && typeof stored === "string" && stored.trim() && [...stored].length <= 64) sessionId = stored;
   } catch { /* 隐私模式禁用存储时仍可使用当前页面会话。 */ }
-  ui.sessionId.textContent = sessionId.slice(4, 16);
-  ui.sessionId.title = `session_id: ${sessionId}`;
+  rememberSession();
+  conversationBrowser.startNew(sessionId);
   ui.messages.replaceChildren();
   replyByTurn.clear();
   orderCards.clear();
@@ -61,9 +145,15 @@ function newConversation({ restore = false } = {}) {
   ui.feedback.hidden = true;
   ui.input.value = "";
   ui.status.textContent = "准备好了，开始聊聊吧";
+  ui.historyStatus.textContent = "";
   followOutput = true;
   updateSendState();
-  if (restore) void syncCurrent(null, requestGeneration);
+  if (restore) {
+    const generation = requestGeneration;
+    void conversationBrowser.restore(sessionId).then(loaded => {
+      if (!loaded && generation === requestGeneration) void syncCurrent(null, generation);
+    });
+  } else void conversationBrowser.refresh();
 }
 
 /**
@@ -218,7 +308,7 @@ function createTextRenderer(node) {
  */
 function updateSendState() {
   ui.input.setCustomValidity("");
-  ui.send.disabled = Boolean(activeController) || pendingActions > 0 || !ui.input.value.trim();
+  ui.send.disabled = Boolean(activeController) || pendingActions > 0 || historyLoading || !ui.input.value.trim();
 }
 
 /**
@@ -228,11 +318,17 @@ function updateSendState() {
  * @throws {Error} 无主动抛出的业务异常。
  */
 function setBusy(busy) {
-  ui.input.readOnly = busy || pendingActions > 0;
+  conversationBrowser.setBusy(busy || pendingActions > 0);
+  paintControls(busy);
+}
+
+/** 绘制输入控件，历史回载不改变业务互斥；参数回复状态；返回void；异常：DOM错误。 */
+function paintControls(busy) {
+  ui.input.readOnly = busy || pendingActions > 0 || historyLoading;
   ui.newChat.disabled = busy || pendingActions > 0;
-  ui.refreshStatus.disabled = busy || pendingActions > 0;
+  ui.refreshStatus.disabled = busy || pendingActions > 0 || historyLoading;
   ui.stop.hidden = !busy;
-  ui.form.setAttribute("aria-busy", String(busy || pendingActions > 0));
+  ui.form.setAttribute("aria-busy", String(busy || pendingActions > 0 || historyLoading));
   updateSendState();
 }
 
@@ -277,7 +373,7 @@ function updateToolBadge(badge, tool) {
 async function sendMessage(event) {
   event.preventDefault();
   const message = ui.input.value;
-  if (activeController || pendingActions || !message.trim()) return;
+  if (activeController || pendingActions || historyLoading || !message.trim()) return;
   for (const card of orderCards) card.disable("已发出新问题，请以当前处理状态为准。");
   ui.welcome.hidden = true;
   ui.feedback.hidden = true;
@@ -297,7 +393,8 @@ function presentCompleted(reply, answer, metadata, receipt = null) {
   reply.bubble.innerHTML = renderMarkdown(answer);
   reply.note.hidden = true;
   reply.completed = true;
-  attachAnswerTools(reply, answer, metadata);
+  if (!reply.historyTools) attachAnswerTools(reply, answer, metadata);
+  else reply.bubble.innerHTML = renderMarkdown(answer, metadata.citations);
   const options = { appendMessage, onBusy: (busy) => {
     pendingActions = Math.max(0, pendingActions + (busy ? 1 : -1));
     setBusy(Boolean(activeController));
@@ -471,6 +568,7 @@ async function runReply(reply, identity, { message, action = null, orderId = nul
     activeRenderer = null;
     activeReply = null;
     setBusy(false);
+    void conversationBrowser.refresh();
     scrollToLatest();
     ui.input.focus({ preventScroll: true });
   }
@@ -536,8 +634,11 @@ ui.input.addEventListener("input", updateSendState);
 ui.input.addEventListener("keydown", onInputKeyDown);
 ui.stop.addEventListener("click", stopReply);
 ui.newChat.addEventListener("click", newConversation);
+ui.historyRefresh.addEventListener("click", () => { void conversationBrowser.refresh(); });
+ui.historyMore.addEventListener("click", () => { void conversationBrowser.more(); });
 ui.refreshStatus.addEventListener("click", () => { if (!activeController && !pendingActions) void syncCurrent(null, requestGeneration); });
 ui.welcome.addEventListener("click", onSuggestionClick);
 ui.conversation.addEventListener("scroll", onConversationScroll, { passive: true });
 document.addEventListener("visibilitychange", onVisibilityChange);
+if (window.matchMedia("(max-width: 860px)").matches) ui.historyDisclosure.open = false;
 newConversation({ restore: true });
