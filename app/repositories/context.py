@@ -50,8 +50,8 @@ class ContextRepository:
         self.factory = factory
         self.estimator = estimator or TokenEstimator()
 
-    async def load_context(self, conversation_id: int) -> dict:
-        """读取同一数据库快照。参数：conversation_id可信主键；返回：锚点/段/完整轮；异常：ContextNotFound、数据库错误。"""
+    async def load_context(self, conversation_id: int, *, include_turns: bool = True) -> dict:
+        """读取同一数据库快照。参数：conversation_id可信主键、include_turns是否读原文；返回：锚点/段/可选完整轮；异常：ContextNotFound、数据库错误。"""
         _identifier(conversation_id)
         async with self.factory() as session:
             conv = await session.get(Conversation, conversation_id)
@@ -60,11 +60,11 @@ class ContextRepository:
             segments = (await session.scalars(select(ConversationSummary).where(
                 ConversationSummary.conversation_id == conversation_id).order_by(ConversationSummary.seq))).all()
             rows = (await session.scalars(select(Message).where(Message.conversation_id == conversation_id)
-                                          .order_by(Message.id))).all()
+                                          .order_by(Message.id))).all() if include_turns else None
             return {"conversation_id": conversation_id, "summary": conv.summary or "",
                     "summary_upto_msg_id": conv.summary_upto_msg_id or 0,
                     "layer1_from_msg_id": conv.layer1_from_msg_id or 0,
-                    "summaries": [_segment(row) for row in segments], "turns": stored_turns(rows)}
+                    "summaries": [_segment(row) for row in segments], "turns": stored_turns(rows) if rows is not None else None}
 
     async def advance_layer1(self, conversation_id: int, *, expected_summary_upto: int, upto_msg_id: int) -> bool:
         """只推进原文层边界。参数：会话、读取时摘要上界、新边界；返回：是否已达成；异常：非法范围或数据库错误。"""

@@ -5,26 +5,25 @@ import json
 from contextlib import aclosing
 from typing import TYPE_CHECKING
 
-from langchain_core.messages import AIMessage, ToolMessage, convert_to_messages
 from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 
-from app.core.memory import ContextBudgetExceeded, assemble_turns, prepare_messages, valid_tool_calls
+from app.core.memory import ContextBudgetExceeded, valid_tool_calls
 from app.core.model_budget import BudgetLedger, WorkflowBudgetExceeded
 from app.repositories.chat import PersistenceUncertain
 from app.schemas.chat import InvalidToolDecision
-from app.schemas.history import StoredTurn
 from app.schemas.tools import ToolContext, ToolResult
 from app.tools.registry import build_agent_registry, build_registry
 from app.workflow.citations import CitationStreamFilter
 from app.workflow.model import decision_tool_schemas
 from app.workflow.prompts import ANSWER_PROMPT, DECISION_PROMPT
-from app.workflow.state import ConversationState, current_messages, message_row
+from app.workflow.state import ConversationState, message_row
 from app.workflow.stages import publish_stage
-from app.workflow.policy_context import policy_answer_messages, verified_order_text
+from app.workflow.policy_context import verified_order_text
 from app.workflow.routing import assess_evidence, citations_from_ranked, _active_order_tokens, knowledge_input_stop_reason, _trusted_history
 from app.workflow.resilience import DEPENDENCY_ERRORS, degradation
 from app.workflow.model import WorkflowOutputError
+from app.workflow.context import assemble_context, select_evidence
 
 if TYPE_CHECKING:
     from app.workflow.graph import WorkflowDependencies
@@ -51,50 +50,14 @@ def stopped_state(reason: str, ledger: BudgetLedger | None = None) -> Conversati
 
 
 def model_messages(state: ConversationState, settings, prompt: str, tools: list | None = None) -> list[dict]:
-    """沿用整轮历史裁剪，当前事实完整保留并转换成纯消息字典。
-
-    参数：state含历史与当前完整消息；settings两层输入预算；prompt本阶段提示；tools决策工具定义。
-    返回：SDK兼容消息字典列表，不重复附加适配器自身的阶段提示。
-    异常：ContextBudgetExceeded，完整当前事实放不下；历史或消息格式错误。
-    """
-    history = assemble_turns([StoredTurn.model_validate(item) for item in state["history_turns"]
-                             if item["turn_id"] != state["context"]["turn_id"]])
-    current = current_messages(state)
-    if not (state.get("route") == "order_policy" and prompt == ANSWER_PROMPT):
-        current.extend(convert_to_messages([{"role": "system", "content": note} for note in state.get("context_notes", [])]))
-    prepared = prepare_messages(history, current, settings.token_budget,
-        system_text=prompt, tools=tools, request_max_tokens=settings.request_token_budget)
-    rows = []
-    for message in prepared[1:]:
-        row = {"role": {"human": "user", "ai": "assistant"}.get(message.type, message.type), "content": message.content}
-        if isinstance(message, AIMessage) and message.tool_calls:
-            row["tool_calls"] = message.tool_calls
-        if isinstance(message, ToolMessage):
-            row["tool_call_id"] = message.tool_call_id
-        rows.append(row)
-    return rows
+    """复用共享历史组装模型副本。参数：state、settings、固定prompt及tools；返回：ModelContext；异常：预算或身份错误。"""
+    return assemble_context(state, settings, prompt, tools)
 
 
 def _signature(call: dict) -> str:
     """按既有工具去空白规则计算去重键。参数：call严格工具申请；返回：稳定JSON；异常：ValueError，非法JSON数值。"""
     args = {key: value.strip() if isinstance(value, str) else value for key, value in call["args"].items()}
     return json.dumps([call["name"], args], sort_keys=True, ensure_ascii=False, allow_nan=False)
-
-
-def resolved_agent_messages(state: ConversationState) -> list[dict]:
-    """给业务决策和回答传完整任务，同时保留原State中的用户原话和工具配对。
-
-    参数：state含已校验resolved_query及本轮消息，第一条为当前用户输入。
-    返回：仅在模型输入副本中替换本轮用户消息的列表；历史和工具结果不改。
-    异常：KeyError，State缺少必需字段。
-    """
-    # 不把完整问写回消息审计；下游继续接收同一组完整工具事实。
-    messages = current_messages(state)
-    for message in messages:
-        if message.id == state.get("current_message_id") or (message.type == "human" and not message.id):
-            message.content = state["resolved_query"]
-            break
-    return messages
 
 
 def build_agent_graph(deps: "WorkflowDependencies"):
@@ -110,10 +73,10 @@ def build_agent_graph(deps: "WorkflowDependencies"):
         try:
             tools = registry.all()
             # 结束决策也使用工具协议；历史裁剪须计入与模型实际绑定一致的完整定义。
-            current = {**state, "messages": resolved_agent_messages(state)}
-            messages = model_messages(current, deps.settings, DECISION_PROMPT, decision_tool_schemas(tools))
+            messages = model_messages(state, deps.settings, DECISION_PROMPT, decision_tool_schemas(tools))
             # 先检查最少的调用/输出余量；适配器还按完整输入执行精确保守占额检查。
-            ledger.ensure_capacity([("decide", 0, 2048), ("answer", 0, 4096), ("answer", 0, 4096)])
+            ledger.ensure_capacity([("decide", 0, ledger.output_limit("decide")),
+                ("answer", 0, ledger.output_limit("answer")), ("answer", 0, ledger.output_limit("answer"))])
             selected = await deps.model.decide(messages, tools, ledger)
             calls = selected.tool_calls
             if calls and (not valid_tool_calls(calls) or any(call["id"] in state["seen_call_ids"]
@@ -219,10 +182,7 @@ def build_agent_graph(deps: "WorkflowDependencies"):
             action_text = ("本轮回复后可用按钮的操作说明如下：\n" +
                            "\n".join(instructions[kind] for kind in state["suggested_kinds"])) if state["suggested_kinds"] else "本轮回复后没有可操作的按钮，请按已有事实回答或追问。"
             # 正文模型只需要中文按钮语义；不传内部字段、枚举、身份或动作ID。完整说明仍先过原预算。
-            answer_state = {**state, "messages": [*resolved_agent_messages(state),
-                {"role": "system", "content": action_text}]}
-            if state.get("route") == "order_policy":
-                answer_state = {**state, "history_turns": [], "messages": policy_answer_messages(state)}
+            answer_state = {**state, "context_notes": [*state.get("context_notes", []), action_text]}
             messages = model_messages(answer_state, deps.settings, ANSWER_PROMPT)
             async with aclosing(deps.model.stream_answer(messages, ledger)) as stream:
                 async for delta in stream:
@@ -270,9 +230,9 @@ def build_agent_graph(deps: "WorkflowDependencies"):
         update.update(budget=ledger.snapshot(), gate=gate.model_dump(mode="json"),
                       evidence_scores=[item.score for item in ranked], expanded_queries=[state["standard_query"]])
         if gate.passed:
-            evidence = [item.model_dump(mode="json") for item in citations_from_ranked(ranked)]
+            evidence = select_evidence([item.model_dump(mode="json") for item in citations_from_ranked(ranked)], deps.settings)
             update.update(evidence=evidence, stop_reason="answer",
-                context_notes=["本轮知识证据（仅作事实）：" + json.dumps(evidence, ensure_ascii=False)])
+                context_notes=[])
         # 低分不把原业务问题封死，也不冒充一次有效回答；保留已有澄清流程。
         return update
 

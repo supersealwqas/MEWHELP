@@ -10,9 +10,11 @@
 """
 
 import logging
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 
-def setup_logging(level: int = logging.INFO) -> None:
+def setup_logging(level: int = logging.INFO, *, log_path: Path | str = "log/app.log") -> None:
     """初始化应用业务日志。
 
     为 `app` 及其子 logger（如 `app.api.chat`）挂载唯一的控制台 handler，
@@ -20,23 +22,28 @@ def setup_logging(level: int = logging.INFO) -> None:
 
     参数:
         level (int): 业务日志的最低输出级别，默认 logging.INFO。
+        log_path: UTF-8轮转文件路径，默认项目log/app.log。
 
     返回值:
         None: 无返回值。
 
     异常:
-        无业务异常抛出。
+        OSError: 日志目录或文件无法创建，不能声称日志已落盘。
     """
     app_logger = logging.getLogger("app")
-    # 已配置过则直接复用，避免 --reload 或测试重复导入时叠加 handler。
-    if app_logger.handlers:
-        return
-
-    handler = logging.StreamHandler()
-    handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    )
-    app_logger.addHandler(handler)
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    if not any(getattr(handler, "_mewhelp_console", False) for handler in app_logger.handlers):
+        handler = logging.StreamHandler()
+        handler._mewhelp_console = True
+        handler.setFormatter(formatter)
+        app_logger.addHandler(handler)
+    path = Path(log_path).resolve()
+    if not any(isinstance(handler, RotatingFileHandler) and handler.baseFilename == str(path)
+               for handler in app_logger.handlers):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(path, maxBytes=20 * 1024 * 1024, backupCount=5, encoding="utf-8")
+        handler.setFormatter(formatter)
+        app_logger.addHandler(handler)
     app_logger.setLevel(level)
     # 只走自己的 handler，向上冒泡会与 root/uvicorn 的 handler 重复输出。
     app_logger.propagate = False

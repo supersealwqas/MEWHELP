@@ -64,7 +64,8 @@ async def test_service_checkpoint_uses_trusted_id_and_reopens_isolated_history(t
         continued = await collect(service, "1001", session="mewhelp:ch05:2")
         assert continued[-1].event == "done"
         classify = next(item for item in deps.model.inputs if item["stage"] == "classify")
-        assert classify["messages"] == [{"role": "user", "content": "查物流"}, {"role": "assistant", "content": "请给订单号"}, {"role": "user", "content": "1001"}]
+        assert classify["messages"][:-1] == [{"role": "user", "content": "查物流"}, {"role": "assistant", "content": "请给订单号"}, {"role": "user", "content": "1001"}]
+        assert classify["messages"][-1]["content"].startswith("上下文资料")
         assert (await service.graph.aget_state(second_config)).values["context"]["turn_id"] == second[-2].data["turn_id"]
 
 
@@ -100,7 +101,8 @@ async def test_next_input_merges_history_without_full_reload_and_understands_100
         assert (await collect(service, "查物流"))[-1].event == "done"
         assert (await collect(service, "1001"))[-1].event == "done"
         classify = [item for item in deps.model.inputs if item["stage"] == "classify"][-1]
-        assert classify["messages"] == [{"role": "user", "content": "查物流"}, {"role": "assistant", "content": "请给订单号"}, {"role": "user", "content": "1001"}]
+        assert classify["messages"][:-1] == [{"role": "user", "content": "查物流"}, {"role": "assistant", "content": "请给订单号"}, {"role": "user", "content": "1001"}]
+        assert classify["messages"][-1]["content"].startswith("上下文资料")
         assert (await collect(service, "谢谢"))[-1].event == "done"
         assert cursors[0] == 0 and all(cursor > 0 for cursor in cursors[1:])
         state = (await service.graph.aget_state({"configurable": {"thread_id": "mewhelp:ch05:1"}})).values

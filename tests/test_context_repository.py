@@ -15,8 +15,6 @@ from tests.recovery_fakes import offline_recovery_database
 async def context_db(tmp_path):
     """提供独占离线库。参数：tmp_path测试目录；返回：factory；异常：数据库或模块缺失。"""
     async with offline_recovery_database(tmp_path) as (engine, factory):
-        async with engine.begin() as conn:
-            await conn.execute(text("CREATE TABLE conversation_summaries (id INTEGER PRIMARY KEY, conversation_id INTEGER NOT NULL, seq INTEGER NOT NULL, from_msg_id INTEGER NOT NULL, upto_msg_id INTEGER NOT NULL, content TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL, UNIQUE(conversation_id, seq))"))
         yield factory
 
 

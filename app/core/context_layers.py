@@ -88,7 +88,9 @@ def _tool_marker(message: ToolMessage, name: str) -> str:
                 if len(identifiers) == 3:
                     break
     identity = json.dumps(identifiers, ensure_ascii=False, separators=(",", ":"))
-    return f"[工具结果已省略；工具={name}；{state}；对象={identity}；原始消息ID={message.additional_kwargs.get('db_message_id')}]"
+    source = (f"原始消息ID={message.additional_kwargs['db_message_id']}" if message.additional_kwargs.get("db_message_id")
+              else f"调用键={message.tool_call_id}")
+    return f"[工具结果已省略；工具={name}；{state}；对象={identity}；{source}]"
 
 
 def _shorten(messages: list[BaseMessage], estimator: TokenEstimator) -> list[BaseMessage]:

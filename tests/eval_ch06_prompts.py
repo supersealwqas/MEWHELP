@@ -72,10 +72,11 @@ def history_messages(history: list[dict]) -> list[dict]:
     return messages
 
 
-def evaluation_messages(history: list[dict], query: str, config, prompt: str, tools: list) -> list[dict]:
+def evaluation_messages(history: list[dict], query: str, config, prompt: str, tools: list,
+                        *, resolved_query: str | None = None) -> list[dict]:
     """复用线上整轮组装和预算裁剪，评估不另造分类消息路径。
 
-    参数：history已剔除标注的标准历史消息；query当前原问或完整问；config本次配置；prompt/tools阶段协议。
+    参数：history已剔除标注的历史；query原问；config配置；prompt/tools阶段协议；resolved_query可选补全问，只进入资料区。
     返回：与根图同规则的SDK消息；异常：历史校验错误或当前输入超预算。
     """
     from app.workflow.agent import model_messages
@@ -88,6 +89,7 @@ def evaluation_messages(history: list[dict], query: str, config, prompt: str, to
         turns[-1]["messages"].append(message)
     state = new_turn_state(ToolContext(conversation_id=1, session_id="evaluation", user_id="evaluation",
         turn_id="evaluation-current", user_message=query), turns, 0)
+    state["resolved_query"] = resolved_query or query
     return model_messages(state, config, prompt, tools)
 
 
@@ -138,9 +140,7 @@ async def evaluate_case(case: dict, history: list[dict], factory) -> dict:
     from app.workflow.model import WorkflowModelAdapter, understanding_tool_schema, intent_tool_schema
     from app.workflow.prompts import UNDERSTANDING_PROMPT, INTENT_PROMPT
     from app.knowledge.query_rewrite import QueryExpander
-    ledger = BudgetLedger(max_model_calls=settings.workflow_max_model_calls,
-        total_token_budget=settings.workflow_total_token_budget, max_decisions=settings.workflow_max_decisions,
-        request_token_budget=settings.request_token_budget)
+    ledger = BudgetLedger.from_settings(settings)
     records = []
 
     def record_factory(**options):
@@ -164,7 +164,7 @@ async def evaluate_case(case: dict, history: list[dict], factory) -> dict:
                 row["failures"].append("invented_numbers")
         else:
             adapter = WorkflowModelAdapter(model_factory=record_factory)
-            # 与根图一致：理解读取原问，分类读取完整问，两阶段均独立组装和裁剪历史。
+            # 与根图一致：原问逐字符保留，分类只在资料区补充已校验的完整问。
             understood = None
             if "expected" in case:
                 understood = await adapter.understand(evaluation_messages(history, case["query"], settings,
@@ -172,8 +172,8 @@ async def evaluate_case(case: dict, history: list[dict], factory) -> dict:
                 row["understanding"] = understood.model_dump(mode="json")
                 row["raw_understanding"] = raw_result(records, "understand")
                 row["failures"].extend(inspect_understanding(case["query"], expected, row["understanding"]))
-            intent = await adapter.classify(evaluation_messages(history,
-                understood.resolved_query if understood else case["query"], settings, INTENT_PROMPT, [intent_tool_schema()]), ledger)
+            intent = await adapter.classify(evaluation_messages(history, case["query"], settings, INTENT_PROMPT,
+                [intent_tool_schema()], resolved_query=understood.resolved_query if understood else None), ledger)
             original = raw_result(records, "classify")
             row.update(predicted_intent=intent.intent, confidence=intent.confidence,
                 raw_classification=original, raw_classification_valid=original is not None, intent_correct=intent.intent == expected["intent"])

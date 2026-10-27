@@ -142,12 +142,12 @@ async def test_policy_followup_retrieves_resolved_question_without_replacing_use
     assert result["gate"]["passed"]
 
 
-@pytest.mark.parametrize("standard_query", ["问" * 2001, "退款政策"])
+@pytest.mark.parametrize("standard_query", ["问" * 2001, "退款政策"], ids=["long-original", "short-rewrite"])
 async def test_classification_cannot_shorten_away_the_original_knowledge_input_limit(standard_query):
     """分类输出短问或空值不能让超长知识原问绕过输入上限。参数：knowledge_query模型输出；返回：None；异常：断言失败。"""
     from types import SimpleNamespace
 
-    deps = dependencies(intents=["退款退货"], understandings=[UnderstandingResult(resolved_query="问" * 2001,
+    deps = dependencies(intents=["退款退货"], max_user_input_tokens=10000, understandings=[UnderstandingResult(resolved_query="问" * 2001,
         standard_query=standard_query, needs_resolution=False, order_id=None)])
     result = await build_workflow(deps, checkpointer=None).ainvoke(turn("问" * 2001))
     assert result["stop_reason"] == "input_limit" and deps.search.calls == []
@@ -338,7 +338,7 @@ async def test_overlong_knowledge_stops_without_retrieval_or_low_confidence(monk
     monkeypatch.delenv("TOKEN_BUDGET", raising=False)
     monkeypatch.delenv("CHAT_TOKEN_BUDGET", raising=False)
     monkeypatch.setenv(budget_env, "31")
-    deps = dependencies(intents=["退款退货"])
+    deps = dependencies(intents=["退款退货"], max_user_input_tokens=10000)
     trace = NodeTrace()
     state = await build_workflow(deps, checkpointer=None).ainvoke(turn("问" * 2001), {"callbacks": [trace]})
     assert state["stop_reason"] == "input_limit"
@@ -377,13 +377,13 @@ async def test_refund_queries_order_before_policy_gate():
     assert [c["name"] for c in deps.executor.calls] == ["query_order"]
     assert state["tool_count"] == 1 and state["gate"]["passed"]
 
-@pytest.mark.parametrize("settings", [{"workflow_max_model_calls": 1}, {"workflow_total_token_budget": 9000}])
-async def test_configured_budget_stops_before_extra_model_request(settings):
+@pytest.mark.parametrize("settings,expected_calls", [({"workflow_max_model_calls": 1}, 1), ({"model_context_window": 14000}, 0)])
+async def test_configured_budget_stops_before_extra_model_request(settings, expected_calls):
     """配置被默认State账本覆盖或预算外补救时失败。参数：settings低限额；返回：None；异常：断言失败。"""
     deps = dependencies(**settings)
     state = await build_workflow(deps, checkpointer=None).ainvoke(turn())
     assert state["stop_reason"] == "budget_exceeded"
-    assert len(deps.model.inputs) == 1
+    assert len(deps.model.inputs) == expected_calls
     assert deps.chat.finished[0]["low_confidence"] is None
 
 async def test_stored_history_is_visible_but_current_question_stays_unchanged():
@@ -393,8 +393,9 @@ async def test_stored_history_is_visible_but_current_question_stays_unchanged():
     state["history_turns"] = [{"turn_id": "old", "turn_status": "completed", "messages": [
         {"role": "user", "content": "查物流"}, {"role": "assistant", "content": "请给订单号"}]}]
     result = await build_workflow(deps, checkpointer=None).ainvoke(state)
-    assert deps.model.inputs[0]["messages"] == [{"role": "user", "content": "查物流"},
+    assert deps.model.inputs[0]["messages"][:-1] == [{"role": "user", "content": "查物流"},
         {"role": "assistant", "content": "请给订单号"}, {"role": "user", "content": " 1001 "}]
+    assert deps.model.inputs[0]["messages"][-1]["content"].startswith("上下文资料")
     assert result["resolved_query"] == result["raw_query"] == " 1001 "
 
 async def test_suggestion_snapshot_survives_json_roundtrip_and_rejects_malformed_payload():

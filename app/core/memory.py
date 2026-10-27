@@ -139,7 +139,7 @@ def valid_tool_calls(calls: list[dict]) -> bool:
 def _message_identity(row: StoredMessage, turn: StoredTurn) -> dict:
     """附加可信消息身份。参数：row原始消息、turn所属轮；返回：消息构造参数；异常：无。"""
     if row.id is None:
-        return {}
+        return {"additional_kwargs": {"turn_id": turn.turn_id}}
     return {"id": f"db:{row.id}", "additional_kwargs": {"db_message_id": row.id, "turn_id": turn.turn_id}}
 
 

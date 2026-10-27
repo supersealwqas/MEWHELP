@@ -37,10 +37,10 @@ def verified_order_text(state: ConversationState) -> str:
     return "\n".join(lines) + "\n\n**政策与办理说明**\n\n"
 
 
-def policy_answer_messages(state: ConversationState) -> list[dict]:
+def policy_facts(state: ConversationState) -> dict:
     """将用户陈述、已确认对象、工具事实与表单职责分别传给政策解释阶段。
 
-    参数：state含订单事实、选单状态和本轮证据；返回：模型消息列表；异常：数据不能JSON序列化时TypeError。
+    参数：state含订单事实、选单状态和本轮证据；返回：动态事实字典；异常：必需字段缺失时KeyError。
     """
     selected = state.get("selection_action") or {}
     facts = {"用户陈述（未经核实）": state["raw_query"], "完整问题": state["resolved_query"],
@@ -49,14 +49,4 @@ def policy_answer_messages(state: ConversationState) -> list[dict]:
              "办理进度": {"当前阶段": "尚未提交" if state["intent"] == "退款退货" else "仅查询信息",
                           "执行回执": None, "展示方式": "由页面表单及服务端回执展示"},
              "后续表单收集": ["退款原因"] if state["intent"] == "退款退货" else []}
-    # 这是各业务通用的来源/职责契约，不包含具体题目、商品、渠道或政策答案。
-    rules = ("本阶段只输出政策与办理说明，程序会单独展示已核实订单信息；不要重复订单事实或重新列金额。"
-             "已确认对象是当前唯一处理对象，即使用户原话记录了此前的犹豫，也不再让用户确认或选择该对象。"
-             "用户陈述仅是用户提供的条件，不能提升为已核实事实；引用时注明来源。"
-             "后续表单收集的字段不在正文追问，也不列为本轮待补信息。"
-             "分别说明证据支持的条件和未覆盖的部分，不用相近规则替代用户实际所问；缺证据时仍给出可继续办理的说明。"
-             "created_at是创建时间，不是signed_at签收时间；缺少签收时间就说明未知。"
-             "办理进度由程序及执行回执展示，本阶段不叙述操作已提交、已保存或已执行；提供建议不等于执行操作。"
-             "只给政策规则标注本轮引用，不为订单事实加引用。\n")
-    return [{"role": "user", "content": state["raw_query"]},
-            {"role": "system", "content": rules + json.dumps(facts, ensure_ascii=False)}]
+    return facts

@@ -1,8 +1,12 @@
 """官方SQLite保存器与图生命周期入口。"""
 from contextlib import asynccontextmanager
 from pathlib import Path
+from dataclasses import asdict
+import logging
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from app.workflow.graph import WorkflowDependencies, build_workflow
+from app.workflow.context import shared_budget
+from app.core.context_budget import ContextBudgetExceeded
 
 @asynccontextmanager
 async def workflow_runtime(deps: WorkflowDependencies, checkpoint_path: Path):
@@ -17,5 +21,11 @@ async def workflow_runtime(deps: WorkflowDependencies, checkpoint_path: Path):
         raise ValueError("工作流必须使用专用SQLite持久化文件")
     path = Path(checkpoint_path).resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        budget = shared_budget(deps.settings)
+    except ContextBudgetExceeded as error:
+        logging.getLogger(__name__).error("上下文预算不足：%s", error)
+        raise
+    logging.getLogger(__name__).info("context budget startup %s", asdict(budget))
     async with AsyncSqliteSaver.from_conn_string(str(path)) as saver:
         yield build_workflow(deps, checkpointer=saver)

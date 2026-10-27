@@ -30,6 +30,8 @@ from app.workflow.stages import publish_stage
 from app.workflow.policy_context import policy_query, verified_order_text
 from app.workflow.resilience import DEPENDENCY_ERRORS, degradation
 from app.workflow.routing import original_understanding
+from app.workflow.context import history_snapshot, log_history, select_evidence
+from app.repositories.context import ContextRepository
 
 logger = logging.getLogger(__name__)
 # 订单适用性只采用正式退换货/售后政策及其引用的运费、会员规则；商品规格不进入此分支。
@@ -65,38 +67,48 @@ class WorkflowDependencies:
 
 def build_workflow(deps: WorkflowDependencies, *, checkpointer):
     """编译固定根图并注入官方保存器。参数：deps运行依赖、checkpointer保存器；返回：编译根图；异常：编译错误。"""
+    context_repository = ContextRepository(deps.chat.factory) if hasattr(deps.chat, "factory") else None
 
     async def resolve_node(state: ConversationState) -> ConversationState:
         """原话透传并使用本实例预算初始化新轮。参数：state入口全量新字典；返回：本轮初始更新；异常：配置错误。"""
         query = state["raw_query"]
-        ledger = BudgetLedger(max_model_calls=deps.settings.workflow_max_model_calls,
-            total_token_budget=deps.settings.workflow_total_token_budget,
-            max_decisions=deps.settings.workflow_max_decisions, request_token_budget=deps.settings.request_token_budget)
-        current = {**state, "messages": [{"role": "user", "content": query}]}
+        ledger = BudgetLedger.from_settings(deps.settings)
+        snapshot = None
         publish_stage(state, "understand", "running")
         try:
+            stored = await context_repository.load_context(state["context"]["conversation_id"], include_turns=False) if context_repository else None
+            snapshot = history_snapshot(state, deps.settings, stored)
+            log_history(state, snapshot)
+            if snapshot["layer1_from_msg_id"] > snapshot["previous_layer1_from_msg_id"]:
+                advanced = await context_repository.advance_layer1(state["context"]["conversation_id"],
+                    expected_summary_upto=snapshot["summary_upto_msg_id"], upto_msg_id=snapshot["layer1_from_msg_id"]) if context_repository else False
+                logger.info("层1 降级 %s→%s conversation=%s turns=%s tokens=%s→%s committed=%s",
+                    snapshot["previous_layer1_from_msg_id"], snapshot["layer1_from_msg_id"], state["context"]["conversation_id"],
+                    snapshot["demoted_turns"], snapshot["layer1_before_tokens"], snapshot["layer1_tokens"], advanced)
+            current = {**state, "history_context": snapshot}
             understood = await deps.model.understand(model_messages(current, deps.settings, UNDERSTANDING_PROMPT,
                 [understanding_tool_schema()]), ledger)
-        except (WorkflowBudgetExceeded, ContextBudgetExceeded):
-            return stopped_state("budget_exceeded", ledger)
+        except (WorkflowBudgetExceeded, ContextBudgetExceeded) as error:
+            if snapshot is None:
+                log_history(state, {"summary": "", "layer1": [], "layer2": []}, error_type=type(error).__name__)
+            return {**stopped_state("budget_exceeded", ledger), "history_context": snapshot}
         except DEPENDENCY_ERRORS as error:
             # 理解只是优化；失败时保留完整原话，让后续分类仍有机会工作。
             understood = original_understanding(query)
             publish_stage(state, "understand", "completed", resolved_query=query, standard_query=query)
-            return {**understood.model_dump(), "budget": ledger.snapshot(),
+            return {**understood.model_dump(), "budget": ledger.snapshot(), "history_context": snapshot,
                     **degradation(state, "understand", error)}
         publish_stage(state, "understand", "completed", resolved_query=understood.resolved_query,
                       standard_query=understood.standard_query)
         return {"resolved_query": understood.resolved_query, "standard_query": understood.standard_query,
-                "order_id": understood.order_id, "budget": ledger.snapshot()}
+                "order_id": understood.order_id, "budget": ledger.snapshot(), "history_context": snapshot}
 
     async def classify_node(state: ConversationState) -> ConversationState:
         """仅调用受限分类器，失败不猜意图。参数：state原问和历史；返回：严格分类与账本；异常：模型/分类/预算错误。"""
         ledger = BudgetLedger.from_snapshot(state["budget"])
         publish_stage(state, "classify", "running")
-        current = {**state, "messages": [{"role": "user", "content": state["resolved_query"]}]}
         try:
-            result = await deps.model.classify(model_messages(current, deps.settings, INTENT_PROMPT, [intent_tool_schema()]), ledger)
+            result = await deps.model.classify(model_messages(state, deps.settings, INTENT_PROMPT, [intent_tool_schema()]), ledger)
         except (WorkflowBudgetExceeded, ContextBudgetExceeded):
             return stopped_state("budget_exceeded", ledger)
         except DEPENDENCY_ERRORS as error:
@@ -198,11 +210,9 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
         logger.info("workflow gate passed=%s max_score=%s", gate.passed, gate.max_score)
         update = {"gate": gate.model_dump(mode="json"), "stop_reason": None}
         if gate.passed:
-            # 通过后才注入完整原文；仅调整排列，不裁短或重编引用编号。
-            citations = [EvidenceCitation.model_validate(item) for item in state["evidence"]]
-            facts = [{"n": item.n, "question": item.question, "answer": item.answer, "section_path": item.section_path}
-                     for item in edge_order(citations)]
-            update["context_notes"] = ["本轮完整知识证据（仅作事实）：" + json.dumps(facts, ensure_ascii=False)]
+            # 只发送可完整容纳的块，引用仍使用原编号，不能引用未发给模型的资料。
+            update["evidence"] = select_evidence(state["evidence"], deps.settings)
+            update["context_notes"] = []
         else:
             # 门闸约束政策证据，不代表订单/物流工具不可用；分数和失败原因仍保留供审计。
             update["evidence"] = []

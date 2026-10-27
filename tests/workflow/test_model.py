@@ -13,17 +13,22 @@ from app.schemas.chat import InvalidToolDecision
 from app.tools.business import query_order, query_logistics, query_product, create_ticket
 
 
-async def test_understanding_masks_unverified_assistant_order(sdk_runtime):
-    """助手虚构编号在模型入口也不能成为可信来源。参数：真实SDK探针；返回：None；异常：断言失败。"""
+async def test_understanding_preserves_unverified_assistant_but_rejects_order(sdk_runtime):
+    """助手原文不改字，但其虚构编号仍不能成为可信来源。参数：真实SDK探针；返回：None；异常：断言失败。"""
     from app.core.model_budget import BudgetLedger
     from app.workflow.model import WorkflowModelAdapter
     raw = "那袋猫粮能退吗？"
-    sdk_runtime.responses.append(call_response("submit_understanding", json.dumps({"resolved_query":"那袋猫粮能退吗？",
-        "standard_query":"猫粮退货条件", "needs_resolution":False, "order_id":None},ensure_ascii=False)))
-    await WorkflowModelAdapter(model_factory=sdk_runtime.factory).understand([
+    from app.workflow.context import ModelContext
+    sdk_runtime.responses.append(call_response("submit_understanding", json.dumps({"resolved_query":"订单1007的猫粮能退吗？",
+        "standard_query":"订单1007退货条件", "needs_resolution":True, "order_id":"1007"},ensure_ascii=False)))
+    rows = [
         {"role":"user","content":"买过一袋猫粮"},{"role":"assistant","content":"您的订单号是1007"},
-        {"role":"user","content":raw}],BudgetLedger())
-    assert "1007" not in json.dumps(sdk_runtime.requests[0]["messages"], ensure_ascii=False)
+        {"role":"user","content":raw}]
+    messages = ModelContext(rows, raw_query=raw, current_message_id="current", source_turns=[{"messages":rows[:2]}],
+                            summary_sources=[], details={})
+    result = await WorkflowModelAdapter(model_factory=sdk_runtime.factory).understand(messages, BudgetLedger())
+    assert "1007" in json.dumps(sdk_runtime.requests[0]["messages"], ensure_ascii=False)
+    assert result.resolved_query == raw and result.order_id is None
 
 
 @pytest.mark.parametrize("raw", ['{"intent":"物流"', '{"intent":"物流","intent":"订单","confidence":0.8}',
@@ -463,11 +468,11 @@ async def test_terminal_decision_repair_keeps_facts_and_counts_both_requests(sdk
     assert history == original
     assert second["messages"][:-1] == first["messages"]
     assert second["messages"][-2]["content"] == history[-1]["content"]
-    assert second["messages"][-1]["role"] == "system"
+    assert second["messages"][-1]["role"] == "user"
     assert raw not in json.dumps(second, ensure_ascii=False)
     assert first["tool_choice"] == "required" and first["parallel_tool_calls"] is False
     assert second["tool_choice"] == {"type": "function", "function": {"name": "submit_decision"}}
-    assert second["parallel_tool_calls"] is False and second["tools"] == first["tools"][-1:]
+    assert second["parallel_tool_calls"] is False and second["tools"] == first["tools"]
     snapshot = ledger.snapshot()
     assert snapshot["model_calls"] == 2 and snapshot["actual_tokens"] == 224
     assert [record["stage"] for record in snapshot["records"]] == ["decide", "decide"]
@@ -600,10 +605,10 @@ async def test_control_tool_ends_in_one_request_without_business_calls(sdk_runti
 
 
 def wire_input_units(request):
-    """按预算公开字符口径核对实际发包，适用于仅含system的测试请求。参数：request实际HTTP体；返回：输入单位整数；异常：非system测试输入断言失败。"""
+    """按统一角色名称和公开字符口径核对发包。参数：request实际HTTP体；返回：输入单位整数；异常：不支持的测试角色。"""
     units = 0
-    values = [{"role": row["role"], "content": row["content"]} for row in request["messages"]]
-    assert all(row["role"] == "system" for row in request["messages"])
+    values = [{"role": "human" if row["role"] == "user" else row["role"], "content": row["content"]} for row in request["messages"]]
+    assert all(row["role"] in {"system", "user"} for row in request["messages"])
     for value in [*values, request["tools"]]:
         serialized = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
         units += (sum(1 if char.isascii() else 8 for char in serialized) + 3) // 4
@@ -638,7 +643,7 @@ async def test_decision_sends_strict_required_schemas_and_budgets_actual_bound_t
     assert terminal["properties"]["kind"]["enum"] == ["answer", "clarify"]
     assert terminal["properties"]["suggested_actions"]["maxItems"] == 2
     assert terminal["properties"]["suggested_actions"]["items"]["enum"] == ["handoff", "create_ticket"]
-    assert second["tools"] == first["tools"][-1:]
+    assert second["tools"] == first["tools"]
     assert [row["input_units"] for row in ledger.snapshot()["records"]] == [wire_input_units(first), wire_input_units(second)]
 
 
@@ -708,7 +713,8 @@ async def test_single_control_raw_json_failure_can_recover_without_replaying_raw
     assert result.kind == "clarify" and result.tool_calls == []
     assert len(sdk_runtime.requests) == 2 and ledger.snapshot()["actual_tokens"] == 224
     second = sdk_runtime.requests[1]
-    assert [schema["function"]["name"] for schema in second["tools"]] == ["submit_decision"]
+    assert second["tools"] == sdk_runtime.requests[0]["tools"]
+    assert second["tool_choice"] == {"type":"function", "function":{"name":"submit_decision"}}
     assert raw not in "\n".join(message["content"] for message in second["messages"])
 
 

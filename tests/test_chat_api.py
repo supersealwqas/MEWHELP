@@ -61,8 +61,9 @@ def test_second_request_contains_completed_history(client, offline_chat_runtime)
     send(client, "我是张三")
     send(client, "我是谁")
     inputs = [row for row in model.inputs if row["stage"] == "classify"][-1]["messages"]
-    assert inputs == [{"role": "user", "content": "我是张三"},
+    assert inputs[:-1] == [{"role": "user", "content": "我是张三"},
                       {"role": "assistant", "content": "你好，我是小喵"}, {"role": "user", "content": "我是谁"}]
+    assert inputs[-1]["role"] == "user" and inputs[-1]["content"].startswith("上下文资料")
 
 
 @pytest.mark.parametrize("chunks", [[RuntimeError("SECRET")]])

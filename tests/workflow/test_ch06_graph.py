@@ -27,6 +27,12 @@ def order_result(order_id="1001"):
     return ToolResult.success({"order_id": order_id, "product": "猫粮", "status": "已签收", "created_at": "2026-01-01"})
 
 
+def context_data(messages):
+    """按资料标记读取动态区，不能再取最后一条工具消息。参数：messages模型输入；返回：字典；异常：标记缺失。"""
+    content = next(row["content"] for row in messages if row["content"].startswith("上下文资料"))
+    return json.loads(content.split("\n", 1)[1])
+
+
 async def test_selected_scope_reaches_policy_and_model_as_confirmed_input(tmp_path):
     """已选对象丢在旧歧义原话里时失败，恢复后必须显式携带确认事实。参数：tmp_path保存器目录；返回：None；异常：断言失败。"""
     deps = dependencies(intents=["退款退货"], results=[order_result("1002")],
@@ -41,7 +47,7 @@ async def test_selected_scope_reaches_policy_and_model_as_confirmed_input(tmp_pa
     assert len(state["expanded_queries"]) == 3
     assert "1002" in deps.search.calls[0][1] and "未拆封" in deps.search.calls[0][1]
     inputs = deps.model.inputs[-1]["messages"]
-    context = json.loads(inputs[-1]["content"].split("\n", 1)[1])
+    context = context_data(inputs)
     assert context["已确认对象"] == {"订单号": "1002", "来源": "用户选单"}
     assert context["后续表单收集"] == ["退款原因"]
 
@@ -56,7 +62,7 @@ async def test_verified_order_section_never_promotes_user_amount(tmp_path):
     facts, explanation = state["answer"].split("**政策与办理说明**", 1)
     assert "129" in facts and "9876" not in facts
     assert "商品总金额" in facts and "仅根据已提供政策判断" in explanation
-    context = json.loads(deps.model.inputs[-1]["messages"][-1]["content"].split("\n", 1)[1])
+    context = context_data(deps.model.inputs[-1]["messages"])
     assert "9876" in context["用户陈述（未经核实）"]
     assert context["订单事实"] == data
 
@@ -81,7 +87,8 @@ async def test_business_followup_uses_resolved_question_after_history_trim(tmp_p
     async with workflow_runtime(deps, tmp_path / "resolved-business.sqlite") as graph:
         state = await graph.ainvoke(initial, {"configurable": {"thread_id": "test"}})
     observed = next(row for row in deps.model.inputs if row["stage"] == stage)
-    assert [message["content"] for message in observed["messages"] if message["role"] == "user"] == [resolved]
+    assert observed["messages"][0]["content"] == "它呢？"
+    assert context_data(observed["messages"])["完整问题"] == resolved
     assert state["raw_query"] == state["context"]["user_message"] == "它呢？"
     current = next(message for message in state["messages"] if message.id == state["current_message_id"])
     assert current.type == "human" and current.content == "它呢？"
@@ -229,7 +236,12 @@ async def test_policy_answer_uses_current_facts_without_old_assistant_claims(tmp
     async with workflow_runtime(deps, tmp_path / "facts.sqlite") as graph:
         state = await graph.ainvoke(initial, {"configurable": {"thread_id": "test"}})
     answer_input = json.dumps(deps.model.inputs[-1]["messages"], ensure_ascii=False)
-    assert "肯定已批准退款" not in answer_input and "低分政策" not in answer_input
+    # 近期助手原话保留，但不能进入本轮核实事实或执行回执。
+    facts = context_data(deps.model.inputs[-1]["messages"])
+    assert "肯定已批准退款" in answer_input and "低分政策" not in answer_input
+    assert "肯定已批准退款" not in json.dumps(facts, ensure_ascii=False)
+    assert facts["办理进度"]["当前阶段"] == "尚未提交" and facts["办理进度"]["执行回执"] is None
+    assert "signed_at" not in facts["订单事实"]
     assert "created_at" in answer_input and "签收" in answer_input and "原因" in answer_input
     assert state["evidence"] == [] and deps.chat.finished[0]["low_confidence"] is None
 

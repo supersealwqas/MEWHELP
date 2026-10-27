@@ -32,6 +32,7 @@ build/
 # 评估/真实运行产物目录（reports/ 下逐次运行的 cases.jsonl、summary 等）
 # 只保留生成规则与文档；结果按运行时间戳产生，不入库
 /reports/
+/log/
 
 # 本地学习文档、示例与 Notebook；开发文档 docs/、dev-notes/ 仍正常跟踪
 /mydemo/

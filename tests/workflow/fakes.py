@@ -17,7 +17,7 @@ class ScriptedWorkflowModel:
 
     async def understand(self, messages: list, ledger: BudgetLedger) -> UnderstandingResult:
         """执行指定理解或明确的原话透传。参数：messages当前消息、ledger账本；返回：理解结果；异常：脚本或预算错误。"""
-        query = next(row["content"] for row in reversed(messages) if row["role"] == "user")
+        query = messages.raw_query
         script = self.understandings or deque([UnderstandingResult(
             resolved_query=query, standard_query=query, needs_resolution=False, order_id=None)])
         return self._take(script, "understand", messages, ledger, OUTPUT_LIMITS["understand"])
@@ -26,7 +26,7 @@ class ScriptedWorkflowModel:
         """消费一次逻辑请求。参数：script 有限队列、stage/messages 观测输入、ledger/output_limit 计量；返回：脚本项；异常：AssertionError/脚本异常/预算错误。"""
         if not script:
             raise AssertionError(f"未预期的额外 {stage} 模型请求")
-        ledger.reserve(stage, 100, output_limit)
+        ledger.reserve(stage, 100, ledger.output_limit(stage))
         self.inputs.append({"stage":stage, "messages":list(messages)})
         result = script.popleft()
         ledger.record_usage(stage, None, None if isinstance(result, BaseException) else "stop")

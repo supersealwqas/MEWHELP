@@ -107,13 +107,15 @@ async def test_unknown_or_write_tool_is_not_executed():
     state = await build_workflow(deps, checkpointer=None).ainvoke(turn())
     assert deps.executor.calls == [] and state["stop_reason"] == "invalid_decision"
 
-async def test_large_tool_fact_stops_without_truncation_or_answer_call():
-    """大工具事实被截短并继续模型请求时失败。参数：无；返回：None；异常：断言失败。"""
+async def test_large_tool_fact_keeps_original_and_answers_from_bounded_view():
+    """大工具只省略模型副本，原文必须保存且仍有答复。参数：无；返回：None；异常：断言失败。"""
     fact = "事实" * 10000
-    deps = dependencies(decisions=[AgentDecision(kind="tools", tool_calls=[call("a")])], results=[ToolResult.success({"details": fact})])
+    deps = dependencies(decisions=[AgentDecision(kind="tools", tool_calls=[call("a")]), AgentDecision(kind="answer")],
+                        results=[ToolResult.success({"details": fact})], answers=[["详情过长，暂不能完整展示。"]])
     state = await build_workflow(deps, checkpointer=None).ainvoke(turn())
-    assert state["stop_reason"] == "budget_exceeded" and len(deps.model.inputs) == 3
+    assert state["stop_reason"] == "answer" and len(deps.model.inputs) == 5
     assert any(fact in message.content for message in state["messages"] if message.type == "tool")
+    assert any("已省略" in row["content"] for row in deps.model.inputs[-1]["messages"] if row["role"] == "tool")
 
 async def test_fifth_decision_can_answer_after_four_tools():
     """把四工具上限错当四次决策，提前阻止最终回答时失败。参数：无；返回：None；异常：断言失败。"""
@@ -131,7 +133,7 @@ async def test_answer_receives_current_confirmed_suggestion_context(actions):
     state = await build_workflow(deps, checkpointer=None).ainvoke(turn("设备故障，请创建售后工单"))
     actual = next(item["messages"] for item in deps.model.inputs if item["stage"] == "answer")
     description = actual[-1]["content"]
-    assert actual[-1]["role"] == "system"
+    assert actual[-1]["role"] == "user" and actual[-1]["content"].startswith("上下文资料")
     assert {action["kind"] for action in state["suggested_actions"]} == set(actions)
     assert ("创建工单" in description) == ("create_ticket" in actions)
     assert ("转人工" in description) == ("handoff" in actions)
@@ -146,9 +148,19 @@ async def test_answer_receives_current_confirmed_suggestion_context(actions):
 
 async def test_answer_action_instructions_cannot_bypass_message_budget():
     """新增按钮说明也必须过现有输入预算，不能预算外加给模型。参数：无；返回：None；异常：断言失败。"""
-    deps = dependencies(token_budget=80, intents=["其他"],
+    from app.workflow.agent import build_agent_graph, model_messages
+    from app.workflow.context import history_snapshot
+    from app.workflow.prompts import ANSWER_PROMPT
+    from app.core.context_budget import TokenEstimator
+    from langchain_core.messages import SystemMessage, convert_to_messages
+    deps = dependencies(intents=["其他"],
         decisions=[AgentDecision(kind="answer", suggested_actions=["create_ticket"])], answers=[["旧路径会越过新增说明预算"]])
-    state = await build_workflow(deps, checkpointer=None).ainvoke(turn("请建单"))
+    initial = turn("请建单")
+    snapshot = history_snapshot(initial, deps.settings)
+    before = model_messages(initial, deps.settings, ANSWER_PROMPT)
+    snapshot["budget"]["request_limit"] = TokenEstimator().message_tokens([SystemMessage(content=ANSWER_PROMPT), *convert_to_messages(before)]) + 1
+    initial["history_context"] = snapshot
+    state = await build_agent_graph(deps).ainvoke(initial)
     assert state["stop_reason"] == "budget_exceeded"
     assert not any(item["stage"] == "answer" for item in deps.model.inputs)
 
@@ -309,15 +321,20 @@ async def test_control_schema_cannot_bypass_current_message_budget():
     from app.tools.registry import build_agent_registry
     from app.workflow.prompts import DECISION_PROMPT
     from app.workflow.agent import build_agent_graph
+    from app.workflow.agent import model_messages
+    from app.workflow.context import history_snapshot
+    from langchain_core.messages import convert_to_messages
 
     query = "查询订单1001"
     old_schemas = [convert_to_openai_tool(tool) for tool in build_agent_registry().all()]
-    old_input_units = (_estimate_message_tokens([SystemMessage(content=DECISION_PROMPT), HumanMessage(content=query)])
-                       + _estimate_token_units(old_schemas))
-    deps = dependencies(request_token_budget=old_input_units + 1,
-        decisions=[AgentDecision(kind="answer")], answers=[["不应在预算外生成的正文"]])
+    deps = dependencies(decisions=[AgentDecision(kind="answer")], answers=[["不应在预算外生成的正文"]])
     state = turn(query)
-    state["messages"] = [{"role": "user", "content": query}]
+    before = model_messages(state, deps.settings, DECISION_PROMPT, old_schemas)
+    old_input_units = (_estimate_message_tokens([SystemMessage(content=DECISION_PROMPT), *convert_to_messages(before)])
+                       + _estimate_token_units(old_schemas))
+    snapshot = history_snapshot(state, deps.settings)
+    snapshot["budget"]["request_limit"] = old_input_units + 1
+    state["history_context"] = snapshot
     # 此用例检查Agent的工具schema预算，不让独立分类提示的长度抢先触发边界。
     completed = await build_agent_graph(deps).ainvoke(state)
 

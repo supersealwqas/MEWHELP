@@ -264,18 +264,21 @@ class QueryRewriter:
         messages = [SystemMessage(content=QUERY_REWRITE_RULES),
                     HumanMessage(content=json.dumps(payload, ensure_ascii=False))]
         tool = output_tool(QueryRewrite, _OUTPUT_TOOL_NAME)
-        input_units = _estimate_message_tokens(messages) + _estimate_token_units([tool])
-        if input_units > self.request_budget:
+        input_units = (budget.estimator.message_tokens(messages) + budget.estimator.value_tokens([tool]) if budget
+                       else _estimate_message_tokens(messages) + _estimate_token_units([tool]))
+        request_limit = budget.snapshot()["request_token_budget"] if budget else self.request_budget
+        output_limit = budget.output_limit("rewrite") if budget else 2048
+        if input_units > request_limit:
             raise QueryRewriteError("单轮改写请求超预算，请缩小问题范围")
         if budget is not None:
             # 先占额再接触模型；工作流预算错误不包装为知识模型故障。
-            budget.reserve("rewrite", input_units, 2048)
+            budget.reserve("rewrite", input_units, output_limit)
         try:
             options = {}
             if budget is not None:
                 from app.config import settings
                 options["stream_usage"] = settings.workflow_stream_usage
-            model = (self.model_factory or get_chat_model)(streaming=True, temperature=0.0, max_tokens=2048,
+            model = (self.model_factory or get_chat_model)(streaming=True, temperature=0.0, max_tokens=output_limit,
                                                            max_retries=1, **options)
             # 只解析强制工具的完整参数；共享边界负责长度、用量和关闭，不保留文本JSON退路。
             gathered = await collect_tool_output(bind_output_tool(model, tool), messages,
@@ -333,9 +336,11 @@ class QueryExpander:
         tool = output_tool(ExpandedQueries, _EXPANSION_TOOL_NAME)
         if required_count == 3:
             tool["function"]["parameters"]["properties"]["queries"].update(minItems=3, maxItems=3)
-        output_limit = OUTPUT_LIMITS["expand"]
-        input_units = _estimate_message_tokens(messages) + _estimate_token_units([tool])
-        if input_units > self.request_budget:
+        output_limit = budget.output_limit("expand") if budget else OUTPUT_LIMITS["expand"]
+        input_units = (budget.estimator.message_tokens(messages) + budget.estimator.value_tokens([tool]) if budget
+                       else _estimate_message_tokens(messages) + _estimate_token_units([tool]))
+        request_limit = budget.snapshot()["request_token_budget"] if budget else self.request_budget
+        if input_units > request_limit:
             raise QueryRewriteError("单轮扩写请求超预算，请缩小问题范围")
         if budget is not None:
             budget.reserve("expand", input_units, output_limit)

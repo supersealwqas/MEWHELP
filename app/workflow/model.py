@@ -12,14 +12,14 @@ from pydantic import ValidationError
 
 from app.config import settings
 from app.core.llm import decision_message, get_chat_model
-from app.core.memory import _estimate_message_tokens, _estimate_token_units
-from app.core.model_budget import OUTPUT_LIMITS, BudgetLedger, WorkflowBudgetExceeded
+from app.core.model_budget import BudgetLedger, WorkflowBudgetExceeded
 from app.core.prompts import ANSWER_NUDGE
 from app.core.structured import StructuredOutputError, bind_output_tool, output_chunk_size, output_tool, parse_tool_output
 from app.schemas.chat import InvalidToolDecision
 from app.schemas.workflow import AgentDecision, IntentResult, UnderstandingResult
 from app.workflow.prompts import ANSWER_PROMPT, DECISION_NUDGE, DECISION_PROMPT, INTENT_PROMPT, UNDERSTANDING_PROMPT
-from app.workflow.routing import _understanding_outcome, original_understanding, _trusted_history, _ORDER_CANDIDATE
+from app.workflow.routing import _understanding_outcome, original_understanding
+from app.workflow.context import ModelContext, log_model_context
 
 READ_ONLY_NAMES = frozenset({"query_order", "query_logistics", "query_product"})
 _CONTROL_NAME = "submit_decision"
@@ -117,9 +117,10 @@ class WorkflowModelAdapter:
         return self._factory(streaming=True, temperature=0.0, max_tokens=output_limit,
                              max_retries=1, request_timeout=60.0, stream_usage=self._stream_usage, **options)
 
-    async def _gather(self, messages: list, model, ledger: BudgetLedger, stage: str):
-        """内部聚合并记录全部 usage/终止原因，不向用户输出。参数：messages/model 输入依赖、ledger/stage 本次账本；返回：完整分片；异常：模型/取消/超长错误。"""
+    async def _gather(self, messages: list, model, ledger: BudgetLedger, stage: str, *, source=None, tools=None):
+        """内部聚合并记录usage/终止原因。参数：messages/model输入、ledger/stage账本、source原问来源、tools绑定schema；返回：完整分片；异常：模型/取消/超长错误。"""
         gathered, size = None, 0
+        log_model_context(source, messages, tools or [], ledger, stage)
         stream = model.astream(messages)
         try:
             async for chunk in stream:
@@ -166,40 +167,29 @@ class WorkflowModelAdapter:
     async def understand(self, messages: list, ledger: BudgetLedger) -> UnderstandingResult:
         """一次工具调用完成指代与标准问法；优化故障整体透传，控制信号保持原义。
 
-        参数：messages当前原问结尾的完整会话消息；ledger本轮独占账本。
+        参数：messages带显式原问身份的ModelContext（兼容单条原问）；ledger本轮独占账本。
         返回：严格理解结果；任何调用/解析/来源失败返回完整原问且记录已消耗预算。
         异常：ValueError，无合法当前用户原问；WorkflowBudgetExceeded或取消原样传播。
         """
         converted = convert_to_messages(messages)
-        users = [index for index, message in enumerate(converted) if message.type == "human"]
-        if not users:
-            raise ValueError("理解必须包含当前用户原问")
-        current_index = users[-1]
-        raw_query = _text(converted[current_index])
+        if isinstance(messages, ModelContext):
+            raw_query = messages.raw_query
+            history_turns, summary_sources = messages.source_turns, messages.summary_sources
+        else:
+            # 旧单问调用没有资料消息；多条human必须由统一组装器显式携带原问身份。
+            users = [message for message in converted if message.type == "human"]
+            if len(users) != 1:
+                raise ValueError("多轮理解必须显式标识当前用户原问")
+            raw_query, history_turns, summary_sources = _text(users[0]), [], []
         fallback = original_understanding(raw_query)
-        history_turns = []
-        for message in converted[:current_index]:
-            if message.type == "human" or not history_turns:
-                history_turns.append({"messages": []})
-            history_turns[-1]["messages"].append({"role": "user" if message.type == "human" else message.type,
-                                                   "content": _text(message)})
-        trusted_text, _, _ = _trusted_history(history_turns)
-        trusted_numbers = set(_ORDER_CANDIDATE.findall(trusted_text + "\n" + raw_query))
-        safe_messages = []
-        for message in converted:
-            if message.type == "ai" and isinstance(message.content, str):
-                # 助手正文只提供主题；未被用户或成功工具证实的编号不进入理解上下文。
-                safe_content = _ORDER_CANDIDATE.sub(lambda match: match.group() if match.group() in trusted_numbers else "[未核实编号]", message.content)
-                message = message.model_copy(update={"content":safe_content})
-            safe_messages.append(message)
-        prepared = [SystemMessage(content=UNDERSTANDING_PROMPT), *safe_messages]
-        tool, output_limit = understanding_tool_schema(), OUTPUT_LIMITS["understand"]
-        ledger.reserve("understand", _estimate_message_tokens(prepared) + _estimate_token_units([tool]), output_limit)
+        prepared = [SystemMessage(content=UNDERSTANDING_PROMPT), *converted]
+        tool, output_limit = understanding_tool_schema(), ledger.output_limit("understand")
+        ledger.reserve("understand", ledger.estimator.message_tokens(prepared) + ledger.estimator.value_tokens([tool]), output_limit)
         gathered = None
         try:
-            gathered = await self._gather(prepared, bind_output_tool(self._model(output_limit), tool), ledger, "understand")
+            gathered = await self._gather(prepared, bind_output_tool(self._model(output_limit), tool), ledger, "understand", source=messages, tools=[tool])
             result = parse_tool_output(gathered, UnderstandingResult, "submit_understanding")
-            validated, source_failed = _understanding_outcome(raw_query, result, history_turns)
+            validated, source_failed = _understanding_outcome(raw_query, result, history_turns, summary_sources=summary_sources)
             if source_failed:
                 diagnostic = self._failure(gathered, "understanding_reference")
                 diagnostic["query_fallback"] = "original_query"
@@ -222,12 +212,12 @@ class WorkflowModelAdapter:
         异常：WorkflowBudgetExceeded、网络/配置错误及取消原样传播，不能伪装为模型分类。
         """
         prepared = [SystemMessage(content=INTENT_PROMPT), *convert_to_messages(messages)]
-        tool, output_limit = intent_tool_schema(), OUTPUT_LIMITS["classify"]
-        ledger.reserve("classify", _estimate_message_tokens(prepared) + _estimate_token_units([tool]), output_limit)
+        tool, output_limit = intent_tool_schema(), ledger.output_limit("classify")
+        ledger.reserve("classify", ledger.estimator.message_tokens(prepared) + ledger.estimator.value_tokens([tool]), output_limit)
         gathered = None
         try:
             gathered = await self._gather(prepared,
-                bind_output_tool(self._model(output_limit, model_name=self._intent_model), tool), ledger, "classify")
+                bind_output_tool(self._model(output_limit, model_name=self._intent_model), tool), ledger, "classify", source=messages, tools=[tool])
             return parse_tool_output(gathered, IntentResult, "submit_intent")
         except (StructuredOutputError, WorkflowOutputError) as error:
             ledger.record_failure("classify", self._failure(gathered, "intent_structure", error))
@@ -248,18 +238,18 @@ class WorkflowModelAdapter:
         retry_messages = [*answer_messages, HumanMessage(content=ANSWER_NUDGE)]
         for attempt in range(2):
             # 原失败文本只留诊断；固定system提示不会取代最近一条用户诉求或裁掉已知事实。
-            current = prepared if attempt == 0 else [*prepared, SystemMessage(content=DECISION_NUDGE)]
-            bound_schemas = schemas if attempt == 0 else schemas[-1:]
-            input_units = _estimate_message_tokens(current) + _estimate_token_units(bound_schemas)
+            current = prepared if attempt == 0 else [*prepared, HumanMessage(content=DECISION_NUDGE)]
+            bound_schemas = schemas
+            input_units = ledger.estimator.message_tokens(current) + ledger.estimator.value_tokens(bound_schemas)
             # 每次真实请求都保留两次正文余量；纠正提示也计入完整输入，不能预算外重试。
-            ledger.ensure_capacity([("decide", input_units, 2048),
-                ("answer", _estimate_message_tokens(answer_messages), 4096),
-                ("answer", _estimate_message_tokens(retry_messages), 4096)])
-            ledger.reserve("decide", input_units, 2048)
-            model = self._model(2048)
+            ledger.ensure_capacity([("decide", input_units, ledger.output_limit("decide")),
+                ("answer", ledger.estimator.message_tokens(answer_messages), ledger.output_limit("answer")),
+                ("answer", ledger.estimator.message_tokens(retry_messages), ledger.output_limit("answer"))])
+            ledger.reserve("decide", input_units, ledger.output_limit("decide"))
+            model = self._model(ledger.output_limit("decide"))
             choice = "required" if attempt == 0 else {"type": "function", "function": {"name": _CONTROL_NAME}}
             bound = model.bind_tools(bound_schemas, tool_choice=choice, parallel_tool_calls=False)
-            gathered = await self._gather(current, bound, ledger, "decide")
+            gathered = await self._gather(current, bound, ledger, "decide", source=messages, tools=bound_schemas)
             _check_finish(gathered.response_metadata.get("finish_reason"), tools=_has_calls(gathered))
             try:
                 message = decision_message(gathered)
@@ -320,7 +310,8 @@ class WorkflowModelAdapter:
         prepared = [SystemMessage(content=ANSWER_PROMPT), *convert_to_messages(messages)]
         for attempt in range(2):
             current = prepared if attempt == 0 else [*prepared, HumanMessage(content=ANSWER_NUDGE)]
-            ledger.reserve("answer", _estimate_message_tokens(current), 4096)
+            ledger.reserve("answer", ledger.estimator.message_tokens(current), ledger.output_limit("answer"))
+            log_model_context(messages, current, [], ledger, "answer")
             produced = False
             async with aclosing(self._answer_once(current, ledger)) as stream:
                 async for delta in stream:
@@ -332,7 +323,7 @@ class WorkflowModelAdapter:
 
     async def _answer_once(self, messages: list, ledger: BudgetLedger) -> AsyncIterator[str]:
         """直接转发正文，过滤协议外工具/推理并及时关闭。参数：messages 完整输入、ledger 已占额账本；返回：正文增量流；异常：超长/截断/网络/取消。"""
-        stream = self._model(4096).astream(messages)
+        stream = self._model(ledger.output_limit("answer")).astream(messages)
         usage, reason, size = None, None, 0
         has_text, prefix = False, ""
         try:

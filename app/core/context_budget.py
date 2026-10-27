@@ -105,15 +105,17 @@ def derive_history_budget(
                          layer1=layer1, layer2=history - layer1, request_limit=request_limit)
 
 
-def context_budget(settings: "Settings", *, fixed_tokens: int) -> ContextBudget:
+def context_budget(settings: "Settings", *, fixed_tokens: int, protocol_tokens: int = 0) -> ContextBudget:
     """将应用配置换算为可复算预算。
 
-    参数：settings已校验配置；fixed_tokens使用相同中文系数实测的system/schema占用。
+    参数：settings已校验配置；fixed_tokens固定前缀实测占用；protocol_tokens实际补救消息预留，默认0供旧入口兼容。
     返回：ContextBudget；异常：ContextBudgetExceeded表示容量不足，ValueError表示非法扣减。
     """
     window = settings.model_context_window
+    if type(protocol_tokens) is not int or protocol_tokens < 0:
+        raise ValueError("协议补救用量必须为非负整数")
     # 一步可能并行申请多个工具，峰值必须按整轮工具数，而非决策步数计算。
-    peak = settings.max_user_input_tokens + settings.tool_max_calls_per_turn * (
+    peak = protocol_tokens + settings.max_user_input_tokens + settings.tool_max_calls_per_turn * (
         settings.tool_result_max_tokens + settings.tool_call_max_tokens)
     return derive_history_budget(
         window=window, fixed_tokens=fixed_tokens,

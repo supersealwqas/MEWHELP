@@ -30,8 +30,9 @@ async def test_prompt_evaluation_preserves_recent_history_and_trims_whole_turns(
     assert row["correct"], (row["failures"], row["error_type"])
     expected_messages = [*recent, {"role": "user", "content": query}]
     assert len(sdk_runtime.requests) == 2
-    assert sdk_runtime.requests[0]["messages"][1:] == expected_messages
-    assert sdk_runtime.requests[1]["messages"][1:] == expected_messages
+    for request in sdk_runtime.requests:
+        assert request["messages"][1:-1] == expected_messages
+        assert request["messages"][-1]["content"].startswith("上下文资料")
 
 
 @pytest.mark.asyncio

@@ -165,15 +165,26 @@ def validate_understanding(raw_query: str, result: UnderstandingResult,
 
 
 def _understanding_outcome(raw_query: str, result: UnderstandingResult,
-                           history_turns: list[dict]) -> tuple[UnderstandingResult, bool]:
+                           history_turns: list[dict], *, summary_sources: list[dict] | None = None) -> tuple[UnderstandingResult, bool]:
     """复用唯一来源校验并标记真实回退，区别正常空白恢复和来源失真。
 
-    参数：raw_query原话、result严格候选、history_turns可信历史。
+    参数：raw_query原话、result严格候选、history_turns滑窗原始来源、summary_sources为实际注入摘要覆盖的原始来源。
     返回：理解结果和是否因来源失真回退的布尔值，供模型边界准确记录失败。
     异常：原问契约非法时抛字段校验错误。
     """
     fallback = original_understanding(raw_query)
     history, recent_orders, products = _trusted_history(history_turns)
+    # 摘要仅负责让模型看到线索；候选仍回查实际注入段覆盖的原始用户/成功工具记录。
+    summary_text, summary_orders = [], set()
+    for turn in summary_sources or []:
+        text, orders, names = _trusted_history([turn])
+        summary_text.append(text)
+        summary_orders.update(orders)
+        products.update(names)
+    summary_candidate = result.needs_resolution and result.order_id in summary_orders
+    if summary_candidate:
+        recent_orders = {result.order_id}
+    history = "\n".join([*summary_text, history])
     current_orders = set(_ORDER_CANDIDATE.findall(raw_query))
     # 原文中被排除的号仍允许逐字符保留，但不能参与本轮唯一对象判断。
     selectable_orders = {token.group() for token in _active_order_tokens(raw_query)} if current_orders else (recent_orders if result.needs_resolution else set())

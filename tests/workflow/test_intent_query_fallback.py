@@ -11,6 +11,13 @@ from app.workflow.model import WorkflowModelAdapter
 from tests.workflow.test_model import call_response, sdk_runtime, text_response, understanding_response
 
 
+def source_messages(history, raw):
+    """显式提供原问和可信源，避免用尾随资料猜原问。参数：history历史、raw原问；返回：模型输入；异常：无。"""
+    from app.workflow.context import ModelContext
+    return ModelContext([*history, {"role":"user", "content":raw}], raw_query=raw,
+        current_message_id="current", source_turns=[{"messages":history}], summary_sources=[], details={})
+
+
 @pytest.mark.parametrize("response", [
     text_response('{"resolved_query":"坏正文"}'),
     call_response("submit_understanding", '{"resolved_query":'),
@@ -61,7 +68,7 @@ async def test_invalid_understanding_source_falls_back_once(sdk_runtime, raw, hi
     sdk_runtime.responses.append(understanding_response(derived, needs_resolution=True, usage=True))
     ledger = BudgetLedger()
     result = await WorkflowModelAdapter(model_factory=sdk_runtime.factory).understand(
-        [*history, {"role": "user", "content": raw}], ledger)
+        source_messages(history, raw), ledger)
     assert result.resolved_query == result.standard_query == raw
     assert result.order_id is None and not result.needs_resolution
     assert ledger.snapshot()["actual_tokens"] == 112
@@ -80,7 +87,7 @@ async def test_valid_understanding_uses_successful_tool_facts(sdk_runtime):
     sdk_runtime.responses.append(understanding_response(resolved, needs_resolution=True, order_id="1001", usage=True))
     ledger = BudgetLedger()
     result = await WorkflowModelAdapter(model_factory=sdk_runtime.factory).understand(
-        [*history, {"role": "user", "content": raw}], ledger)
+        source_messages(history, raw), ledger)
     assert result.resolved_query == resolved and result.order_id == "1001"
     assert "failure" not in ledger.snapshot()["records"][0]
 
@@ -127,7 +134,7 @@ async def test_invalid_resolved_query_alone_keeps_failure_diagnostic(sdk_runtime
     sdk_runtime.responses.append(understanding_response("订单1001的运费怎么算", standard="运费怎么算"))
     ledger = BudgetLedger()
     result = await WorkflowModelAdapter(model_factory=sdk_runtime.factory).understand(
-        [{"role": "user", "content": "订单1001"}, {"role": "user", "content": "运费怎么算"}], ledger)
+        source_messages([{"role": "user", "content": "订单1001"}], "运费怎么算"), ledger)
     assert result.resolved_query == result.standard_query == "运费怎么算"
     assert ledger.snapshot()["records"][0]["failure"]["terminal_decision"]["validation_category"] == "understanding_reference"
 
