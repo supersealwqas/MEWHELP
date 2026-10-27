@@ -94,3 +94,30 @@ async def test_mysql_summary_rollback_keeps_boundary(ch07_database):
             from_msg_id=turns[0].messages[0].id, upto_msg_id=upto, content="原始事实", projection_max_tokens=500)
     loaded = await ContextRepository(factory).load_context(ctx.conversation_id)
     assert loaded["summary_upto_msg_id"] == 0 and loaded["summaries"] == []
+
+
+async def test_mysql_manager_cancel_then_restart_from_committed_range(ch07_database):
+    """真实MySQL上取消模型后重启按DB恢复，不依赖旧内存队列。参数：隔离库；返回：None；异常：断言或数据库错误。"""
+    from app.repositories.chat import ChatRepository
+    from app.repositories.context import ContextRepository
+    from tests.test_summaries import ControlledGenerator, manager, wait_idle
+    factory, ctx = ch07_database
+    turns = await ChatRepository(factory).load_turns(ctx.conversation_id)
+    upto = turns[-1].messages[-1].id
+    await ContextRepository(factory).advance_layer1(ctx.conversation_id, expected_summary_upto=0, upto_msg_id=upto)
+    generator = ControlledGenerator(blocked=True)
+    worker = manager(factory, generator, close_seconds=0.01)
+    try:
+        await worker.maybe_schedule(ctx.conversation_id)
+        await asyncio.wait_for(generator.started.wait(), 3)
+    finally:
+        await worker.close()
+    assert (await ContextRepository(factory).load_context(ctx.conversation_id))["summary_upto_msg_id"] == 0
+    resumed = manager(factory, ControlledGenerator())
+    try:
+        await resumed.recover()
+        await wait_idle(resumed)
+        loaded = await ContextRepository(factory).load_context(ctx.conversation_id)
+        assert loaded["summary_upto_msg_id"] == upto and len(loaded["summaries"]) == 1
+    finally:
+        await resumed.close()

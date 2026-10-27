@@ -515,10 +515,19 @@ class _WorkflowTrace(BaseCallbackHandler):
 class ChatService:
     """显式消费真实编译图的在线入口；完成事务和最终checkpoint均成功后才发布完成帧。"""
 
-    def __init__(self, chat_repository, graph, executor, settings, *, guard: ConversationGuard | None = None):
-        """注入共享资源。参数：仓储/编译图/已有执行器/配置及可选共享互斥；返回：None；异常：无。"""
+    def __init__(self, chat_repository, graph, executor, settings, *, guard: ConversationGuard | None = None, summaries=None):
+        """注入共享资源。参数：仓储/编译图/执行器/配置、可选互斥和应用摘要管理器；返回：None；异常：无。"""
         self.chat, self.graph, self.executor, self.settings = chat_repository, graph, executor, settings
         self.guard = guard if guard is not None else ConversationGuard()
+        self.summaries = summaries
+
+    async def _schedule_summary(self, values: dict, conversation_id: int) -> None:
+        """登记已有积压，不等待后台模型。参数：最终State/可信会话；返回：None；异常：调度错误隔离并留痕。"""
+        if self.summaries is not None and values.get("history_context", {}).get("summary_required"):
+            try:
+                await self.summaries.maybe_schedule(conversation_id)
+            except Exception as error:
+                logger.warning("summary fail conversation=%s reason=schedule type=%s", conversation_id, type(error).__name__)
 
     async def _stream_workflow(self, state: dict, config: dict):
         """由独占asyncio任务拥有整个图，隔离ASGI取消域的重复取消。
@@ -713,11 +722,13 @@ class ChatService:
                 outcome["paused"] = True
                 await self.chat.save_order_wait(context, action)
                 outcome["waiting"] = action.model_dump(mode="json")
+                await self._schedule_summary(final.values, context.conversation_id)
                 return
             metadata = final.values.get("completion_metadata", {})
             if final.next or metadata.get("turn_id") != context.turn_id or metadata.get("status") != "completed":
                 raise PersistenceUncertain("工作流最终状态尚未确认")
             outcome["completed"] = True
+            await self._schedule_summary(final.values, context.conversation_id)
             yield ChatEvent(event="answer_metadata", data=metadata)
             yield ChatEvent(event="done")
         finally:

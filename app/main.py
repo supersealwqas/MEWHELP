@@ -29,8 +29,11 @@ from app.knowledge.runtime import online_search_runtime
 from app.api.kb import router as kb_router
 from app.knowledge.store import KnowledgeStore
 from app.repositories.chat import ChatRepository
+from app.repositories.context import ContextRepository
 from app.repositories.support import SupportRepository
 from app.services.chat import ChatService
+from app.services.summaries import SummaryManager
+from app.workflow.summarization import SummaryGenerator
 from app.tools.registry import build_agent_registry
 from app.tools.executor import ToolExecutor
 from app.workflow.graph import WorkflowDependencies
@@ -142,9 +145,16 @@ async def database_runtime():
             deps = WorkflowDependencies(WorkflowModelAdapter(), search, executor, repository, settings,
                 QueryExpander(request_budget=settings.request_token_budget))
             async with workflow_runtime(deps, Path(settings.workflow_checkpoint_path)) as graph:
-                service = ChatService(repository, graph, executor, settings)
-                await service.reconcile_waiting_turns()
-                yield service
+                summaries = SummaryManager(ContextRepository(factory), SummaryGenerator(settings), settings)
+                try:
+                    service = ChatService(repository, graph, executor, settings, summaries=summaries)
+                    await service.reconcile_waiting_turns()
+                    await summaries.recover()
+                    yield service
+                finally:
+                    # 摘要先收回，数据库与模型依赖随后关闭；外部取消不能跳过收尾。
+                    with anyio.CancelScope(shield=True):
+                        await summaries.close()
     finally:
         with anyio.CancelScope(shield=True):
             try:

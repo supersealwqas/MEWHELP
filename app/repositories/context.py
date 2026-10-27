@@ -83,6 +83,20 @@ class ContextRepository:
             conv.layer1_from_msg_id = upto_msg_id
         return True
 
+    async def pending_summary_ids(self, *, after_id: int = 0, limit: int = 32) -> list[int]:
+        """只读扫描存在未摘要层2的会话，是否超量交计量器判断。
+
+        参数：after_id主键开游标、limit为1至1000；返回：升序ID；异常：参数或数据库错误。
+        """
+        _identifier(after_id, zero=True)
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("恢复分页数量须为1至1000")
+        async with self.factory() as session:
+            rows = await session.execute(text("SELECT id FROM conversations WHERE id>:after_id "
+                "AND COALESCE(layer1_from_msg_id,0)>COALESCE(summary_upto_msg_id,0) ORDER BY id LIMIT :limit"),
+                {"after_id": after_id, "limit": limit})
+            return list(rows.scalars())
+
     async def _find_segment(self, conversation_id: int, first: int, last: int) -> dict | None:
         """提交结果不确定时独立回读。参数：会话及冻结范围；返回：已提交段或None；异常：数据库读取错误。"""
         async with self.factory() as session:

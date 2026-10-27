@@ -6,7 +6,7 @@ from copy import deepcopy
 from app.core.context_budget import TokenEstimator
 
 OUTPUT_LIMITS = {"understand": 2048, "classify": 4096, "expand": 2048,
-                 "rewrite": 2048, "decide": 2048, "answer": 4096}
+                 "rewrite": 2048, "decide": 2048, "answer": 4096, "summary": 2048}
 
 
 def budget_summary(snapshot: dict | None) -> dict | None:
@@ -47,11 +47,12 @@ class BudgetLedger:
         self._records: list[dict] = []
 
     @classmethod
-    def from_settings(cls, settings) -> "BudgetLedger":
-        """从窗口创建CH07独占账本。参数：settings实例配置；返回：新账本；异常：配置预算非法。"""
+    def from_settings(cls, settings, *, summary_only: bool = False) -> "BudgetLedger":
+        """从窗口创建独占账本。参数：settings实例配置、summary_only是否后台单请求；返回：新账本；异常：配置预算非法。"""
         safety = max(512, (settings.model_context_window + 19) // 20)
-        return cls(max_model_calls=settings.workflow_max_model_calls,
-            total_token_budget=2 * settings.workflow_max_model_calls * settings.model_context_window,
+        calls = 1 if summary_only else settings.workflow_max_model_calls
+        return cls(max_model_calls=calls,
+            total_token_budget=2 * calls * settings.model_context_window,
             max_decisions=settings.workflow_max_decisions,
             request_token_budget=settings.model_context_window - safety - settings.max_output_tokens,
             output_limits={stage: min(limit, settings.max_output_tokens) for stage, limit in OUTPUT_LIMITS.items()},
@@ -64,9 +65,13 @@ class BudgetLedger:
     @classmethod
     def from_snapshot(cls, snapshot: dict) -> "BudgetLedger":
         """恢复可信 State 快照。参数：snapshot 为 snapshot() 结果；返回：独占账本；异常：KeyError/ValueError，快照错误。"""
+        output_limits = snapshot.get("output_limits")
+        if output_limits is not None and set(output_limits) == set(OUTPUT_LIMITS) - {"summary"}:
+            # CH07之前的在途会话没有后台阶段；保留原阶段额度，只补独立摘要的默认上限。
+            output_limits = {**output_limits, "summary": min(OUTPUT_LIMITS["summary"], max(output_limits.values()))}
         ledger = cls(**{key: snapshot[key] for key in (
             "max_model_calls", "total_token_budget", "max_decisions", "request_token_budget")},
-            output_limits=snapshot.get("output_limits"), non_ascii_tokens=snapshot.get("non_ascii_tokens", 2.0))
+            output_limits=output_limits, non_ascii_tokens=snapshot.get("non_ascii_tokens", 2.0))
         ledger._records = deepcopy(snapshot["records"])
         return ledger
 
@@ -85,7 +90,7 @@ class BudgetLedger:
         if (sum(counts.values()) > self._limits["max_model_calls"]
                 or counts["decide"] > self._limits["max_decisions"] or counts["answer"] > 2
                 or counts["classify"] > 1 or counts["understand"] > 1
-                or counts["expand"] > 1 or counts["rewrite"] > 1
+                or counts["expand"] > 1 or counts["rewrite"] > 1 or counts["summary"] > 1
                 or reserved > self._limits["total_token_budget"]):
             raise WorkflowBudgetExceeded("本轮模型调用次数或总预算不足")
 
