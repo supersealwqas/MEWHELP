@@ -26,7 +26,8 @@ def test_new_turn_replaces_every_runtime_field_and_retains_history():
     previous.update(resolved_query="旧问题", messages=[{"role": "tool", "content": "旧事实"}],
                     intent="物流", standard_query="旧检索问题", intent_confidence=0.9, order_id="1001",
                     order_data={"order_id": "1001"}, expanded_queries=["旧扩写"], selection_action={"action_id": "old"}, route="business", evidence=[{"chunk_id": 9}], evidence_scores=[0.9],
-                    gate={"passed": True}, pending_calls=[{"id": "old-call"}], seen_call_ids=["old-call"],
+                    gate={"passed": True}, retrieval_attempted=True, degradations=[{"stage": "answer", "error_type": "ConnectionError"}],
+                    pending_calls=[{"id": "old-call"}], seen_call_ids=["old-call"],
                     seen_call_signatures=["old-signature"], tool_count=4, decision_count=5,
                     suggested_kinds=["handoff"], suggested_actions=[{"action_id": "old-action"}],
                     refund_action={"action_id": "old-refund"}, answer="旧答案", stop_reason="answer", completion_metadata={"old": True})
@@ -42,7 +43,7 @@ def test_new_turn_replaces_every_runtime_field_and_retains_history():
         "raw_query": "1001", "resolved_query": "", "history_turns": history, "audit_cursor": 13,
         "messages": [], "intent": None, "standard_query": "", "intent_confidence": None,
         "order_id": None, "order_data": None, "expanded_queries": [], "selection_action": None, "route": None, "evidence": [], "evidence_scores": [],
-        "gate": None, "pending_calls": [], "seen_call_ids": [], "seen_call_signatures": [],
+        "gate": None, "retrieval_attempted": False, "degradations": [], "pending_calls": [], "seen_call_ids": [], "seen_call_signatures": [],
         "tool_count": 0, "decision_count": 0, "suggested_kinds": [], "suggested_actions": [],
         "refund_action": None, "answer": "", "stop_reason": None, "completion_metadata": {},
     }

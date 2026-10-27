@@ -33,6 +33,8 @@ class ConversationState(TypedDict, total=False):
     evidence: list[dict]  # 本轮完整EvidenceCitation字典，编号保持稳定。
     evidence_scores: list[float]  # 本轮全部归一化重排分，与权威证据同源。
     gate: dict | None  # GateDecision的JSON快照，未执行证据闸时为空。
+    retrieval_attempted: bool  # 本轮是否已经尝试知识检索，防止分类补救重复检索。
+    degradations: list[dict]  # 本轮外部故障的阶段和类型，不含错误原文。
     pending_calls: list[dict]  # 本轮下一批待执行的只读工具申请。
     seen_call_ids: list[str]  # 已见工具调用ID，用于跨决策查重。
     seen_call_signatures: list[str]  # 已见工具名称和参数签名，用于拒绝重复申请。
@@ -65,6 +67,7 @@ def new_turn_state(context: ToolContext, history_turns: list[dict], audit_cursor
         "order_id": None, "order_data": None, "expanded_queries": [], "selection_action": None,
         "history_turns": deepcopy(history_turns), "audit_cursor": audit_cursor, "messages": [],
         "intent": None, "intent_confidence": None, "route": None, "evidence": [], "evidence_scores": [], "gate": None,
+        "retrieval_attempted": False, "degradations": [],
         "pending_calls": [], "seen_call_ids": [], "seen_call_signatures": [],
         "tool_count": 0, "decision_count": 0, "budget": BudgetLedger().snapshot(),
         "suggested_kinds": [], "suggested_actions": [], "refund_action": None, "answer": "", "stop_reason": None,

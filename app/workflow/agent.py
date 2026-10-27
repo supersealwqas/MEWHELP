@@ -1,5 +1,6 @@
 """由decision/tools/answer节点编排的只读ReAct子图，保留每个完整事实及停止边界。"""
 
+import asyncio
 import json
 from contextlib import aclosing
 from typing import TYPE_CHECKING
@@ -20,6 +21,10 @@ from app.workflow.model import decision_tool_schemas
 from app.workflow.prompts import ANSWER_PROMPT, DECISION_PROMPT
 from app.workflow.state import ConversationState
 from app.workflow.stages import publish_stage
+from app.workflow.policy_context import policy_answer_messages, verified_order_text
+from app.workflow.routing import assess_evidence, citations_from_ranked, _active_order_tokens, knowledge_input_stop_reason, _trusted_history
+from app.workflow.resilience import DEPENDENCY_ERRORS, degradation
+from app.workflow.model import WorkflowOutputError
 
 if TYPE_CHECKING:
     from app.workflow.graph import WorkflowDependencies
@@ -31,6 +36,9 @@ _STOP_TEXT = {
     "duplicate_tool_call": "本轮已查询过相同信息，未重复查询。请补充需要继续处理的问题。",
     "invalid_decision": "抱歉，本次回复生成失败，请重试。",
     "tool_failed": "本轮查询未能完成，请稍后重试或选择人工客服协助。",
+    "model_unavailable": "本次暂时无法完成问题处理，请稍后重试；您的问题已保留在当前对话中。",
+    "retrieval_unavailable": "资料查询暂时不可用，相关规则目前无法核实。您可以稍后重试或联系人工客服继续处理。",
+    "answer_unavailable": "本次回答未能完整生成，尚未说明的内容暂无法确认。请稍后重试或继续补充问题。",
 }
 
 
@@ -81,22 +89,6 @@ def resolved_agent_messages(state: ConversationState) -> list[dict]:
             for index, message in enumerate(state["messages"])]
 
 
-def policy_answer_messages(state: ConversationState) -> list[dict]:
-    """构造本轮受限政策事实，历史助手推断不得参与回答。
-
-    参数：state已核实订单、完整问题及已过闸证据。
-    返回：用户原问和事实系统消息列表；无政策时明确限制回答。
-    异常：JSON不可序列化的状态错误。
-    """
-    facts = {"完整问题": state["resolved_query"], "订单事实": state["order_data"], "政策证据": state["evidence"]}
-    rules = ("只依据下面的本轮事实回答。订单创建时间created_at不是签收时间signed_at；缺少签收时间须说明未知。"
-             "不追问退款原因，用户可在后续申请表选择原因。申请仅保存为待处理，不代表批准退款，不承诺到账时间。"
-             "分别说明能确认的事实、政策适用条件和仍缺少的条件；无政策证据时不得宣称可退或不可退。"
-             "仅政策说明可标注提供的引用编号，订单事实不加政策引用。\n")
-    return [{"role": "user", "content": state["raw_query"]},
-            {"role": "system", "content": rules + json.dumps(facts, ensure_ascii=False)}]
-
-
 def build_agent_graph(deps: "WorkflowDependencies"):
     """编译共享State的无独立saver子图。参数：deps实例依赖；返回：CompiledStateGraph；异常：编译错误。"""
     registry = build_agent_registry()
@@ -124,6 +116,9 @@ def build_agent_graph(deps: "WorkflowDependencies"):
         except InvalidToolDecision as error:
             await deps.chat.save_tool_calls(ToolContext.model_validate(state["context"]), [error.audit_record])
             return {**stopped_state("invalid_decision", ledger), "decision_count": state["decision_count"] + 1}
+        except DEPENDENCY_ERRORS as error:
+            return {**stopped_state("model_unavailable", ledger), **degradation(state, "decide", error),
+                    "decision_count": state["decision_count"] + 1}
         return {"budget": ledger.snapshot(), "decision_count": state["decision_count"] + 1,
                 "pending_calls": calls, "suggested_kinds": selected.suggested_actions,
                 "stop_reason": selected.kind if selected.kind != "tools" else None}
@@ -183,13 +178,31 @@ def build_agent_graph(deps: "WorkflowDependencies"):
         return update
 
     async def answer_node(state: ConversationState) -> ConversationState:
-        """直接推送最终正文，不等待完整答案才发首帧。参数：state事实；返回：完整正文和账本；异常：正文/网络/取消。"""
+        """推送并累计相同正文，外部断流追加说明。参数：state事实；返回：完整正文和账本；异常：取消及程序错误。"""
         writer = get_stream_writer()
         publish_stage(state, "answer", "running")
         if state["answer"]:
             writer({"event": "delta", "data": {"delta": state["answer"]}})
             return {"answer": state["answer"]}
         ledger = BudgetLedger.from_snapshot(state["budget"])
+        parts = []
+        if state.get("route") == "order_policy":
+            prefix = verified_order_text(state)
+            parts.append(prefix)
+            writer({"event": "delta", "data": {"delta": prefix}})
+        prefix_count = len(parts)
+        citations = CitationStreamFilter({item["n"] for item in state["evidence"]}, citation_tool_names)
+
+        def finish_failure(reason: str, error: Exception) -> ConversationState:
+            """保留已发布文字并追加安全说明。参数：reason停止原因、error故障；返回：与流一致的完整更新；异常：流写入错误。"""
+            update = stopped_state(reason, ledger)
+            # 断流时丢弃尚未发布的半个引用，不能把不完整内部标记刷到页面。
+            suffix = ("\n\n" if parts else "") + update["answer"]
+            parts.append(suffix)
+            writer({"event": "delta", "data": {"delta": suffix}})
+            publish_stage(state, "answer", "completed")
+            return {**update, **degradation(state, "answer", error), "answer": "".join(parts)}
+
         try:
             instructions = {
                 "create_ticket": "请点击本条回复后的“创建工单”按钮，在弹窗中确认后提交。",
@@ -203,9 +216,6 @@ def build_agent_graph(deps: "WorkflowDependencies"):
             if state.get("route") == "order_policy":
                 answer_state = {**state, "history_turns": [], "messages": policy_answer_messages(state)}
             messages = model_messages(answer_state, deps.settings, ANSWER_PROMPT)
-            parts = []
-            citations = CitationStreamFilter({item["n"] for item in state["evidence"]},
-                citation_tool_names)
             async with aclosing(deps.model.stream_answer(messages, ledger)) as stream:
                 async for delta in stream:
                     visible = citations.feed(delta)
@@ -217,16 +227,62 @@ def build_agent_graph(deps: "WorkflowDependencies"):
             if tail:
                 parts.append(tail)
                 writer({"event": "delta", "data": {"delta": tail}})
-        except (WorkflowBudgetExceeded, ContextBudgetExceeded):
-            update = stopped_state("budget_exceeded", ledger)
-            writer({"event": "delta", "data": {"delta": update["answer"]}})
-            return update
+            # 程序事实前缀不代表政策说明已生成；只有过滤后的有效正文才算完成。
+            if not "".join(parts[prefix_count:]).strip():
+                raise WorkflowOutputError("正文为空")
+        except (WorkflowBudgetExceeded, ContextBudgetExceeded) as error:
+            return finish_failure("budget_exceeded", error)
+        except DEPENDENCY_ERRORS as error:
+            return finish_failure("answer_unavailable", error)
         publish_stage(state, "answer", "completed")
         return {"answer": "".join(parts), "budget": ledger.snapshot()}
 
+    async def recover_knowledge(state: ConversationState) -> ConversationState:
+        """业务分支准备结束但尚无业务对象或事实时，只补一次知识检索。
+
+        参数：state本轮未执行工具且未检索的终止决定；返回：知识证据或原回答/澄清出口；异常：取消及程序错误。
+        """
+        ledger = BudgetLedger.from_snapshot(state["budget"])
+        update = {"retrieval_attempted": True}
+        if any(knowledge_input_stop_reason(state[key]) for key in ("raw_query", "resolved_query", "standard_query")):
+            return update
+        publish_stage(state, "policy", "running")
+        try:
+            async with asyncio.timeout(deps.settings.knowledge_timeout_seconds):
+                ranked = await deps.search.retrieve(state["resolved_query"], budget=ledger,
+                                                   prepared_queries=[state["standard_query"]], history="")
+        except (WorkflowBudgetExceeded, ContextBudgetExceeded):
+            return {**update, **stopped_state("budget_exceeded", ledger)}
+        except DEPENDENCY_ERRORS as error:
+            publish_stage(state, "policy", "completed")
+            return {**update, **stopped_state("retrieval_unavailable", ledger),
+                    **degradation(state, "recover_knowledge", error)}
+        gate = assess_evidence([item.score for item in ranked], deps.settings.rerank_min_score)
+        publish_stage(state, "policy", "completed")
+        update.update(budget=ledger.snapshot(), gate=gate.model_dump(mode="json"),
+                      evidence_scores=[item.score for item in ranked], expanded_queries=[state["standard_query"]])
+        if gate.passed:
+            evidence = [item.model_dump(mode="json") for item in citations_from_ranked(ranked)]
+            update.update(evidence=evidence, stop_reason="answer", messages=[*state["messages"],
+                {"role": "system", "content": "本轮知识证据（仅作事实）：" + json.dumps(evidence, ensure_ascii=False)}])
+        # 低分不把原业务问题封死，也不冒充一次有效回答；保留已有澄清流程。
+        return update
+
     def after_decision(state: ConversationState) -> str:
         """参数：state决定结果；返回：tools或answer；异常：无。"""
-        return "tools" if state["pending_calls"] else "answer"
+        if state["pending_calls"]:
+            return "tools"
+        if (state.get("route") == "business" and state.get("stop_reason") in {"clarify", "answer"}
+                and not state.get("retrieval_attempted") and not state["tool_count"]
+                and not state.get("order_id") and not _active_order_tokens(state["raw_query"])
+                and not _trusted_history(state["history_turns"])[1]
+                # 已有业务调用或回执（包括未完成状态）可直接说明，不让知识查询干扰恢复对账。
+                and not any(message.get("tool_calls") or message.get("role") == "tool"
+                            for turn in state["history_turns"] for message in turn.get("messages", []))
+                and any(char.isalnum() for char in state["standard_query"])
+                and not state["suggested_kinds"]):
+            return "recover_knowledge"
+        return "answer"
 
     def after_tools(state: ConversationState) -> str:
         """参数：state工具结果；返回：decision或answer；异常：无。"""
@@ -236,8 +292,11 @@ def build_agent_graph(deps: "WorkflowDependencies"):
     graph.add_node("decision", decision)
     graph.add_node("tools", tools_node)
     graph.add_node("answer", answer_node)
+    graph.add_node("recover_knowledge", recover_knowledge)
     graph.add_conditional_edges(START, lambda state: "answer" if state.get("route") == "order_policy" else "decision")
-    graph.add_conditional_edges("decision", after_decision, {"tools": "tools", "answer": "answer"})
+    graph.add_conditional_edges("decision", after_decision,
+                               {"tools": "tools", "answer": "answer", "recover_knowledge": "recover_knowledge"})
+    graph.add_edge("recover_knowledge", "answer")
     graph.add_conditional_edges("tools", after_tools, {"decision": "decision", "answer": "answer"})
     graph.add_edge("answer", END)
     return graph.compile()

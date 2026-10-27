@@ -1,10 +1,101 @@
 """真实客服根图的固定路由、知识门闸、建议快照与完成契约测试。"""
 import json
 import pytest
+from app.core.model_budget import WorkflowBudgetExceeded
 from app.schemas.workflow import AgentDecision, UnderstandingResult
 from app.schemas.tools import ToolResult
 from app.workflow.graph import build_workflow
 from tests.workflow.graph_fakes import NodeTrace, dependencies, turn, ranked, call
+
+
+@pytest.mark.parametrize("question", ["支持哪些付款方式？", "商品的清洁注意事项有哪些？", "设备耗材的兼容规则在哪里？"])
+@pytest.mark.parametrize("decision", ["clarify", "answer"])
+async def test_misclassified_clarification_can_recover_with_knowledge(question, decision):
+    """业务分类不能封死无具体对象的知识问题。参数：question不同领域问题、decision拟澄清或回答；返回：None；异常：断言失败。"""
+    deps = dependencies(intents=["订单"], decisions=[AgentDecision(kind=decision)],
+                        ranked=[ranked(answer="本轮可用说明")], answers=[["依据资料回答[1]。"]])
+    state = await build_workflow(deps, checkpointer=None).ainvoke(turn(question))
+    assert deps.search.calls == [("retrieve", question)]
+    assert state["retrieval_attempted"] and state["evidence"] and state["stop_reason"] == "answer"
+    assert "本轮可用说明" in json.dumps(deps.model.inputs[-1]["messages"], ensure_ascii=False)
+    assert len([row for row in deps.model.inputs if row["stage"] == "decide"]) == 1
+    assert deps.executor.calls == []
+
+
+@pytest.mark.parametrize("stage", ["classify", "decide", "answer", "retrieve", "empty_answer"])
+async def test_dependency_failure_has_a_persisted_reply_instead_of_crashing(stage):
+    """外部依赖异常或空正文不能留下空回答，异常原文也不得泄露。参数：stage故障阶段；返回：None；异常：断言失败。"""
+    from app.knowledge.search import KnowledgeSearchUnavailable
+    error = ConnectionError("private-upstream-token")
+    deps = dependencies(intents=[error if stage == "classify" else "商品咨询" if stage == "retrieve" else "订单"],
+                        decisions=[error if stage == "decide" else AgentDecision(kind="answer")],
+                        answers=[[error]] if stage == "answer" else [[]] if stage == "empty_answer" else [["正常正文"]])
+    if stage == "retrieve":
+        deps.search.error = KnowledgeSearchUnavailable("private-upstream-token")
+    state = await build_workflow(deps, checkpointer=None).ainvoke(turn())
+    assert state["answer"].strip() and "private-upstream-token" not in state["answer"]
+    assert len(deps.chat.finished) == 1 and deps.chat.finished[0]["content"] == state["answer"]
+    assert state["degradations"] and state["completion_metadata"]
+
+
+async def test_partial_answer_failure_keeps_stream_and_persistence_equal():
+    """流式输出中断后不能丢失已发文字或让数据库只保存错误提示。参数：无；返回：None；异常：断言失败。"""
+    deps = dependencies(decisions=[AgentDecision(kind="answer")], answers=[["已查到部分信息。", ConnectionError("私密端点")]])
+    fragments, final = [], None
+    async for namespace, mode, payload in build_workflow(deps, checkpointer=None).astream(
+            turn(), stream_mode=["custom", "values"], subgraphs=True):
+        if mode == "values" and not namespace:
+            final = payload
+        elif mode == "custom" and payload["event"] == "delta":
+            fragments.append(payload["data"]["delta"])
+    assert final["answer"].startswith("已查到部分信息。")
+    assert final["answer"] == "".join(fragments) == deps.chat.finished[0]["content"]
+    assert final["stop_reason"] == "answer_unavailable" and "私密端点" not in final["answer"]
+
+
+async def test_policy_retrieval_failure_can_still_answer_verified_order():
+    """检索服务不可用时不能丢失已核实订单或将故障伪装低分入池。参数：无；返回：None；异常：断言失败。"""
+    from app.knowledge.search import KnowledgeSearchUnavailable
+    deps = dependencies(intents=["退款退货"], results=[ToolResult.success({"order_id": "1001", "status": "已发货"})],
+                        answers=[["暂时无法查询政策，可稍后重试。"]])
+    deps.search.error = KnowledgeSearchUnavailable("服务中断")
+    initial = turn("订单1001的售后怎么处理")
+    initial["context"]["user_id"] = "demo-user"
+    state = await build_workflow(deps, checkpointer=None).ainvoke(initial)
+    assert state["order_id"] == "1001" and "已发货" in state["answer"]
+    assert not state["evidence"] and state["degradations"]
+    assert deps.chat.finished[0]["low_confidence"] is None
+
+
+@pytest.mark.parametrize("stage", ["understand", "recover_knowledge", "answer"])
+async def test_other_dependency_boundaries_keep_safe_completion(stage):
+    """补全失败保留原话，补救检索失败或纯空白回答也可靠结束。参数：stage边界；返回：None；异常：断言失败。"""
+    deps = dependencies(understandings=[ConnectionError("敏感信息")] if stage == "understand" else [],
+                        decisions=[AgentDecision(kind="clarify" if stage == "recover_knowledge" else "answer")],
+                        answers=[[" \n "]] if stage == "answer" else [["有效回复"]])
+    if stage == "recover_knowledge":
+        deps.search.error = TimeoutError("敏感信息")
+    query = "请说明商品的清洁方法"
+    state = await build_workflow(deps, checkpointer=None).ainvoke(turn(query))
+    assert state["raw_query"] == state["resolved_query"] == query
+    assert state["answer"].strip() and "敏感信息" not in json.dumps(state, ensure_ascii=False)
+    assert state["degradations"][0]["stage"] == stage
+    assert deps.chat.finished[0]["content"] == state["answer"]
+
+
+@pytest.mark.parametrize("error", [ConnectionError("断流"), WorkflowBudgetExceeded("额度")])
+async def test_policy_answer_interruption_keeps_verified_prefix(error):
+    """政策说明中断仍保存程序事实及已发出的说明，预算耗尽同样不能丢字。参数：error故障；返回：None；异常：断言失败。"""
+    deps = dependencies(intents=["售后"], results=[ToolResult.success({"order_id": "1001", "total_amount": 89})],
+                        answers=[["先说明已查到的部分。", error]])
+    initial = turn("订单1001能否维修")
+    initial["context"]["user_id"] = "demo-user"
+    pieces = []
+    async for _, event in build_workflow(deps, checkpointer=None).astream(initial, stream_mode="custom", subgraphs=True):
+        if event["event"] == "delta":
+            pieces.append(event["data"]["delta"])
+    assert "商品总金额：89" in "".join(pieces) and "先说明已查到的部分。" in "".join(pieces)
+    assert deps.chat.finished[0]["content"] == "".join(pieces)
 
 
 @pytest.mark.parametrize("query,previous,reply", [
@@ -83,7 +174,11 @@ async def test_knowledge_nodes_precede_agent_and_keep_full_evidence(intent, entr
     state = await build_workflow(deps, checkpointer=None).ainvoke(original, {"callbacks": [trace]})
     retrieval_node = "retrieve_policy" if intent == "退款退货" else "retrieve_knowledge"
     assert trace.nodes.index(retrieval_node) < trace.nodes.index("confidence_check") < trace.nodes.index("main_agent")
-    assert deps.search.calls == [(entry, original["raw_query"] + (" 已签收" if intent == "退款退货" else ""))]
+    assert len(deps.search.calls) == 1 and deps.search.calls[0][0] == entry
+    assert original["raw_query"] in deps.search.calls[0][1]
+    if intent == "退款退货":
+        assert "当前已确认对象：订单1001" in deps.search.calls[0][1] and "已签收" in deps.search.calls[0][1]
+        assert len(state["expanded_queries"]) == 3
     assert len(state["evidence"]) == len(evidence)
     decision_input = deps.model.inputs[-1]["messages"]
     assert all(item.chunk.text.answer in json.dumps(decision_input, ensure_ascii=False) for item in evidence)
@@ -254,12 +349,12 @@ async def test_overlong_knowledge_stops_without_retrieval_or_low_confidence(monk
 
 @pytest.mark.parametrize("error", [TimeoutError("慢"), ConnectionError("不可用")])
 async def test_retrieval_failure_is_not_completed_as_low_confidence(error):
-    """故障被伪装低证据并完成时失败。参数：error依赖故障；返回：None；异常：受控错误。"""
+    """依赖故障应有明确回复但不能当低证据入池。参数：error依赖故障；返回：None；异常：断言失败。"""
     deps = dependencies(intents=["商品咨询"])
     deps.search.error = error
-    with pytest.raises(type(error)):
-        await build_workflow(deps, checkpointer=None).ainvoke(turn())
-    assert deps.chat.finished == []
+    state = await build_workflow(deps, checkpointer=None).ainvoke(turn())
+    assert state["stop_reason"] == "retrieval_unavailable" and state["answer"]
+    assert deps.chat.finished[0]["low_confidence"] is None and not state["evidence"]
 
 @pytest.mark.parametrize("intent,want", [("投诉", ["handoff", "create_ticket"]), ("闲聊", [])])
 async def test_fixed_exits_create_stable_suggestions_without_agent(intent, want):

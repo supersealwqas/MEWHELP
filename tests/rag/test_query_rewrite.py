@@ -488,3 +488,33 @@ async def test_query_expander_propagates_cancel_budget_and_invalid_seed():
     with pytest.raises(asyncio.CancelledError):
         await task
     assert waiting.closed and budget.snapshot()["model_calls"] == 1
+
+
+@pytest.mark.parametrize("payload", [
+    {"queries": ["已购滤芯能否退货"]},
+    {"queries": ["凭空增加999天退货期"]},
+    {"queries": ["", "", ""]},
+])
+async def test_required_policy_coverage_survives_bad_expansion(rewrite_sdk, payload):
+    """核心政策检索不能因模型单条或坏输出丢失覆盖，也不能新增重试。参数：HTTP夹具/坏结果；返回：None；异常：断言失败。"""
+    from app.core.model_budget import BudgetLedger
+    from app.knowledge.query_rewrite import QueryExpander, validate_prepared_queries
+    seed = "已购滤芯未拆封能否退货 已发货"
+    rewrite_sdk.responses.append(rewrite_response(json.dumps(payload), name="submit_expanded_queries"))
+    ledger = BudgetLedger()
+    result = await QueryExpander(rewrite_sdk.factory).expand(seed, simple_query="已购滤芯能否退货",
+                                                            required_count=3, budget=ledger)
+    assert len(result.queries) == len(set(result.queries)) == 3
+    assert all(seed in query for query in result.queries)
+    validate_prepared_queries(seed, result.queries)
+    assert len(rewrite_sdk.requests) == 1 and ledger.snapshot()["model_calls"] == 1
+    assert ledger.snapshot()["records"][0]["failure"]
+
+
+def test_policy_queries_preserve_product_models_but_not_order_identifiers():
+    """订单号与商品型号必须有不同保留规则，不能为通过订单用例放开真实型号。参数：无；返回：None；异常：断言失败。"""
+    from app.knowledge.query_rewrite import validate_prepared_queries, QueryRewriteError
+    seed = "订单SO-4801的ZX-W77滤芯如何保修"
+    validate_prepared_queries(seed, ["ZX-W77保修条件", "ZX-W77保修限制", "ZX-W77保修流程"])
+    with pytest.raises(QueryRewriteError, match="型号"):
+        validate_prepared_queries(seed, ["其他滤芯如何保修"])

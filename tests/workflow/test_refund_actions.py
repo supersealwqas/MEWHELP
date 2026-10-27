@@ -56,10 +56,11 @@ async def test_finish_retry_compares_refund_snapshot(tmp_path):
         metadata = events[-2].data
         ctx = await deps.chat.get_turn_context("s", "demo-user", metadata["turn_id"])
         action = workflow.RefundAction.model_validate(metadata["refund_action"])
-        assert await deps.chat.finish_turn(ctx, "待处理申请", citations=[], suggested_actions=[],
+        answer = "".join(event.data["delta"] for event in events if event.event == "delta")
+        assert await deps.chat.finish_turn(ctx, answer, citations=[], suggested_actions=[],
             workflow_metadata=metadata["workflow"], refund_action=action) == metadata
         with pytest.raises(PersistenceUncertain):
-            await deps.chat.finish_turn(ctx, "待处理申请", citations=[], suggested_actions=[], workflow_metadata=metadata["workflow"])
+            await deps.chat.finish_turn(ctx, answer, citations=[], suggested_actions=[], workflow_metadata=metadata["workflow"])
 
 
 @pytest.mark.parametrize("override", [{"confirmed": False}, {"confirmed": 1}, {"amount": 1}, {"order_id": "1002"},

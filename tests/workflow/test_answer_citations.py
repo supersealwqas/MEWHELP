@@ -85,15 +85,15 @@ async def test_pending_marker_does_not_hold_already_available_plain_text():
 async def test_interrupted_answer_never_flushes_an_incomplete_marker(pending):
     """在异常清理时错误刷新缓冲会让半个标记漏到页面。
 
-    参数：pending 模型中断前的半个角标；返回：None，核对可见前缀和未完成落库。
-    异常：AssertionError，损坏标记被发布或失败答案被保存。
+    参数：pending 模型中断前的半个角标；返回：None，核对前缀、故障说明及保存正文。
+    异常：AssertionError，损坏标记被发布或流与落库不一致。
     """
     deps = dependencies(decisions=[AgentDecision(kind="answer")],
         answers=[["订单金额为89元" + pending, ConnectionError("模拟正文断流")]])
     pieces = []
-    with pytest.raises(ConnectionError, match="模拟正文断流"):
-        async for _, event in build_workflow(deps, checkpointer=None).astream(turn(), stream_mode="custom", subgraphs=True):
-            if event["event"] == "delta":
-                pieces.append(event["data"]["delta"])
-    assert "".join(pieces) == "订单金额为89元"
-    assert deps.chat.finished == []
+    async for _, event in build_workflow(deps, checkpointer=None).astream(turn(), stream_mode="custom", subgraphs=True):
+        if event["event"] == "delta":
+            pieces.append(event["data"]["delta"])
+    answer = "".join(pieces)
+    assert answer.startswith("订单金额为89元\n\n") and "[" not in answer
+    assert deps.chat.finished[0]["content"] == answer

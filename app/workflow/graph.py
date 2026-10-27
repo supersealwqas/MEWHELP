@@ -27,6 +27,9 @@ from app.workflow.routing import assess_evidence, citations_from_ranked, fixed_r
 from app.tools.business import list_user_orders, owns_order
 from app.workflow.state import ConversationState
 from app.workflow.stages import publish_stage
+from app.workflow.policy_context import policy_query, verified_order_text
+from app.workflow.resilience import DEPENDENCY_ERRORS, degradation
+from app.workflow.routing import original_understanding
 
 logger = logging.getLogger(__name__)
 # 订单适用性只采用正式退换货/售后政策及其引用的运费、会员规则；商品规格不进入此分支。
@@ -76,6 +79,12 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
                 [understanding_tool_schema()]), ledger)
         except (WorkflowBudgetExceeded, ContextBudgetExceeded):
             return stopped_state("budget_exceeded", ledger)
+        except DEPENDENCY_ERRORS as error:
+            # 理解只是优化；失败时保留完整原话，让后续分类仍有机会工作。
+            understood = original_understanding(query)
+            publish_stage(state, "understand", "completed", resolved_query=query, standard_query=query)
+            return {**understood.model_dump(), "messages": current["messages"], "budget": ledger.snapshot(),
+                    **degradation(state, "understand", error)}
         publish_stage(state, "understand", "completed", resolved_query=understood.resolved_query,
                       standard_query=understood.standard_query)
         return {"resolved_query": understood.resolved_query, "standard_query": understood.standard_query,
@@ -90,6 +99,9 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
             result = await deps.model.classify(model_messages(current, deps.settings, INTENT_PROMPT, [intent_tool_schema()]), ledger)
         except (WorkflowBudgetExceeded, ContextBudgetExceeded):
             return stopped_state("budget_exceeded", ledger)
+        except DEPENDENCY_ERRORS as error:
+            publish_stage(state, "classify", "completed")
+            return {**stopped_state("model_unavailable", ledger), **degradation(state, "classify", error)}
         update = {"intent": result.intent, "intent_confidence": result.confidence}
         publish_stage(state, "classify", "completed", intent=result.intent, confidence=result.confidence)
         route = route_by_intent({**state, **update})
@@ -115,6 +127,9 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
             "source_turn_id": context.turn_id, "orders": orders}
         if identifier is None:
             identifier = interrupt(action)
+            action = {**action, "status": "accepted", "accepted_order_id": identifier}
+        else:
+            action = None
         # 恢复值也不可信，必须再次核对完整订单号及当前归属。
         if not isinstance(identifier, str) or identifier not in {row["order_id"] for row in orders} or not owns_order(context.user_id, identifier):
             raise ValueError("所选订单不属于当前用户")
@@ -133,10 +148,10 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
         if not result.ok or result.data.get("order_id") != identifier:
             return {**update, **stopped_state("tool_failed")}
         publish_stage(state, "order", "completed", order_id=identifier)
-        return {**update, "order_data": result.data}
+        return {**update, "order_data": result.data, "selection_action": action}
 
     async def retrieve_node(state: ConversationState) -> ConversationState:
-        """按知识类别取得全部原文快照，异常不转低证据。参数：state已分类原问；返回：证据/分数/账本；异常：检索故障。"""
+        """按类别取得原文，依赖故障单独降级。参数：state已分类原问；返回：证据/分数/账本或安全回复；异常：取消及程序错误。"""
         reason = next((knowledge_input_stop_reason(state[key]) for key in ("raw_query", "resolved_query", "standard_query")
                        if knowledge_input_stop_reason(state[key])), None)
         if reason:
@@ -145,11 +160,12 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
         try:
             async with asyncio.timeout(deps.settings.knowledge_timeout_seconds):
                 if state["route"] == "order_policy":
-                    query = f"{state['resolved_query']} {state['order_data'].get('status', '')}".strip()
+                    query = policy_query(state)
                     if knowledge_input_stop_reason(query):
                         return {"stop_reason": "input_limit"}
                     publish_stage(state, "expand", "running")
-                    expanded = await deps.query_expander.expand(query, simple_query=state["standard_query"], budget=ledger)
+                    expanded = await deps.query_expander.expand(query, simple_query=state["standard_query"],
+                                                                required_count=3, budget=ledger)
                     publish_stage(state, "expand", "completed", queries=expanded.queries)
                     prepared_queries = expanded.queries
                     retrieve = deps.search.retrieve_policy
@@ -159,13 +175,22 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
                     options = {}
                 publish_stage(state, "policy", "running")
                 ranked = await retrieve(query, prepared_queries=prepared_queries, budget=ledger, history="", **options)
-        except WorkflowBudgetExceeded:
+        except (WorkflowBudgetExceeded, ContextBudgetExceeded):
             return stopped_state("budget_exceeded", ledger)
+        except DEPENDENCY_ERRORS as error:
+            # 依赖故障不能冒充低分证据，也不能把越界或失配原文交给模型。
+            update = stopped_state("retrieval_unavailable", ledger)
+            if state.get("order_data"):
+                update["answer"] = verified_order_text(state) + update["answer"]
+            publish_stage(state, "policy", "completed")
+            return {**update, **degradation(state, "retrieve", error), "retrieval_attempted": True,
+                    "evidence": [], "evidence_scores": [], "gate": None}
         citations = citations_from_ranked(ranked)
         publish_stage(state, "policy", "completed")
         # 检索结果先交给证据闸；尚未通过的内容不能进入模型消息。
         return {"evidence": [item.model_dump(mode="json") for item in citations],
-                "evidence_scores": [item.score for item in ranked], "budget": ledger.snapshot(), "expanded_queries": prepared_queries}
+                "evidence_scores": [item.score for item in ranked], "budget": ledger.snapshot(),
+                "expanded_queries": prepared_queries, "retrieval_attempted": True}
 
     def confidence_node(state: ConversationState) -> ConversationState:
         """控制政策证据是否可用，业务仍可查事实。参数：state完整分数；返回：闸、可用证据与消息；异常：分数非法。"""
@@ -235,6 +260,7 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
         metadata["budget"] = budget_summary(state["budget"])
         metadata.update({"intent_confidence": state.get("intent_confidence"), "resolved_query": state["resolved_query"],
                          "standard_query": state["standard_query"], "order_id": state.get("order_id")})
+        metadata["degraded_stages"] = [item["stage"] for item in state.get("degradations", [])]
         refund_action = None
         if state["intent"] == "退款退货" and state.get("order_data") and state.get("order_id"):
             refund_action = RefundAction(action_id=str(uuid5(NAMESPACE_URL,

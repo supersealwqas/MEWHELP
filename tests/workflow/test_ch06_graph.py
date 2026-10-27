@@ -27,6 +27,40 @@ def order_result(order_id="1001"):
     return ToolResult.success({"order_id": order_id, "product": "猫粮", "status": "已签收", "created_at": "2026-01-01"})
 
 
+async def test_selected_scope_reaches_policy_and_model_as_confirmed_input(tmp_path):
+    """已选对象丢在旧歧义原话里时失败，恢复后必须显式携带确认事实。参数：tmp_path保存器目录；返回：None；异常：断言失败。"""
+    deps = dependencies(intents=["退款退货"], results=[order_result("1002")],
+                        ranked=[ranked()], answers=[["请按页面申请。"]])
+    original = owned_turn("其中一笔想退，未拆封，但我还没决定哪笔。")
+    config = {"configurable": {"thread_id": "selected-scope"}}
+    async with workflow_runtime(deps, tmp_path / "scope.sqlite") as graph:
+        await graph.ainvoke(original, config)
+        state = await graph.ainvoke(Command(resume="1002"), config)
+    assert state["raw_query"] == original["raw_query"]
+    assert state["selection_action"]["accepted_order_id"] == "1002"
+    assert len(state["expanded_queries"]) == 3
+    assert "1002" in deps.search.calls[0][1] and "未拆封" in deps.search.calls[0][1]
+    inputs = deps.model.inputs[-1]["messages"]
+    context = json.loads(inputs[-1]["content"].split("\n", 1)[1])
+    assert context["已确认对象"] == {"订单号": "1002", "来源": "用户选单"}
+    assert context["后续表单收集"] == ["退款原因"]
+
+
+async def test_verified_order_section_never_promotes_user_amount(tmp_path):
+    """用户自报金额进入程序生成的核实事实区时失败。参数：tmp_path隔离目录；返回：None；异常：断言失败。"""
+    data = {"order_id": "1001", "product": "滤芯", "status": "已发货", "total_amount": 129.0}
+    deps = dependencies(intents=["退款退货"], results=[ToolResult.success(data)],
+                        ranked=[ranked()], answers=[["仅根据已提供政策判断。"]])
+    async with workflow_runtime(deps, tmp_path / "provenance.sqlite") as graph:
+        state = await graph.ainvoke(owned_turn("订单1001实付9876元，想退货"), {"configurable": {"thread_id": "fact"}})
+    facts, explanation = state["answer"].split("**政策与办理说明**", 1)
+    assert "129" in facts and "9876" not in facts
+    assert "商品总金额" in facts and "仅根据已提供政策判断" in explanation
+    context = json.loads(deps.model.inputs[-1]["messages"][-1]["content"].split("\n", 1)[1])
+    assert "9876" in context["用户陈述（未经核实）"]
+    assert context["订单事实"] == data
+
+
 @pytest.mark.parametrize("stage", ["decide", "answer"])
 async def test_business_followup_uses_resolved_question_after_history_trim(tmp_path, stage):
     """理解后的完整问题必须到达业务模型，即使旧历史被整轮裁剪，原始输入仍保留。
@@ -53,6 +87,17 @@ async def test_business_followup_uses_resolved_question_after_history_trim(tmp_p
     assert [row["stage"] for row in deps.model.inputs] == ["understand", "classify", "decide", "answer"]
 
 
+async def test_policy_answer_receives_unsubmitted_action_state():
+    """生成申请表单前没有提交回执，正文输入与程序展示必须保留未提交状态。参数：无；返回：None；异常：断言失败。"""
+    from app.workflow.graph import build_workflow
+    deps = dependencies(intents=["退款退货"], results=[order_result()], answers=[["请阅读政策说明。"]])
+    state = await build_workflow(deps, checkpointer=None).ainvoke(owned_turn("订单1001能退吗"))
+    model_input = json.dumps(deps.model.inputs[-1]["messages"], ensure_ascii=False)
+    assert "尚未提交" in model_input and "执行回执" in model_input
+    assert "申请保存为待处理" not in model_input
+    assert "退款申请：尚未提交" in state["answer"]
+
+
 @pytest.mark.parametrize("intent", ["退款退货", "售后"])
 async def test_order_precedes_policy_and_answer_without_agent_decision(tmp_path, intent):
     """政策必须先核实订单且直接回答。参数：tmp_path隔离目录、intent政策类；返回：None；异常：断言失败。"""
@@ -65,7 +110,9 @@ async def test_order_precedes_policy_and_answer_without_agent_decision(tmp_path,
     assert [row["stage"] for row in deps.model.inputs] == ["understand", "classify", "answer"]
     assert state["order_data"]["order_id"] == "1001" and state["decision_count"] == 0
     assert len(deps.chat.calls) == len(deps.chat.results) == 1
-    assert deps.query_expander.calls == [("订单1001能退吗 已签收", "订单1001能退吗")]
+    assert len(deps.query_expander.calls) == 1
+    assert "订单1001" in deps.query_expander.calls[0][0] and "猫粮" in deps.query_expander.calls[0][0]
+    assert "已签收" in deps.query_expander.calls[0][0] and len(state["expanded_queries"]) == 3
 
 
 @pytest.mark.parametrize("query,candidate", [
@@ -189,13 +236,12 @@ async def test_policy_answer_uses_current_facts_without_old_assistant_claims(tmp
 @pytest.mark.parametrize("intent", ["退款退货", "售后"])
 @pytest.mark.parametrize("scope_case", ["mixed", "empty", "ignored"])
 async def test_order_policy_enforces_document_scope(tmp_path, intent, scope_case):
-    """实际根图和检索编排必须过滤非政策来源，空范围不放宽，索引越界时报错。
+    """实际根图必须过滤非政策来源，空范围不放宽，索引越界时安全降级。
 
     参数：tmp_path独立保存器；intent订单政策意图；scope_case混合语料/空范围/索引忽略过滤。
     返回：None；异常：断言失败。
     """
     from app.knowledge.retrieval import HybridKnowledgeSearch
-    from app.knowledge.search import KnowledgeSearchUnavailable
     from tests.knowledge.fakes import FakeEncoder, MemoryKnowledgeStore, make_settings
     from tests.rag.test_online_filters import FilterIndex
     from tests.rag.test_retrieval import _chunk, RerankBoundary
@@ -210,14 +256,13 @@ async def test_order_policy_enforces_document_scope(tmp_path, intent, scope_case
     deps = dependencies(intents=[intent], results=[order_result()], answers=[["需核对适用条件。"]])
     deps.search = search
     async with workflow_runtime(deps, tmp_path / "policy-scope.sqlite") as graph:
-        if scope_case == "ignored":
-            with pytest.raises(KnowledgeSearchUnavailable, match="范围"):
-                await graph.ainvoke(owned_turn("订单1001能退吗"), {"configurable": {"thread_id": "test"}})
-            assert not deps.chat.finished
-            return
         state = await graph.ainvoke(owned_turn("订单1001能退吗"), {"configurable": {"thread_id": "test"}})
-    if scope_case == "empty":
+    if scope_case == "ignored":
+        assert not state["evidence"] and state["stop_reason"] == "retrieval_unavailable"
+        assert state["degradations"] and "1001" in state["answer"]
+        assert deps.chat.finished[0]["low_confidence"] is None
+    elif scope_case == "empty":
         assert state["evidence"] == [] and index.calls == []
     else:
         assert {item["source_key"] for item in state["evidence"]} == set(sources)
-        assert index.filters == [[1, 2, 3, 4]]
+        assert index.filters == [[1, 2, 3, 4]] * 3

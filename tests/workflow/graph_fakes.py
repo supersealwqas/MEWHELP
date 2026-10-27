@@ -103,12 +103,13 @@ class StrictExpander:
         """建立调用列表。参数：无；返回：None；异常：无。"""
         self.calls = []
 
-    async def expand(self, query, *, simple_query, budget):
-        """返回单查询。参数：query种子、simple_query标准问法、budget账本；返回：ExpandedQueries；异常：预算错误。"""
+    async def expand(self, query, *, simple_query, budget, required_count=None):
+        """遵照流程条数返回查询。参数：query种子、simple_query标准问法、budget账本、required_count指定条数；返回：ExpandedQueries；异常：预算错误。"""
         from app.knowledge.query_rewrite import ExpandedQueries
         self.calls.append((query, simple_query))
         budget.reserve("expand", 100, 2048)
-        return ExpandedQueries(queries=[simple_query])
+        return ExpandedQueries(queries=[f"{query} {aspect}" for aspect in ("适用条件", "限制", "流程")]
+                               if required_count == 3 else [simple_query])
 
 
 def dependencies(*, intents=("订单",), decisions=(), answers=(), ranked=(), results=(), understandings=(), **settings):

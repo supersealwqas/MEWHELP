@@ -53,6 +53,8 @@ QUERY_EXPANSION_RULES = """你是退款与售后政策检索查询扩写器，�
 _OUTPUT_TOOL_NAME = "submit_query_rewrite"
 _EXPANSION_TOOL_NAME = "submit_expanded_queries"
 _MODEL = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]+(?:-[A-Za-z]+)*-?\d+[A-Za-z0-9-]*")
+_EXPLICIT_ORDER = re.compile(r"订单(?:编号|号码|号)?\s*[:：]?\s*([A-Za-z0-9][A-Za-z0-9_-]*)")
+_POLICY_ASPECTS = ("适用条件及时限", "限制与例外", "办理流程及所需材料")
 # 仅金额、百分比、时长等带单位的数量词视为可省略的对话细节；裸数字（型号、单号、数量）仍须保留。
 _NUMBER = re.compile(r"\d+(?:\.\d+)?")
 # “39块9”这类连读金额整体吃掉，避免尾部数字被当成需要保留的标识数字。
@@ -150,10 +152,10 @@ def _identifier_tokens(text: str) -> set[str]:
     return set(_MODEL.findall(text)) | set(_ORDER_CODE.findall(text))
 
 
-def validate_rewrite(query: str, rewrite: QueryRewrite, *, context: str = "") -> None:
+def validate_rewrite(query: str, rewrite: QueryRewrite, *, context: str = "", order_ids: tuple[str, ...] = ()) -> None:
     """只拦截凭空编造的型号与数字，不要求检索问法原样保留原问细节。
 
-    参数：query 可信原问；rewrite 严格输出；context 可选的可信历史用户/工具文本。
+    参数：query 可信原问；rewrite 严格输出；context 可选可信历史；order_ids 已单独校验来源的订单标识。
     返回：None，不自动修补或换词。
     异常：QueryRewriteError，问法引入了原问和历史都没有的型号或数字，
         或原问已明确的标识（订单号/型号）被另一个历史标识顶替。
@@ -162,12 +164,16 @@ def validate_rewrite(query: str, rewrite: QueryRewrite, *, context: str = "") ->
     因此省略细节最多影响召回质量，而编造或替换标识会搜错对象，只有后者值得终止整轮。
     """
     # 可信事实白名单：当前原问加上历史用户/工具文本；助手散文不参与。
-    query_models, context_models = set(_MODEL.findall(query)), set(_MODEL.findall(context))
+    # 订单与商品型号可能长得一样，但订单由业务字段定位；检索必须保留的是商品型号。
+    # 只从可信原话/上下文和调用方类型信息排除订单，不让生成文本自行声称某型号是订单。
+    known_orders = set(order_ids) | set(_EXPLICIT_ORDER.findall(query)) | set(_EXPLICIT_ORDER.findall(context))
+    query_models = set(_MODEL.findall(query)) - known_orders
+    context_models = set(_MODEL.findall(context)) - known_orders
     query_identifiers = _identifier_tokens(query)
     allowed_models = query_models | context_models
     allowed_numbers = _fact_tokens(query) | _fact_tokens(context)
     for text in [rewrite.standard_query, *rewrite.synonyms]:
-        text_models, text_numbers = set(_MODEL.findall(text)), _fact_tokens(text)
+        text_models, text_numbers = set(_MODEL.findall(text)) - known_orders, _fact_tokens(text)
         # 只要不出现白名单里没有的型号/数字，检索问法可以自由概括、合并或删减细节。
         if not text_models.issubset(allowed_models):
             raise QueryRewriteError("检索问法引入了原问和历史都没有的型号")
@@ -293,12 +299,12 @@ class QueryExpander:
             raise ValueError("扩写请求预算必须为正整数")
         self.model_factory, self.request_budget = model_factory, request_budget
 
-    async def expand(self, query: str, *, simple_query: str,
+    async def expand(self, query: str, *, simple_query: str, required_count: int | None = None,
                      budget: BudgetLedger | None = None) -> ExpandedQueries:
-        """执行一次政策查询扩写，模型/解析/内容校验失败时回退为单条[query]并保留账本。
+        """执行一次政策扩写，失败按调用契约回退完整种子或三个通用角度并保留账本。
 
         参数：query 1–2000字符完整问与已核实订单状态的种子；simple_query 1–2000字符标准问法；
-            budget 当前轮次独占账本。
+            required_count 为None沿用简单/复杂判定，为3时由业务流程强制三角度覆盖；budget 当前轮次独占账本。
         返回：ExpandedQueries，含1条或3条已通过validate_prepared_queries校验的查询。
         异常：QueryRewriteError，输入种子或标准问法越界、单次请求超预算；
             WorkflowBudgetExceeded，工作流预算耗尽；取消原样传播并关闭流。
@@ -307,6 +313,12 @@ class QueryExpander:
             raise QueryRewriteError("扩写种子必须为1–2000字符")
         if not isinstance(simple_query, str) or not simple_query.strip() or len(simple_query) > 2000:
             raise QueryRewriteError("标准问法必须为1–2000字符")
+        if required_count is not None and (type(required_count) is not int or required_count != 3):
+            raise QueryRewriteError("流程指定的扩写条数只能为3")
+        fallback_queries = ([f"{aspect}：{query}" for aspect in _POLICY_ASPECTS]
+                            if required_count == 3 else [query])
+        # 先确认可靠回退可执行，避免在模型调用之后才发现原话过长；不悄悄截断用户条件。
+        validate_prepared_queries(query, fallback_queries)
         from app.core.llm import get_chat_model
         from app.core.memory import _estimate_message_tokens, _estimate_token_units
         from app.core.model_budget import OUTPUT_LIMITS, WorkflowBudgetExceeded
@@ -319,6 +331,8 @@ class QueryExpander:
             HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
         ]
         tool = output_tool(ExpandedQueries, _EXPANSION_TOOL_NAME)
+        if required_count == 3:
+            tool["function"]["parameters"]["properties"]["queries"].update(minItems=3, maxItems=3)
         output_limit = OUTPUT_LIMITS["expand"]
         input_units = _estimate_message_tokens(messages) + _estimate_token_units([tool])
         if input_units > self.request_budget:
@@ -339,6 +353,8 @@ class QueryExpander:
             )
             result = parse_tool_output(gathered, ExpandedQueries, _EXPANSION_TOOL_NAME)
             validate_prepared_queries(query, result.queries)
+            if required_count is not None and len(result.queries) != required_count:
+                raise QueryRewriteError("扩写未满足流程要求的政策覆盖")
             # 简单问题沿用本轮标准问法；模型擅自换题也按内容失败记录并回退完整种子。
             if len(result.queries) == 1 and result.queries != [simple_query]:
                 raise QueryRewriteError("单条扩写必须采用原标准问法")
@@ -355,9 +371,9 @@ class QueryExpander:
                 )
                 diagnostic = invalid.audit_record
                 diagnostic["error_type"] = type(error).__name__
-                diagnostic["query_fallback"] = "seed_query"
+                diagnostic["query_fallback"] = "coverage_queries" if required_count == 3 else "seed_query"
                 budget.record_failure("expand", diagnostic)
-            # 优化调用失败只退回一次[query]并通过同一确定性护栏，不触发第二次模型调用。
-            fallback = ExpandedQueries(queries=[query])
+            # 优化失败按流程要求回退完整种子或三角度查询，不触发第二次模型调用。
+            fallback = ExpandedQueries(queries=fallback_queries)
             validate_prepared_queries(query, fallback.queries)
             return fallback

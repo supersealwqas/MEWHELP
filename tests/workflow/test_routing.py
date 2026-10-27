@@ -213,3 +213,23 @@ def test_non_order_numbers_cannot_become_current_or_historical_order(raw):
     orders = [{"order_id": "1001"}, {"order_id": "2026"}]
     assert order_candidate({"raw_query": raw, "order_id": None}, orders) is None
     assert _trusted_history([{"messages": [{"role": "user", "content": raw}]}])[1] == set()
+
+
+@pytest.mark.parametrize("identifier", ["SO-4801", "ABC90022"])
+def test_order_identifier_can_be_omitted_from_search_without_losing_target(identifier):
+    """检索问法省略已单独保存的订单号不能清空可信目标。参数：identifier完整订单号；返回：None；异常：断言失败。"""
+    from app.workflow.routing import validate_understanding
+    raw = f"查订单{identifier}的状态和金额。"
+    result = validate_understanding(raw, _understanding(resolved_query=raw,
+        standard_query="查询订单状态与金额", order_id=identifier), [])
+    assert result.order_id == identifier and result.resolved_query == raw
+    assert result.standard_query == "查询订单状态与金额"
+
+
+def test_excluded_prefixed_order_does_not_become_required_product_model():
+    """被明确排除的订单号不能强制出现在新订单检索中。参数：无；返回：None；异常：断言失败。"""
+    from app.workflow.routing import validate_understanding
+    raw = "不要查订单SO-4801了，只查订单9205的物流。"
+    result = validate_understanding(raw, _understanding(resolved_query=raw,
+        standard_query="查询订单9205物流", order_id="9205"), [])
+    assert result.order_id == "9205" and result.standard_query == "查询订单9205物流"

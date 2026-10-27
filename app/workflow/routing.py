@@ -184,7 +184,8 @@ def _understanding_outcome(raw_query: str, result: UnderstandingResult,
             # UnderstandingResult已做严格类型与4000字校验；这里只复用事实护栏，
             # 不借QueryRewrite的2000字检索限制裁短合法原话，检索节点稍后独立停止。
             rewrite = QueryRewrite.model_construct(standard_query=candidate, synonyms=[])
-            validate_rewrite(raw_query, rewrite, context=source)
+            typed_orders = (result.order_id,) if result.order_id in selectable_orders else ()
+            validate_rewrite(raw_query, rewrite, context=source, order_ids=typed_orders)
             candidate_orders = set(_ORDER_CANDIDATE.findall(candidate))
             if (current_orders or result.needs_resolution) and not candidate_orders.issubset(allowed_orders):
                 # 同时约束完整问和标准问，不能靠order_id=null绕过最近对象保护。

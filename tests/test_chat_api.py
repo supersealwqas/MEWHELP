@@ -65,9 +65,9 @@ def test_second_request_contains_completed_history(client, offline_chat_runtime)
                       {"role": "assistant", "content": "你好，我是小喵"}, {"role": "user", "content": "我是谁"}]
 
 
-@pytest.mark.parametrize("chunks", [[RuntimeError("SECRET")], ["部分", TimeoutError("SECRET")], [WorkflowOutputError("空正文")]])
+@pytest.mark.parametrize("chunks", [[RuntimeError("SECRET")]])
 def test_error_has_no_done_and_preserves_failed_audit(client, offline_chat_runtime, chunks):
-    """上游故障和空回复不得伪装成功。参数：客户端、依赖、分片；返回：None；异常：断言失败。"""
+    """未知程序故障不得伪装完成。参数：客户端、依赖、分片；返回：None；异常：断言失败。"""
     _, repo, _, model = offline_chat_runtime
     model.answers.clear()
     model.answers.append(chunks)
@@ -75,6 +75,22 @@ def test_error_has_no_done_and_preserves_failed_audit(client, offline_chat_runti
     assert "event: error" in response.text and "[DONE]" not in response.text and "SECRET" not in response.text
     turn = next(iter(repo.turns.values()))
     assert turn.turn_status == "failed" and len(turn.messages) == 1
+
+
+@pytest.mark.parametrize("chunks", [["部分", TimeoutError("SECRET")], [WorkflowOutputError("空正文")]])
+def test_upstream_failure_finishes_with_saved_safe_reply(client, offline_chat_runtime, chunks):
+    """已知上游故障返回可保存说明，SSE与数据库正文一致。参数：客户端、依赖、分片；返回：None；异常：断言失败。"""
+    _, repo, _, model = offline_chat_runtime
+    model.answers.clear()
+    model.answers.append(chunks)
+    response = send(client)
+    assert "event: error" not in response.text and response.text.endswith("data: [DONE]\n\n")
+    assert "SECRET" not in response.text and "answer_unavailable" in response.text
+    deltas = [json.loads(block.removeprefix("data: "))["delta"] for block in response.text.split("\n\n")
+              if block.startswith('data: {"delta":')]
+    turn = next(iter(repo.turns.values()))
+    assert turn.turn_status == "completed" and turn.messages[-1].content == "".join(deltas)
+    assert "未能完整生成" in turn.messages[-1].content
 
 
 def test_model_factory_failure_is_safe(client, offline_chat_runtime):
