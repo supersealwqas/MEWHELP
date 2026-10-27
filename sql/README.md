@@ -43,9 +43,18 @@ uv run python -m app.knowledge.cli import-docs --manifest data/kb/manifest.json
 |---|---|
 | `ch04-ddl.sql` | 依赖第二章会话表，建立低置信度问题池和编造个案台账。 |
 | `ch06-ticket-type.sql` | 第六章再启用“退款”工单类型；当前代码只支持售后、投诉、咨询。 |
-| `ch07-ddl.sql` | 依赖第二章会话表，增加摘要字段。 |
+| `ch07-ddl.sql`、`ch07-layers.sql` | CH07依赖会话/消息表；两份按顺序应用，增加摘要投影、两个锚点及只追加摘要表。已有部分结构时使用下方增量命令。 |
 | `ch08-ddl.sql` | 建工具审计表，当前工具执行器尚未写入该表。 |
 | `ch09-ddl.sql` | 依赖第四章问题池，建审核队列、评估记录并补充关联字段。 |
 | `ch10-ddl.sql` | 依赖第四章问题池，建主题分类表。 |
 
 后续 `CREATE TABLE` / `ALTER TABLE` 脚本按对应章节执行一次，不应作为可任意重跑的初始化命令。
+
+CH07已有库升级先预览，再显式应用；重复应用只补缺失结构，不清空原文或重写摘要：
+
+```bash
+uv run python -m app.db.migrate_ch07 --env-file .env --database mewhelp
+uv run python -m app.db.migrate_ch07 --env-file .env --database mewhelp --apply
+```
+
+`create_all()`不会为旧会话表补列，升级已有库必须执行增量迁移。MySQL的DDL隐式提交，迁移中断后检查输出并重跑补齐；摘要业务行的追加和锚点推进则由仓储短事务原子提交。

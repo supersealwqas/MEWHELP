@@ -1,4 +1,4 @@
-"""业务初始化包含CH06退款申请；质量模型加载后不能扩大业务创建/清理范围。"""
+"""业务初始化包含退款申请与会话摘要；质量模型加载后不能扩大业务创建/清理范围。"""
 
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ from tests.knowledge.fakes import make_settings
 
 
 def test_original_business_metadata_excludes_quality_tables() -> None:
-    """业务五表与质量台账保持隔离。参数：无；返回：None；异常：断言失败。"""
-    assert set(Base.metadata.tables) == {"conversations", "messages", "faq", "tickets", "refund_applications"}
+    """业务六表与质量台账保持隔离。参数：无；返回：None；异常：断言失败。"""
+    assert set(Base.metadata.tables) == {"conversations", "messages", "faq", "tickets", "refund_applications", "conversation_summaries"}
     assert FaithCase.__table__.metadata is not Base.metadata
     assert LowConfidenceQuestion.__table__.metadata is not Base.metadata
 
@@ -50,4 +50,4 @@ async def test_original_initializer_creates_only_original_business_tables(monkey
     monkeypatch.setattr(init_db, "seed_database", seed)
     await init_db.initialize_database()
     assert not any("faith_cases" in statement or "low_confidence_questions" in statement for statement in statements)
-    assert sum("CREATE TABLE" in statement for statement in statements) == 5
+    assert sum("CREATE TABLE" in statement for statement in statements) == 6

@@ -66,7 +66,7 @@ def repository():
     """建立测试内存库，仅测试SQL行为，不替代MySQL集成。参数：无；返回：仓储；异常：SQL错误。"""
     engine = create_engine("sqlite://")
     with engine.begin() as connection:
-        connection.execute(text("CREATE TABLE conversations (id INTEGER PRIMARY KEY, session_id TEXT, user_id TEXT, status TEXT DEFAULT '进行中', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)"))
+        connection.execute(text("CREATE TABLE conversations (id INTEGER PRIMARY KEY, session_id TEXT, user_id TEXT, status TEXT DEFAULT '进行中', summary TEXT, summary_upto_msg_id INTEGER, layer1_from_msg_id INTEGER, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)"))
         connection.execute(text("CREATE TABLE messages (id INTEGER PRIMARY KEY, conversation_id INTEGER, role TEXT, content TEXT, tool_calls JSON, rag_metadata JSON, tool_call_id TEXT, turn_id TEXT, turn_status TEXT DEFAULT 'running', created_at DATETIME DEFAULT CURRENT_TIMESTAMP)"))
         connection.execute(text("CREATE TABLE knowledge_chunks (id INTEGER PRIMARY KEY, source_key TEXT, ordinal INTEGER, questions TEXT, answer TEXT, category TEXT, section_path TEXT, is_active INTEGER)"))
         connection.execute(text("INSERT INTO knowledge_chunks VALUES (20, 'qa:10', 0, '来源问法', '权威正文', '分类', NULL, 1)"))

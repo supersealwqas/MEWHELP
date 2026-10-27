@@ -76,6 +76,18 @@ class PersistenceUncertain(RuntimeError):
     """数据库提交结果无法确认；不能当作业务失败重新执行。"""
 
 
+def stored_turns(rows: list[Message]) -> list[StoredTurn]:
+    """把有序ORM流水转为完整轮。参数：rows按主键排序的本会话消息；返回：含真实ID的轮；异常：字段校验失败。"""
+    turns: dict[str, StoredTurn] = {}
+    for row in rows:
+        turn = turns.setdefault(row.turn_id, StoredTurn(turn_id=row.turn_id, turn_status=row.turn_status))
+        if row.role == "user" and isinstance(row.rag_metadata, dict):
+            turn.order_selection = row.rag_metadata.get("order_selection")
+        turn.messages.append(StoredMessage(id=row.id, role=row.role, content=row.content or "",
+                                          tool_calls=row.tool_calls, tool_call_id=row.tool_call_id))
+    return list(turns.values())
+
+
 class ChatRepository:
     """每次操作独立会话，不把数据库事务带入模型网络等待。"""
 
@@ -132,14 +144,7 @@ class ChatRepository:
             statement = statement.where(Message.turn_id != exclude_turn_id)
         async with self.factory() as session:
             rows = (await session.scalars(statement.order_by(Message.id))).all()
-        turns: dict[str, StoredTurn] = {}
-        for row in rows:
-            turn = turns.setdefault(row.turn_id, StoredTurn(turn_id=row.turn_id, turn_status=row.turn_status))
-            if row.role == "user" and isinstance(row.rag_metadata, dict):
-                turn.order_selection = row.rag_metadata.get("order_selection")
-            turn.messages.append(StoredMessage(role=row.role, content=row.content or "",
-                                              tool_calls=row.tool_calls, tool_call_id=row.tool_call_id))
-        return list(turns.values())
+        return stored_turns(rows)
 
     async def load_history_delta(self, conversation_id: int, after_message_id: int, *,
                                  refresh_turn_id: str | None = None, exclude_turn_id: str | None = None) -> HistoryDelta:
@@ -163,14 +168,7 @@ class ChatRepository:
                 return HistoryDelta(turns=[], last_message_id=last_id)
             rows = (await session.scalars(select(Message).where(Message.conversation_id == conversation_id,
                 Message.turn_id.in_(affected)).order_by(Message.id))).all()
-        turns: dict[str, StoredTurn] = {}
-        for row in rows:
-            turn = turns.setdefault(row.turn_id, StoredTurn(turn_id=row.turn_id, turn_status=row.turn_status))
-            if row.role == "user" and isinstance(row.rag_metadata, dict):
-                turn.order_selection = row.rag_metadata.get("order_selection")
-            turn.messages.append(StoredMessage(role=row.role, content=row.content or "",
-                                              tool_calls=row.tool_calls, tool_call_id=row.tool_call_id))
-        return HistoryDelta(turns=list(turns.values()), last_message_id=last_id)
+        return HistoryDelta(turns=stored_turns(rows), last_message_id=last_id)
 
     async def get_turn_context(self, session_id: str, user_id: str, turn_id: str) -> ToolContext | None:
         """读取本人原轮。参数：会话/用户/原轮标识；返回：可信上下文或None；异常：数据库错误。"""

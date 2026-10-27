@@ -1,7 +1,7 @@
-"""按用户 DDL 定义四张业务表，补充会话映射、轮次恢复与结果防重字段。"""
+"""客服业务表：会话、完整流水、FAQ、工单、退款申请与只追加会话摘要。"""
 
 from datetime import datetime
-from sqlalchemy import CheckConstraint, Enum, ForeignKey, Index, JSON, String, Text, UniqueConstraint, text
+from sqlalchemy import CheckConstraint, Enum, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, text
 from sqlalchemy.dialects.mysql import BIGINT, DATETIME
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -9,7 +9,7 @@ TABLE_OPTIONS = {"mysql_engine": "InnoDB", "mysql_charset": "utf8mb4"}
 
 
 class Base(DeclarativeBase):
-    """四张业务表共用的声明式元数据。"""
+    """客服业务表共用的声明式元数据，与质量评估库隔离。"""
 
 
 class Conversation(Base):
@@ -20,8 +20,27 @@ class Conversation(Base):
     session_id: Mapped[str] = mapped_column(String(64, collation="utf8mb4_bin"), unique=True, comment="兼容客户端会话标识")
     user_id: Mapped[str] = mapped_column(String(64, collation="utf8mb4_bin"), comment="用户标识")
     status: Mapped[str] = mapped_column(Enum("进行中", "已转人工", "已结束"), server_default="进行中", comment="处理状态")
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True, comment="最近完整摘要段拼成的有界投影")
+    summary_upto_msg_id: Mapped[int | None] = mapped_column(BIGINT(unsigned=True), nullable=True, comment="分段摘要已覆盖到的消息主键")
+    layer1_from_msg_id: Mapped[int | None] = mapped_column(BIGINT(unsigned=True), nullable=True, comment="此消息之后为原文层，此消息及之前为半压或摘要层")
     created_at: Mapped[datetime] = mapped_column(DATETIME, server_default=text("CURRENT_TIMESTAMP"), comment="开启时间")
     updated_at: Mapped[datetime] = mapped_column(DATETIME, server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"), comment="更新时间")
+
+
+class ConversationSummary(Base):
+    """当前会话的只追加摘要段；旧段不更新、不回炉重压。"""
+
+    __tablename__ = "conversation_summaries"
+    __table_args__ = (UniqueConstraint("conversation_id", "seq", name="uk_conv_seq"),
+        Index("idx_conv_upto", "conversation_id", "upto_msg_id"),
+        {**TABLE_OPTIONS, "comment": "分段摘要，一段一行只追加"})
+    id: Mapped[int] = mapped_column(BIGINT(unsigned=True), primary_key=True, autoincrement=True, comment="摘要段主键")
+    conversation_id: Mapped[int] = mapped_column(BIGINT(unsigned=True), comment="所属会话主键")
+    seq: Mapped[int] = mapped_column(Integer, comment="该会话第几段，从1开始")
+    from_msg_id: Mapped[int] = mapped_column(BIGINT(unsigned=True), comment="本段覆盖首消息，闭区间")
+    upto_msg_id: Mapped[int] = mapped_column(BIGINT(unsigned=True), comment="本段覆盖末消息，闭区间")
+    content: Mapped[str] = mapped_column(Text, comment="仅来自该区间的摘要，显式无事实段可为空")
+    created_at: Mapped[datetime] = mapped_column(DATETIME, server_default=text("CURRENT_TIMESTAMP"), comment="摘要提交时间")
 
 
 class Message(Base):
