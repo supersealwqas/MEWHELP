@@ -127,7 +127,6 @@ async def database_runtime():
     lease_engine = None
     try:
         repository = ChatRepository(factory)
-        await repository.recover_interrupted_turns()
         lease_engine = create_async_engine(
             engine.url,
             poolclass=NullPool,
@@ -143,7 +142,9 @@ async def database_runtime():
             deps = WorkflowDependencies(WorkflowModelAdapter(), search, executor, repository, settings,
                 QueryExpander(request_budget=settings.request_token_budget))
             async with workflow_runtime(deps, Path(settings.workflow_checkpoint_path)) as graph:
-                yield ChatService(repository, graph, executor, settings)
+                service = ChatService(repository, graph, executor, settings)
+                await service.reconcile_waiting_turns()
+                yield service
     finally:
         with anyio.CancelScope(shield=True):
             try:

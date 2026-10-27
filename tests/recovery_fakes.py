@@ -184,7 +184,7 @@ async def assert_application_recovery_contract(database, repositories, monkeypat
             assert manager.state_path.parent == manager.reports_root
             assert manager.log_path.parent == manager.reports_root
             service = application.state.chat_service
-            assert len(model.inputs) == index * 3
+            assert len(model.inputs) == index * 4
             factory = boundary.factories[-1]
             async with factory() as session:
                 old_rows = (await session.scalars(select(Message).where(Message.turn_id == "old-turn"))).all()
@@ -195,12 +195,12 @@ async def assert_application_recovery_contract(database, repositories, monkeypat
                 if with_result:
                     assert tickets[0].ticket_no == result.data["ticket_no"]
             events = [event async for event in service.stream_turn(ChatRequest(session_id="restart", message=question))]
-            assert len(model.inputs) == (index + 1) * 3, "脚本模型未控制当前图的classify/decide/answer"
+            assert len(model.inputs) == (index + 1) * 4, "脚本模型未控制当前图的understand/classify/decide/answer"
             assert events[-1].event == "done"
             assert "".join(event.data["delta"] for event in events if event.event == "delta") == answer
             assert not any(event.event in ("error", "tool_status") for event in events)
-            current_inputs = model.inputs[index * 3:]
-            assert [item["stage"] for item in current_inputs] == ["classify", "decide", "answer"]
+            current_inputs = model.inputs[index * 4:]
+            assert [item["stage"] for item in current_inputs] == ["understand", "classify", "decide", "answer"]
             for item in current_inputs:
                 messages = item["messages"]
                 facts = [message for message in messages if message["role"] == "tool"]

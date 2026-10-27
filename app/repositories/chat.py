@@ -359,14 +359,28 @@ class ChatRepository:
                 return None
             return next((item for item in row.rag_metadata.get("citations", []) if item.get("n") == n), None)
 
-    async def mark_turn(self, context: ToolContext, status: str) -> None:
+    async def list_pending_workflow_turns(self) -> list[dict]:
+        """列出需启动对账的可信原轮，完成记录天然保护。
+
+        参数：无；返回：包含context、turn_status、order_selection的内部列表。
+        异常：数据库/字段校验错误，不能吞为空列表。
+        """
+        async with self.factory() as session:
+            rows = (await session.execute(select(Conversation, Message).join(Message, Conversation.id == Message.conversation_id)
+                .where(Message.role == "user", Message.turn_status.in_(["running", "awaiting_input"]))
+                .order_by(Message.id))).all()
+            return [{"context": source_context(conversation, source), "turn_status": source.turn_status,
+                     "order_selection": (source.rag_metadata or {}).get("order_selection")}
+                    for conversation, source in rows]
+
+    async def mark_turn(self, context: ToolContext, status: str, *, include_waiting: bool = False) -> None:
         """标记失败或中断并保护已提交终态。参数：上下文与 failed/cancelled；返回：None；异常：状态或数据库错误。"""
         if status not in {"failed", "cancelled"}:
             raise ValueError("非法终止状态")
         async with self.factory.begin() as session:
             await session.execute(update(Message).where(Message.conversation_id == context.conversation_id,
                                                         Message.turn_id == context.turn_id,
-                                                        Message.turn_status == "running").values(turn_status=status))
+                                                        Message.turn_status.in_(["running", "awaiting_input"] if include_waiting else ["running"])).values(turn_status=status))
 
     async def recover_interrupted_turns(self) -> int:
         """单实例启动前恢复遗留轮次。参数：无；返回：恢复轮数；异常：数据库错误，应终止启动。"""

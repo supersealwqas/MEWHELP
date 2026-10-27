@@ -597,6 +597,36 @@ class ChatService:
         expected = str(uuid5(NAMESPACE_URL, f"mewhelp:ch06:{context.conversation_id}:{context.turn_id}:select_order"))
         return action if action.source_turn_id == context.turn_id and action.action_id == expected else None
 
+    async def reconcile_waiting_turns(self) -> None:
+        """启动后先对账官方保存器，再处理真正遗留的运行轮。
+
+        参数：无；返回：None；匹配暂停修复等待，已接受暂停保留原选择。
+        异常：任意数据库/检查点读取失败阻止启动；不猜测没有等待。
+        """
+        pending = await self.chat.list_pending_workflow_turns()
+        resolved = []
+        # 先完成所有检查点读取，任何读取失败都不能导致部分原轮被当作遗留取消。
+        for row in pending:
+            context = row["context"]
+            config = {"configurable": {"thread_id": checkpoint_thread_id(context.conversation_id)}}
+            snapshot = await self.graph.aget_state(config)
+            resolved.append((row, self._waiting_action(snapshot, context)))
+        for row, action in resolved:
+            context, saved = row["context"], row["order_selection"]
+            if action is not None:
+                if isinstance(saved, dict) and saved.get("status") == "accepted":
+                    expected = {key: saved.get(key) for key in ("type", "action_id", "source_turn_id", "orders")}
+                    if (action.model_dump(mode="json") == expected and row["turn_status"] == "running"
+                            and saved.get("accepted_order_id") in {order.order_id for order in action.orders}):
+                        continue
+                elif saved is None or saved.get("status") == "awaiting_input":
+                    await self.chat.save_order_wait(context, action)
+                    continue
+            inconsistent = row["turn_status"] == "awaiting_input" or saved is not None
+            if inconsistent:
+                logger.warning("选单等待与检查点不一致 turn=%s", context.turn_id)
+            await self.chat.mark_turn(context, "failed" if inconsistent else "cancelled", include_waiting=True)
+
     async def get_current_actions(self, session_id: str, user_id: str) -> CurrentActions:
         """读取当前保存动作，已接受未续跑时提供继续标记。参数：会话/用户；返回：CurrentActions；异常：身份或检查点读取错误。"""
         row = await self.chat.get_workflow_turn(session_id, user_id)
