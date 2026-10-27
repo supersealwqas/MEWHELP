@@ -160,15 +160,15 @@ async def test_recovered_classification_diagnostic_stays_out_of_operational_log(
             """记录结构失败后成功分类。参数：messages与ledger契约；返回：闲聊分类；异常：预算错误。"""
             ledger.reserve("classify", 50, 128)
             ledger.record_failure("classify", InvalidToolDecision(raw_output="SECRET_CLASSIFICATION_RAW").audit_record)
-            ledger.reserve("classify", 100, 128)
-            return IntentResult(intent="闲聊", knowledge_query=None)
+            return IntentResult(intent="闲聊", confidence=0.9)
 
         deps.model.classify = classify
         with caplog.at_level("INFO"):
             events = await collect(service)
         assert events[-1].event == "done"
         state = (await service.graph.aget_state({"configurable": {"thread_id": "mewhelp:ch05:1"}})).values
-        assert state["budget"]["records"][0]["failure"]["terminal_decision"]["raw_output"] == "SECRET_CLASSIFICATION_RAW"
+        failure = next(record["failure"] for record in state["budget"]["records"] if "failure" in record)
+        assert failure["terminal_decision"]["raw_output"] == "SECRET_CLASSIFICATION_RAW"
         assert "SECRET_CLASSIFICATION_RAW" not in caplog.text
         assert "SECRET_CLASSIFICATION_RAW" not in str(events)
 

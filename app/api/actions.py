@@ -4,12 +4,23 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 from app.api.chat import get_chat_service
 from app.repositories.actions import ActionRepository
-from app.schemas.workflow import TicketConfirmation, TicketReceipt
+from app.schemas.workflow import TicketConfirmation, TicketReceipt, CurrentActions
 from app.services.actions import TicketActionError, TicketActionService
 from app.tools.executor import ToolExecutor
 from app.tools.registry import build_ticket_registry
 
 router = APIRouter(prefix="/api/actions", tags=["actions"])
+
+
+@router.get("/current", response_model=CurrentActions)
+async def current_actions(session_id: str, user_id: str = "demo-user", service=Depends(get_chat_service)) -> CurrentActions:
+    """回读当前会话动作。参数：身份及共享服务；返回：保存状态；异常：404身份、503读取故障。"""
+    try:
+        return await service.get_current_actions(session_id.strip(), user_id.strip())
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail={"message": "会话不存在或不属于当前用户"}) from error
+    except Exception as error:
+        raise HTTPException(status_code=503, detail={"message": "暂时无法读取处理状态", "outcome": "unknown"}) from error
 
 
 def get_ticket_action_service(request: Request) -> TicketActionService:

@@ -2,9 +2,10 @@
 
 import json
 import anyio
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Request, HTTPException
 from fastapi.responses import StreamingResponse
 from app.schemas.chat import ChatRequest
+from app.schemas.workflow import OrderSelection, OrderSelectionConflict
 from app.services.chat import ChatService
 
 router = APIRouter(prefix="/api", tags=["chat"])
@@ -33,9 +34,25 @@ def get_chat_service(request: Request) -> ChatService:
 @router.post("/chat")
 async def chat(req: ChatRequest, service: ChatService = Depends(get_chat_service)) -> StreamingResponse:
     """把语义事件编码为 SSE。参数：请求和依赖注入服务；返回：流式响应；异常：客户端断开导致取消。"""
+    return workflow_response(service.stream_turn(req))
+
+
+@router.post("/chat/resume")
+async def resume_chat(req: OrderSelection, service: ChatService = Depends(get_chat_service)) -> StreamingResponse:
+    """预检来源后返回同轮续跑流。参数：req原动作、service共享服务；返回：SSE；异常：404/409预检错误或取消。"""
+    try:
+        await service.validate_resume(req)
+    except OrderSelectionConflict as error:
+        raise HTTPException(status_code=409, detail={"message": str(error), "outcome": "not_started"}) from error
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail={"message": "该动作不存在或不属于当前会话", "outcome": "not_started"}) from error
+    return workflow_response(service.stream_resume(req))
+
+
+def workflow_response(stream) -> StreamingResponse:
+    """编码普通/续跑的同一事件协议并拥有上游关闭责任。参数：stream事件迭代器；返回：StreamingResponse；异常：发送/取消错误。"""
     async def event_stream():
         """编码并关闭本轮生成器。参数：无；返回：SSE 字符串流；异常：取消向上传播。"""
-        stream = service.stream_turn(req)
         try:
             async for event in stream:
                 if event.event == "done":

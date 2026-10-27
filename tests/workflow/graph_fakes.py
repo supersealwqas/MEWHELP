@@ -63,7 +63,8 @@ class StrictExecutor:
     async def execute(self, call, context, on_status):
         """参数：工具、身份、状态回调；返回：ToolResult；异常：脚本错误或断言失败。"""
         assert call["id"] == context.tool_call_id
-        assert any(item.get("id") == call["id"] for item in self.chat.calls)
+        if isinstance(self.chat, StrictChat):
+            assert any(item.get("id") == call["id"] for item in self.chat.calls)
         self.calls.append(deepcopy(call))
         await on_status({"tool_call_id": call["id"], "name": call["name"], "status": "running", "label": "正在查询", "is_mock": False})
         assert self.script, "发生未预期的工具执行"

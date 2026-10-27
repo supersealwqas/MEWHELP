@@ -43,7 +43,22 @@ class MemoryRepository:
             if key != exclude_turn_id and (key == refresh_turn_id or any(i > after_message_id for i in self.message_ids.get(key, [])))],
             last_message_id=self.last_message_id)
 
-    async def save_tool_calls(self, context, calls):
+    async def get_workflow_turn(self, session_id, user_id, turn_id=None):
+        """读取内存原轮快照。参数：身份与可选轮；返回：状态或None；异常：无。"""
+        contexts = [ctx for ctx in self.contexts if ctx.session_id == session_id and ctx.user_id == user_id
+                    and (turn_id is None or ctx.turn_id == turn_id)]
+        if not contexts:
+            return None
+        ctx = contexts[-1]
+        turn = self.turns[ctx.turn_id]
+        return {"context": ctx, "turn_status": turn.turn_status, "order_selection": turn.order_selection,
+                "answer": turn.messages[-1].content if turn.turn_status == "completed" else None,
+                "completion_metadata": self.metadata.get(ctx.turn_id)}
+
+    async def cancel_order_wait(self, session_id, user_id):
+        """普通聊天替身不产生等待。参数：会话/用户；返回：None；异常：无。"""
+
+    async def save_tool_calls(self, context, calls, *, deduplicate=False):
         """保存申请。参数：上下文、申请；返回：None；异常：无。"""
         self.turns[context.turn_id].messages.append(StoredMessage(role="assistant", content="", tool_calls=calls))
         self._message_added(context.turn_id)

@@ -64,7 +64,7 @@ class ChatChunk(BaseModel):
 
 class ChatEvent(BaseModel):
     """服务层的语义事件，由 API 层编码为 SSE。"""
-    event: Literal["delta", "tool_status", "answer_metadata", "error", "done"] = Field(description="事件类型")
+    event: Literal["delta", "tool_status", "workflow_stage", "select_order", "action_status", "answer_metadata", "error", "done"] = Field(description="事件类型")
     data: dict = Field(default_factory=dict, description="安全事件载荷；error 可包含 retry_safe 重试提示，done 为空")
 
 

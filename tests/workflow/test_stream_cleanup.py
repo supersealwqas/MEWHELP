@@ -32,7 +32,7 @@ async def test_send_failure_closes_suspended_model_and_releases_guard(tmp_path, 
         async def send(message):
             """首正文发送失败。参数：message响应帧；返回：None；异常：OSError。"""
             sent.append(message)
-            if message["type"] == "http.response.body":
+            if message["type"] == "http.response.body" and b"delta" in message.get("body", b""):
                 raise OSError("连接已关闭")
 
         deps.model.stream_answer = waiting_answer

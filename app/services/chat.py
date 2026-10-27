@@ -23,6 +23,7 @@ from app.schemas.chat import ChatEvent, ChatRequest, InvalidToolDecision
 from app.schemas.tools import ToolContext, ToolResult
 from app.tools.executor import ToolExecutor
 from app.workflow.state import checkpoint_thread_id
+from app.schemas.workflow import CurrentActions, OrderSelection, OrderSelectionAction, OrderSelectionConflict
 
 logger = logging.getLogger(__name__)
 
@@ -579,6 +580,199 @@ class ChatService:
             merged[turn.turn_id] = turn.model_dump(mode="json")
         return new_turn_state(context, list(merged.values()), delta.last_message_id)
 
+    def _waiting_action(self, snapshot, context: ToolContext) -> OrderSelectionAction | None:
+        """核对官方待执行任务的interrupt与可信原轮，普通next不算等待。
+
+        参数：snapshot官方StateSnapshot、context数据库原轮。
+        返回：唯一匹配的选单或None；异常：ValueError，损坏动作。
+        """
+        from uuid import NAMESPACE_URL, uuid5
+        saved = snapshot.values.get("context", {})
+        if any(saved.get(key) != getattr(context, key) for key in ("conversation_id", "session_id", "user_id", "turn_id", "user_message")):
+            return None
+        interrupts = [item for task in getattr(snapshot, "tasks", ()) for item in task.interrupts]
+        if len(interrupts) != 1:
+            return None
+        action = OrderSelectionAction.model_validate(interrupts[0].value)
+        expected = str(uuid5(NAMESPACE_URL, f"mewhelp:ch06:{context.conversation_id}:{context.turn_id}:select_order"))
+        return action if action.source_turn_id == context.turn_id and action.action_id == expected else None
+
+    async def get_current_actions(self, session_id: str, user_id: str) -> CurrentActions:
+        """读取当前保存动作，已接受未续跑时提供继续标记。参数：会话/用户；返回：CurrentActions；异常：身份或检查点读取错误。"""
+        row = await self.chat.get_workflow_turn(session_id, user_id)
+        if row is None:
+            return CurrentActions()
+        saved = row["order_selection"]
+        action = None
+        resume_required = False
+        if isinstance(saved, dict):
+            action = OrderSelectionAction.model_validate({key: saved[key] for key in ("type", "action_id", "source_turn_id", "orders")})
+            if saved.get("status") == "accepted" and row["turn_status"] == "running":
+                config = {"configurable": {"thread_id": checkpoint_thread_id(row["context"].conversation_id)}}
+                pending = self._waiting_action(await self.graph.aget_state(config), row["context"])
+                resume_required = pending == action
+        return CurrentActions(source_turn_id=row["context"].turn_id, turn_status=row["turn_status"],
+            order_selection=action, accepted_order_id=saved.get("accepted_order_id") if saved else None,
+            answer=row["answer"], completion_metadata=row["completion_metadata"], resume_required=resume_required)
+
+    def _public_event(self, payload: dict, context: ToolContext) -> ChatEvent | None:
+        """筛选并规范公开事件。参数：payload图custom帧、context原轮；返回：事件或None；异常：无。"""
+        from app.workflow.stages import LABELS, FIELDS
+        if not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
+            return None
+        data, event = payload["data"], payload.get("event")
+        if event == "delta" and isinstance(data.get("delta"), str) and data["delta"]:
+            return ChatEvent(event="delta", data={"delta": data["delta"]})
+        if event == "tool_status":
+            return ChatEvent(event="tool_status", data={key: data[key] for key in ("tool_call_id", "name", "status", "label", "is_mock") if key in data})
+        stage, status = data.get("stage"), data.get("status")
+        if event == "workflow_stage" and stage in LABELS and status in {"running", "completed"}:
+            safe = {"source_turn_id": context.turn_id, "stage": stage, "status": status, "label": LABELS[stage]}
+            if status == "completed":
+                for key in FIELDS[stage]:
+                    value = data.get(key)
+                    if key == "confidence":
+                        import math
+                        if type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 1:
+                            safe[key] = value
+                    elif key == "queries":
+                        if isinstance(value, list) and len(value) in {1, 3} and all(isinstance(item, str) and 0 < len(item) <= 2000 for item in value):
+                            safe[key] = value
+                    elif isinstance(value, str) and 0 < len(value) <= 4000:
+                        safe[key] = value
+            return ChatEvent(event="workflow_stage", data=safe)
+        return None
+
+    async def _run_graph(self, initial, context: ToolContext, outcome: dict):
+        """消费图并确认完成或持久化等待，退出前收回图流。
+
+        参数：initial新轮State或原轮Command；context可信原轮；outcome本请求清理状态。
+        返回：公开增量和完成事件；选单只存outcome供锁外发送。
+        异常：图/存储/取消错误；已确认暂停后不改原轮终态。
+        """
+        config = {"configurable": {"thread_id": checkpoint_thread_id(context.conversation_id)}}
+        stream = self._stream_workflow(initial, {**config, "callbacks": [_WorkflowTrace()]})
+        try:
+            async for namespace, payload in stream:
+                event = self._public_event(payload, context)
+                if event is not None:
+                    yield event
+            final = await self.graph.aget_state(config)
+            action = self._waiting_action(final, context)
+            if action is not None:
+                # SQLite已提交暂停，即使MySQL下一步失败也保留原轮，交启动对账修复。
+                outcome["paused"] = True
+                await self.chat.save_order_wait(context, action)
+                outcome["waiting"] = action.model_dump(mode="json")
+                return
+            metadata = final.values.get("completion_metadata", {})
+            if final.next or metadata.get("turn_id") != context.turn_id or metadata.get("status") != "completed":
+                raise PersistenceUncertain("工作流最终状态尚未确认")
+            outcome["completed"] = True
+            yield ChatEvent(event="answer_metadata", data=metadata)
+            yield ChatEvent(event="done")
+        finally:
+            with anyio.CancelScope(shield=True):
+                await stream.aclose()
+
+    async def _cleanup_turn(self, context: ToolContext, outcome: dict, terminal: str) -> None:
+        """只标记本请求仍在运行的原轮，已等待或完成请求不再写状态。参数：context/outcome/terminal；返回：None；异常：记录后不抛。"""
+        if outcome.get("started") and not outcome.get("completed") and not outcome.get("paused"):
+            try:
+                await self.chat.mark_turn(context, terminal)
+            except Exception as error:
+                logger.warning("轮次终态保存失败 turn=%s type=%s", context.turn_id, type(error).__name__)
+
+    def _stream_error(self, error: Exception) -> ChatEvent:
+        """生成安全错误，保留状态码与未知结果语义。参数：error异常；返回：error事件；异常：无。"""
+        from app.repositories.actions import ActionNotFound
+        status = 409 if isinstance(error, (ConversationBusy, OrderSelectionConflict)) else 404 if isinstance(error, ActionNotFound) or type(error) is ValueError else 503
+        message = ("当前会话正在处理，请稍后继续原操作" if isinstance(error, ConversationBusy)
+                   else str(error) if isinstance(error, OrderSelectionConflict)
+                   else "该动作不存在或不属于当前会话" if status == 404 else LegacyChatService._error_message(error))
+        return ChatEvent(event="error", data={"error": message, "status_code": status,
+            "retry_safe": not isinstance(error, PersistenceUncertain), "outcome": "unknown" if status == 503 else "not_started"})
+
+    async def validate_resume(self, request: OrderSelection) -> dict:
+        """只读核验选单请求，供HTTP预检及忙碌重试复用。参数：request原键；返回：可信保存行；异常：404/409语义异常。"""
+        from app.repositories.actions import ActionNotFound
+        row = await self.chat.get_workflow_turn(request.session_id, request.user_id, request.source_turn_id)
+        saved = row.get("order_selection") if row else None
+        if not isinstance(saved, dict) or saved.get("action_id") != request.action_id:
+            raise ActionNotFound("该选单动作不存在")
+        from app.tools.business import owns_order
+        if request.order_id not in {item["order_id"] for item in saved.get("orders", [])} or not owns_order(request.user_id, request.order_id):
+            raise ActionNotFound("该订单不存在")
+        if saved.get("status") == "cancelled" or row["turn_status"] in {"cancelled", "failed"}:
+            raise OrderSelectionConflict("这张选单卡已失效，请使用当前页面的动作")
+        if saved.get("status") == "accepted" and saved.get("accepted_order_id") != request.order_id:
+            raise OrderSelectionConflict("同一动作不能更换订单，请继续原订单")
+        return row
+
+    async def stream_resume(self, request: OrderSelection) -> AsyncIterator[ChatEvent]:
+        """取回原轮锁后以Command续跑，不创建用户消息或重置预算。
+
+        参数：request冻结身份与原动作；返回：完成/等待/接受状态事件流。
+        异常：取消透传；业务错误输出安全error，HTTP预检可提前返回对应状态码。
+        """
+        from langgraph.types import Command
+        from app.repositories.actions import ActionRepository
+        outcome, context, terminal = {}, None, "cancelled"
+        try:
+            async with self.guard.hold(request.session_id):
+                try:
+                    row = await self.validate_resume(request)
+                    context = row["context"]
+                    if row["turn_status"] == "completed":
+                        if row["answer"] is None or not row["completion_metadata"]:
+                            raise PersistenceUncertain("完成回执缺失")
+                        yield ChatEvent(event="delta", data={"delta": row["answer"]})
+                        yield ChatEvent(event="answer_metadata", data=row["completion_metadata"])
+                        yield ChatEvent(event="done")
+                        return
+                    config = {"configurable": {"thread_id": checkpoint_thread_id(context.conversation_id)}}
+                    action = self._waiting_action(await self.graph.aget_state(config), context)
+                    if action is None:
+                        if row["order_selection"].get("status") == "accepted":
+                            yield ChatEvent(event="action_status", data={"action_id": request.action_id, "source_turn_id": request.source_turn_id, "status": "accepted"})
+                            return
+                        raise PersistenceUncertain("选单与暂停检查点不匹配")
+                    saved_action = {key: row["order_selection"][key] for key in ("type", "action_id", "source_turn_id", "orders")}
+                    if action.model_dump(mode="json") != saved_action:
+                        raise PersistenceUncertain("原选单内容不一致")
+                    accepted = await ActionRepository(self.chat.factory).accept_order_selection(request)
+                    # 提交接受后Command之前若断开，保留accepted/running以便原键继续。
+                    outcome.update(started=True, paused=True)
+                    stream = self._run_graph(Command(resume=accepted.accepted_order_id), context, outcome)
+                    try:
+                        async for event in stream:
+                            # 任何新阶段表示Command已开始处理；此后普通断流沿用取消语义。
+                            outcome["paused"] = False
+                            yield event
+                    finally:
+                        with anyio.CancelScope(shield=True):
+                            await stream.aclose()
+                except (asyncio.CancelledError, GeneratorExit):
+                    raise
+                except Exception as error:
+                    terminal = "failed"
+                    yield self._stream_error(error)
+                finally:
+                    with anyio.CancelScope(shield=True):
+                        if context is not None:
+                            await self._cleanup_turn(context, outcome, terminal)
+            if outcome.get("waiting"):
+                yield ChatEvent(event="select_order", data=outcome["waiting"])
+        except ConversationBusy as error:
+            try:
+                row = await self.validate_resume(request)
+                if row["order_selection"].get("status") == "accepted":
+                    yield ChatEvent(event="action_status", data={"action_id": request.action_id, "source_turn_id": request.source_turn_id, "status": "accepted"})
+                else:
+                    yield self._stream_error(error)
+            except Exception as invalid:
+                yield self._stream_error(invalid)
+
     async def stream_turn(self, request: ChatRequest) -> AsyncIterator[ChatEvent]:
         """消费带namespace的安全custom事件并拥有整轮图资源。
 
@@ -587,7 +781,7 @@ class ChatService:
         """
         context = ToolContext(session_id=request.session_id, user_id=request.user_id,
                               turn_id=str(uuid4()), user_message=request.message)
-        started, completed, terminal, stream = False, False, "cancelled", None
+        outcome, terminal, stream = {}, "cancelled", None
         try:
             async with self.guard.hold(request.session_id):
                 try:
@@ -595,28 +789,17 @@ class ChatService:
                     from app.workflow.model import intent_tool_schema
                     prepare_messages([], [HumanMessage(content=request.message)], self.settings.token_budget,
                         system_text=INTENT_PROMPT, tools=[intent_tool_schema()], request_max_tokens=self.settings.request_token_budget)
+                    current = await self.get_current_actions(request.session_id, request.user_id)
+                    if current.resume_required:
+                        raise OrderSelectionConflict("上一笔订单已经确认，请先点击继续处理")
+                    await self.chat.cancel_order_wait(request.session_id, request.user_id)
                     context = await self.chat.start_turn(context, request.message)
-                    started = True
+                    outcome["started"] = True
                     config = {"configurable": {"thread_id": checkpoint_thread_id(context.conversation_id)}}
                     state = await self._initial_state(context, config)
-                    stream = self._stream_workflow(state, {**config, "callbacks": [_WorkflowTrace()]})
-                    async for namespace, payload in stream:
-                        # 只有框架custom通道的两类公开事件可转发；内部JSON/工具参数不成为正文。
-                        if not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
-                            continue
-                        data = payload["data"]
-                        if payload.get("event") == "delta" and isinstance(data.get("delta"), str) and data["delta"]:
-                            yield ChatEvent(event="delta", data={"delta": data["delta"]})
-                        elif payload.get("event") == "tool_status":
-                            allowed = {key: data[key] for key in ("tool_call_id", "name", "status", "label", "is_mock") if key in data}
-                            yield ChatEvent(event="tool_status", data=allowed)
-                    final = await self.graph.aget_state(config)
-                    metadata = final.values.get("completion_metadata", {})
-                    if final.next or metadata.get("turn_id") != context.turn_id or metadata.get("status") != "completed":
-                        raise PersistenceUncertain("工作流最终状态尚未确认")
-                    completed = True
-                    yield ChatEvent(event="answer_metadata", data=metadata)
-                    yield ChatEvent(event="done")
+                    stream = self._run_graph(state, context, outcome)
+                    async for event in stream:
+                        yield event
                 except (asyncio.CancelledError, GeneratorExit):
                     raise
                 except Exception as error:
@@ -630,7 +813,7 @@ class ChatService:
                         except Exception as audit_error:
                             # 附加诊断保存失败不应吞掉用户可见错误，原finally仍负责标记终态。
                             logger.warning("模型诊断保存失败 turn=%s type=%s", context.turn_id, type(audit_error).__name__)
-                    yield ChatEvent(event="error", data={"error": LegacyChatService._error_message(error), "retry_safe": True})
+                    yield self._stream_error(error)
                 finally:
                     # 关闭图会取消其模型/工具任务；屏蔽ASGI取消域直到上游和短事务真正退出。
                     with anyio.CancelScope(shield=True):
@@ -638,10 +821,9 @@ class ChatService:
                             if stream is not None:
                                 await stream.aclose()
                         finally:
-                            if started and not completed:
-                                try:
-                                    await self.chat.mark_turn(context, terminal)
-                                except Exception as error:
-                                    logger.warning("轮次终态保存失败 turn=%s type=%s", context.turn_id, type(error).__name__)
-        except ConversationBusy:
-            yield ChatEvent(event="error", data={"error": "当前会话正在回复，请稍后再发", "retry_safe": True})
+                            await self._cleanup_turn(context, outcome, terminal)
+            # 等待提交、图流关闭及guard释放全部完成后，才进入可能受网络背压影响的发送。
+            if outcome.get("waiting"):
+                yield ChatEvent(event="select_order", data=outcome["waiting"])
+        except ConversationBusy as error:
+            yield self._stream_error(error)
