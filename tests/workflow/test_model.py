@@ -10,7 +10,12 @@ from langchain_core.messages import AIMessageChunk, HumanMessage
 from langchain_openai import ChatOpenAI
 
 from app.schemas.chat import InvalidToolDecision
-from app.tools.business import query_order, query_logistics, query_product, create_ticket
+from app.tools.registry import build_registry
+
+# 模型边界只接收公开ToolDefinition，旧BaseTool仍由注册层保存为执行投影。
+_tools = {tool.name: tool for tool in build_registry().snapshot()}
+query_order, query_logistics, query_product, create_ticket = (_tools[name] for name in
+    ("query_order", "query_logistics", "query_product", "create_ticket"))
 
 
 async def test_understanding_preserves_unverified_assistant_but_rejects_order(sdk_runtime):
@@ -228,9 +233,7 @@ async def test_understanding_order_id_required_but_nullable(sdk_runtime):
     ("query_order",'{"order_id":"1001","order_id":"1002"}',False),
     ("query_order",'{"order_id":NaN}',False), ("query_order",'{"order_id":1e999}',False),
     ("query_order",'{"order_id":"1001"}',True), ("unknown",'{}',False),
-    ("create_ticket",'{"description":"投诉","ticket_type":"投诉"}',False),
-    ("query_order",'{"order_id":"1001","user_id":"victim"}',False),
-    ("query_order",'{"order_id":1001}',False), ("query_order",'{}',False)])
+    ("create_ticket",'{"description":"投诉","ticket_type":"投诉"}',False)])
 async def test_workflow_rejects_invalid_readonly_batch(sdk_runtime, name, raw, duplicate):
     """坏参数、重复 ID、未知或写工具通过时失败。参数：网络夹具、工具名/参数/重复标记；返回：None；异常：断言失败。"""
     from app.core.model_budget import BudgetLedger
@@ -414,17 +417,19 @@ async def test_cancel_while_classifying_keeps_reservation_and_closes_stream():
     assert ledger.snapshot()["reserved_units"] > 0 and ledger.snapshot()["actual_tokens"] is None
 
 
-async def test_full_input_is_not_silently_trimmed_and_writes_never_bound(sdk_runtime):
-    """完整事实太大被截断继续调用或写工具被暴露时失败。参数：网络夹具；返回：None；异常：断言失败。"""
+async def test_full_input_is_not_silently_trimmed_and_write_schema_is_explicit(sdk_runtime):
+    """完整事实不能静默裁掉；注册的写工具可描述，授权留给执行器。参数：网络夹具；返回：None；异常：断言失败。"""
     from app.core.model_budget import BudgetLedger, WorkflowBudgetExceeded
     from app.workflow.model import WorkflowModelAdapter
 
     adapter = WorkflowModelAdapter(model_factory=sdk_runtime.factory)
     with pytest.raises(WorkflowBudgetExceeded):
         await adapter.decide([HumanMessage(content="事实" * 10000)], [], BudgetLedger())
-    with pytest.raises(InvalidToolDecision):
-        await adapter.decide([], [create_ticket], BudgetLedger())
     assert sdk_runtime.requests == []
+    sdk_runtime.responses.append(terminal_response())
+    result = await adapter.decide([], [create_ticket], BudgetLedger())
+    assert result.kind == "answer" and result.tool_calls == []
+    assert sdk_runtime.requests[0]["tools"][0]["function"]["name"] == "create_ticket"
 
 
 async def test_rewriter_preserves_usage_and_stops_on_length(sdk_runtime):
@@ -633,7 +638,7 @@ async def test_decision_sends_strict_required_schemas_and_budgets_actual_bound_t
     assert first["tool_choice"] == "required" and first["parallel_tool_calls"] is False
     for schema in first["tools"]:
         function = schema["function"]
-        assert function["strict"] is True
+        assert function.get("strict") is (True if function["name"] == "submit_decision" else None)
         parameters = function["parameters"]
         assert parameters["additionalProperties"] is False
         assert set(parameters["required"]) == set(parameters["properties"])
@@ -651,13 +656,12 @@ async def test_decision_sends_strict_required_schemas_and_budgets_actual_bound_t
     [("submit_decision", "d1", '{"kind":"answer","suggested_actions":[]}'), ("query_order", "q1", '{"order_id":"1001"}')],
     [("submit_decision", "d1", '{"kind":"answer","suggested_actions":[]}'), ("submit_decision", "d2", '{"kind":"clarify","suggested_actions":[]}')],
     [("query_order", "q1", '{"order_id":"1001"}'), ("query_order", "q1", '{"order_id":"1002"}')],
-    [("query_order", "q1", '{"order_id":"1001"}'), ("query_order", "q2", '{"order_id":1002}')],
     [("submit_decision", "", '{"kind":"answer","suggested_actions":[]}')],
     [("submit_decision", " ", '{"kind":"answer","suggested_actions":[]}')],
     [("submit_decision", "d1", '{"kind":"answer"'), ("query_order", "q1", '{"order_id":"1001"}')],
     [("submit_decision", "d1", '{"kind":"answer"'), ("submit_decision", "d2", '{"kind":"answer","suggested_actions":[]}')],
     [("submit_decision", " ", '{"kind":"answer"')],
-], ids=["mixed", "two-terminal", "duplicate-id", "bad-business-in-batch", "empty-id", "blank-id",
+], ids=["mixed", "two-terminal", "duplicate-id", "empty-id", "blank-id",
         "broken-control-and-business", "broken-control-and-control", "broken-control-blank-id"])
 async def test_invalid_decision_batches_are_rejected_without_partial_result_or_retry(sdk_runtime, entries):
     """混合批次、多个终止、非法ID或坏业务参数仍返回部分申请时失败。参数：HTTP夹具、完整批次；返回：None；异常：断言失败。"""

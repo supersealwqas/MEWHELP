@@ -107,16 +107,16 @@ async def test_policy_answer_receives_unsubmitted_action_state():
 
 
 @pytest.mark.parametrize("intent", ["退款退货", "售后"])
-async def test_order_precedes_policy_and_answer_without_agent_decision(tmp_path, intent):
-    """政策必须先核实订单且直接回答。参数：tmp_path隔离目录、intent政策类；返回：None；异常：断言失败。"""
+async def test_order_precedes_policy_and_answer_after_one_saved_decision(tmp_path, intent):
+    """前置决定一次后仍先核实订单与政策，不重复决定。参数：tmp_path隔离目录、intent政策类；返回：None；异常：断言失败。"""
     deps = dependencies(intents=[intent], results=[order_result()], ranked=[ranked()], answers=[["订单已签收，政策说明[1]。"]])
     trace = NodeTrace()
     async with workflow_runtime(deps, tmp_path / "graph.sqlite") as graph:
         state = await graph.ainvoke(owned_turn("订单1001能退吗"), {"configurable": {"thread_id": "test"}, "callbacks": [trace]})
-    positions = [trace.nodes.index(name) for name in ["resolve_reference", "classify_intent", "fetch_order", "retrieve_policy", "main_agent"]]
+    positions = [trace.nodes.index(name) for name in ["resolve_reference", "classify_intent", "decide_tools", "fetch_order", "retrieve_policy", "main_agent"]]
     assert positions == sorted(positions)
-    assert [row["stage"] for row in deps.model.inputs] == ["understand", "classify", "answer"]
-    assert state["order_data"]["order_id"] == "1001" and state["decision_count"] == 0
+    assert [row["stage"] for row in deps.model.inputs] == ["understand", "classify", "decide", "answer"]
+    assert state["order_data"]["order_id"] == "1001" and state["decision_count"] == 1
     assert len(deps.chat.calls) == len(deps.chat.results) == 1
     assert len(deps.query_expander.calls) == 1
     assert "订单1001" in deps.query_expander.calls[0][0] and "猫粮" in deps.query_expander.calls[0][0]
@@ -150,7 +150,7 @@ async def test_tracking_number_never_used_as_order_id(tmp_path, query, candidate
     assert action["type"] == "select_order" and action["orders"]
     assert "2003" not in {row["order_id"] for row in action["orders"]}
     assert not deps.executor.calls and not deps.chat.calls and not deps.search.calls
-    assert [row["stage"] for row in deps.model.inputs] == ["understand", "classify"]
+    assert [row["stage"] for row in deps.model.inputs] == ["understand", "classify", "decide"]
 
 
 @pytest.mark.parametrize("query", ["1001退款", "订单1001能退吗", "订单1001实付1002元，能退吗",

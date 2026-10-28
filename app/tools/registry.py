@@ -33,6 +33,10 @@ class ToolRegistry:
 
         async def invoke(arguments, context, scope):
             """适配旧内置工具且只注入服务端身份。参数：公开参数/可信身份/资源；返回：ToolResult；异常：业务异常。"""
+            if tool in (query_faq, query_refund_policy) and scope.knowledge is not None:
+                # 共享图内知识申请只能经过本地证据闸，旧章独立工具调用仍保持原返回契约。
+                from app.tools.knowledge import verified_knowledge_tool
+                return await verified_knowledge_tool(arguments, context, scope)
             values = dict(arguments)
             fields = getattr(tool.args_schema, "model_fields", {})
             if "user_id" in fields and "user_id" not in public_schema(tool).get("properties", {}):
@@ -122,9 +126,12 @@ def build_registry(*, include_refund_policy: bool = True) -> ToolRegistry:
 
 
 def build_agent_registry() -> ToolRegistry:
-    """提供Agent固定只读范围。参数：无；返回：三项只读注册表；异常：工具注册冲突。"""
+    """建立生产Agent的完整内置清单，物流由MCP独占提供。
+
+    参数：无；返回：唯一运行注册表，后续可原位登记新工具；异常：工具注册冲突。
+    """
     registry = ToolRegistry()
-    for business_tool in (query_order, query_logistics, query_product):
+    for business_tool in (query_order, query_product, query_faq, query_refund_policy, create_ticket):
         registry.register(business_tool)
     return registry
 

@@ -10,6 +10,23 @@ def test_lifespan_recovery_failure_blocks_startup(monkeypatch, tmp_path, offline
     from app import main
     from app.repositories.chat import ChatRepository
     disposed = []
+    observed = []
+    original_workflow_runtime, original_service = main.workflow_runtime, main.ChatService
+
+    @asynccontextmanager
+    async def checked_workflow_runtime(deps, path):
+        """保留真实保存器并核对生产依赖共享。参数：实例依赖/路径；返回：图；异常：原运行时故障。"""
+        assert deps.registry is deps.executor.registry is deps.mcp.registry
+        assert deps.permissions is deps.executor.permissions is deps.mcp.permissions
+        observed.append(deps)
+        async with original_workflow_runtime(deps, path) as graph:
+            yield graph
+
+    def checked_service(repository, graph, executor, config, **options):
+        """保留真实CH05服务并核对统一执行器。参数：服务资源；返回：服务；异常：原初始化错误。"""
+        service = original_service(repository, graph, executor, config, **options)
+        assert service.executor is observed[0].executor
+        return service
     class Engine:
         """记录资源生命周期的外部边界。"""
         url = "mysql+asyncmy://test/isolated"
@@ -36,12 +53,15 @@ def test_lifespan_recovery_failure_blocks_startup(monkeypatch, tmp_path, offline
     monkeypatch.setattr(main, "create_database", lambda: (Engine("business"), None))
     monkeypatch.setattr(main, "create_async_engine", lambda *args, **kwargs: Engine("lease"))
     monkeypatch.setattr(main, "online_search_runtime", search)
+    monkeypatch.setattr(main, "workflow_runtime", checked_workflow_runtime)
+    monkeypatch.setattr(main, "ChatService", checked_service)
     monkeypatch.setattr(ChatRepository, "list_pending_workflow_turns", broken_recovery)
     app = main.create_app(runtime_factory=main.database_runtime)
     with pytest.raises(ConnectionError):
         with TestClient(app):
             pytest.fail("恢复失败后不应进入服务状态")
     assert disposed == ["search", "lease", "business"] and not hasattr(app.state, "chat_service")
+    assert len(observed) == 1 and observed[0].mcp._closed
 
 
 def test_runtime_available_only_within_lifespan():

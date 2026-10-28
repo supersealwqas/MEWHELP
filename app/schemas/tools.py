@@ -95,6 +95,17 @@ class ToolError(BaseModel):
         return self
 
 
+class VerifiedKnowledgeOutcome(BaseModel):
+    """仅由本地知识适配器生成的已过闸结果及原轮计量，不接受 MCP 自报证据。"""
+
+    model_config = ConfigDict(extra="forbid")
+    evidence: list[dict] = Field(description="已通过分数门槛并能完整注入的引用证据；弱证据为空")
+    gate: dict = Field(description="本地证据门槛判断及低分原因")
+    evidence_scores: list[float] = Field(description="本次权威重排分数")
+    expanded_queries: list[str] = Field(description="实际使用的完整检索问法")
+    budget: dict = Field(description="原轮共享账本的单调消费快照")
+
+
 class ToolResult(BaseModel):
     """统一工具结果；未命中仍属于成功查询。
 
@@ -106,6 +117,8 @@ class ToolResult(BaseModel):
     data: dict | None = Field(default=None, description="成功的业务数据")
     error: ToolError | None = Field(default=None, description="失败时的安全错误")
     is_mock: bool = Field(default=False, description="是否为演示数据")
+    verified_knowledge: VerifiedKnowledgeOutcome | None = Field(default=None,
+        exclude_if=lambda value: value is None, description="本地知识适配器内部证据，模型视图不得包含；旧回执可缺省")
 
     @classmethod
     def success(cls, data: dict, *, is_mock: bool = False) -> "ToolResult":

@@ -76,6 +76,9 @@ class KnowledgeCallContext:
 
     state: dict  # 已保存的本轮原问、政策条件与可信证据。
     ledger: BudgetLedger  # 当前轮独占预算账本。
+    search: Any = None  # 本实例权威检索器，不进入检查点。
+    settings: Any = None  # 本实例证据和预算配置。
+    query_expander: Any = None  # 本实例政策扩写器。
 
 
 @dataclass
@@ -110,3 +113,18 @@ class ToolDefinition:
     def binding(self) -> ToolBinding:
         """冻结当前来源和schema。参数：无；返回：ToolBinding；异常：schema不能JSON序列化。"""
         return ToolBinding(self.identity, json_hash(self.parameters))
+
+
+def binding_dict(binding: ToolBinding) -> dict:
+    """序列化已冻结的可信来源。参数：绑定；返回：可持久化字典；异常：无。"""
+    return {"identity": {"source": binding.identity.source, "server": binding.identity.server,
+                         "name": binding.identity.name}, "schema_hash": binding.schema_hash}
+
+
+def binding_from_dict(value: dict) -> ToolBinding:
+    """恢复服务器保存的绑定。参数：原绑定字典；返回：ToolBinding；异常：ValueError/KeyError，快照损坏。"""
+    identity = ToolIdentity(**value["identity"])
+    digest = value["schema_hash"]
+    if not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest):
+        raise ValueError("工具schema摘要不合法")
+    return ToolBinding(identity, digest)

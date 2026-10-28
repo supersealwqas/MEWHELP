@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from copy import deepcopy
 from contextlib import aclosing
 from typing import TYPE_CHECKING
 
@@ -10,20 +11,20 @@ from langgraph.graph import END, START, StateGraph
 
 from app.core.memory import ContextBudgetExceeded, valid_tool_calls
 from app.core.model_budget import BudgetLedger, WorkflowBudgetExceeded
-from app.repositories.chat import PersistenceUncertain
 from app.schemas.chat import InvalidToolDecision
 from app.schemas.tools import ToolContext, ToolResult
-from app.tools.registry import build_agent_registry, build_registry
+from app.tools.contracts import KnowledgeCallContext, ToolExecutionScope, binding_dict, binding_from_dict
+from app.tools.knowledge import merge_knowledge_budget, retrieve_verified_knowledge
 from app.workflow.citations import CitationStreamFilter
 from app.workflow.model import decision_tool_schemas
 from app.workflow.prompts import ANSWER_PROMPT, DECISION_PROMPT
 from app.workflow.state import ConversationState, message_row
 from app.workflow.stages import publish_stage
 from app.workflow.policy_context import verified_order_text
-from app.workflow.routing import assess_evidence, citations_from_ranked, _active_order_tokens, knowledge_input_stop_reason, _trusted_history
+from app.workflow.routing import _active_order_tokens, knowledge_input_stop_reason, _trusted_history
 from app.workflow.resilience import DEPENDENCY_ERRORS, degradation
 from app.workflow.model import WorkflowOutputError
-from app.workflow.context import assemble_context, select_evidence
+from app.workflow.context import assemble_context
 
 if TYPE_CHECKING:
     from app.workflow.graph import WorkflowDependencies
@@ -49,9 +50,9 @@ def stopped_state(reason: str, ledger: BudgetLedger | None = None) -> Conversati
     return update
 
 
-def model_messages(state: ConversationState, settings, prompt: str, tools: list | None = None) -> list[dict]:
-    """复用共享历史组装模型副本。参数：state、settings、固定prompt及tools；返回：ModelContext；异常：预算或身份错误。"""
-    return assemble_context(state, settings, prompt, tools)
+def model_messages(state: ConversationState, settings, prompt: str, tools: list | None = None, *, registry=None) -> list[dict]:
+    """复用共享历史组装模型副本。参数：state、settings、固定prompt、tools和共享registry；返回：ModelContext；异常：预算或身份错误。"""
+    return assemble_context(state, settings, prompt, tools, registry=registry)
 
 
 def _signature(call: dict) -> str:
@@ -60,20 +61,23 @@ def _signature(call: dict) -> str:
     return json.dumps([call["name"], args], sort_keys=True, ensure_ascii=False, allow_nan=False)
 
 
-def build_agent_graph(deps: "WorkflowDependencies"):
-    """编译共享State的无独立saver子图。参数：deps实例依赖；返回：CompiledStateGraph；异常：编译错误。"""
-    registry = build_agent_registry()
-    citation_tool_names = {tool.name for tool in build_registry().all()} | {"submit_intent", "submit_decision"}
-
+def build_agent_decision(deps: "WorkflowDependencies"):
+    """建立根图和子图共用的决定节点。参数：deps唯一实例依赖；返回：异步节点；异常：无。"""
     async def decision(state: ConversationState) -> ConversationState:
         """执行有界内部决定，不发布内部JSON。参数：state当前事实；返回：申请或终止更新；异常：模型/审计错误。"""
         ledger = BudgetLedger.from_snapshot(state["budget"])
         if state["decision_count"] >= deps.settings.workflow_max_decisions:
             return stopped_state("decision_limit", ledger)
         try:
-            tools = registry.all()
+            if deps.permissions is not None:
+                deps.permissions.reload()
+            if deps.mcp is not None:
+                await deps.mcp.refresh()
+            tools = [tool for tool in deps.registry.snapshot()
+                     if deps.permissions is None and tool.identity.source == "builtin"
+                     or deps.permissions is not None and deps.permissions.allowed(tool.identity)]
             # 结束决策也使用工具协议；历史裁剪须计入与模型实际绑定一致的完整定义。
-            messages = model_messages(state, deps.settings, DECISION_PROMPT, decision_tool_schemas(tools))
+            messages = model_messages(state, deps.settings, DECISION_PROMPT, decision_tool_schemas(tools), registry=deps.registry)
             # 先检查最少的调用/输出余量；适配器还按完整输入执行精确保守占额检查。
             ledger.ensure_capacity([("decide", 0, ledger.output_limit("decide")),
                 ("answer", 0, ledger.output_limit("answer")), ("answer", 0, ledger.output_limit("answer"))])
@@ -90,22 +94,31 @@ def build_agent_graph(deps: "WorkflowDependencies"):
         except DEPENDENCY_ERRORS as error:
             return {**stopped_state("model_unavailable", ledger), **degradation(state, "decide", error),
                     "decision_count": state["decision_count"] + 1}
+        by_name = {tool.name: tool for tool in tools}
         return {"budget": ledger.snapshot(), "decision_count": state["decision_count"] + 1,
-                "pending_calls": calls, "suggested_kinds": selected.suggested_actions,
+                "pending_calls": calls, "pending_bindings": {call["id"]: binding_dict(by_name[call["name"]].binding) for call in calls},
+                "suggested_kinds": selected.suggested_actions,
                 "stop_reason": selected.kind if selected.kind != "tools" else None}
+    return decision
+
+
+def build_agent_graph(deps: "WorkflowDependencies", *, decision=None):
+    """编译共享State的无独立saver子图。参数：deps实例依赖、decision共用节点；返回：子图；异常：编译错误。"""
+    decision = decision or build_agent_decision(deps)
 
     async def tools_node(state: ConversationState) -> ConversationState:
         """逐个执行已批准申请并写完整配对。参数：state待执行批次；返回：完整替换更新；异常：持久化错误/取消。"""
-        # 延迟读取既有拒绝表，避免服务层接图时发生模块导入循环。
-        from app.services.chat import fixed_reply as rejection_reply
-
         context = ToolContext.model_validate(state["context"])
         calls, messages = state["pending_calls"], []
+        bindings = state.get("pending_bindings", {})
+        ledger = BudgetLedger.from_snapshot(state["budget"])
+        knowledge_state = deepcopy(state)
+        knowledge_state.setdefault("knowledge_cache", {})
         seen_ids, seen_signatures = list(state["seen_call_ids"]), list(state["seen_call_signatures"])
-        count, reason, answer = state["tool_count"], None, ""
+        count, reason, batch_failed = state["tool_count"], None, False
         writer = get_stream_writer()
-        await deps.chat.save_tool_calls(context, calls)
-        messages.append(message_row(context.turn_id, "assistant", "", calls=calls))
+        await deps.chat.save_tool_calls(context, calls, deduplicate=True, bindings=bindings)
+        messages.append(message_row(context.turn_id, "assistant", "", calls=calls, bindings=bindings))
 
         async def on_status(frame: dict) -> None:
             """发布执行器安全状态。参数：frame状态字典；返回：None；异常：流写入错误。"""
@@ -115,37 +128,41 @@ def build_agent_graph(deps: "WorkflowDependencies"):
             call_context = context.model_copy(update={"tool_call_id": call["id"]})
             signature = _signature(call)
             seen_ids.append(call["id"])
-            if reason is None and count >= min(4, deps.settings.tool_max_calls_per_turn):
+            if reason is None and count >= deps.settings.tool_max_calls_per_turn:
                 reason = "tool_call_limit"
             if reason is None and signature in seen_signatures:
                 reason = "duplicate_tool_call"
-            if reason is not None:
-                # 失败后剩余申请仍各自保存结果，避免历史出现悬空tool_calls。
-                result = await deps.chat.save_tool_result(call_context, ToolResult.failed("TOOL_SKIPPED", "本轮已停止，该申请未执行"))
-                await on_status({"tool_call_id": call["id"], "name": call["name"], "status": "failed", "label": "未执行", "is_mock": False})
-            else:
+            rejection = ToolResult.failed("TOOL_SKIPPED", "前序申请未完成或已达到处理边界，该申请未执行") if reason or batch_failed else None
+            if rejection is None:
                 seen_signatures.append(signature)
                 count += 1
+            binding = binding_from_dict(bindings[call["id"]]) if call["id"] in bindings else None
+            runtime = KnowledgeCallContext(knowledge_state, ledger, deps.search, deps.settings, deps.query_expander)
+            # 编排拒绝也进入执行器；中断、取消及提交未知由执行器原样透传，不能另造结果。
+            result = await deps.executor.execute(call, call_context, on_status,
+                scope=ToolExecutionScope(binding=binding, rejection=rejection, knowledge=runtime))
+            if (result.verified_knowledge is not None and binding is not None
+                    and binding.identity.source == "builtin" and call["name"] in {"query_faq", "query_refund_policy"}):
+                outcome = result.verified_knowledge
+                ledger = BudgetLedger.from_snapshot(merge_knowledge_budget(ledger.snapshot(), outcome.budget))
+                knowledge_state.update(outcome.model_dump(mode="json"), retrieval_attempted=True)
+            if result.ok and call["name"] == "query_order" and result.data and result.data.get("order_id"):
+                knowledge_state.update(order_id=result.data["order_id"], order_data=deepcopy(result.data))
+            if not result.ok and result.error is not None:
+                batch_failed = True
                 try:
-                    result = await deps.executor.execute(call, call_context, on_status)
-                except PersistenceUncertain:
-                    # 无法确认已提交事实时绝不能另存失败覆盖它；服务层负责对账。
-                    raise
-                except Exception:
-                    result = await deps.chat.save_tool_result(call_context, ToolResult.failed("TOOL_EXECUTION_FAILED", "工具执行未能完成"))
-                    # 补写结果成功后同步发布终态；仓储若返回已存在的成功事实则尊重它。
-                    await on_status({"tool_call_id": call["id"], "name": call["name"],
-                                     "status": "succeeded" if result.ok else "failed",
-                                     "label": "已完成" if result.ok else "未完成", "is_mock": result.is_mock})
-                if not result.ok:
-                    answer = rejection_reply(result) or ""
-                    reason = "order_not_owned" if answer else "tool_failed"
+                    write = binding is not None and deps.registry.get_definition(binding.identity).access == "write"
+                except KeyError:
+                    write = False
+                if result.error.code in {"USER_CANCELLED", "WRITE_RESULT_UNKNOWN"} or write and result.error.category == "fault":
+                    reason = "tool_failed"
             messages.append(message_row(context.turn_id, "tool", result.model_dump_json(), call_id=call["id"]))
-        update = {"messages": messages, "pending_calls": [], "seen_call_ids": seen_ids,
-                  "seen_call_signatures": seen_signatures, "tool_count": count}
+        update = {"messages": messages, "pending_calls": [], "pending_bindings": {}, "seen_call_ids": seen_ids,
+                  "seen_call_signatures": seen_signatures, "tool_count": count, "budget": ledger.snapshot(),
+                  **{key: knowledge_state[key] for key in ("knowledge_cache", "evidence", "gate", "evidence_scores",
+                     "expanded_queries", "retrieval_attempted", "order_id", "order_data")}}
         if reason:
-            update.update(stopped_state(reason) if reason != "order_not_owned" else
-                          {"answer": answer, "stop_reason": reason, "suggested_kinds": []})
+            update.update(stopped_state(reason))
         return update
 
     async def answer_node(state: ConversationState) -> ConversationState:
@@ -162,6 +179,7 @@ def build_agent_graph(deps: "WorkflowDependencies"):
             parts.append(prefix)
             writer({"event": "delta", "data": {"delta": prefix}})
         prefix_count = len(parts)
+        citation_tool_names = {tool.name for tool in deps.registry.snapshot()} | {"submit_intent", "submit_decision"}
         citations = CitationStreamFilter({item["n"] for item in state["evidence"]}, citation_tool_names)
 
         def finish_failure(reason: str, error: Exception) -> ConversationState:
@@ -183,7 +201,7 @@ def build_agent_graph(deps: "WorkflowDependencies"):
                            "\n".join(instructions[kind] for kind in state["suggested_kinds"])) if state["suggested_kinds"] else "本轮回复后没有可操作的按钮，请按已有事实回答或追问。"
             # 正文模型只需要中文按钮语义；不传内部字段、枚举、身份或动作ID。完整说明仍先过原预算。
             answer_state = {**state, "context_notes": [*state.get("context_notes", []), action_text]}
-            messages = model_messages(answer_state, deps.settings, ANSWER_PROMPT)
+            messages = model_messages(answer_state, deps.settings, ANSWER_PROMPT, registry=deps.registry)
             async with aclosing(deps.model.stream_answer(messages, ledger)) as stream:
                 async for delta in stream:
                     visible = citations.feed(delta)
@@ -217,22 +235,20 @@ def build_agent_graph(deps: "WorkflowDependencies"):
         publish_stage(state, "policy", "running")
         try:
             async with asyncio.timeout(deps.settings.knowledge_timeout_seconds):
-                ranked = await deps.search.retrieve(state["resolved_query"], budget=ledger,
-                                                   prepared_queries=[state["standard_query"]], history="")
+                knowledge_state = deepcopy(state)
+                outcome = await retrieve_verified_knowledge(knowledge_state, ledger, search=deps.search,
+                    settings=deps.settings, query_expander=deps.query_expander, query=state["resolved_query"],
+                    prepared_queries=[state["standard_query"]])
         except (WorkflowBudgetExceeded, ContextBudgetExceeded):
             return {**update, **stopped_state("budget_exceeded", ledger)}
         except DEPENDENCY_ERRORS as error:
             publish_stage(state, "policy", "completed")
             return {**update, **stopped_state("retrieval_unavailable", ledger),
                     **degradation(state, "recover_knowledge", error)}
-        gate = assess_evidence([item.score for item in ranked], deps.settings.rerank_min_score)
         publish_stage(state, "policy", "completed")
-        update.update(budget=ledger.snapshot(), gate=gate.model_dump(mode="json"),
-                      evidence_scores=[item.score for item in ranked], expanded_queries=[state["standard_query"]])
-        if gate.passed:
-            evidence = select_evidence([item.model_dump(mode="json") for item in citations_from_ranked(ranked)], deps.settings)
-            update.update(evidence=evidence, stop_reason="answer",
-                context_notes=[])
+        update.update(outcome.model_dump(mode="json"), knowledge_cache=knowledge_state.get("knowledge_cache", {}))
+        if outcome.gate["passed"]:
+            update.update(stop_reason="answer", context_notes=[])
         # 低分不把原业务问题封死，也不冒充一次有效回答；保留已有澄清流程。
         return update
 
@@ -240,7 +256,11 @@ def build_agent_graph(deps: "WorkflowDependencies"):
         """参数：state决定结果；返回：tools或answer；异常：无。"""
         if state["pending_calls"]:
             return "tools"
-        if (state.get("route") == "business" and state.get("stop_reason") in {"clarify", "answer"}
+        if (state.get("stop_reason") == "answer" and state.get("route") in {"knowledge", "order_policy"}
+                and not state.get("route_ready")):
+            # 回到根图继续原政策检索/选单；普通工具事实不能把政策证据闸短路。
+            return "route"
+        if (state.get("route") == "business" and state.get("stop_reason") == "answer"
                 and not state.get("retrieval_attempted") and not state["tool_count"]
                 and not state.get("order_id") and not _active_order_tokens(state["raw_query"])
                 and not _trusted_history(state["history_turns"])[1]
@@ -261,9 +281,11 @@ def build_agent_graph(deps: "WorkflowDependencies"):
     graph.add_node("tools", tools_node)
     graph.add_node("answer", answer_node)
     graph.add_node("recover_knowledge", recover_knowledge)
-    graph.add_conditional_edges(START, lambda state: "answer" if state.get("route") == "order_policy" else "decision")
+    graph.add_conditional_edges(START, lambda state: after_decision(state) if state.get("pending_calls") or state.get("stop_reason")
+                                else "answer" if state.get("route_ready") else "decision",
+                                {"tools": "tools", "answer": "answer", "recover_knowledge": "recover_knowledge", "route": END, "decision": "decision"})
     graph.add_conditional_edges("decision", after_decision,
-                               {"tools": "tools", "answer": "answer", "recover_knowledge": "recover_knowledge"})
+                               {"tools": "tools", "answer": "answer", "recover_knowledge": "recover_knowledge", "route": END})
     graph.add_edge("recover_knowledge", "answer")
     graph.add_conditional_edges("tools", after_tools, {"decision": "decision", "answer": "answer"})
     graph.add_edge("answer", END)

@@ -65,7 +65,7 @@ async def test_trailing_data_does_not_become_query_and_assistant_guess_stays_unt
     assert result.resolved_query == raw and result.order_id is None
 
 
-@pytest.mark.parametrize("window,output_limit", [(131072, 4096), (18000, 2000)])
+@pytest.mark.parametrize("window,output_limit", [(131072, 4096), (22000, 2000)])
 async def test_sdk_context_log_matches_each_actual_request(sdk_runtime, context_logs, window, output_limit):
     """不能把适配器处理前的消息冒充实际日志；同阶段前缀跨轮稳定。参数：SDK及日志；返回：None；异常：断言失败。"""
     deps = dependencies(model_context_window=window, max_output_tokens=output_limit, max_agent_steps=3)
@@ -96,7 +96,7 @@ async def test_fixed_reply_still_logs_one_shared_history_snapshot(context_logs):
     state = await build_workflow(deps, checkpointer=None).ainvoke(turn("你好"))
     logs = [record.message for record in context_logs.records if "history_ctx " in record.message]
     assert len(logs) == 1 and state["history_context"] is not None
-    assert [entry["stage"] for entry in deps.model.inputs] == ["understand", "classify"]
+    assert [entry["stage"] for entry in deps.model.inputs] == ["understand", "classify", "decide"]
 
 
 async def test_large_current_tool_is_explicitly_omitted_only_in_model_view():
@@ -109,7 +109,7 @@ async def test_large_current_tool_is_explicitly_omitted_only_in_model_view():
     assert any(original in row.content for row in state["messages"] if row.type == "tool")
     answer_input = next(entry["messages"] for entry in deps.model.inputs if entry["stage"] == "answer")
     tool = next(row for row in answer_input if row["role"] == "tool")
-    assert "已省略" in tool["content"] and "1001" in tool["content"]
+    assert json.loads(tool["content"])["truncated"] and json.loads(tool["content"])["data"]["order_id"] == "1001"
     assert TokenEstimator().message_tokens(convert_to_messages([tool])) <= deps.settings.tool_result_max_tokens
 
 
@@ -120,6 +120,17 @@ async def test_old_message_caps_do_not_override_configured_model_window():
     state = await build_workflow(deps, checkpointer=None).ainvoke(turn("订单查询"))
     assert state["answer"] == "新窗口预算正常。"
     assert state["budget"]["request_token_budget"] > 16000
+
+
+async def test_full_dynamic_schema_cannot_be_omitted_to_fit_small_window(sdk_runtime):
+    """完整工具清单已超旧演示预留时，漏计schema继续发包会失败。
+
+    参数：sdk_runtime 外部HTTP替身；返回：None；异常：图或断言失败。
+    """
+    deps = dependencies(model_context_window=18000, max_output_tokens=2000, max_agent_steps=3)
+    deps.model = WorkflowModelAdapter(model_factory=sdk_runtime.factory)
+    state = await build_workflow(deps, checkpointer=None).ainvoke(turn("查询订单1001"))
+    assert state["stop_reason"] == "budget_exceeded" and sdk_runtime.requests == []
 
 
 @pytest.mark.parametrize("claimed,expected", [("1001", "1001"), ("1007", None)])

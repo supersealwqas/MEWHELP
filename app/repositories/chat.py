@@ -245,13 +245,16 @@ class ChatRepository:
             await session.execute(update(Message).where(Message.conversation_id == conversation.id,
                 Message.turn_id == source.turn_id, Message.turn_status == "awaiting_input").values(turn_status="cancelled"))
 
-    async def save_tool_calls(self, context: ToolContext, calls: list[dict], *, deduplicate: bool = False) -> None:
+    async def save_tool_calls(self, context: ToolContext, calls: list[dict], *, deduplicate: bool = False,
+                              bindings: dict | None = None) -> None:
         """执行前保存完整申请，确定性节点可按键防重。
 
-        参数：context可信上下文；calls完整申请；deduplicate是否在来源行锁内按ID校验。
+        参数：context可信上下文；calls完整申请；deduplicate是否按ID校验；bindings决定时可信来源快照。
         返回：None；相同完整申请不新增。
         异常：PersistenceUncertain，缺来源或相同ID内容冲突；数据库写入错误。
         """
+        calls = [{**call, **({"binding": bindings[call["id"]]} if bindings and call.get("id") in bindings else {})}
+                 for call in calls]
         async with self.factory.begin() as session:
             if deduplicate:
                 source = await session.scalar(select(Message).where(Message.conversation_id == context.conversation_id,

@@ -37,6 +37,9 @@ from app.services.summaries import SummaryManager
 from app.workflow.summarization import SummaryGenerator
 from app.tools.registry import build_agent_registry
 from app.tools.executor import ToolExecutor
+from app.tools.permissions import ToolPermissions
+from app.tools.mcp import MCPToolManager
+from app.repositories.tool_audit import ToolAuditRepository
 from app.workflow.graph import WorkflowDependencies
 from app.workflow.model import WorkflowModelAdapter
 from app.workflow.runtime import workflow_runtime
@@ -129,6 +132,7 @@ async def database_runtime():
         raise ValueError("CH05工作流要求knowledge_retrieval_mode=hybrid；dense仅适用于旧章独立入口")
     engine, factory = create_database()
     lease_engine = None
+    mcp = None
     try:
         repository = ChatRepository(factory)
         lease_engine = create_async_engine(
@@ -139,12 +143,20 @@ async def database_runtime():
         store = KnowledgeStore(factory, lease_engine)
         async with online_search_runtime(settings, store) as search:
             support = SupportRepository(factory, search)
-            executor = ToolExecutor(build_agent_registry(), repository, support, settings.tool_timeout_seconds,
+            registry = build_agent_registry()
+            permissions = ToolPermissions(settings.mcp_permissions_path)
+            permissions.reload()
+            mcp = MCPToolManager(registry, permissions, {
+                "logistics": {"transport": "streamable_http", "url": settings.mcp_logistics_url},
+                "after_sales": {"transport": "streamable_http", "url": settings.mcp_after_sales_url}},
+                timeout_seconds=settings.mcp_discovery_timeout_seconds)
+            executor = ToolExecutor(registry, repository, support, settings.tool_timeout_seconds,
                 settings.tool_max_retries, settings.tool_retry_delay_seconds,
-                knowledge_timeout_seconds=settings.knowledge_timeout_seconds)
+                knowledge_timeout_seconds=settings.knowledge_timeout_seconds, permissions=permissions,
+                audit_repository=ToolAuditRepository(factory), audit_timeout_seconds=settings.tool_audit_timeout_seconds)
             from app.knowledge.query_rewrite import QueryExpander
             deps = WorkflowDependencies(WorkflowModelAdapter(), search, executor, repository, settings,
-                QueryExpander(request_budget=settings.request_token_budget))
+                QueryExpander(request_budget=settings.request_token_budget), registry=registry, permissions=permissions, mcp=mcp)
             async with workflow_runtime(deps, Path(settings.workflow_checkpoint_path)) as graph:
                 summaries = SummaryManager(ContextRepository(factory), SummaryGenerator(settings), settings)
                 try:
@@ -159,6 +171,8 @@ async def database_runtime():
     finally:
         with anyio.CancelScope(shield=True):
             try:
+                if mcp is not None:
+                    await mcp.aclose()
                 if lease_engine is not None:
                     await lease_engine.dispose()
             finally:

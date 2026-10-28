@@ -8,17 +8,19 @@ from app.workflow.graph import build_workflow
 from tests.workflow.graph_fakes import dependencies, turn, call
 from tests.workflow.test_model import sdk_runtime, text_response, call_response, intent_response, understanding_response
 
-async def test_order_then_logistics_uses_complete_pairs_and_read_only_registry():
-    """跳过订单事实、乱序执行或暴露写工具时失败。参数：无；返回：None；异常：断言失败。"""
+async def test_order_then_logistics_uses_complete_pairs_and_shared_registry():
+    """跳过订单事实、乱序执行或另建私有清单时失败。参数：无；返回：None；异常：断言失败。"""
     deps = dependencies(decisions=[AgentDecision(kind="tools", tool_calls=[call("a", order_id="1001")]),
         AgentDecision(kind="tools", tool_calls=[call("b", "query_logistics", tracking_no="SF1")]),
         AgentDecision(kind="answer")], results=[ToolResult.success({"tracking_no": "SF1"}), ToolResult.success({"status": "运输中"})], answers=[["运输中"]])
     state = await build_workflow(deps, checkpointer=None).ainvoke(turn())
     from app.tools.registry import build_agent_registry, build_ticket_registry
     assert [c["name"] for c in deps.executor.calls] == ["query_order", "query_logistics"]
-    assert [t.name for t in build_agent_registry().all()] == ["query_order", "query_logistics", "query_product"]
+    assert {t.name for t in build_agent_registry().snapshot()} == {
+        "query_order", "query_product", "query_faq", "query_refund_policy", "create_ticket"}
     assert [t.name for t in build_ticket_registry().all()] == ["create_ticket"]
-    assert all({t.name for t in item["tools"]} == {"query_order", "query_logistics", "query_product"} for item in deps.model.inputs if item["stage"] == "decide")
+    assert all({t.name for t in item["tools"]} == {t.name for t in deps.registry.snapshot()}
+               for item in deps.model.inputs if item["stage"] == "decide")
     for item in deps.model.inputs[3:]:
         assert "SF1" in json.dumps(item["messages"], ensure_ascii=False)
     assert [m.tool_call_id for m in state["messages"] if m.type == "tool"] == ["a", "b"]
@@ -47,20 +49,22 @@ async def test_first_delta_arrives_before_answer_generator_finishes():
     assert first_delta_received.is_set() and answer_completed.is_set()
     assert "".join(e["data"]["delta"] for e in events if e["event"] == "delta") == "第一段第二段"
 
-async def test_order_rejection_skips_remaining_logistics_and_never_calls_model_again():
-    """订单归属拒绝后继续查物流或改写固定拒绝时失败。参数：无；返回：None；异常：断言失败。"""
-    deps = dependencies(decisions=[AgentDecision(kind="tools", tool_calls=[call("a"), call("b", "query_logistics", tracking_no="SF2")])],
-        results=[ToolResult.failed("order_not_owned", "不可查")])
+async def test_order_rejection_pairs_remaining_and_model_explains_without_more_queries():
+    """订单归属拒绝后继续查物流或遗漏拒绝回灌时失败。参数：无；返回：None；异常：断言失败。"""
+    deps = dependencies(decisions=[AgentDecision(kind="tools", tool_calls=[call("a"), call("b", "query_logistics", tracking_no="SF2")]),
+        AgentDecision(kind="clarify")], results=[ToolResult.failed("order_not_owned", "不可查")], answers=[["请核对本人订单号。"]])
     state = await build_workflow(deps, checkpointer=None).ainvoke(turn())
     assert len(deps.executor.calls) == 1
-    assert state["answer"] == "没有找到您的这笔订单，请确认订单号或物流单号后重试。"
+    assert state["answer"] == "请核对本人订单号。"
     assert [r[0] for r in deps.chat.results] == ["a", "b"]
-    assert state["pending_calls"] == [] and len(deps.model.inputs) == 3
+    assert state["pending_calls"] == [] and len(deps.model.inputs) == 5
+    assert "order_not_owned" in json.dumps(deps.model.inputs[-2]["messages"])
 
 @pytest.mark.parametrize("result", [ToolResult.failed("TOOL_TIMEOUT", "超时"), ConnectionError("故障")])
 async def test_tool_failure_pairs_unexecuted_remainder(result):
     """工具故障后状态仍查询中、剩余申请悬空或继续调用时失败。参数：result受控错误；返回：None；异常：断言失败。"""
-    deps = dependencies(decisions=[AgentDecision(kind="tools", tool_calls=[call("a"), call("b")])], results=[result])
+    deps = dependencies(decisions=[AgentDecision(kind="tools", tool_calls=[call("a"), call("b")]), AgentDecision(kind="answer")],
+        results=[result], answers=[["查询暂未完成，请稍后重试。"]])
     frames, state = [], None
     async for namespace, mode, payload in build_workflow(deps, checkpointer=None).astream(
             turn(), stream_mode=["custom", "values"], subgraphs=True):
@@ -71,7 +75,8 @@ async def test_tool_failure_pairs_unexecuted_remainder(result):
     assert len(deps.executor.calls) == 1
     assert [r[0] for r in deps.chat.results] == ["a", "b"]
     assert all(not result.ok for _, result in deps.chat.results)
-    assert state["stop_reason"] == "tool_failed" and state["pending_calls"] == []
+    assert state["stop_reason"] == "answer" and state["pending_calls"] == []
+    assert len([item for item in deps.model.inputs if item["stage"] == "decide"]) == 2
     assert [(frame["tool_call_id"], frame["status"]) for frame in frames] == [
         ("a", "running"), ("a", "failed"), ("b", "failed")]
     assert frames[1]["label"] == "未完成" and frames[2]["label"] == "未执行"
@@ -101,9 +106,9 @@ async def test_decision_limit_stops_before_next_model_request():
     assert state["decision_count"] == 1 and len(deps.model.inputs) == 3
     assert state["stop_reason"] == "decision_limit"
 
-async def test_unknown_or_write_tool_is_not_executed():
-    """绕过适配器的写申请进入执行器时失败。参数：无；返回：None；异常：断言失败。"""
-    deps = dependencies(decisions=[AgentDecision(kind="tools", tool_calls=[call("a", "create_ticket", description="投诉", ticket_type="投诉")])])
+async def test_unregistered_tool_is_not_executed():
+    """未注册申请绕过快照检查进入执行器时失败。参数：无；返回：None；异常：断言失败。"""
+    deps = dependencies(decisions=[AgentDecision(kind="tools", tool_calls=[call("a", "not_registered", description="投诉")])])
     state = await build_workflow(deps, checkpointer=None).ainvoke(turn())
     assert deps.executor.calls == [] and state["stop_reason"] == "invalid_decision"
 
@@ -115,7 +120,7 @@ async def test_large_tool_fact_keeps_original_and_answers_from_bounded_view():
     state = await build_workflow(deps, checkpointer=None).ainvoke(turn())
     assert state["stop_reason"] == "answer" and len(deps.model.inputs) == 5
     assert any(fact in message.content for message in state["messages"] if message.type == "tool")
-    assert any("已省略" in row["content"] for row in deps.model.inputs[-1]["messages"] if row["role"] == "tool")
+    assert any(json.loads(row["content"]).get("truncated") for row in deps.model.inputs[-1]["messages"] if row["role"] == "tool")
 
 async def test_fifth_decision_can_answer_after_four_tools():
     """把四工具上限错当四次决策，提前阻止最终回答时失败。参数：无；返回：None；异常：断言失败。"""
@@ -220,8 +225,9 @@ async def test_followup_recovers_decision_format_without_losing_order_or_policy(
         assert any(m["role"] == "user" and m["content"] == query for m in messages)
         assert any(m["role"] == "tool" and json.loads(m["content"])["data"]["order_id"] == order_id
                    and json.loads(m["content"])["data"]["total_amount"] == amount for m in messages)
-        assert policy in json.dumps(messages, ensure_ascii=False)
         assert invalid_raw not in json.dumps(messages, ensure_ascii=False)
+    # CH08前置决定尚未执行本轮检索；最终正文仍必须取得原知识证据。
+    assert policy in json.dumps(sdk_runtime.requests[-1]["messages"], ensure_ascii=False)
     assert "".join(e["data"]["delta"] for e in events if e["event"] == "delta") == answer
     assert deps.chat.finished[0]["workflow_metadata"]["stop_reason"] == "answer"
     assert [r["stage"] for r in completed["budget"]["records"]] == [

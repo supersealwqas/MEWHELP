@@ -44,10 +44,17 @@ class StrictChat:
         turns = [turn.model_copy(deep=True) for turn in self.history.values() if turn.turn_id != exclude_turn_id
                  and (turn.turn_id == refresh_turn_id or any(row.id > after_message_id for row in turn.messages))]
         return HistoryDelta(turns=turns, last_message_id=max(after_message_id, self.next_id - 1))
-    async def save_tool_calls(self, context, calls, *, deduplicate=False):
+    async def save_tool_calls(self, context, calls, *, deduplicate=False, bindings=None):
         """参数：可信上下文与申请；返回：None；异常：断言失败。"""
         assert isinstance(context, ToolContext)
-        self.calls.extend(deepcopy([call for call in calls if not deduplicate or call not in self.calls]))
+        calls = [{**call, **({"binding": bindings[call["id"]]} if bindings and call["id"] in bindings else {})} for call in calls]
+        if deduplicate:
+            by_id = {call["id"]: call for call in self.calls if "id" in call}
+            assert all(call["id"] not in by_id or by_id[call["id"]] == call for call in calls)
+            calls = [call for call in calls if call["id"] not in by_id]
+            if not calls:
+                return
+        self.calls.extend(deepcopy(calls))
         self.order.append("calls")
         self._record(context, "assistant", "", tool_calls=deepcopy(calls))
     async def save_tool_result(self, context, result):
@@ -83,17 +90,24 @@ class StrictExecutor:
     def __init__(self, chat, results=()):
         """参数：chat仓储、results结果脚本；返回：None；异常：无。"""
         self.chat, self.script, self.calls = chat, list(results), []
-    async def execute(self, call, context, on_status):
+    async def execute(self, call, context, on_status, *, scope=None):
         """参数：工具、身份、状态回调；返回：ToolResult；异常：脚本错误或断言失败。"""
         assert call["id"] == context.tool_call_id
         if isinstance(self.chat, StrictChat):
             assert any(item.get("id") == call["id"] for item in self.chat.calls)
+        if scope is not None and scope.rejection is not None:
+            result = await self.chat.save_tool_result(context, scope.rejection)
+            await on_status({"tool_call_id": call["id"], "name": call["name"], "status": "failed", "label": "未执行", "is_mock": False})
+            return result
         self.calls.append(deepcopy(call))
         await on_status({"tool_call_id": call["id"], "name": call["name"], "status": "running", "label": "正在查询", "is_mock": False})
         assert self.script, "发生未预期的工具执行"
         result = self.script.pop(0)
         if isinstance(result, Exception):
-            raise result
+            from app.repositories.chat import PersistenceUncertain
+            if isinstance(result, PersistenceUncertain):
+                raise result
+            result = ToolResult.failed("TOOL_EXECUTION_FAILED", "工具执行未能完成")
         result = await self.chat.save_tool_result(context, result)
         await on_status({"tool_call_id": call["id"], "name": call["name"],
                          "status": "succeeded" if result.ok else "failed",
@@ -105,7 +119,7 @@ class StrictSearch:
     def __init__(self, ranked=(), error=None):
         """参数：ranked权威结果、error可选故障；返回：None；异常：无。"""
         self.ranked, self.error, self.calls = list(ranked), error, []
-    async def retrieve(self, query, *, budget, prepared_queries=None, history=""):
+    async def retrieve(self, query, *, budget, prepared_queries=None, history="", filters=None, source_query=None):
         """参数：query原问、budget独占账本；返回：排名；异常：脚本故障。"""
         return self._take("retrieve", query, budget)
     async def retrieve_policy(self, query, *, budget, prepared_queries=None, history="", filters=None):
@@ -139,9 +153,15 @@ def dependencies(*, intents=("订单",), decisions=(), answers=(), ranked=(), re
     chat = StrictChat()
     # 沿用全局夹具的离线快照，避免SDK导入.env污染预算；用例显式覆盖仍参与校验。
     options = {**config.settings.model_dump(), **settings}
+    from app.tools.registry import build_registry
+    if not decisions and intents and all(isinstance(intent, str) and intent in {
+            "商品咨询", "退款退货", "售后", "投诉", "闲聊"} for intent in intents):
+        # CH08原固定出口也先真实决定一次，旧场景明确选择继续其原出口。
+        from app.schemas.workflow import AgentDecision
+        decisions = [AgentDecision(kind="answer") for _ in intents]
     return WorkflowDependencies(ScriptedWorkflowModel(intents=intents, decisions=decisions, answers=answers, understandings=understandings),
         StrictSearch(ranked), StrictExecutor(chat, results), chat,
-        Settings(_env_file=None, **options), query_expander=StrictExpander())
+        Settings(_env_file=None, **options), query_expander=StrictExpander(), registry=build_registry())
 
 def turn(query="查订单1001", *, session="session", turn_id=None):
     """参数：query原问、session会话、turn_id可选轮ID；返回：新轮State；异常：原问错误。"""

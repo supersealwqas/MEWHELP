@@ -43,6 +43,9 @@ class ConversationState(TypedDict, total=False):
     retrieval_attempted: bool  # 本轮是否已经尝试知识检索，防止分类补救重复检索。
     degradations: list[dict]  # 本轮外部故障的阶段和类型，不含错误原文。
     pending_calls: list[dict]  # 本轮下一批待执行的只读工具申请。
+    pending_bindings: dict[str, dict]  # 决定时按调用ID冻结的工具来源与schema。
+    knowledge_cache: dict[str, dict]  # 本轮精确查询/筛选对应的本地可信结果，下一轮清空。
+    route_ready: bool  # 当前知识/订单政策固定流程是否已经完成证据门槛。
     seen_call_ids: list[str]  # 已见工具调用ID，用于跨决策查重。
     seen_call_signatures: list[str]  # 已见工具名称和参数签名，用于拒绝重复申请。
     tool_count: int  # 本轮逻辑工具调用次数。
@@ -57,10 +60,10 @@ class ConversationState(TypedDict, total=False):
 
 
 def message_row(turn_id: str, role: str, content: str, *, calls: list[dict] | None = None,
-                call_id: str | None = None, db_id: int | None = None) -> dict:
+                call_id: str | None = None, db_id: int | None = None, bindings: dict | None = None) -> dict:
     """生成跨落库稳定的消息身份。
 
-    参数：turn_id轮次、role角色、content原文、calls申请、call_id结果键、db_id可选持久化主键。
+    参数：turn_id轮次、role角色、content原文、calls申请、call_id结果键、db_id主键、bindings可信绑定。
     返回：可供add_messages转换的字典；异常：无，坏申请保存在审计元数据中而非可执行协议。
     """
     from app.core.memory import valid_tool_calls
@@ -72,7 +75,10 @@ def message_row(turn_id: str, role: str, content: str, *, calls: list[dict] | No
         metadata["db_message_id"] = db_id
     row = {"id": f"turn:{turn_id}:{key}", "role": role, "content": content, "additional_kwargs": metadata}
     if valid:
-        row["tool_calls"] = deepcopy(calls)
+        row["tool_calls"] = [{key: deepcopy(call[key]) for key in ("id", "name", "args")} for call in calls]
+        saved_bindings = bindings or {call["id"]: call["binding"] for call in calls if call.get("binding")}
+        if saved_bindings:
+            metadata["tool_bindings"] = deepcopy(saved_bindings)
     elif calls:
         metadata["raw_tool_calls"] = deepcopy(calls)
     if role == "tool":
@@ -124,7 +130,8 @@ def new_turn_state(context: ToolContext, history_turns: list[dict], audit_cursor
         "history_context": None, "context_notes": [],
         "intent": None, "intent_confidence": None, "route": None, "evidence": [], "evidence_scores": [], "gate": None,
         "retrieval_attempted": False, "degradations": [],
-        "pending_calls": [], "seen_call_ids": [], "seen_call_signatures": [],
+        "pending_calls": [], "pending_bindings": {}, "knowledge_cache": {}, "route_ready": False,
+        "seen_call_ids": [], "seen_call_signatures": [],
         "tool_count": 0, "decision_count": 0, "budget": BudgetLedger().snapshot(),
         "suggested_kinds": [], "suggested_actions": [], "refund_action": None, "answer": "", "stop_reason": None,
         "completion_metadata": {},

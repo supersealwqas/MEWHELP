@@ -183,7 +183,12 @@ def assemble_turns(turns: list[StoredTurn]) -> list[list[BaseMessage]]:
                 # 只丢弃缺失或重复结果的调用，已唯一配对的工单事实必须保留。
                 paired_calls = [call for call in calls if result_counts[call["id"]] == 1]
                 if paired_calls:
-                    group.append(AIMessage(content=row.content, tool_calls=paired_calls, **_message_identity(row, turn)))
+                    public_calls = [{key: call[key] for key in ("id", "name", "args")} for call in paired_calls]
+                    identity = _message_identity(row, turn)
+                    bindings = {call["id"]: call["binding"] for call in paired_calls if call.get("binding")}
+                    if bindings:
+                        identity["additional_kwargs"]["tool_bindings"] = bindings
+                    group.append(AIMessage(content=row.content, tool_calls=public_calls, **identity))
                     by_id = {m.tool_call_id: m for m in results}
                     group.extend(ToolMessage(content=by_id[c["id"]].content, tool_call_id=c["id"],
                                              **_message_identity(by_id[c["id"]], turn)) for c in paired_calls)
@@ -237,12 +242,23 @@ def _estimate_message_tokens(messages: list[BaseMessage]) -> int:
     return TokenEstimator().message_tokens(messages)
 
 
+def _without_tool_metadata(value):
+    """递归移除内部来源与知识声明。参数：原始JSON值；返回：独立公开副本；异常：无。"""
+    if isinstance(value, list):
+        return [_without_tool_metadata(item) for item in value]
+    if isinstance(value, dict):
+        hidden = {"verified_knowledge", "tool_bindings", "bindings", "is_mock", "mcp_server", "tool_source",
+                  "source_key", "source_revision"}
+        return {key: _without_tool_metadata(item) for key, item in value.items() if key not in hidden}
+    return value
+
+
 def _model_message(message: BaseMessage, *, policy: ResultPolicy | None = None,
                    max_tokens: int | None = None, estimator: TokenEstimator | None = None) -> BaseMessage:
     """为模型生成工具事实视图，隔离后台来源标记，不改写原消息。
 
     参数：message当前或历史消息；policy可选本地结果规则；max_tokens可选正文预算；estimator统一估算器。
-    返回：BaseMessage，结果副本保留调用配对；默认仅移除is_mock，显式规则或预算启用统一投影。
+    返回：BaseMessage，结果副本保留调用配对；默认移除内部来源及知识字段，显式规则或预算启用统一投影。
     异常：ContextBudgetExceeded，核心事实超预算；兼容历史非JSON或非统一结果正文。
     """
     if not isinstance(message, ToolMessage) or not isinstance(message.content, str):
@@ -253,6 +269,7 @@ def _model_message(message: BaseMessage, *, policy: ResultPolicy | None = None,
         return message
     if not isinstance(payload, dict):
         return message
+    payload = _without_tool_metadata(payload)
     if (policy is not None or max_tokens is not None) and type(payload.get("ok")) is bool:
         estimator = estimator or TokenEstimator()
         result = ToolResult.model_validate(payload)
@@ -260,10 +277,7 @@ def _model_message(message: BaseMessage, *, policy: ResultPolicy | None = None,
             max_tokens=max_tokens if max_tokens is not None else max(1, estimator.value_tokens(payload) * 4),
             estimator=estimator)
         return message.model_copy(update={"content": json.dumps(payload, ensure_ascii=False, separators=(",", ":"))})
-    if "is_mock" not in payload:
-        return message
-    # 只移除协议外层的运行元数据，业务字段、错误事实和数据库审计均保持原样。
-    payload.pop("is_mock")
+    # 仅改模型副本，完整数据库回执与内部证据继续保留。
     return message.model_copy(update={"content": json.dumps(payload, ensure_ascii=False, separators=(",", ":"))})
 
 

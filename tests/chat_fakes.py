@@ -58,8 +58,14 @@ class MemoryRepository:
     async def cancel_order_wait(self, session_id, user_id):
         """普通聊天替身不产生等待。参数：会话/用户；返回：None；异常：无。"""
 
-    async def save_tool_calls(self, context, calls, *, deduplicate=False):
+    async def save_tool_calls(self, context, calls, *, deduplicate=False, bindings=None):
         """保存申请。参数：上下文、申请；返回：None；异常：无。"""
+        calls = [{**call, **({"binding": bindings[call["id"]]} if bindings and call["id"] in bindings else {})} for call in calls]
+        if deduplicate:
+            existing = {call["id"] for row in self.turns[context.turn_id].messages for call in row.tool_calls or [] if "id" in call}
+            calls = [call for call in calls if call["id"] not in existing]
+            if not calls:
+                return
         self.turns[context.turn_id].messages.append(StoredMessage(role="assistant", content="", tool_calls=calls))
         self._message_added(context.turn_id)
 

@@ -1,9 +1,9 @@
 """客服根图：政策证据过闸后才注入，知识低分不阻断业务只读查询，正常出口统一完成审计。"""
 
 import asyncio
-import json
 import logging
 from dataclasses import dataclass
+from copy import deepcopy
 from uuid import NAMESPACE_URL, uuid5
 
 from langgraph.config import get_stream_writer
@@ -13,17 +13,22 @@ from langgraph.types import interrupt
 from app.config import Settings
 from app.core.memory import ContextBudgetExceeded
 from app.core.model_budget import BudgetLedger, WorkflowBudgetExceeded, budget_summary
-from app.knowledge.answering import EvidenceCitation, edge_order
+from app.knowledge.answering import EvidenceCitation
 from app.knowledge.retrieval import HybridKnowledgeSearch
 from app.knowledge.query_rewrite import QueryExpander
 from app.repositories.chat import ChatRepository
-from app.schemas.tools import ToolContext
+from app.schemas.tools import ToolContext, ToolResult
 from app.schemas.workflow import GateDecision, SuggestedAction, RefundAction
 from app.tools.executor import ToolExecutor
-from app.workflow.agent import build_agent_graph, model_messages, stopped_state
+from app.tools.registry import ToolRegistry, build_agent_registry
+from app.tools.permissions import ToolPermissions
+from app.tools.mcp import MCPToolManager
+from app.tools.contracts import ToolExecutionScope, binding_dict
+from app.tools.knowledge import ORDER_POLICY_SOURCES, retrieve_verified_knowledge
+from app.workflow.agent import build_agent_decision, build_agent_graph, model_messages, stopped_state
 from app.workflow.model import WorkflowModelAdapter, intent_tool_schema, understanding_tool_schema
 from app.workflow.prompts import INTENT_PROMPT, UNDERSTANDING_PROMPT
-from app.workflow.routing import assess_evidence, citations_from_ranked, fixed_reply, knowledge_input_stop_reason, route_by_intent, order_candidate
+from app.workflow.routing import assess_evidence, fixed_reply, knowledge_input_stop_reason, route_by_intent, order_candidate
 from app.tools.business import list_user_orders, owns_order
 from app.workflow.state import ConversationState, full_history_messages, message_row
 from app.workflow.stages import publish_stage
@@ -34,9 +39,6 @@ from app.workflow.context import history_snapshot, log_history, select_evidence
 from app.repositories.context import ContextRepository
 
 logger = logging.getLogger(__name__)
-# 订单适用性只采用正式退换货/售后政策及其引用的运费、会员规则；商品规格不进入此分支。
-ORDER_POLICY_SOURCES = ("doc:returns-policy.md", "doc:after-sales-manual.md",
-                        "doc:billing-shipping.md", "doc:member-benefits.md")
 
 
 def _pooled_low_confidence(state: ConversationState):
@@ -63,6 +65,14 @@ class WorkflowDependencies:
     chat: ChatRepository  # 业务聊天仓储；Task5扩展完成事务。
     settings: Settings  # 本实例配置。
     query_expander: QueryExpander  # 同一上游和账本控制的政策扩写器。
+    registry: ToolRegistry | None = None  # 应用级唯一可动态变更清单。
+    permissions: ToolPermissions | None = None  # 本地授权热加载器。
+    mcp: MCPToolManager | None = None  # 同清单的MCP发现生命周期。
+
+    def __post_init__(self):
+        """只在依赖建立时提供兼容清单，不在构图或决定时复制。参数：自身；返回：None；异常：无。"""
+        if self.registry is None:
+            self.registry = getattr(self.executor, "registry", None) or build_agent_registry()
 
 
 def build_workflow(deps: WorkflowDependencies, *, checkpointer):
@@ -77,7 +87,7 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
         publish_stage(state, "understand", "running")
         try:
             stored = await context_repository.load_context(state["context"]["conversation_id"], include_turns=False) if context_repository else None
-            snapshot = history_snapshot(state, deps.settings, stored)
+            snapshot = history_snapshot(state, deps.settings, stored, registry=deps.registry)
             log_history(state, snapshot)
             if snapshot["layer1_from_msg_id"] > snapshot["previous_layer1_from_msg_id"]:
                 advanced = await context_repository.advance_layer1(state["context"]["conversation_id"],
@@ -87,7 +97,7 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
                     snapshot["demoted_turns"], snapshot["layer1_before_tokens"], snapshot["layer1_tokens"], advanced)
             current = {**state, "history_context": snapshot}
             understood = await deps.model.understand(model_messages(current, deps.settings, UNDERSTANDING_PROMPT,
-                [understanding_tool_schema()]), ledger)
+                [understanding_tool_schema()], registry=deps.registry), ledger)
         except (WorkflowBudgetExceeded, ContextBudgetExceeded) as error:
             if snapshot is None:
                 log_history(state, {"summary": "", "layer1": [], "layer2": []}, error_type=type(error).__name__)
@@ -108,7 +118,7 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
         ledger = BudgetLedger.from_snapshot(state["budget"])
         publish_stage(state, "classify", "running")
         try:
-            result = await deps.model.classify(model_messages(state, deps.settings, INTENT_PROMPT, [intent_tool_schema()]), ledger)
+            result = await deps.model.classify(model_messages(state, deps.settings, INTENT_PROMPT, [intent_tool_schema()], registry=deps.registry), ledger)
         except (WorkflowBudgetExceeded, ContextBudgetExceeded):
             return stopped_state("budget_exceeded", ledger)
         except DEPENDENCY_ERRORS as error:
@@ -130,6 +140,10 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
         if any(knowledge_input_stop_reason(state[key]) for key in ("raw_query", "resolved_query", "standard_query")):
             return {"stop_reason": "input_limit"}
         context = ToolContext.model_validate(state["context"])
+        if (state.get("order_data") and state.get("order_id")
+                and state["order_data"].get("order_id") == state["order_id"]
+                and owns_order(context.user_id, state["order_id"])):
+            return {"stop_reason": None}
         orders = list_user_orders(context.user_id)
         if not orders:
             return {"answer": "暂未找到您的订单，请核对当前账号或联系人工客服。", "stop_reason": "no_owned_orders"}
@@ -147,20 +161,24 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
             raise ValueError("所选订单不属于当前用户")
         publish_stage(state, "order", "running")
         call = {"id": f"ch06:order:{context.turn_id}:{identifier}", "name": "query_order", "args": {"order_id": identifier}}
-        await deps.chat.save_tool_calls(context, [call], deduplicate=True)
+        definition = next(row for row in deps.registry.snapshot() if row.name == "query_order" and row.identity.source == "builtin")
+        bindings = {call["id"]: binding_dict(definition.binding)}
+        await deps.chat.save_tool_calls(context, [call], deduplicate=True, bindings=bindings)
 
         async def on_status(frame: dict) -> None:
             """发布工具安全状态。参数：frame执行状态；返回：None；异常：流错误。"""
             get_stream_writer()({"event": "tool_status", "data": frame})
 
-        result = await deps.executor.execute(call, context.model_copy(update={"tool_call_id": call["id"]}), on_status)
-        messages = [message_row(context.turn_id, "assistant", "", calls=[call]),
+        rejection = ToolResult.failed("TOOL_SKIPPED", "本轮查询次数已达到上限") if state["tool_count"] >= deps.settings.tool_max_calls_per_turn else None
+        result = await deps.executor.execute(call, context.model_copy(update={"tool_call_id": call["id"]}), on_status,
+            scope=ToolExecutionScope(binding=definition.binding, rejection=rejection))
+        messages = [message_row(context.turn_id, "assistant", "", calls=[call], bindings=bindings),
                     message_row(context.turn_id, "tool", result.model_dump_json(), call_id=call["id"])]
-        update = {"messages": messages, "order_id": identifier, "tool_count": state["tool_count"] + 1}
+        update = {"messages": messages, "order_id": identifier, "tool_count": state["tool_count"] + (0 if rejection else 1)}
         if not result.ok or result.data.get("order_id") != identifier:
             return {**update, **stopped_state("tool_failed")}
         publish_stage(state, "order", "completed", order_id=identifier)
-        return {**update, "order_data": result.data, "selection_action": action}
+        return {**update, "order_data": result.data, "selection_action": action, "stop_reason": None}
 
     async def retrieve_node(state: ConversationState) -> ConversationState:
         """按类别取得原文，依赖故障单独降级。参数：state已分类原问；返回：证据/分数/账本或安全回复；异常：取消及程序错误。"""
@@ -169,24 +187,26 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
         if reason:
             return {"stop_reason": reason}
         ledger = BudgetLedger.from_snapshot(state["budget"])
+
+        def knowledge_stage(stage, status, **details):
+            """保留实际扩写与检索的原进度顺序。参数：阶段、状态、已核实详情；返回：None；异常：流写入错误。"""
+            publish_stage(state, stage, status, **details)
+
         try:
             async with asyncio.timeout(deps.settings.knowledge_timeout_seconds):
                 if state["route"] == "order_policy":
                     query = policy_query(state)
                     if knowledge_input_stop_reason(query):
                         return {"stop_reason": "input_limit"}
-                    publish_stage(state, "expand", "running")
-                    expanded = await deps.query_expander.expand(query, simple_query=state["standard_query"],
-                                                                required_count=3, budget=ledger)
-                    publish_stage(state, "expand", "completed", queries=expanded.queries)
-                    prepared_queries = expanded.queries
-                    retrieve = deps.search.retrieve_policy
-                    options = {"filters": {"source_key": list(ORDER_POLICY_SOURCES)}}
+                    prepared_queries = None
+                    options = {"filters": {"source_key": list(ORDER_POLICY_SOURCES)}, "policy": True}
                 else:
-                    query, prepared_queries, retrieve = state["resolved_query"], [state["standard_query"]], deps.search.retrieve
+                    query, prepared_queries = state["resolved_query"], [state["standard_query"]]
                     options = {}
-                publish_stage(state, "policy", "running")
-                ranked = await retrieve(query, prepared_queries=prepared_queries, budget=ledger, history="", **options)
+                knowledge_state = deepcopy(state)
+                outcome = await retrieve_verified_knowledge(knowledge_state, ledger, search=deps.search,
+                    settings=deps.settings, query_expander=deps.query_expander, query=query,
+                    prepared_queries=prepared_queries, stage_callback=knowledge_stage, **options)
         except (WorkflowBudgetExceeded, ContextBudgetExceeded):
             return stopped_state("budget_exceeded", ledger)
         except DEPENDENCY_ERRORS as error:
@@ -197,18 +217,15 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
             publish_stage(state, "policy", "completed")
             return {**update, **degradation(state, "retrieve", error), "retrieval_attempted": True,
                     "evidence": [], "evidence_scores": [], "gate": None}
-        citations = citations_from_ranked(ranked)
-        publish_stage(state, "policy", "completed")
         # 检索结果先交给证据闸；尚未通过的内容不能进入模型消息。
-        return {"evidence": [item.model_dump(mode="json") for item in citations],
-                "evidence_scores": [item.score for item in ranked], "budget": ledger.snapshot(),
-                "expanded_queries": prepared_queries, "retrieval_attempted": True}
+        return {**outcome.model_dump(mode="json"), "knowledge_cache": knowledge_state.get("knowledge_cache", {}),
+                "retrieval_attempted": True, "stop_reason": None}
 
     def confidence_node(state: ConversationState) -> ConversationState:
         """控制政策证据是否可用，业务仍可查事实。参数：state完整分数；返回：闸、可用证据与消息；异常：分数非法。"""
         gate = assess_evidence(state["evidence_scores"], deps.settings.rerank_min_score)
         logger.info("workflow gate passed=%s max_score=%s", gate.passed, gate.max_score)
-        update = {"gate": gate.model_dump(mode="json"), "stop_reason": None}
+        update = {"gate": gate.model_dump(mode="json"), "stop_reason": "answer", "route_ready": True}
         if gate.passed:
             # 只发送可完整容纳的块，引用仍使用原编号，不能引用未发给模型的资料。
             update["evidence"] = select_evidence(state["evidence"], deps.settings)
@@ -235,7 +252,7 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
         else:
             reply_kind = "input_limit" if state["stop_reason"] == "input_limit" else kind
             update = fixed_reply(reply_kind)
-            update["stop_reason"] = state["stop_reason"] or kind
+            update["stop_reason"] = kind if state["stop_reason"] in {None, "answer", "clarify"} else state["stop_reason"]
         get_stream_writer()({"event": "delta", "data": {"delta": update["answer"]}})
         return update
 
@@ -295,7 +312,22 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
 
     def after_confidence(state: ConversationState) -> str:
         """参数：state证据闸的可用性结论；返回：可回答业务的Agent或固定拒答；异常：缺失状态。"""
-        return "fallback_reply" if state["stop_reason"] else "main_agent"
+        return "fallback_reply" if state["stop_reason"] not in {None, "answer"} else "main_agent"
+
+    def fixed_route(state: ConversationState) -> str:
+        """保留原分类固定出口。参数：已保存终止决定；返回：原路线节点；异常：非法route。"""
+        return {"knowledge": "retrieve_knowledge", "business": "main_agent", "order_policy": "fetch_order",
+                "complaint": "complaint_reply", "chitchat": "chitchat_reply"}[state["route"]]
+
+    def after_predecision(state: ConversationState) -> str:
+        """先执行申请，追问直接答复，回答再进入原分流。参数：保存决定；返回：节点名；异常：非法状态。"""
+        if state["pending_calls"] or state["stop_reason"] == "clarify":
+            return "main_agent"
+        return fixed_route(state) if state["stop_reason"] == "answer" else "fallback_reply"
+
+    def after_agent(state: ConversationState) -> str:
+        """工具事实仍需政策核验时回到原流程。参数：子图状态；返回：检索/选单/完成节点；异常：非法状态。"""
+        return fixed_route(state) if not state["answer"] and state["stop_reason"] == "answer" else "log_turn"
 
     graph = StateGraph(ConversationState)
     graph.add_node("resolve_reference", resolve_node)
@@ -304,21 +336,23 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
     graph.add_node("fetch_order", fetch_order)
     graph.add_node("retrieve_policy", retrieve_node)
     graph.add_node("confidence_check", confidence_node)
-    graph.add_node("main_agent", build_agent_graph(deps))
+    decision = build_agent_decision(deps)
+    graph.add_node("decide_tools", decision)
+    graph.add_node("main_agent", build_agent_graph(deps, decision=decision))
     graph.add_node("complaint_reply", complaint_node)
     graph.add_node("chitchat_reply", chitchat_node)
     graph.add_node("fallback_reply", fallback_node)
     graph.add_node("log_turn", log_node)
     graph.add_edge(START, "resolve_reference")
     graph.add_conditional_edges("resolve_reference", lambda state: "fallback_reply" if state["stop_reason"] else "classify_intent")
-    graph.add_conditional_edges("classify_intent", lambda state: "fallback_reply" if state["stop_reason"] else {
-        "knowledge": "retrieve_knowledge", "business": "main_agent", "order_policy": "fetch_order",
-        "complaint": "complaint_reply", "chitchat": "chitchat_reply"}[state["route"]])
+    graph.add_conditional_edges("classify_intent", lambda state: "fallback_reply" if state["stop_reason"] else "decide_tools")
+    graph.add_conditional_edges("decide_tools", after_predecision)
     graph.add_conditional_edges("fetch_order", lambda state: "fallback_reply" if state["stop_reason"] else "retrieve_policy")
     graph.add_conditional_edges("retrieve_policy", after_retrieval, {"confidence_check": "confidence_check", "fallback_reply": "fallback_reply"})
     graph.add_conditional_edges("retrieve_knowledge", after_retrieval, {"confidence_check": "confidence_check", "fallback_reply": "fallback_reply"})
     graph.add_conditional_edges("confidence_check", after_confidence, {"main_agent": "main_agent", "fallback_reply": "fallback_reply"})
-    for node in ("main_agent", "complaint_reply", "chitchat_reply", "fallback_reply"):
+    graph.add_conditional_edges("main_agent", after_agent)
+    for node in ("complaint_reply", "chitchat_reply", "fallback_reply"):
         graph.add_edge(node, "log_turn")
     graph.add_edge("log_turn", END)
     return graph.compile(checkpointer=checkpointer).with_config({"recursion_limit": 64})

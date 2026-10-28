@@ -7,7 +7,6 @@ from typing import AsyncIterator
 
 import anyio
 from langchain_core.messages import HumanMessage, SystemMessage, convert_to_messages
-from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import ValidationError
 
 from app.config import settings
@@ -20,8 +19,8 @@ from app.schemas.workflow import AgentDecision, IntentResult, UnderstandingResul
 from app.workflow.prompts import ANSWER_PROMPT, DECISION_NUDGE, DECISION_PROMPT, INTENT_PROMPT, UNDERSTANDING_PROMPT
 from app.workflow.routing import _understanding_outcome, original_understanding
 from app.workflow.context import ModelContext, log_model_context
+from app.tools.contracts import ToolDefinition
 
-READ_ONLY_NAMES = frozenset({"query_order", "query_logistics", "query_product"})
 _CONTROL_NAME = "submit_decision"
 _CONTROL_SCHEMA = {"type": "function", "function": {
     "name": _CONTROL_NAME,
@@ -50,19 +49,18 @@ def intent_tool_schema() -> dict:
     return output_tool(IntentResult, "submit_intent")
 
 
-def decision_tool_schemas(tools: list) -> list[dict]:
-    """生成决策绑定及预算共用的严格公开工具定义。
+def decision_tool_schemas(tools: list[ToolDefinition]) -> list[dict]:
+    """按本次真实快照生成绑定与预算共用的公开定义。
 
-    参数：tools既有只读业务工具列表，名称必须唯一且属于允许集合。
+    参数：tools当前授权快照，名称必须唯一且不能占用控制名。
     返回：list[dict]，业务schema后追加独立的submit_decision控制schema。
-    异常：InvalidToolDecision，包含写工具、未知工具或重复名称；schema转换错误原样传播。
+    异常：InvalidToolDecision，名称重复或占用控制协议。
     """
-    if any(tool.name not in READ_ONLY_NAMES or "write" in (tool.tags or []) for tool in tools):
+    if len({tool.name for tool in tools}) != len(tools) or any(tool.name == _CONTROL_NAME for tool in tools):
         raise InvalidToolDecision()
-    if len({tool.name for tool in tools}) != len(tools):
-        raise InvalidToolDecision()
-    # SDK只公开业务参数，不暴露注入的身份；控制工具只用于协议，不加入业务注册表。
-    return [*[convert_to_openai_tool(tool, strict=True) for tool in tools], deepcopy(_CONTROL_SCHEMA)]
+    # 不向业务schema强加strict，避免改变外部工具可选字段；权限与参数仍由执行器重验。
+    return [*[{"type": "function", "function": {"name": tool.name, "description": tool.description,
+              "parameters": deepcopy(tool.parameters)}} for tool in tools], deepcopy(_CONTROL_SCHEMA)]
 
 
 def _parse_terminal_decision(payload: dict) -> AgentDecision:
@@ -223,10 +221,10 @@ class WorkflowModelAdapter:
             ledger.record_failure("classify", self._failure(gathered, "intent_structure", error))
             return IntentResult(intent="其他", confidence=0.0)
 
-    async def decide(self, messages: list, tools: list, ledger: BudgetLedger) -> AgentDecision:
+    async def decide(self, messages: list, tools: list[ToolDefinition], ledger: BudgetLedger) -> AgentDecision:
         """仅接受业务工具或唯一终止控制工具，缺控制调用或其参数非法时有限纠正。
 
-        参数：messages完整事实、tools既有只读工具、ledger独占账本。
+        参数：messages完整事实、tools当前授权快照、ledger独占账本。
         返回：AgentDecision，纠正轮只能回答或追问，不能再申请工具。
         异常：预算/协议/网络错误及取消；坏业务批次、非法ID和异常结束不触发纠正。
         """
@@ -296,11 +294,10 @@ class WorkflowModelAdapter:
         try:
             for call in message.tool_calls:
                 call_id, name, args = call.get("id"), call.get("name"), call.get("args")
-                schema = available[name].tool_call_schema
-                if not isinstance(args, dict) or set(args) - set(schema.model_fields):
-                    raise ValueError("工具参数包含未公开字段")
-                validated = schema.model_validate(args, strict=True).model_dump()
-                validated_calls.append({"id":call_id, "name":name, "args":validated})
+                if not isinstance(args, dict):
+                    raise ValueError("工具参数必须是JSON对象")
+                # 这里只验证协议；缺字段或类型错误形成真实配对回执后，模型才有机会纠正。
+                validated_calls.append({"id":call_id, "name":name, "args":deepcopy(args)})
             return AgentDecision(kind="tools", tool_calls=validated_calls)
         except (ValueError, TypeError, ValidationError) as error:
             raise InvalidToolDecision(tool_calls=message.tool_calls) from error
