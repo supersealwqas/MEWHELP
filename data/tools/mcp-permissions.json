@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "tools": [
+    {"source": "mcp", "server": "logistics", "name": "query_logistics", "enabled": true, "access": "read", "ownership": "tracking_no", "result_policy": {"is_mock": true}},
+    {"source": "mcp", "server": "after_sales", "name": "query_warranty", "enabled": true, "access": "read", "ownership": "order_id", "result_policy": {"is_mock": true, "enum_labels": {"warranty_status": {"in_warranty": "在保", "expired": "已过保"}}}},
+    {"source": "mcp", "server": "after_sales", "name": "query_return_progress", "enabled": true, "access": "read", "ownership": "order_id", "result_policy": {"is_mock": true, "enum_labels": {"return_status": {"processing": "处理中", "completed": "已完成"}}}}
+  ]
+}

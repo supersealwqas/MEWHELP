@@ -87,6 +87,10 @@ class Settings(BaseSettings):
     tool_timeout_seconds: float = Field(default=5, gt=0, le=60, description="单次工具执行超时秒数")
     tool_max_retries: int = Field(default=1, ge=0, le=1, description="工具最大故障重试次数")
     tool_retry_delay_seconds: float = Field(default=0.2, ge=0, le=5, description="可取消的重试等待秒数")
+    mcp_logistics_url: str = Field(default="http://127.0.0.1:8101/mcp", description="本机物流MCP Streamable HTTP端点")
+    mcp_after_sales_url: str = Field(default="http://127.0.0.1:8102/mcp", description="本机售后MCP Streamable HTTP端点")
+    mcp_discovery_timeout_seconds: float = Field(default=3, gt=0, le=30, description="每个MCP Server独立发现时限")
+    mcp_permissions_path: str = Field(default="data/tools/mcp-permissions.json", description="本地MCP权限JSON热配置文件")
     tool_max_calls_per_turn: int = Field(
         default=4, ge=1, le=8,
         description="一条用户消息内最多执行的业务工具数，包含同批次及连续决策；执行器内部重试不重复计数",
