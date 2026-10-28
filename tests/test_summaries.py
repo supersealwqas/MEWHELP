@@ -234,7 +234,7 @@ async def test_summary_sdk_input_budget_and_usage_are_independent(sdk_runtime, c
     assert [tool["function"]["name"] for tool in request["tools"]] == ["submit_summary"]
     assert draft.content.startswith("用户自报")
     usage = next(json.loads(r.message.removeprefix("summary usage ")) for r in caplog.records if r.message.startswith("summary usage "))
-    assert usage["actual_tokens"] == 112 and usage["max_model_calls"] == usage["model_calls"] == 1
+    assert usage["actual_tokens"] == 112 and usage["max_model_calls"] == 2 and usage["model_calls"] == 1
     assert before["model_calls"] == 0
     too_large = [rows[0].model_copy(update={"content":"超长原文"*10000})]
     assert not generator.fits(too_large, "")
@@ -250,11 +250,12 @@ async def test_summary_rejects_text_json_and_background_numbers(sdk_runtime):
     generator = module.SummaryGenerator(dependencies().settings, model_factory=sdk_runtime.factory)
     rows = [StoredMessage(id=1, role="user", content="想问粮食怎么保存")]
     output = json.dumps({"content":"订单9999需要退货", "source_msg_ids":[1], "no_facts":False})
-    sdk_runtime.responses.extend([text_response(output), call_response("submit_summary", output)])
+    sdk_runtime.responses.extend([text_response(output), text_response(output),
+        call_response("submit_summary", output), call_response("submit_summary", output)])
     for _ in range(2):
         with pytest.raises(ValueError):
             await generator.generate(rows, "用户之前询问订单9999")
-    assert len(sdk_runtime.requests) == 2
+    assert len(sdk_runtime.requests) == 4
 
 
 async def test_timeout_is_bounded_and_logs_do_not_leak_failure_text(context_db, caplog):
@@ -331,3 +332,50 @@ def test_failed_tool_is_failure_source_but_never_numeric_fact_source():
     module.validate_summary(module.SummaryDraft(content="用户查询订单1001，查询失败待处理。", source_msg_ids=[1,2], no_facts=False), rows)
     with pytest.raises(ValueError):
         module.validate_summary(module.SummaryDraft(content="查询失败，金额999。", source_msg_ids=[1,2], no_facts=False), rows)
+
+
+async def test_invalid_summary_source_gets_one_bounded_repair(sdk_runtime):
+    """来源校验失败后只补救一次，完整本段与旧背景保持隔离。参数：SDK网络边界；返回None；异常：断言失败。"""
+    from app.schemas.history import StoredMessage
+    module, _ = summary_modules()
+    rows = [StoredMessage(id=31, role="user", content="这笔订单先不催，只查询配送情况"),
+            StoredMessage(id=32, role="assistant", content="订单9876已发货")]
+    bad = {"content":"订单9876已发货", "source_msg_ids":[31,32], "no_facts":False}
+    good = {"content":"用户暂不催单，仅要求查询配送情况。", "source_msg_ids":[31], "no_facts":False}
+    sdk_runtime.responses.extend([call_response("submit_summary", json.dumps(item)) for item in [bad,good]])
+    generator = module.SummaryGenerator(dependencies().settings, model_factory=sdk_runtime.factory)
+    draft = await generator.generate(rows, "此前提过订单9876")
+    assert draft.content == good["content"]
+    assert len(sdk_runtime.requests) == 2
+    first, second = sdk_runtime.requests
+    assert second["messages"][:2] == first["messages"]
+    assert "9876" not in second["messages"][-1]["content"]
+    assert "31" in second["messages"][-1]["content"]
+    assert "32" not in second["messages"][-1]["content"]
+
+
+def test_summary_repair_supplies_only_numbers_from_current_trusted_sources():
+    """补救必须明确本批可用编号，避免从旧背景或助手猜号补全。参数无；返回None；异常断言失败。"""
+    from app.schemas.history import StoredMessage
+    module, _ = summary_modules()
+    generator = module.SummaryGenerator(dependencies().settings)
+    rows = [StoredMessage(id=1, role="user", content="这笔订单什么状态？"),
+            StoredMessage(id=2, role="assistant", content="订单9876金额123")]
+    repair = generator._repair(rows).content
+    constraint = json.loads(repair.split("\n")[-1])
+    assert constraint == {"source_msg_ids":[1], "numeric_facts":[]}
+    rows[0] = rows[0].model_copy(update={"content":"另查AB-3456，电话13900139000"})
+    constraint = json.loads(generator._repair(rows).content.split("\n")[-1])
+    assert constraint["numeric_facts"] == ["13900139000","AB-3456"]
+
+
+async def test_repeated_bad_summary_does_not_retry_without_limit(sdk_runtime):
+    """两次来源都不合法即失败，不让生成器无限刷答案。参数：SDK边界；返回None；异常：断言失败。"""
+    from app.schemas.history import StoredMessage
+    module, _ = summary_modules()
+    bad = {"content":"订单9999需要退款", "source_msg_ids":[1], "no_facts":False}
+    sdk_runtime.responses.extend([call_response("submit_summary", json.dumps(bad)) for _ in range(2)])
+    generator = module.SummaryGenerator(dependencies().settings, model_factory=sdk_runtime.factory)
+    with pytest.raises(ValueError):
+        await generator.generate([StoredMessage(id=1, role="user", content="想问保存方法")], "订单9999")
+    assert len(sdk_runtime.requests) == 2

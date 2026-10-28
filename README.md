@@ -125,6 +125,7 @@ uv run python tests/verify_ch03_live.py recovery --test --report dev-notes/ch03-
 - [CH03 开发记录](dev-notes/ch03.md)、[CH03 校准](dev-notes/ch03-calibration.md)、[CH03 验收](dev-notes/ch03-evaluation.md)、[CH03 运行手册](docs/ch03-runbook.md)。
 - [CH04 开发记录](dev-notes/ch04.md)、[CH04 运行手册](docs/ch04-runbook.md)、[CH04 题集](docs/ch04-evaluation-set.md)。
 - [CH05开发记录](dev-notes/ch05.md)、[CH05运行手册与真实验收](docs/ch05-runbook.md)。
+- [CH07开发记录](dev-notes/ch07.md)、[CH07上下文管理运行与验收](docs/ch07-runbook.md)：三层历史、后台追加摘要和多会话回载；已有应用库启用前需按手册增量迁移。
 
 当前 embedding 使用本地 BGE-M3。`EMBED_BASE_URL`、`EMBED_MODEL`、`EMBED_API_KEY` 仍是预留配置，填写它们不会切换编码器；云端接入与配置切换后续单独实现。
 

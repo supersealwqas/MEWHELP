@@ -48,9 +48,9 @@ class BudgetLedger:
 
     @classmethod
     def from_settings(cls, settings, *, summary_only: bool = False) -> "BudgetLedger":
-        """从窗口创建独占账本。参数：settings实例配置、summary_only是否后台单请求；返回：新账本；异常：配置预算非法。"""
+        """从窗口创建独占账本。参数：settings实例配置、summary_only是否后台摘要（含一次校验补救）；返回：新账本；异常：配置预算非法。"""
         safety = max(512, (settings.model_context_window + 19) // 20)
-        calls = 1 if summary_only else settings.workflow_max_model_calls
+        calls = 2 if summary_only else settings.workflow_max_model_calls
         return cls(max_model_calls=calls,
             total_token_budget=2 * calls * settings.model_context_window,
             max_decisions=settings.workflow_max_decisions,
@@ -90,7 +90,7 @@ class BudgetLedger:
         if (sum(counts.values()) > self._limits["max_model_calls"]
                 or counts["decide"] > self._limits["max_decisions"] or counts["answer"] > 2
                 or counts["classify"] > 1 or counts["understand"] > 1
-                or counts["expand"] > 1 or counts["rewrite"] > 1 or counts["summary"] > 1
+                or counts["expand"] > 1 or counts["rewrite"] > 1 or counts["summary"] > 2
                 or reserved > self._limits["total_token_budget"]):
             raise WorkflowBudgetExceeded("本轮模型调用次数或总预算不足")
 
