@@ -5,7 +5,7 @@ import logging
 from time import monotonic
 
 from app.core.context_budget import TokenEstimator
-from app.core.context_layers import build_context_snapshot, project_summaries
+from app.core.context_layers import build_context_snapshot, history_blocks, project_summaries
 from app.repositories.context import ContextRepository, _identifier
 from app.workflow.context import shared_budget
 from app.workflow.summarization import validate_summary
@@ -61,31 +61,34 @@ class SummaryManager:
             async with self._slots:
                 stored = await self.repository.load_context(conversation_id)
                 anchor, upto = stored["summary_upto_msg_id"], stored["layer1_from_msg_id"]
-                turns = [turn for turn in stored["turns"] if turn.messages and
-                         anchor < turn.messages[-1].id <= upto]
+                blocks = history_blocks(stored["turns"])
+                if any(block.first_id <= boundary < block.last_id for block in blocks for boundary in (anchor, upto)):
+                    raise ValueError("摘要冻结边界不能切开相交轮组")
+                blocks = [block for block in blocks if anchor < block.last_id <= upto]
+                turns = [turn for block in blocks for turn in block.turns]
                 snapshot = build_context_snapshot(turns, summary_upto_msg_id=anchor, layer1_from_msg_id=upto,
                     summaries=stored["summaries"], budget=self.budget, estimator=self.estimator)
                 if not snapshot.summary_required:
                     logger.info("summary skip conversation=%s from=%s upto=%s reason=within_budget tokens=%s budget=%s elapsed_ms=%.1f",
                         conversation_id, anchor, upto, snapshot.layer2_tokens, self.budget.layer2, (monotonic()-started)*1000)
                     return
-                first = turns[0].messages[0].id
+                first = blocks[0].first_id
                 logger.info("summary trigger conversation=%s from=%s upto=%s 层2约%s token > 预算%s elapsed_ms=%.1f",
                     conversation_id, first, upto, snapshot.layer2_tokens, self.budget.layer2, (monotonic()-started)*1000)
                 segments, offset = list(stored["summaries"]), 0
-                while offset < len(turns):
+                while offset < len(blocks):
                     background, _ = project_summaries(segments, self.budget.summary_tokens, self.estimator)
                     batch, end = [], offset
-                    # 从未摘要首轮向后装整轮；按原文和背景实际用量检查，不按条数触发。
-                    while end < len(turns):
-                        candidate = [*batch, *turns[end].messages]
+                    # 按相交轮组装批，块内原文按主键排序；延迟回执与中间新问不能分开摘要。
+                    while end < len(blocks):
+                        candidate = [*batch, *blocks[end].messages]
                         if not self.generator.fits(candidate, background):
                             break
                         batch, end = candidate, end + 1
                     if not batch:
                         self._retry_after[conversation_id] = monotonic() + self.retry_seconds
                         logger.warning("summary skip conversation=%s from=%s upto=%s reason=oversized_turn elapsed_ms=%.1f",
-                            conversation_id, turns[offset].messages[0].id, turns[offset].messages[-1].id,
+                            conversation_id, blocks[offset].first_id, blocks[offset].last_id,
                             (monotonic()-started)*1000)
                         return
                     first, last = batch[0].id, batch[-1].id

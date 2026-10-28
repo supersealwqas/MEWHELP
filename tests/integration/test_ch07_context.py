@@ -11,14 +11,14 @@ from sqlalchemy import delete, select, text
 from app.config import Settings
 from app.db.session import create_database
 from app.models.customer_service import Conversation, Message
-from tests.test_context_repository import seed_context
+from tests.test_context_repository import seed_context, seed_interleaved_context
 
 pytestmark = pytest.mark.mysql
 
 
 @pytest.fixture
-async def ch07_database():
-    """准备增量结构并登记本例会话。参数：无；返回：factory/context；异常：连接或目标校验失败。"""
+async def ch07_database(request):
+    """准备增量结构并登记本例会话。参数：request可选择交错历史；返回：factory/context；异常：连接或目标校验失败。"""
     migration = importlib.import_module("app.db.migrate_ch07")
     models = importlib.import_module("app.models.customer_service")
     settings = Settings(_env_file=Path(__file__).resolve().parents[2] / ".env")
@@ -31,7 +31,8 @@ async def ch07_database():
                 await conn.run_sync(lambda sync, table=table: table.create(sync, checkfirst=True))
             await conn.run_sync(lambda sync: migration.migrate_connection(sync, apply=True))
             assert await conn.run_sync(lambda sync: migration.migrate_connection(sync, apply=True)) == []
-        ctx, _ = await seed_context(factory, session_id=session_id, user_id=user_id)
+        seed = seed_interleaved_context if getattr(request, "param", None) == "interleaved" else seed_context
+        ctx, _ = await seed(factory, session_id=session_id, user_id=user_id)
         yield factory, ctx
     finally:
         # 即使seed中途失败，也按事先登记的随机session及身份精确清理本例。
@@ -121,3 +122,23 @@ async def test_mysql_manager_cancel_then_restart_from_committed_range(ch07_datab
         assert loaded["summary_upto_msg_id"] == upto and len(loaded["summaries"]) == 1
     finally:
         await resumed.close()
+
+
+@pytest.mark.parametrize("ch07_database", ["interleaved"], indirect=True)
+async def test_mysql_interleaved_receipt_uses_one_complete_summary_range(ch07_database):
+    """真实MySQL中延迟回执和中间新问必须同段且不可部分覆盖。参数：登记测试会话；返回：None；异常：断言失败。"""
+    from app.repositories.chat import ChatRepository
+    from app.repositories.context import ContextRepository
+    factory, ctx = ch07_database
+    turns = await ChatRepository(factory).load_turns(ctx.conversation_id)
+    first, end = turns[0].messages[0].id, turns[0].messages[-1].id
+    middle_end = turns[1].messages[-1].id
+    storage = ContextRepository(factory)
+    with pytest.raises(ValueError):
+        await storage.advance_layer1(ctx.conversation_id, expected_summary_upto=0, upto_msg_id=middle_end)
+    assert await storage.advance_layer1(ctx.conversation_id, expected_summary_upto=0, upto_msg_id=end)
+    saved = await storage.append_summary(ctx.conversation_id, expected_summary_upto=0,
+        from_msg_id=first, upto_msg_id=end, content="保留查询及延迟回执", projection_max_tokens=500)
+    loaded = await storage.load_context(ctx.conversation_id)
+    assert loaded["summary_upto_msg_id"] == end and len(loaded["summaries"]) == 1
+    assert saved["from_msg_id"] == first and saved["upto_msg_id"] == end

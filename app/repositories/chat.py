@@ -83,8 +83,19 @@ def stored_turns(rows: list[Message]) -> list[StoredTurn]:
         turn = turns.setdefault(row.turn_id, StoredTurn(turn_id=row.turn_id, turn_status=row.turn_status))
         if row.role == "user" and isinstance(row.rag_metadata, dict):
             turn.order_selection = row.rag_metadata.get("order_selection")
+            # 独立动作在恢复后可能标cancelled/failed，但成功回执仍可凭原键补写。
+            turn.receipt_pending = row.rag_metadata.get("ticket_action") is not None and row.turn_status != "completed"
         turn.messages.append(StoredMessage(id=row.id, role=row.role, content=row.content or "",
                                           tool_calls=row.tool_calls, tool_call_id=row.tool_call_id))
+    for turn in turns.values():
+        if turn.receipt_pending:
+            results = [row for row in turn.messages if row.role == "tool"]
+            try:
+                # 已确认的工具失败不会生成成功回执；未知或损坏结果仍按可能补写保守处理。
+                if len(results) == 1 and not ToolResult.model_validate_json(results[0].content).ok:
+                    turn.receipt_pending = False
+            except ValueError:
+                pass
     return list(turns.values())
 
 

@@ -99,7 +99,7 @@ uv run --no-sync --offline pytest -q -m mysql \
   --basetemp=.superpowers/sdd/2026-10-28-ch07-context/tmp-manual-mysql
 ```
 
-最近实际结果：后端1818 passed、44 skipped、34 deselected；前端117 passed；显式CH06/CH07 MySQL 9 passed。44项跳过与34项未选中不算通过。日志保留在 `.superpowers/sdd/2026-10-28-ch07-context/closeout-{full,node,mysql}.log`。
+合并审查修复后的实际结果：后端1839 passed、44 skipped、35 deselected；前端117 passed；显式CH06/CH07 MySQL 10 passed。44项跳过与35项未选中不算通过。日志保留在 `.superpowers/sdd/2026-10-28-ch07-context/fix-{full,node,mysql}.log`。修复前的 `closeout-*` 日志继续保留。
 
 ## 验收证据与边界
 
@@ -108,9 +108,10 @@ uv run --no-sync --offline pytest -q -m mysql \
 - `demo-r2` 对应旧补救提示，只有7项界面检查；保留原报告，不能将其旧 `passed` 视为当前严格判定通过。`default-r2` 中断于4轮，已按登记回收并保留 `recovery-cleanup.json`。
 - 摘要标注评估记录为9/10：有一例纯寒暄被写成“结束对话”。属于可见的语义偏差，可能多占摘要容量；没有宣称所有摘要零幻觉，也没有用单题排除词刷分。见 [摘要语义评估](superpowers/reviews/2026-10-28-ch07-summary-eval.md)。
 - 知识不足兜底只算正常完成回复，不算知识答案正确。后台暂未生成摘要时可以临时省略最老半压整轮，但不删除原文或推进摘要锚点；失败退避后可在后续对话或重启扫描时恢复。
-- 摘要投影有容量上限；旧摘要段一直保存，但无限会话不保证最早一段始终进入模型。单个完整轮过大时记录 `oversized_turn`，保留原文和锚点，不截断用户原话硬塞入摘要。
+- 摘要投影有容量上限；旧摘要段一直保存，但无限会话不保证最早一段始终进入模型。延迟回执与中间轮次形成相交区间时共同分块；单轮或相交整组过大时记录 `oversized_turn`，保留原文和锚点，不拆组或截断用户原话硬塞入摘要。
+- 成功工单仍待补回执时，即使恢复标为中断也不能先摘要；使用原动作键完成回执修复后才可正常推进。旧版等待选单在没有冻结快照的那次续跑跳过摘要调度，下一正常轮重新读取数据库冻结，原动作与原轮保持。
 - 日志 `log/app.log` 含 `history_ctx`、`model_ctx` 和摘要阶段，保留业务正文且轮转；不输出连接串或密钥。查看真实请求时使用报告中的 `models.json`、`summary-models.json` 和 `turn-*.json` 相互核对。
 
 本章保留本地工作分支、原始验收证据和用户原有草稿；合并、推送和应用库部署不属于本次本地交付。
 
-全分支自查、已处理问题及保留边界见 [CH07最终审查](superpowers/reviews/2026-10-28-ch07-final-review.md)。
+全分支原验收见 [CH07最终审查](superpowers/reviews/2026-10-28-ch07-final-review.md)，当前合并结论、修复问题及验证见 [合并审查与修复复审](superpowers/reviews/2026-10-28-ch07-merge-readiness.md)。

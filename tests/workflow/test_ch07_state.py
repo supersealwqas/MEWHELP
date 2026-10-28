@@ -111,19 +111,33 @@ async def test_legacy_waiting_checkpoint_resumes_same_action_without_reclassific
     """旧等待升级不能换动作、重跑分类或保留临时system。参数：tmp_path；返回：None；异常：断言失败。"""
     from tests.workflow.test_ch06_graph import order_result
     from tests.workflow.test_order_selection import resume_request
+    from tests.test_summaries import ControlledGenerator, manager
     config = {"configurable": {"thread_id": "mewhelp:ch05:1"}}
     async with service_runtime(tmp_path, intents=["退款退货"], results=[order_result()],
-                               answers=[["签收时间还需核实。"]]) as (service, deps, _):
-        action = (await collect(service, "我要退款"))[-1].data
-        await service.graph.aupdate_state(config, {"context_version": 6, "current_message_id": "",
-            "messages": Overwrite([{"role": "user", "content": "我要退款"},
-                {"role": "system", "content": "旧临时内容"}])}, as_node="classify_intent")
-        await service.graph.ainvoke(None, config)  # 在同一节点再次挂回原来的确定性动作。
-        resumed = [event async for event in service.stream_resume(resume_request(action))]
-        assert resumed[-1].event == "done"
-        state = (await service.graph.aget_state(config)).values
-        assert state["context_version"] == 7
-        assert state["context"]["turn_id"] == action["source_turn_id"]
-        assert sum(item["stage"] == "classify" for item in deps.model.inputs) == 1
-        assert all(message.type != "system" for message in state["messages"])
-        assert len({message.id for message in state["messages"]}) == len(state["messages"]) == 4
+                               answers=[["签收时间还需核实。"]]) as (service, deps, factory):
+        worker = manager(factory, ControlledGenerator())
+        service.summaries = worker
+        try:
+            action = (await collect(service, "我要退款"))[-1].data
+            await service.graph.aupdate_state(config, {"context_version": 6, "current_message_id": "",
+                "messages": Overwrite([{"role": "user", "content": "我要退款"},
+                    {"role": "system", "content": "旧临时内容"}])}, as_node="classify_intent")
+            await service.graph.ainvoke(None, config)  # 在同一节点再次挂回原来的确定性动作。
+            resumed = [event async for event in service.stream_resume(resume_request(action))]
+            assert [event.event for event in resumed[-2:]] == ["answer_metadata", "done"]
+            state = (await service.graph.aget_state(config)).values
+            assert state["context_version"] == 7
+            assert state["context"]["turn_id"] == action["source_turn_id"]
+            assert sum(item["stage"] == "classify" for item in deps.model.inputs) == 1
+            assert all(message.type != "system" for message in state["messages"])
+            assert len({message.id for message in state["messages"]}) == len(state["messages"]) == 4
+        finally:
+            await worker.close()
+
+
+def test_full_history_rebuild_orders_delayed_receipts_by_real_message_id():
+    """冷启动重建不能把延迟回执插到中间新问题之前。参数：无；返回：None；异常：断言失败。"""
+    from app.workflow.state import full_history_messages
+    from tests.test_context_layers import interleaved_turns
+    messages = full_history_messages([turn.model_dump(mode="json") for turn in interleaved_turns()])
+    assert [row["additional_kwargs"]["db_message_id"] for row in messages] == [11, 17, 22, 26, 29, 35]

@@ -523,11 +523,12 @@ class ChatService:
 
     async def _schedule_summary(self, values: dict, conversation_id: int) -> None:
         """登记已有积压，不等待后台模型。参数：最终State/可信会话；返回：None；异常：调度错误隔离并留痕。"""
-        if self.summaries is not None and values.get("history_context", {}).get("summary_required"):
-            try:
+        try:
+            # 旧等待续跑没有冻结快照时跳过；下一正常轮会从数据库重新冻结，不影响原轮完成。
+            if self.summaries is not None and (values.get("history_context") or {}).get("summary_required"):
                 await self.summaries.maybe_schedule(conversation_id)
-            except Exception as error:
-                logger.warning("summary fail conversation=%s reason=schedule type=%s", conversation_id, type(error).__name__)
+        except Exception as error:
+            logger.warning("summary fail conversation=%s reason=schedule type=%s", conversation_id, type(error).__name__)
 
     async def _stream_workflow(self, state: dict, config: dict):
         """由独占asyncio任务拥有整个图，隔离ASGI取消域的重复取消。

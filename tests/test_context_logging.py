@@ -26,4 +26,3 @@ def test_context_log_is_utf8_rotating_and_setup_is_idempotent(tmp_path):
             if handler not in original:
                 logger.removeHandler(handler)
                 handler.close()
-

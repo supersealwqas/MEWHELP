@@ -221,6 +221,76 @@ async def test_committed_ticket_failed_audit_returns_real_receipt_then_repairs(t
         assert len(rows) == 6
 
 
+@pytest.mark.parametrize("reopen", [False, True], ids=["same-runtime", "reopened-runtime"])
+async def test_delayed_ticket_receipt_after_new_chat_keeps_conversation_usable(tmp_path, monkeypatch, reopen):
+    """跨新问补写回执后不能误判历史损坏或重复工单。参数：独占目录、故障注入、是否重开；返回：None；异常：断言失败。"""
+    async def verify_continuation(chat, factory):
+        """核对再次聊天、消息顺序及唯一工单。参数：真实聊天服务和工厂；返回：None；异常：断言失败。"""
+        for query in ("谢谢，我想继续咨询", "再问一个问题"):
+            events = await collect(chat, query)
+            assert [event.event for event in events[-2:]] == ["answer_metadata", "done"]
+        state = (await chat.graph.aget_state({"configurable":{"thread_id":"mewhelp:ch05:1"}})).values
+        _, rows, tickets = await records(factory)
+        assert len(tickets) == 1 and len(rows) == len(state["messages"]) == 12
+        assert [message.additional_kwargs["db_message_id"] for message in state["messages"]] == list(range(1, 13))
+        assert [message.content for message in state["messages"]] == [row.content or "" for row in rows]
+
+    async with action_runtime(tmp_path, intents=["闲聊"] * 3) as (chat, actions, client, factory):
+        body = await saved_suggestion(chat.chat)
+        finish = actions.repository.finish_ticket_action
+
+        async def fail_finish(action, result):
+            """模拟成功后的审计故障。参数：已提交动作和结果；返回：无；异常：OSError。"""
+            raise OSError("审计暂不可写")
+
+        monkeypatch.setattr(actions.repository, "finish_ticket_action", fail_finish)
+        first = await client.post("/api/actions/tickets", json=body)
+        assert first.status_code == 200 and first.json()["audit_sync_pending"] is True
+        assert (await collect(chat, "这是修复回执前的新问题"))[-1].event == "done"
+        monkeypatch.setattr(actions.repository, "finish_ticket_action", finish)
+        repaired = await client.post("/api/actions/tickets", json=body)
+        assert repaired.status_code == 200 and repaired.json()["audit_sync_pending"] is False
+        assert repaired.json()["ticket_no"] == first.json()["ticket_no"]
+        if not reopen:
+            await verify_continuation(chat, factory)
+    if reopen:
+        async with service_runtime(tmp_path, intents=["闲聊"] * 2) as (chat, _, factory):
+            await verify_continuation(chat, factory)
+
+
+@pytest.mark.parametrize("terminal", ["cancelled", "failed"])
+async def test_pending_ticket_receipt_after_recovery_cannot_cross_summary_boundary(tmp_path, monkeypatch, terminal):
+    """恢复标终止后仍待补回执的动作不能先被摘要，否则补写会穿过已提交锚点。参数：目录/故障/终态；返回：None；异常：断言失败。"""
+    from app.repositories.context import ContextRepository
+    from app.schemas.workflow import TicketConfirmation
+    async with action_runtime(tmp_path, intents=["闲聊"] * 2) as (chat, actions, client, factory):
+        body = await saved_suggestion(chat.chat)
+
+        async def fail_finish(action, result):
+            """暂时阻止成功动作审计。参数：动作/已存结果；返回：无；异常：OSError。"""
+            raise OSError("审计暂不可写")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(actions.repository, "finish_ticket_action", fail_finish)
+            first = await client.post("/api/actions/tickets", json=body)
+        assert first.status_code == 200 and first.json()["audit_sync_pending"]
+        prepared = await actions.repository.prepare_ticket(TicketConfirmation(**body))
+        await chat.chat.mark_turn(prepared.context, terminal)
+        assert (await collect(chat, "恢复后先继续咨询"))[-1].event == "done"
+        storage = ContextRepository(factory)
+        _, before, _ = await records(factory)
+        with pytest.raises(ValueError, match="未完成|结束|配对"):
+            await storage.advance_layer1(1, expected_summary_upto=0, upto_msg_id=before[-1].id)
+        assert (await storage.load_context(1))["layer1_from_msg_id"] == 0
+        repaired = await client.post("/api/actions/tickets", json=body)
+        assert repaired.status_code == 200 and not repaired.json()["audit_sync_pending"]
+        assert repaired.json()["ticket_no"] == first.json()["ticket_no"]
+        _, rows, tickets = await records(factory)
+        assert len(tickets) == 1
+        assert await storage.advance_layer1(1, expected_summary_upto=0, upto_msg_id=rows[-1].id)
+        assert (await collect(chat, "回执修复后继续"))[-1].event == "done"
+
+
 async def test_known_failure_reuses_result_without_reexecuting(tmp_path):
     """已缓存确定失败改键重执行时失败。参数：tmp_path；返回：None；异常：断言失败。"""
     async with action_runtime(tmp_path) as (chat, actions, client, factory):
@@ -232,6 +302,10 @@ async def test_known_failure_reuses_result_without_reexecuting(tmp_path):
         second = await client.post("/api/actions/tickets", json=body)
         assert first.status_code == second.status_code == 422 and first.json() == second.json()
         assert first.json()["detail"]["outcome"] == "failed" and (await records(factory))[2] == []
+        # 确定失败不会再补成功回执，不能被待回执保护永久挡在摘要区外。
+        from app.repositories.context import ContextRepository
+        _, rows, _ = await records(factory)
+        assert await ContextRepository(factory).advance_layer1(1, expected_summary_upto=0, upto_msg_id=rows[-1].id)
 
 
 async def test_unknown_database_outcome_does_not_claim_failure(tmp_path, monkeypatch):

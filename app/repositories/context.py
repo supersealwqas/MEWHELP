@@ -3,7 +3,7 @@
 from sqlalchemy import select, text
 
 from app.core.context_budget import TokenEstimator
-from app.core.context_layers import _safe_to_demote, project_summaries
+from app.core.context_layers import _safe_to_demote, history_blocks, project_summaries
 from app.core.memory import assemble_turns
 from app.models.customer_service import Conversation, ConversationSummary, Message
 from app.repositories.chat import stored_turns
@@ -28,16 +28,20 @@ async def _range(session, conversation_id: int, after: int, upto: int) -> list:
     """核验连续完整源区间。参数：session短事务、会话ID、开/闭上界；返回：原始轮；异常：ValueError或数据库错误。"""
     rows = (await session.scalars(select(Message).where(Message.conversation_id == conversation_id)
                                   .order_by(Message.id))).all()
-    chosen = []
-    for turn in stored_turns(rows):
-        first, last = turn.messages[0].id, turn.messages[-1].id
+    chosen, end = [], 0
+    for block in history_blocks(stored_turns(rows)):
+        first, last = block.first_id, block.last_id
         if last <= after or first > upto:
             continue
-        groups = assemble_turns([turn])
-        if first <= after or last > upto or not _safe_to_demote(turn, groups[0] if groups else []):
+        if first <= after or last > upto:
             raise ValueError("摘要边界必须覆盖完整已结束且工具配对的轮")
-        chosen.append(turn)
-    if not chosen or chosen[-1].messages[-1].id != upto:
+        for turn in block.turns:
+            groups = assemble_turns([turn])
+            if not _safe_to_demote(turn, groups[0] if groups else []):
+                raise ValueError("摘要边界必须覆盖完整已结束且工具配对的轮")
+        chosen.extend(block.turns)
+        end = last  # 分组中的最后一轮可能早于延迟回执结束，须使用共同末尾。
+    if not chosen or end != upto:
         raise ValueError("摘要边界不是当前会话的完整轮末尾")
     return chosen
 

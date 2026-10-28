@@ -7,7 +7,7 @@ import pytest
 from sqlalchemy import text
 
 from app.repositories.chat import ChatRepository
-from app.schemas.tools import ToolContext
+from app.schemas.tools import ToolContext, ToolResult
 from tests.recovery_fakes import offline_recovery_database
 
 
@@ -26,6 +26,21 @@ async def seed_context(factory, *, session_id="ch07", user_id="owner", count=3):
             turn_id=f"turn-{index}", user_message=f"第{index}轮原问\n  "), f"第{index}轮原问\n  ")
         await chat.finish_turn(ctx, "完整客服原文" * 100)
     return ctx, await chat.load_turns(ctx.conversation_id)
+
+
+async def seed_interleaved_context(factory, *, session_id="ch07-interleaved", user_id="owner"):
+    """保存工具成功后延迟收尾的两轮。参数：独占工厂/身份；返回：首轮上下文和完整轮；异常：数据库错误。"""
+    chat = ChatRepository(factory)
+    original = "请保留完整的订单查询原文。" * 50
+    first = await chat.start_turn(ToolContext(session_id=session_id, user_id=user_id,
+        turn_id="turn-0", user_message=original), original)
+    await chat.save_tool_calls(first, [{"id":"call-0", "name":"query_order", "args":{"order_id":"1001"}}])
+    await chat.save_tool_result(first.model_copy(update={"tool_call_id":"call-0"}), ToolResult.success({"order_id":"1001"}))
+    second = await chat.start_turn(ToolContext(session_id=session_id, user_id=user_id,
+        turn_id="turn-1", user_message="中间的新问题"), "中间的新问题")
+    await chat.finish_turn(second, "中间答复")
+    await chat.finish_turn(first, "稍后补写的完成回执")
+    return first, await chat.load_turns(first.conversation_id)
 
 
 def repo(factory):
@@ -144,3 +159,20 @@ async def test_conversation_listing_is_owned_stable_and_reports_committed_summar
     for identifier in (foreign.conversation_id, 999):
         with pytest.raises(LookupError):
             await storage.list_messages("owner", identifier, after_id=0, limit=10)
+
+
+async def test_interleaved_completed_turns_advance_only_to_common_end(context_db):
+    """合法延迟收尾不能拒绝整组边界，块内另一轮末尾也不可推进。参数：隔离库；返回：None；异常：断言失败。"""
+    ctx, _ = await seed_interleaved_context(context_db)
+    storage = repo(context_db)
+    with pytest.raises(ValueError):
+        await storage.advance_layer1(ctx.conversation_id, expected_summary_upto=0, upto_msg_id=5)
+    assert await storage.advance_layer1(ctx.conversation_id, expected_summary_upto=0, upto_msg_id=6)
+    with pytest.raises(ValueError):
+        await storage.append_summary(ctx.conversation_id, expected_summary_upto=0,
+            from_msg_id=1, upto_msg_id=5, content="不能漏掉延迟回执", projection_max_tokens=500)
+    saved = await storage.append_summary(ctx.conversation_id, expected_summary_upto=0,
+        from_msg_id=1, upto_msg_id=6, content="保留完整查询与回执", projection_max_tokens=500)
+    assert saved["from_msg_id"] == 1 and saved["upto_msg_id"] == 6
+    original = await storage.list_messages("owner", ctx.conversation_id)
+    assert [row["id"] for row in original["items"]] == [1, 2, 3, 4, 5, 6]

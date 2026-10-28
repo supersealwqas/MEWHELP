@@ -86,9 +86,13 @@ def full_history_messages(turns: list[dict]) -> list[dict]:
     参数：turns含真实主键的StoredTurn字典，旧测试允许空主键。
     返回：所有原文消息的独立字典；异常：KeyError表示原始契约损坏。
     """
+    rows = [(turn, row) for turn in turns for row in turn["messages"]]
+    # 延迟回执仍属于原轮，但完整checkpoint必须按实际流水恢复；无主键的旧离线输入保留原序。
+    if all(type(row.get("id")) is int and row["id"] > 0 for _, row in rows):
+        rows.sort(key=lambda item: item[1]["id"])
     return [message_row(turn["turn_id"], row["role"], row["content"], calls=row.get("tool_calls"),
                         call_id=row.get("tool_call_id"), db_id=row.get("id"))
-            for turn in turns for row in turn["messages"]]
+            for turn, row in rows]
 
 
 def current_messages(state: ConversationState) -> list[BaseMessage]:

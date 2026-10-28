@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy import text
 
 from app.repositories.context import ContextRepository
-from tests.test_context_repository import context_db, seed_context
+from tests.test_context_repository import context_db, seed_context, seed_interleaved_context
 from tests.workflow.graph_fakes import dependencies
 from tests.workflow.service_fakes import collect, service_runtime
 from tests.workflow.test_model import sdk_runtime, call_response, text_response
@@ -165,6 +165,29 @@ async def test_source_batches_split_on_whole_turns_and_never_recompress_old_segm
         assert generator.calls[0][1] == ""
         assert all("用户希望继续处理之前的问题。" in background for _, background in generator.calls[1:])
         assert all("完整客服原文" * 100 == rows[1].content for rows, _ in generator.calls)
+    finally:
+        await worker.close()
+
+
+@pytest.mark.parametrize("capacity", [4, 6])
+async def test_interleaved_summary_batch_keeps_all_originals_in_one_range(context_db, capacity):
+    """交错轮次不能拆批漏掉中间新问，放不下整组时不前移。参数：隔离库、模型消息容量；返回：None；异常：断言失败。"""
+    ctx, _ = await seed_interleaved_context(context_db)
+    await ContextRepository(context_db).advance_layer1(ctx.conversation_id, expected_summary_upto=0, upto_msg_id=6)
+    generator = ControlledGenerator(max_messages=capacity)
+    worker = manager(context_db, generator)
+    try:
+        await worker.maybe_schedule(ctx.conversation_id)
+        await wait_idle(worker)
+        loaded = await ContextRepository(context_db).load_context(ctx.conversation_id)
+        if capacity == 6:
+            assert loaded["summary_upto_msg_id"] == 6
+            assert [(row["from_msg_id"], row["upto_msg_id"]) for row in loaded["summaries"]] == [(1, 6)]
+            assert [[row.id for row in rows] for rows, _ in generator.calls] == [[1, 2, 3, 4, 5, 6]]
+            assert generator.calls[0][0][0].content == "请保留完整的订单查询原文。" * 50
+        else:
+            assert loaded["summary_upto_msg_id"] == 0 and loaded["summaries"] == []
+            assert not generator.calls
     finally:
         await worker.close()
 

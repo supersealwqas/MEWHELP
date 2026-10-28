@@ -11,7 +11,51 @@ from langchain_core.messages import AIMessage, BaseMessage, ToolMessage, trim_me
 
 from app.core.context_budget import ContextBudget, ContextBudgetExceeded, TokenEstimator
 from app.core.memory import _model_message, assemble_turns, valid_tool_calls
-from app.schemas.history import StoredTurn
+from app.schemas.history import StoredMessage, StoredTurn
+
+
+@dataclass(frozen=True)
+class HistoryBlock:
+    """消息区间相交的完整轮次，共用裁剪和摘要边界，不修改原始消息。"""
+
+    turns: list[StoredTurn]  # 按首条消息ID排列的原始轮。
+    messages: list[StoredMessage]  # 块内按真实主键排序的完整原文。
+
+    @property
+    def first_id(self) -> int:
+        """读取共同起点。参数：无；返回：已校验的首条主键；异常：无。"""
+        return self.messages[0].id
+
+    @property
+    def last_id(self) -> int:
+        """读取共同末尾。参数：无；返回：已校验的末条主键；异常：无。"""
+        return self.messages[-1].id
+
+
+def history_blocks(turns: list[StoredTurn]) -> list[HistoryBlock]:
+    """将延迟补写形成的相交区间合为不可拆分块。
+
+    参数：turns完整历史，各轮内部消息须按真实主键升序，空轮忽略。
+    返回：按时间排列的块，块内原文亦按真实主键排序。
+    异常：ValueError表示缺主键、轮内错序或全局主键重复。
+    """
+    nonempty, seen = [], set()
+    for turn in turns:
+        ids = [row.id for row in turn.messages]
+        if any(type(value) is not int or value <= 0 for value in ids) or ids != sorted(set(ids)) or seen.intersection(ids):
+            raise ValueError("历史必须提供真实且轮内有序、全局不重复的消息主键ID")
+        seen.update(ids)
+        if ids:
+            nonempty.append(turn)
+    groups, last = [], 0
+    for turn in sorted(nonempty, key=lambda item: item.messages[0].id):
+        if not groups or turn.messages[0].id > last:
+            groups.append([])
+        # 延迟回执可能跨过多个轮，须按累计末尾合并传递相交，不能仅比较相邻轮。
+        groups[-1].append(turn)
+        last = max(last, turn.messages[-1].id)
+    return [HistoryBlock(group, sorted([row for turn in group for row in turn.messages], key=lambda row: row.id))
+            for group in groups]
 
 
 @dataclass(frozen=True)
@@ -57,7 +101,7 @@ def project_summaries(summaries: list[dict], max_tokens: int, estimator: TokenEs
 
 def _safe_to_demote(turn: StoredTurn, messages: list[BaseMessage]) -> bool:
     """判断轮次能否跨入摘要区。参数：原始轮及已配对视图；返回：安全性；异常：无。"""
-    if turn.turn_status not in {"completed", "failed", "cancelled"}:
+    if turn.receipt_pending or turn.turn_status not in {"completed", "failed", "cancelled"}:
         return False
     calls = [call for row in turn.messages for call in (row.tool_calls or [])]
     if not valid_tool_calls(calls):
@@ -68,6 +112,30 @@ def _safe_to_demote(turn: StoredTurn, messages: list[BaseMessage]) -> bool:
     if any(not isinstance(identifier, str) or not identifier for identifier in stored):
         return False
     return sorted(expected) == sorted(actual) == sorted(stored)
+
+
+def _block_view(block: HistoryBlock) -> tuple[list[BaseMessage], bool]:
+    """按时间渲染整块，同时保持工具申请与唯一结果紧邻。
+
+    参数：block已校验的完整相交轮组；返回：独立模型消息及整块是否可降级。
+    异常：消息协议转换错误，不会改变数据库原文顺序。
+    """
+    units, safe = [], True
+    for turn in block.turns:
+        # 运行轮仍计入容量；任何未完成或未配对轮都会阻止整块降级。
+        visible = turn if turn.turn_status != "running" else turn.model_copy(update={"turn_status": "awaiting_input"})
+        groups = assemble_turns([visible])
+        group = [_model_message(message).model_copy(deep=True) for message in (groups[0] if groups else [])]
+        safe = _safe_to_demote(turn, group) and safe
+        for index, message in enumerate(group):
+            if isinstance(message, ToolMessage):
+                # assemble_turns只输出唯一配对结果，工具结果与前面的申请作为协议整体排序。
+                units[-1][2].append(message)
+            else:
+                # 合成的未完成说明跟在本轮末尾后；排序键不会写成持久化消息ID。
+                key = message.additional_kwargs.get("db_message_id", turn.messages[-1].id)
+                units.append((key, index, [message]))
+    return [message for _, _, unit in sorted(units, key=lambda unit: unit[:2]) for message in unit], safe
 
 
 def _tool_marker(message: ToolMessage, name: str) -> str:
@@ -132,7 +200,7 @@ def build_context_snapshot(
 ) -> ContextSnapshot:
     """生成三层视图并建议降级边界，不修改原始记录。
 
-    参数：turns按消息ID有序的完整轮；两个锚点为非负真实主键；summaries已提交段；budget预算；estimator计量器。
+    参数：turns轮内按消息ID有序的完整轮；两个锚点为非负真实主键；summaries已提交段；budget预算；estimator计量器。
     返回：ContextSnapshot，含未省略用量、实际发送消息和临时省略区间。
     异常：ValueError表示缺ID、错序、轮内锚点或不安全持久化边界；ContextBudgetExceeded表示未完成轮阻止安全降级。
     """
@@ -140,36 +208,27 @@ def build_context_snapshot(
         raise ValueError("上下文锚点必须是非负消息ID")
     if summary_upto_msg_id > layer1_from_msg_id:
         raise ValueError("摘要锚点不能超过原文层边界")
-    rows = [row for turn in turns for row in turn.messages]
-    ids = [row.id for row in rows]
-    if any(type(value) is not int or value <= 0 for value in ids) or ids != sorted(set(ids)):
-        raise ValueError("历史必须提供真实且按顺序不重复的消息主键ID")
+    blocks = history_blocks(turns)
     entries = []
-    for turn in turns:
-        if not turn.messages:
-            continue
-        first, last = turn.messages[0].id, turn.messages[-1].id
+    for block in blocks:
+        first, last = block.first_id, block.last_id
         if any(first <= anchor < last for anchor in (summary_upto_msg_id, layer1_from_msg_id)):
-            raise ValueError("上下文锚点不能切开完整轮")
+            raise ValueError("上下文锚点不能切开完整轮或相交轮组")
         if last <= summary_upto_msg_id:
             continue
-        # 当前运行/等待轮只可作为未完成背景；不让旧assemble的running过滤隐藏它的容量。
-        visible_turn = turn if turn.turn_status != "running" else turn.model_copy(update={"turn_status": "awaiting_input"})
-        groups = assemble_turns([visible_turn])
-        group = [_model_message(message).model_copy(deep=True) for message in (groups[0] if groups else [])]
-        safe = _safe_to_demote(turn, group)
+        group, safe = _block_view(block)
         if last <= layer1_from_msg_id and not safe:
             raise ValueError("半压边界覆盖未完成或工具未配对的轮")
-        entries.append((turn, group, safe))
-    old = [entry for entry in entries if entry[0].messages[-1].id <= layer1_from_msg_id]
-    recent = [entry for entry in entries if entry[0].messages[-1].id > layer1_from_msg_id]
+        entries.append((block, group, safe))
+    old = [entry for entry in entries if entry[0].last_id <= layer1_from_msg_id]
+    recent = [entry for entry in entries if entry[0].last_id > layer1_from_msg_id]
     recent_groups = [entry[1] for entry in recent]
     kept = _suffix(recent_groups, budget.layer1, estimator)
     demotion_count = len(recent) - len(kept)
     demoted = recent[:demotion_count]
     if any(not safe for _, _, safe in demoted):
         raise ContextBudgetExceeded("上下文预算不足：未完成或工具未配对轮阻止安全降级")
-    proposed = demoted[-1][0].messages[-1].id if demoted else layer1_from_msg_id
+    proposed = demoted[-1][0].last_id if demoted else layer1_from_msg_id
     layer2_entries = [*old, *demoted]
     half_groups = [_shorten(group, estimator) for _, group, _ in layer2_entries]
     full_half = [message for group in half_groups for message in group]
@@ -182,9 +241,9 @@ def build_context_snapshot(
     summary, seqs = project_summaries(committed, budget.summary_tokens, estimator)
     return ContextSnapshot(summary_upto_msg_id=summary_upto_msg_id,
         previous_layer1_from_msg_id=layer1_from_msg_id, layer1_from_msg_id=proposed,
-        original_from_msg_id=ids[0] if ids else 0, original_upto_msg_id=ids[-1] if ids else 0,
+        original_from_msg_id=blocks[0].first_id if blocks else 0, original_upto_msg_id=blocks[-1].last_id if blocks else 0,
         summary=summary, summary_seqs=seqs, layer1=layer1, layer2=layer2, budget=budget,
         layer1_tokens=estimator.message_tokens(layer1), layer2_tokens=half_tokens,
         sent_layer2_tokens=estimator.message_tokens(layer2),
-        omitted_ranges=[(turn.messages[0].id, turn.messages[-1].id) for turn, _, _ in omitted],
+        omitted_ranges=[(block.first_id, block.last_id) for block, _, _ in omitted],
         summary_required=half_tokens > budget.layer2)

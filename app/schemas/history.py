@@ -19,3 +19,4 @@ class StoredTurn(BaseModel):
     turn_status: str = Field(description="轮次完成状态")
     messages: list[StoredMessage] = Field(default_factory=list, description="按消息主键顺序排列的记录")
     order_selection: dict | None = Field(default=None, description="来源用户消息中已保存的选单状态，包含首次接受订单")
+    receipt_pending: bool = Field(default=False, description="独立工单仍可补写回执；即使轮已标中断也不能跨摘要边界")
