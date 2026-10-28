@@ -57,6 +57,23 @@ class StrictChat:
         self.calls.extend(deepcopy(calls))
         self.order.append("calls")
         self._record(context, "assistant", "", tool_calls=deepcopy(calls))
+    async def save_ticket_intent(self, context, intent):
+        """保存测试原轮短期诉求，供后续真实图决定读取。
+
+        参数：context 原轮，intent 有界状态或空；返回：None；异常：无。
+        """
+        if context.turn_id in self.history:
+            self.history[context.turn_id].ticket_intent = intent.model_dump(mode="json") if intent else None
+    async def get_pending_ticket(self, context):
+        """读取替身原轮确认状态。参数：context 原轮；返回：冻结流程或 None；异常：无。"""
+        turn = self.history.get(context.turn_id)
+        return deepcopy(turn.ticket_confirmation) if turn else None
+    async def finish_ticket_preview(self, context, result):
+        """没有预览的拒绝无需收尾，真实暂停测试使用 SQLite 仓储。
+
+        参数：context 原调用，result 确定结果；返回：原冻结流程或 None；异常：无。
+        """
+        return await self.get_pending_ticket(context)
     async def save_tool_result(self, context, result):
         """参数：可信上下文与结果；返回：ToolResult；异常：断言失败。"""
         assert context.tool_call_id and isinstance(result, ToolResult)

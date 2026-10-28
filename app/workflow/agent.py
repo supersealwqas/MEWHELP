@@ -13,6 +13,8 @@ from app.core.memory import ContextBudgetExceeded, valid_tool_calls
 from app.core.model_budget import BudgetLedger, WorkflowBudgetExceeded
 from app.schemas.chat import InvalidToolDecision
 from app.schemas.tools import ToolContext, ToolResult
+from app.repositories.chat import PersistenceUncertain
+from app.tools.confirmation import TicketIntentState, request_ticket_authorization, ticket_context_notes, ticket_write_rejection
 from app.tools.contracts import KnowledgeCallContext, ToolExecutionScope, binding_dict, binding_from_dict
 from app.tools.knowledge import merge_knowledge_budget, retrieve_verified_knowledge
 from app.workflow.citations import CitationStreamFilter
@@ -36,6 +38,7 @@ _STOP_TEXT = {
     "duplicate_tool_call": "本轮已查询过相同信息，未重复查询。请补充需要继续处理的问题。",
     "invalid_decision": "抱歉，本次回复生成失败，请重试。",
     "tool_failed": "本轮查询未能完成，请稍后重试或选择人工客服协助。",
+    "ticket_cancelled": "工单申请已取消，本次没有创建工单。",
     "model_unavailable": "本次暂时无法完成问题处理，请稍后重试；您的问题已保留在当前对话中。",
     "retrieval_unavailable": "资料查询暂时不可用，相关规则目前无法核实。您可以稍后重试或联系人工客服继续处理。",
     "answer_unavailable": "本次回答未能完整生成，尚未说明的内容暂无法确认。请稍后重试或继续补充问题。",
@@ -77,7 +80,10 @@ def build_agent_decision(deps: "WorkflowDependencies"):
                      if deps.permissions is None and tool.identity.source == "builtin"
                      or deps.permissions is not None and deps.permissions.allowed(tool.identity)]
             # 结束决策也使用工具协议；历史裁剪须计入与模型实际绑定一致的完整定义。
-            messages = model_messages(state, deps.settings, DECISION_PROMPT, decision_tool_schemas(tools), registry=deps.registry)
+            ticket_intent = TicketIntentState.model_validate(state["ticket_intent"]) if state.get("ticket_intent") else None
+            # 每次决定重新派生建单边界，避免确认后残留旧许可，也不向正文模型传技术操作提示。
+            current = {**state, "context_notes": [*state.get("context_notes", []), *ticket_context_notes(ticket_intent)]}
+            messages = model_messages(current, deps.settings, DECISION_PROMPT, decision_tool_schemas(tools), registry=deps.registry)
             # 先检查最少的调用/输出余量；适配器还按完整输入执行精确保守占额检查。
             ledger.ensure_capacity([("decide", 0, ledger.output_limit("decide")),
                 ("answer", 0, ledger.output_limit("answer")), ("answer", 0, ledger.output_limit("answer"))])
@@ -95,9 +101,12 @@ def build_agent_decision(deps: "WorkflowDependencies"):
             return {**stopped_state("model_unavailable", ledger), **degradation(state, "decide", error),
                     "decision_count": state["decision_count"] + 1}
         by_name = {tool.name: tool for tool in tools}
+        frozen = {call["id"]: binding_dict(by_name[call["name"]].binding) for call in calls}
+        suggested = [kind for kind in selected.suggested_actions
+                     if kind != "create_ticket" or not state.get("ticket_write_state")]
         return {"budget": ledger.snapshot(), "decision_count": state["decision_count"] + 1,
-                "pending_calls": calls, "pending_bindings": {call["id"]: binding_dict(by_name[call["name"]].binding) for call in calls},
-                "suggested_kinds": selected.suggested_actions,
+                "pending_calls": calls, "pending_bindings": frozen, "pending_tool_bindings": frozen,
+                "suggested_kinds": suggested,
                 "stop_reason": selected.kind if selected.kind != "tools" else None}
     return decision
 
@@ -110,7 +119,9 @@ def build_agent_graph(deps: "WorkflowDependencies", *, decision=None):
         """逐个执行已批准申请并写完整配对。参数：state待执行批次；返回：完整替换更新；异常：持久化错误/取消。"""
         context = ToolContext.model_validate(state["context"])
         calls, messages = state["pending_calls"], []
-        bindings = state.get("pending_bindings", {})
+        bindings = state.get("pending_tool_bindings") or state.get("pending_bindings", {})
+        ticket_intent = TicketIntentState.model_validate(state["ticket_intent"]) if state.get("ticket_intent") else None
+        pending_ticket, ticket_write_state = state.get("pending_ticket"), state.get("ticket_write_state")
         ledger = BudgetLedger.from_snapshot(state["budget"])
         knowledge_state = deepcopy(state)
         knowledge_state.setdefault("knowledge_cache", {})
@@ -138,9 +149,36 @@ def build_agent_graph(deps: "WorkflowDependencies", *, decision=None):
                 count += 1
             binding = binding_from_dict(bindings[call["id"]]) if call["id"] in bindings else None
             runtime = KnowledgeCallContext(knowledge_state, ledger, deps.search, deps.settings, deps.query_expander)
+            builtin_ticket = (binding is not None and binding.identity.source == "builtin"
+                              and binding.identity.server is None and binding.identity.name == "create_ticket")
+            authorize = None
+            if builtin_ticket:
+                pending_ticket = await deps.chat.get_pending_ticket(context)
+                rejection = ticket_write_rejection(ticket_intent, call["args"], call_context, pending_ticket) or rejection
+
+                async def authorize(saved_binding, arguments, original_context):
+                    """把当前服务器诉求和仓储绑定到唯一内置写工具。
+
+                    参数：原来源、参数和上下文；返回：已保存决定；异常：中断、拒绝或仓储故障。
+                    """
+                    return await request_ticket_authorization(saved_binding, arguments, original_context,
+                        intent=ticket_intent, repository=deps.chat)
+
             # 编排拒绝也进入执行器；中断、取消及提交未知由执行器原样透传，不能另造结果。
-            result = await deps.executor.execute(call, call_context, on_status,
-                scope=ToolExecutionScope(binding=binding, rejection=rejection, knowledge=runtime))
+            try:
+                result = await deps.executor.execute(call, call_context, on_status,
+                    scope=ToolExecutionScope(binding=binding, rejection=rejection, knowledge=runtime, authorize_write=authorize))
+            except PersistenceUncertain:
+                if builtin_ticket:
+                    await deps.chat.finish_ticket_preview(call_context, None)
+                raise
+            if builtin_ticket:
+                pending_ticket = await deps.chat.finish_ticket_preview(call_context, result)
+                if pending_ticket:
+                    ticket_write_state = {"action_id": pending_ticket["action"]["action_id"],
+                        "tool_call_id": pending_ticket["action"]["tool_call_id"], "status": pending_ticket["status"]}
+                    if ticket_intent and pending_ticket["action"]["tool_call_id"] == call["id"]:
+                        ticket_intent = ticket_intent.model_copy(update={"status": "confirmed" if result.ok else "cancelled"})
             if (result.verified_knowledge is not None and binding is not None
                     and binding.identity.source == "builtin" and call["name"] in {"query_faq", "query_refund_policy"}):
                 outcome = result.verified_knowledge
@@ -149,15 +187,22 @@ def build_agent_graph(deps: "WorkflowDependencies", *, decision=None):
             if result.ok and call["name"] == "query_order" and result.data and result.data.get("order_id"):
                 knowledge_state.update(order_id=result.data["order_id"], order_data=deepcopy(result.data))
             if not result.ok and result.error is not None:
+                if (binding is not None and binding.identity.source == "builtin"
+                        and binding.identity.name == "query_refund_policy" and result.error.code == "ORDER_REQUIRED"
+                        and signature in seen_signatures):
+                    # 本地前置闸尚未查询政策，核实订单后可用新ID重提同参数；调用ID和次数仍保留。
+                    seen_signatures.remove(signature)
                 batch_failed = True
                 try:
                     write = binding is not None and deps.registry.get_definition(binding.identity).access == "write"
                 except KeyError:
                     write = False
                 if result.error.code in {"USER_CANCELLED", "WRITE_RESULT_UNKNOWN"} or write and result.error.category == "fault":
-                    reason = "tool_failed"
+                    reason = "ticket_cancelled" if result.error.code == "USER_CANCELLED" else "tool_failed"
             messages.append(message_row(context.turn_id, "tool", result.model_dump_json(), call_id=call["id"]))
-        update = {"messages": messages, "pending_calls": [], "pending_bindings": {}, "seen_call_ids": seen_ids,
+        update = {"messages": messages, "pending_calls": [], "pending_bindings": {}, "pending_tool_bindings": {},
+                  "pending_ticket": pending_ticket, "ticket_write_state": ticket_write_state,
+                  "ticket_intent": ticket_intent.model_dump(mode="json") if ticket_intent else None, "seen_call_ids": seen_ids,
                   "seen_call_signatures": seen_signatures, "tool_count": count, "budget": ledger.snapshot(),
                   **{key: knowledge_state[key] for key in ("knowledge_cache", "evidence", "gate", "evidence_scores",
                      "expanded_queries", "retrieval_attempted", "order_id", "order_data")}}
@@ -169,11 +214,27 @@ def build_agent_graph(deps: "WorkflowDependencies", *, decision=None):
         """推送并累计相同正文，外部断流追加说明。参数：state事实；返回：完整正文和账本；异常：取消及程序错误。"""
         writer = get_stream_writer()
         publish_stage(state, "answer", "running")
+        receipt_prefix = ""
+        pending = state.get("pending_ticket")
+        if pending and pending.get("status") == "completed":
+            # 真实工单回执优先于模型正文，外部模型断流不能隐藏已经提交的工单号。
+            from app.schemas.workflow import TicketReceipt
+            action = pending["action"]
+            original_context = ToolContext.model_validate(state["context"]).model_copy(update={"tool_call_id": action["tool_call_id"]})
+            result = await deps.chat.get_tool_result(original_context)
+            if result is not None and result.ok and result.data:
+                receipt = TicketReceipt(action_id=action["action_id"], ticket_no=result.data["ticket_no"],
+                    ticket_type=result.data["ticket_type"], status=result.data["status"])
+                receipt_prefix = f"工单已创建，工单号：{receipt.ticket_no}，状态：{receipt.status}。\n\n"
         if state["answer"]:
-            writer({"event": "delta", "data": {"delta": state["answer"]}})
-            return {"answer": state["answer"]}
+            answer = receipt_prefix + state["answer"]
+            writer({"event": "delta", "data": {"delta": answer}})
+            return {"answer": answer}
         ledger = BudgetLedger.from_snapshot(state["budget"])
         parts = []
+        if receipt_prefix:
+            parts.append(receipt_prefix)
+            writer({"event": "delta", "data": {"delta": receipt_prefix}})
         if state.get("route") == "order_policy":
             prefix = verified_order_text(state)
             parts.append(prefix)
@@ -219,6 +280,11 @@ def build_agent_graph(deps: "WorkflowDependencies", *, decision=None):
         except (WorkflowBudgetExceeded, ContextBudgetExceeded) as error:
             return finish_failure("budget_exceeded", error)
         except DEPENDENCY_ERRORS as error:
+            return finish_failure("answer_unavailable", error)
+        except RuntimeError as error:
+            # 只有已提交票据的正文故障在这里收尾；其他程序错误继续交由外层定位。
+            if not receipt_prefix:
+                raise
             return finish_failure("answer_unavailable", error)
         publish_stage(state, "answer", "completed")
         return {"answer": "".join(parts), "budget": ledger.snapshot()}

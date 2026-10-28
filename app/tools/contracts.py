@@ -70,6 +70,17 @@ class WriteAuthorization:
     origin: Literal["chat", "action"]  # 聊天暂停或旧按钮确认。
 
 
+class WriteAuthorizationRejected(Exception):
+    """授权事务明确拒绝某个申请，允许统一执行器记录拒绝而不吞掉程序错误。"""
+
+    def __init__(self, result: ToolResult):
+        """携带已经分类的确定拒绝。参数：result 失败工具结果；返回：None；异常：ValueError，传入成功结果。"""
+        if result.ok or result.error is None:
+            raise ValueError("授权拒绝必须携带失败结果")
+        super().__init__(result.error.message)
+        self.result = result
+
+
 @dataclass
 class KnowledgeCallContext:
     """知识工具共享本轮证据与预算，只在运行时存在。"""

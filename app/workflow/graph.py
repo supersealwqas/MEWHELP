@@ -82,6 +82,12 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
     async def resolve_node(state: ConversationState) -> ConversationState:
         """原话透传并使用本实例预算初始化新轮。参数：state入口全量新字典；返回：本轮初始更新；异常：配置错误。"""
         query = state["raw_query"]
+        from app.tools.confirmation import TicketIntentState, advance_ticket_intent
+        previous_intent = TicketIntentState.model_validate(state["ticket_intent"]) if state.get("ticket_intent") else None
+        ticket_intent = advance_ticket_intent(previous_intent, ToolContext.model_validate(state["context"]), state["current_message_id"])
+        await deps.chat.save_ticket_intent(ToolContext.model_validate(state["context"]), ticket_intent)
+        ticket_update = {"ticket_intent": ticket_intent.model_dump(mode="json") if ticket_intent else None}
+        state = {**state, **ticket_update}
         ledger = BudgetLedger.from_settings(deps.settings)
         snapshot = None
         publish_stage(state, "understand", "running")
@@ -101,17 +107,17 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
         except (WorkflowBudgetExceeded, ContextBudgetExceeded) as error:
             if snapshot is None:
                 log_history(state, {"summary": "", "layer1": [], "layer2": []}, error_type=type(error).__name__)
-            return {**stopped_state("budget_exceeded", ledger), "history_context": snapshot}
+            return {**stopped_state("budget_exceeded", ledger), "history_context": snapshot, **ticket_update}
         except DEPENDENCY_ERRORS as error:
             # 理解只是优化；失败时保留完整原话，让后续分类仍有机会工作。
             understood = original_understanding(query)
             publish_stage(state, "understand", "completed", resolved_query=query, standard_query=query)
-            return {**understood.model_dump(), "budget": ledger.snapshot(), "history_context": snapshot,
+            return {**understood.model_dump(), "budget": ledger.snapshot(), "history_context": snapshot, **ticket_update,
                     **degradation(state, "understand", error)}
         publish_stage(state, "understand", "completed", resolved_query=understood.resolved_query,
                       standard_query=understood.standard_query)
         return {"resolved_query": understood.resolved_query, "standard_query": understood.standard_query,
-                "order_id": understood.order_id, "budget": ledger.snapshot(), "history_context": snapshot}
+                "order_id": understood.order_id, "budget": ledger.snapshot(), "history_context": snapshot, **ticket_update}
 
     async def classify_node(state: ConversationState) -> ConversationState:
         """仅调用受限分类器，失败不猜意图。参数：state原问和历史；返回：严格分类与账本；异常：模型/分类/预算错误。"""

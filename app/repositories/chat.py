@@ -9,7 +9,7 @@ from app.models.knowledge import KnowledgeChunk
 from app.models.rag_quality import LowConfidenceQuestion
 from app.models.customer_service import Conversation, Message
 from app.schemas.history import StoredMessage, StoredTurn
-from app.schemas.tools import ToolContext, ToolResult
+from app.schemas.tools import ToolContext, ToolError, ToolResult
 from app.schemas.workflow import HistoryDelta, RetrievalLowConfidence, SuggestedAction, OrderSelectionAction, RefundAction
 
 
@@ -61,7 +61,10 @@ async def validate_refund_evidence(session, context: ToolContext, action: Refund
         Message.turn_id == context.turn_id, Message.role == "assistant", Message.tool_calls.is_not(None)))).all()
     expected_call = {"id": call_id, "name": "query_order", "args": {"order_id": action.order_id}}
     if (fact is None or not fact.ok or not fact.data or fact.data.get("order_id") != action.order_id
-            or not any(expected_call in row.tool_calls for row in calls)):
+            or not any(all(call.get(key) == value for key, value in expected_call.items())
+                       and (not call.get("binding") or call["binding"].get("identity") == {
+                           "source": "builtin", "server": None, "name": "query_order"})
+                       for row in calls for call in row.tool_calls)):
         raise ValueError("退款动作缺少本轮已核实订单事实")
 
 
@@ -83,12 +86,18 @@ def stored_turns(rows: list[Message]) -> list[StoredTurn]:
         turn = turns.setdefault(row.turn_id, StoredTurn(turn_id=row.turn_id, turn_status=row.turn_status))
         if row.role == "user" and isinstance(row.rag_metadata, dict):
             turn.order_selection = row.rag_metadata.get("order_selection")
+            turn.ticket_intent = row.rag_metadata.get("ticket_intent")
+            turn.ticket_confirmation = row.rag_metadata.get("pending_ticket")
             # 独立动作在恢复后可能标cancelled/failed，但成功回执仍可凭原键补写。
             turn.receipt_pending = row.rag_metadata.get("ticket_action") is not None and row.turn_status != "completed"
+            if isinstance(turn.ticket_confirmation, dict):
+                status = turn.ticket_confirmation.get("status")
+                if status in {"awaiting_input", "accepted", "unknown"} or status == "completed" and row.turn_status != "completed":
+                    turn.receipt_pending = True
         turn.messages.append(StoredMessage(id=row.id, role=row.role, content=row.content or "",
                                           tool_calls=row.tool_calls, tool_call_id=row.tool_call_id))
     for turn in turns.values():
-        if turn.receipt_pending:
+        if turn.receipt_pending and turn.ticket_confirmation is None:
             results = [row for row in turn.messages if row.role == "tool"]
             try:
                 # 已确认的工具失败不会生成成功回执；未知或损坏结果仍按可能补写保守处理。
@@ -202,8 +211,130 @@ class ChatRepository:
                 Message.turn_status == "completed").order_by(Message.id.desc()).limit(1))
             return {"context": source_context(conversation, source), "turn_status": source.turn_status,
                     "order_selection": (source.rag_metadata or {}).get("order_selection"),
+                    "pending_ticket": (source.rag_metadata or {}).get("pending_ticket"),
+                    "ticket_intent": (source.rag_metadata or {}).get("ticket_intent"),
+                    "ticket_write_state": (source.rag_metadata or {}).get("ticket_write_state"),
                     "answer": answer.content if answer is not None else None,
                     "completion_metadata": answer.rag_metadata if answer is not None else None}
+
+    async def save_ticket_intent(self, context: ToolContext, intent) -> None:
+        """把当前诉求保存到原用户行，不修改原始聊天正文。
+
+        参数：context 可信原轮，intent 为有界意图或 None；返回：None；异常：PersistenceUncertain，来源不符；数据库错误。
+        """
+        async with self.factory.begin() as session:
+            conversation, source = await owned_source(session, context.session_id, context.user_id, context.turn_id, lock=True)
+            if source is None or source_context(conversation, source) != context.model_copy(update={"tool_call_id": ""}):
+                raise PersistenceUncertain("建单诉求缺少可信原用户消息")
+            metadata = dict(source.rag_metadata or {})
+            # 有预览后其意图由确认流程更新，节点重放不得把它倒退为 collecting。
+            if metadata.get("pending_ticket") is None:
+                metadata["ticket_intent"] = intent.model_dump(mode="json") if intent else None
+                source.rag_metadata = metadata
+
+    async def get_pending_ticket(self, context: ToolContext) -> dict | None:
+        """回读当前原轮唯一冻结流程，带调用标识时不接受串用其他申请。
+
+        参数：context 可信会话和可选原调用标识；返回：冻结流程或 None；异常：PersistenceUncertain，身份不符；数据库错误。
+        """
+        async with self.factory() as session:
+            conversation, source = await owned_source(session, context.session_id, context.user_id, context.turn_id)
+            if source is None or source_context(conversation, source) != context.model_copy(update={"tool_call_id": ""}):
+                raise PersistenceUncertain("工单流程来源不匹配")
+            pending = (source.rag_metadata or {}).get("pending_ticket")
+            if pending is not None and context.tool_call_id and pending["action"]["tool_call_id"] != context.tool_call_id:
+                return None
+            return pending
+
+    async def prepare_ticket_preview(self, context: ToolContext, binding, action, intent) -> dict:
+        """在原用户行锁内冻结唯一预览和来源绑定，再结束事务等待用户。
+
+        参数：context 原调用、binding 决定快照、action 稳定预览、intent 本诉求原话；返回：原冻结流程；
+        异常：WriteAuthorizationRejected，意图/描述/原流程不符；PersistenceUncertain，来源损坏；数据库错误。
+        """
+        from app.tools.confirmation import ticket_description, ticket_preview
+        from app.tools.contracts import WriteAuthorizationRejected, binding_dict, json_hash
+        arguments = {"description": action.description, "ticket_type": action.ticket_type}
+        if (binding.identity.source != "builtin" or binding.identity.server is not None
+                or binding.identity.name != "create_ticket" or action != ticket_preview(context, arguments)
+                or ticket_description(intent) != action.description):
+            raise WriteAuthorizationRejected(ToolResult(ok=False, error=ToolError(code="NOT_CONFIRMED", message="建单申请与可信原话不匹配", category="permission_denied")))
+        payload = {"action": action.model_dump(mode="json"), "binding": binding_dict(binding),
+            "arguments_hash": json_hash(arguments), "status": "awaiting_input", "decision": None, "execution_started": False}
+        async with self.factory.begin() as session:
+            conversation, source = await owned_source(session, context.session_id, context.user_id, context.turn_id, lock=True)
+            if source is None or source_context(conversation, source) != context.model_copy(update={"tool_call_id": ""}):
+                raise PersistenceUncertain("工单预览缺少可信原轮")
+            metadata = dict(source.rag_metadata or {})
+            saved = metadata.get("pending_ticket")
+            if saved is not None:
+                if any(saved.get(key) != payload[key] for key in ("action", "binding", "arguments_hash")):
+                    raise WriteAuthorizationRejected(ToolResult(ok=False, error=ToolError(code="TICKET_FLOW_USED", message="本轮已有工单流程，不能再次申请", category="permission_denied")))
+                return saved
+            if metadata.get("ticket_intent") != intent.model_dump(mode="json") or source.turn_status != "running":
+                raise WriteAuthorizationRejected(ToolResult(ok=False, error=ToolError(code="NOT_CONFIRMED", message="原建单诉求已改变，本次没有执行", category="permission_denied")))
+            calls = (await session.scalars(select(Message).where(Message.conversation_id == context.conversation_id,
+                Message.turn_id == context.turn_id, Message.tool_calls.is_not(None)))).all()
+            expected_call = {"id": context.tool_call_id, "name": "create_ticket", "args": arguments, "binding": binding_dict(binding)}
+            if not any(expected_call in row.tool_calls for row in calls):
+                raise PersistenceUncertain("工单预览没有对应的完整原申请")
+            metadata.update(pending_ticket=payload, ticket_intent=intent.model_copy(update={"status": "preview"}).model_dump(mode="json"),
+                ticket_write_state={"action_id": action.action_id, "tool_call_id": context.tool_call_id, "status": "awaiting_input"})
+            source.rag_metadata = metadata
+            await session.execute(update(Message).where(Message.conversation_id == context.conversation_id,
+                Message.turn_id == context.turn_id).values(turn_status="awaiting_input"))
+            return payload
+
+    async def save_ticket_wait(self, context: ToolContext, action) -> None:
+        """核验图中断所展示的是已冻结卡片，不覆盖已接受的决定。
+
+        参数：context 原轮，action 官方 interrupt 的卡片；返回：None；异常：PersistenceUncertain，快照不一致；数据库错误。
+        """
+        pending = await self.get_pending_ticket(context)
+        if pending is None or pending.get("action") != action.model_dump(mode="json"):
+            raise PersistenceUncertain("工单中断与已保存预览不一致")
+
+    async def mark_ticket_execution(self, context: ToolContext, action_id: str) -> None:
+        """确认后标记唯一执行边界，无确定结果的重入不得再次产生副作用。
+
+        参数：context 原调用，action_id 已核对动作；返回：None；异常：PersistenceUncertain，来源/决定异常或已经开始；数据库错误。
+        """
+        async with self.factory.begin() as session:
+            conversation, source = await owned_source(session, context.session_id, context.user_id, context.turn_id, lock=True)
+            saved = (source.rag_metadata or {}).get("pending_ticket") if source is not None else None
+            if (source is None or source_context(conversation, source) != context.model_copy(update={"tool_call_id": ""})
+                    or not saved or saved["action"]["action_id"] != action_id
+                    or saved["action"]["tool_call_id"] != context.tool_call_id
+                    or saved.get("decision") != "confirm" or saved.get("status") != "accepted"
+                    or saved.get("execution_started")):
+                raise PersistenceUncertain("工单执行边界已经开始或无法核实")
+            source.rag_metadata = {**source.rag_metadata, "pending_ticket": {**saved, "execution_started": True}}
+
+    async def finish_ticket_preview(self, context: ToolContext, result: ToolResult | None) -> dict | None:
+        """记录原冻结流程终态，保留首次决定和原参数供恢复核对。
+
+        参数：context 原调用，result 确定工具结果或 None 表示提交未知；返回：最新流程或 None；异常：数据库错误。
+        """
+        async with self.factory.begin() as session:
+            conversation, source = await owned_source(session, context.session_id, context.user_id, context.turn_id, lock=True)
+            if source is None or source_context(conversation, source) != context.model_copy(update={"tool_call_id": ""}):
+                raise PersistenceUncertain("工单收尾来源不匹配")
+            metadata = dict(source.rag_metadata or {})
+            saved = metadata.get("pending_ticket")
+            if saved is None or saved["action"]["tool_call_id"] != context.tool_call_id:
+                return saved
+            status = "unknown" if result is None else "completed" if result.ok else "cancelled"
+            saved = {**saved, "status": status}
+            intent = dict(metadata.get("ticket_intent") or {})
+            if intent:
+                intent["status"] = "unknown" if result is None else "confirmed" if result.ok else "cancelled"
+            source.rag_metadata = {**metadata, "pending_ticket": saved, "ticket_intent": intent or None,
+                "ticket_write_state": {"action_id": saved["action"]["action_id"], "tool_call_id": context.tool_call_id, "status": status}}
+            if result is not None:
+                # 无效恢复也已有确定拒绝结果；结束等待后允许保存原轮最终答复。
+                await session.execute(update(Message).where(Message.conversation_id == context.conversation_id,
+                    Message.turn_id == context.turn_id, Message.turn_status == "awaiting_input").values(turn_status="running"))
+            return saved
 
     async def save_order_wait(self, context: ToolContext, action: OrderSelectionAction) -> None:
         """将匹配的原轮保存为等待，绝不倒退已接受或完成状态。
@@ -412,7 +543,8 @@ class ChatRepository:
                 .where(Message.role == "user", Message.turn_status.in_(["running", "awaiting_input"]))
                 .order_by(Message.id))).all()
             return [{"context": source_context(conversation, source), "turn_status": source.turn_status,
-                     "order_selection": (source.rag_metadata or {}).get("order_selection")}
+                     "order_selection": (source.rag_metadata or {}).get("order_selection"),
+                     "pending_ticket": (source.rag_metadata or {}).get("pending_ticket")}
                     for conversation, source in rows]
 
     async def mark_turn(self, context: ToolContext, status: str, *, include_waiting: bool = False) -> None:

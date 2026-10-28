@@ -23,7 +23,7 @@ from sqlalchemy.exc import DBAPIError
 from app.repositories.chat import PersistenceUncertain
 from app.repositories.tool_audit import ToolAuditEntry
 from app.schemas.tools import ToolContext, ToolError, ToolResult
-from app.tools.contracts import ToolBinding, ToolDefinition, ToolExecutionScope, WriteAuthorization, json_hash
+from app.tools.contracts import ToolBinding, ToolDefinition, ToolExecutionScope, WriteAuthorization, WriteAuthorizationRejected, json_hash
 from app.tools.validation import validate_arguments
 
 logger = logging.getLogger(__name__)
@@ -251,7 +251,11 @@ class ToolExecutor:
         """
         if scope.authorize_write is None:
             return ToolResult.failed("NOT_CONFIRMED", "此写入尚未得到有效确认，本次没有执行")
-        authorization = await scope.authorize_write(scope.binding, deepcopy(arguments), context)
+        try:
+            authorization = await scope.authorize_write(scope.binding, deepcopy(arguments), context)
+        except WriteAuthorizationRejected as error:
+            # 只转换已明确分类的事务拒绝；程序错误、中断和未知提交继续上抛。
+            return error.result
         if (not isinstance(authorization, WriteAuthorization)
                 or authorization.conversation_id != context.conversation_id
                 or authorization.turn_id != context.turn_id or authorization.tool_call_id != context.tool_call_id

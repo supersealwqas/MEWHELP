@@ -44,6 +44,10 @@ class ConversationState(TypedDict, total=False):
     degradations: list[dict]  # 本轮外部故障的阶段和类型，不含错误原文。
     pending_calls: list[dict]  # 本轮下一批待执行的只读工具申请。
     pending_bindings: dict[str, dict]  # 决定时按调用ID冻结的工具来源与schema。
+    pending_tool_bindings: dict[str, dict]  # CH08确认恢复公开状态名，与pending_bindings同步并兼容旧checkpoint。
+    pending_ticket: dict | None  # 本原轮唯一冻结预览及用户决定，不由模型提供。
+    ticket_intent: dict | None  # 当前未完成诉求的有界真实用户来源。
+    ticket_write_state: dict | None  # 原工具轮已占用的唯一流程状态，新轮重置。
     knowledge_cache: dict[str, dict]  # 本轮精确查询/筛选对应的本地可信结果，下一轮清空。
     route_ready: bool  # 当前知识/订单政策固定流程是否已经完成证据门槛。
     seen_call_ids: list[str]  # 已见工具调用ID，用于跨决策查重。
@@ -120,6 +124,10 @@ def new_turn_state(context: ToolContext, history_turns: list[dict], audit_cursor
         raise ValueError("当前原话必须为1–4000字符的非空文本")
     if type(audit_cursor) is not int or audit_cursor < 0:
         raise ValueError("历史审计游标必须为非负整数")
+    from app.tools.confirmation import TicketIntentState
+    previous = history_turns[-1].get("ticket_intent") if history_turns else None
+    # 只取紧接前轮已保存状态，不从历史正文重新猜测一次旧许可。
+    previous = TicketIntentState.model_validate(previous).model_dump(mode="json") if previous else None
     # 新input必须显式覆盖每个字段，防止同thread的旧checkpoint残留运行数据。
     return {
         "context": context.model_dump(mode="json"), "raw_query": query, "resolved_query": "", "standard_query": "",
@@ -130,7 +138,9 @@ def new_turn_state(context: ToolContext, history_turns: list[dict], audit_cursor
         "history_context": None, "context_notes": [],
         "intent": None, "intent_confidence": None, "route": None, "evidence": [], "evidence_scores": [], "gate": None,
         "retrieval_attempted": False, "degradations": [],
-        "pending_calls": [], "pending_bindings": {}, "knowledge_cache": {}, "route_ready": False,
+        "pending_calls": [], "pending_bindings": {}, "pending_tool_bindings": {},
+        "pending_ticket": None, "ticket_intent": previous, "ticket_write_state": None,
+        "knowledge_cache": {}, "route_ready": False,
         "seen_call_ids": [], "seen_call_signatures": [],
         "tool_count": 0, "decision_count": 0, "budget": BudgetLedger().snapshot(),
         "suggested_kinds": [], "suggested_actions": [], "refund_action": None, "answer": "", "stop_reason": None,

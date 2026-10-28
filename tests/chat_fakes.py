@@ -58,6 +58,24 @@ class MemoryRepository:
     async def cancel_order_wait(self, session_id, user_id):
         """普通聊天替身不产生等待。参数：会话/用户；返回：None；异常：无。"""
 
+    async def save_ticket_intent(self, context, intent):
+        """保存短期诉求到原用户轮，不修改正文。
+
+        参数：context 原轮，intent 有界意图或空；返回：None；异常：轮次不存在。
+        """
+        self.turns[context.turn_id].ticket_intent = intent.model_dump(mode="json") if intent else None
+
+    async def get_pending_ticket(self, context):
+        """读取替身原轮确认状态。参数：context 原轮；返回：冻结流程或 None；异常：轮次不存在。"""
+        return self.turns[context.turn_id].ticket_confirmation
+
+    async def finish_ticket_preview(self, context, result):
+        """无预览的拒绝无需收尾，真实确认由专用 SQLite 测试验证。
+
+        参数：context 原调用，result 确定结果；返回：原冻结流程或 None；异常：轮次不存在。
+        """
+        return await self.get_pending_ticket(context)
+
     async def save_tool_calls(self, context, calls, *, deduplicate=False, bindings=None):
         """保存申请。参数：上下文、申请；返回：None；异常：无。"""
         calls = [{**call, **({"binding": bindings[call["id"]]} if bindings and call["id"] in bindings else {})} for call in calls]
@@ -216,7 +234,7 @@ def make_workflow_service(*, intents=("订单",), decisions=None, answers=None, 
     from app.services.chat import ChatService
     from app.schemas.workflow import AgentDecision
     from app.tools.executor import ToolExecutor
-    from app.tools.registry import build_agent_registry
+    from app.tools.registry import build_registry
     from app.workflow.graph import build_workflow
     from tests.workflow.graph_fakes import dependencies
 
@@ -226,7 +244,9 @@ def make_workflow_service(*, intents=("订单",), decisions=None, answers=None, 
         deps.settings = settings
     repository, support = MemoryRepository(), FAQRepository()
     deps.chat = repository
-    deps.executor = ToolExecutor(build_agent_registry(), repository, support, deps.settings.tool_timeout_seconds,
+    # 旧章HTTP离线样例使用含演示物流的兼容清单，图与执行器仍必须共享同一实例。
+    deps.registry = build_registry()
+    deps.executor = ToolExecutor(deps.registry, repository, support, deps.settings.tool_timeout_seconds,
         deps.settings.tool_max_retries, deps.settings.tool_retry_delay_seconds)
     graph = build_workflow(deps, checkpointer=InMemorySaver())
     service = ChatService(repository, graph, deps.executor, deps.settings)

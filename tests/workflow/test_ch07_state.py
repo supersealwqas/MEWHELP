@@ -121,7 +121,8 @@ async def test_legacy_waiting_checkpoint_resumes_same_action_without_reclassific
             action = (await collect(service, "我要退款"))[-1].data
             await service.graph.aupdate_state(config, {"context_version": 6, "current_message_id": "",
                 "messages": Overwrite([{"role": "user", "content": "我要退款"},
-                    {"role": "system", "content": "旧临时内容"}])}, as_node="classify_intent")
+                    # CH08新增前置工具决定；旧等待的位置仍是已完成决定之后的fetch_order。
+                    {"role": "system", "content": "旧临时内容"}])}, as_node="decide_tools")
             await service.graph.ainvoke(None, config)  # 在同一节点再次挂回原来的确定性动作。
             resumed = [event async for event in service.stream_resume(resume_request(action))]
             assert [event.event for event in resumed[-2:]] == ["answer_metadata", "done"]
