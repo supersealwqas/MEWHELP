@@ -58,3 +58,8 @@ uv run python -m app.db.migrate_ch07 --env-file .env --database mewhelp --apply
 ```
 
 `create_all()`不会为旧会话表补列，升级已有库必须执行增量迁移。MySQL的DDL隐式提交，迁移中断后检查输出并重跑补齐；摘要业务行的追加和锚点推进则由仓储短事务原子提交。
+# CH08 工具审计增量迁移
+
+既有库使用 `uv run python -m app.db.migrate_ch08 --env-file .env --database <显式库名>` 先预览；确认目标后加 `--apply` 创建 `tool_audit_logs`。
+迁移直接读取 `sql/ch08-ddl.sql`，不清表；已存在时核对字段类型、中文枚举、默认值、主键、三个普通索引和无外键约束。结构不兼容会拒绝执行，重复执行无变更。
+审计为独立短事务，默认写入时限一秒；它不代替完整工具消息，也不承担业务防重复职责。
