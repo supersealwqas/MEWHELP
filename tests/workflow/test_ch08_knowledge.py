@@ -2,11 +2,55 @@
 
 import json
 
+import pytest
+
 from app.schemas.tools import ToolResult
 from app.schemas.workflow import AgentDecision
 from app.workflow.graph import build_workflow
 from tests.workflow.graph_fakes import call, ranked, turn
 from tests.workflow.test_ch08_dynamic_tools import dynamic_dependencies, read_definition
+
+
+@pytest.mark.parametrize("score,passed", [(0.9, True), (0.1, False)])
+async def test_refund_policy_before_order_preserves_required_expansion(tmp_path, score, passed):
+    """未核验订单的前置政策工具抢占唯一扩写额度、绕过政策条件或证据闸时失败。
+
+    参数：tmp_path 隔离权限目录、score 权威证据评分、passed 预期门槛结论。
+    返回：None；异常：图运行或断言失败。
+    """
+    query = "订单1001能退吗"
+    deps = dynamic_dependencies(tmp_path, intents=["退款退货"], ranked=[ranked(score)], decisions=[
+        AgentDecision(kind="tools", tool_calls=[call("early-policy", "query_refund_policy", query=query)]),
+        AgentDecision(kind="answer")], answers=[["退货条件以已核实证据为准。"]])
+    original_search = deps.search.retrieve_policy
+
+    async def checked_search(search_query, **options):
+        """在真实检索边界核对已核实订单与来源约束。
+
+        参数：search_query 完整政策问句、options 真实检索参数；返回：离线排名；异常：断言失败。
+        """
+        assert any(result.ok and result.data.get("order_id") == "1001" for _, result in deps.chat.results)
+        assert "当前已确认对象：订单1001，商品：" in search_query and "，状态：" in search_query
+        assert query in search_query
+        assert options["filters"] == {"source_key": ["doc:returns-policy.md", "doc:after-sales-manual.md",
+                                                     "doc:billing-shipping.md", "doc:member-benefits.md"]}
+        return await original_search(search_query, **options)
+
+    deps.search.retrieve_policy = checked_search
+    initial = turn(query)
+    initial["context"]["user_id"] = "demo-user"
+    state = await build_workflow(deps, checkpointer=None).ainvoke(initial)
+    assert state["stop_reason"] == "answer"
+    assert state["order_id"] == "1001" and state["order_data"]["order_id"] == "1001"
+    assert state["route_ready"] and state["gate"]["passed"] is passed
+    assert bool(state["evidence"]) is passed
+    assert len(deps.query_expander.calls) == len(deps.search.calls) == 1
+    assert [row["stage"] for row in state["budget"]["records"]].count("expand") == 1
+    early_result = deps.chat.results[0][1]
+    assert not early_result.ok and early_result.error.code == "ORDER_REQUIRED"
+    assert early_result.verified_knowledge is None
+    if not passed:
+        assert deps.chat.finished[0]["citations"] == []
 
 
 async def test_same_turn_evidence_is_reused(tmp_path):

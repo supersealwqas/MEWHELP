@@ -106,7 +106,10 @@ async def verified_knowledge_tool(arguments: dict, context: ToolContext, scope: 
     filters = {key: arguments[key] for key in ("category", "content_type") if arguments.get(key) is not None}
     if policy:
         filters["source_key"] = list(ORDER_POLICY_SOURCES)
-        if state.get("route") == "order_policy" and state.get("order_data"):
+        if state.get("route") == "order_policy":
+            if not state.get("order_data"):
+                # 订单政策必须用核验后的商品与状态扩写，不能让前置申请抢占本轮唯一扩写额度。
+                return ToolResult.failed("ORDER_REQUIRED", "请先核实本次订单，再按已核实的商品和状态查询退款政策。")
             query = policy_query(state)
     outcome = await retrieve_verified_knowledge(state, runtime.ledger, search=runtime.search, settings=runtime.settings,
         query_expander=runtime.query_expander, query=query, policy=policy, filters=filters,

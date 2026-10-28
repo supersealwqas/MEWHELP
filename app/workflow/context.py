@@ -1,7 +1,7 @@
 """CH07每轮历史快照和模型输入：只读投影、固定前缀、原问定位及SDK边界日志。"""
 
 from copy import deepcopy
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import hashlib
 import json
 import logging
@@ -9,7 +9,7 @@ import logging
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage, convert_to_messages
 
 from app.core.context_budget import ContextBudgetExceeded, TokenEstimator, context_budget
-from app.core.context_layers import _suffix, build_context_snapshot
+from app.core.context_layers import _suffix, build_context_snapshot, history_blocks
 from app.core.memory import _model_message, _without_tool_metadata, assemble_turns
 from app.knowledge.answering import edge_order
 from app.schemas.history import StoredTurn
@@ -82,7 +82,7 @@ def _result_policy(registry, binding: dict | None, name: str | None):
 
 
 def _project_history(turns: list[StoredTurn], settings, registry, estimator) -> list[StoredTurn]:
-    """在CH07分层计量前生成工具结果副本，不变更消息主键或原始审计。
+    """为已选中的原文或半压轮生成工具结果副本，不变更消息主键或原始审计。
 
     参数：完整轮、窗口配置、共享清单、计量器；返回：按本地规则投影的新轮列表。
     异常：ContextBudgetExceeded，不能完整保留关键事实；损坏的绑定快照原样报错。
@@ -104,6 +104,48 @@ def _project_history(turns: list[StoredTurn], settings, registry, estimator) -> 
     return projected
 
 
+def _layered_history(turns, settings, registry, estimator, budget, anchors):
+    """先按完整轮分层，再投影实际正文；不能容纳的旧关键事实整块降为半压标识。
+
+    参数：turns 完整历史、settings 配置、registry 本地清单、estimator 计量器、budget 容量、anchors 已提交边界。
+    返回：ContextSnapshot，保留原始范围和真实旧边界；异常：ValueError 为坏锚点，ContextBudgetExceeded 为不安全降级。
+    """
+    options = {"summary_upto_msg_id": anchors.get("summary_upto_msg_id", 0),
+               "layer1_from_msg_id": anchors.get("layer1_from_msg_id", 0),
+               "summaries": anchors.get("summaries", []), "budget": budget, "estimator": estimator}
+    # 先由CH07校验全量主键、相交轮和持久化边界，摘要与半压原文此时不做单工具投影。
+    snapshot = build_context_snapshot(turns, **options)
+    boundary, projected = snapshot.layer1_from_msg_id, {}
+    for block in reversed(history_blocks(turns)):
+        if block.last_id <= boundary:
+            break
+        try:
+            projected.update({turn.turn_id: turn for turn in _project_history(block.turns, settings, registry, estimator)})
+        except ContextBudgetExceeded:
+            # 仅旧历史可整块降级；逆序查找让更旧的轮直接走原半压路径，不丢关键字段冒充完整结果。
+            boundary = block.last_id
+            break
+    try:
+        # 新边界先重新走原半压渲染；标识里保留成功/失败、调用配对和原始主键。
+        if boundary != snapshot.layer1_from_msg_id:
+            snapshot = build_context_snapshot(turns, **{**options, "layer1_from_msg_id": boundary})
+    except ValueError as error:
+        # 原边界已通过校验；新建议边界若跨过未完成/未配对轮，仍按容量不足拒绝。
+        raise ContextBudgetExceeded("上下文预算不足：未完成或工具未配对轮阻止安全降级") from error
+    half_results = {message.additional_kwargs["db_message_id"]: message.content
+                    for message in snapshot.layer2 if isinstance(message, ToolMessage)}
+    for turn in turns:
+        if not any(row.id in half_results for row in turn.messages):
+            continue
+        # 仅投影实际保留的半压正文：大结果已经是标识，小结果仍需本地枚举/字段规则。
+        bounded = turn.model_copy(update={"messages": [row.model_copy(update={"content": half_results[row.id]}, deep=True)
+            if row.id in half_results else row for row in turn.messages]}, deep=True)
+        projected[turn.turn_id] = _project_history([bounded], settings, registry, estimator)[0]
+    snapshot = build_context_snapshot([projected.get(turn.turn_id, turn) for turn in turns],
+        **{**options, "layer1_from_msg_id": boundary})
+    return replace(snapshot, previous_layer1_from_msg_id=options["layer1_from_msg_id"])
+
+
 def history_snapshot(state, settings, stored: dict | None = None, *, registry=None) -> dict:
     """创建本轮冻结历史，持久化消息用真实锚点，旧无主键的离线输入仅可读裁剪。
 
@@ -116,10 +158,10 @@ def history_snapshot(state, settings, stored: dict | None = None, *, registry=No
     source_turns = stored["turns"] if stored and stored.get("turns") is not None else state["history_turns"]
     turns = [turn if isinstance(turn, StoredTurn) else StoredTurn.model_validate(turn) for turn in source_turns]
     turns = [turn for turn in turns if turn.turn_id != current_turn]
-    turns = _project_history(turns, settings, registry, estimator)
     anchors = stored or {}
     if any(row.id is None for turn in turns for row in turn.messages):
         # 兼容旧章评估输入：没有真实主键时绝不能凭下标产生可持久化边界。
+        turns = _project_history(turns, settings, registry, estimator)
         groups = [[_model_message(message) for message in group] for group in assemble_turns(turns)]
         layers = [message for group in _suffix(groups, budget.layer1, estimator) for message in group]
         payload = {"summary": "", "summary_seqs": [], "layer1": message_rows(layers, metadata=True), "layer2": [],
@@ -127,9 +169,7 @@ def history_snapshot(state, settings, stored: dict | None = None, *, registry=No
             "layer1_tokens": estimator.message_tokens(layers), "layer2_tokens": 0, "sent_layer2_tokens": 0,
             "summary_required": False, "omitted_ranges": [], "budget": asdict(budget)}
     else:
-        snapshot = build_context_snapshot(turns, summary_upto_msg_id=anchors.get("summary_upto_msg_id", 0),
-            layer1_from_msg_id=anchors.get("layer1_from_msg_id", 0), summaries=anchors.get("summaries", []),
-            budget=budget, estimator=estimator)
+        snapshot = _layered_history(turns, settings, registry, estimator, budget, anchors)
         payload = asdict(snapshot)
         payload.update(layer1=message_rows(snapshot.layer1, metadata=True), layer2=message_rows(snapshot.layer2, metadata=True))
     payload["summary_ranges"] = [(row["from_msg_id"], row["upto_msg_id"]) for row in anchors.get("summaries", [])
