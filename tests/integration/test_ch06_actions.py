@@ -1,6 +1,7 @@
-"""CH06真实MySQL事务验收：仅mewhelp_ch04_test，随机会话，按登记主键清理。"""
+"""CH06真实MySQL事务验收：具名测试库、随机会话，按登记主键清理。"""
 
 import asyncio
+import os
 from pathlib import Path
 from uuid import uuid4, uuid5, NAMESPACE_URL
 import pytest
@@ -15,6 +16,9 @@ from app.schemas.workflow import OrderSelectionConflict
 from tests.workflow.test_order_wait_state import prepare_wait, selection
 
 pytestmark = pytest.mark.mysql
+DATABASE = os.environ.get("MEWHELP_ACTIONS_TEST_DATABASE", "mewhelp_ch04_test")
+if DATABASE not in {"mewhelp_ch04_test", "mewhelp_test"}:
+    raise ValueError("动作验收仅允许具名测试数据库")
 
 
 @pytest.fixture
@@ -25,12 +29,12 @@ async def ch06_database():
     异常：数据库不可用或越过测试库边界时失败，不回退应用库、不drop_all。
     """
     config = Settings(_env_file=Path(__file__).resolve().parents[2] / ".env")
-    engine, factory = create_database(config, database="mewhelp_ch04_test")
+    engine, factory = create_database(config, database=DATABASE)
     session_id = "ch06-test-" + uuid4().hex
     registered = None
     try:
         async with engine.begin() as conn:
-            assert await conn.scalar(text("SELECT DATABASE()")) == "mewhelp_ch04_test"
+            assert await conn.scalar(text("SELECT DATABASE()")) == DATABASE
             for table in (Conversation.__table__, Message.__table__, Ticket.__table__):
                 await conn.run_sync(lambda sync, table=table: table.create(sync, checkfirst=True))
             await conn.run_sync(lambda sync: migrate_connection(sync, apply=True))

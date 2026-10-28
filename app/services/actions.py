@@ -8,6 +8,7 @@ from app.repositories.actions import ActionNotFound, ActionRepository, InvalidTi
 from app.repositories.chat import PersistenceUncertain
 from app.schemas.workflow import TicketConfirmation, TicketReceipt, RefundSubmission, RefundReceipt, OrderSelectionConflict
 from app.services.chat import ConversationBusy, ConversationGuard
+from app.tools.contracts import ToolExecutionScope, WriteAuthorization, json_hash
 
 logger = logging.getLogger(__name__)
 
@@ -87,8 +88,25 @@ class TicketActionService:
         result = action.existing_result
         if result is None:
             try:
+                async def authorize(binding, arguments, context):
+                    """把已验证的旧按钮决定绑定到原调用，不再次展示聊天预览。
+
+                    参数：binding 当前工具来源、arguments 冻结参数、context 服务器调用；
+                    返回：原动作专用授权；异常：PersistenceUncertain 或原来源核验错误。
+                    """
+                    verified = await self.repository.prepare_ticket(request)
+                    if (binding.identity.source != "builtin" or binding.identity.server is not None
+                            or binding.identity.name != "create_ticket" or context != verified.context
+                            or arguments != verified.call["args"] or verified.context != action.context
+                            or verified.call != action.call or not verified.execution_started):
+                        raise PersistenceUncertain("按钮确认与原工具申请不一致")
+                    return WriteAuthorization(conversation_id=context.conversation_id, turn_id=context.turn_id,
+                        action_id=request.action_id, tool_call_id=context.tool_call_id,
+                        arguments_hash=json_hash(arguments), decision="confirm", origin="action")
+
                 await self.repository.begin_ticket_execution(action)
-                result = await self.executor.execute(action.call, action.context, _ignore_status)
+                result = await self.executor.execute(action.call, action.context, _ignore_status,
+                                                     scope=ToolExecutionScope(authorize_write=authorize))
             except asyncio.CancelledError:
                 with anyio.CancelScope(shield=True):
                     await self._mark(action, "cancelled")

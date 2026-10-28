@@ -6,8 +6,6 @@ from app.api.chat import get_chat_service
 from app.repositories.actions import ActionRepository
 from app.schemas.workflow import TicketConfirmation, TicketReceipt, CurrentActions, RefundSubmission, RefundReceipt, REFUND_REASONS
 from app.services.actions import TicketActionError, TicketActionService, RefundActionService
-from app.tools.executor import ToolExecutor
-from app.tools.registry import build_ticket_registry
 
 router = APIRouter(prefix="/api/actions", tags=["actions"])
 
@@ -47,10 +45,7 @@ async def current_actions(session_id: str, user_id: str = "demo-user", service=D
 def get_ticket_action_service(request: Request) -> TicketActionService:
     """复用线上聊天的仓储、业务资源和同一锁。参数：request HTTP请求；返回：确认服务；异常：运行时未就绪。"""
     chat = get_chat_service(request)
-    settings = chat.settings
-    executor = ToolExecutor(build_ticket_registry(), chat.chat, chat.executor.support,
-        settings.tool_timeout_seconds, settings.tool_max_retries, settings.tool_retry_delay_seconds)
-    return TicketActionService(ActionRepository(chat.chat.factory), executor, chat.guard)
+    return TicketActionService(ActionRepository(chat.chat.factory), chat.executor, chat.guard)
 
 
 @router.post("/tickets", response_model=TicketReceipt)

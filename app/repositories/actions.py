@@ -12,6 +12,9 @@ from app.schemas.tools import TicketArgs, ToolContext, ToolResult
 from app.schemas.workflow import (PreparedTicketAction, SuggestedAction, TicketConfirmation, TicketReceipt,
                                  OrderSelection, OrderSelectionAction, AcceptedOrderSelection, OrderSelectionConflict)
 from app.schemas.workflow import RefundAction, RefundSubmission, RefundReceipt
+from app.schemas.workflow import TicketResume
+from app.tools.confirmation import TicketPreviewAction, ticket_preview
+from app.tools.contracts import WriteAuthorization, binding_from_dict, json_hash
 
 
 class ActionNotFound(ValueError):
@@ -28,6 +31,123 @@ class ActionRepository:
     def __init__(self, session_factory):
         """保存短事务工厂。参数：session_factory异步会话工厂；返回：None；异常：无。"""
         self.factory = session_factory
+
+    async def _ticket_resume_source(self, session, request: TicketResume, *, lock: bool = False) -> dict:
+        """从本人原消息核验冻结预览、申请与首次决定，不相信客户端参数。
+
+        参数：session 短事务、request 严格恢复请求、lock 是否锁定来源用户行。
+        返回：可信上下文、预览、原消息及保存状态；异常：ActionNotFound、OrderSelectionConflict 或持久化错误。
+        """
+        conversation, source = await owned_source(session, request.session_id, request.user_id,
+                                                  request.source_turn_id, lock=lock)
+        saved = (source.rag_metadata or {}).get("pending_ticket") if source is not None else None
+        if not isinstance(saved, dict) or not isinstance(saved.get("action"), dict):
+            raise ActionNotFound("工单预览不存在")
+        if saved["action"].get("action_id") != request.action_id:
+            raise ActionNotFound("工单预览不存在")
+        try:
+            action = TicketPreviewAction.model_validate(saved["action"])
+            context = source_context(conversation, source).model_copy(update={"tool_call_id": action.tool_call_id})
+            arguments = {"description": action.description, "ticket_type": action.ticket_type}
+            binding = binding_from_dict(saved["binding"])
+            if (action != ticket_preview(context, arguments) or saved.get("arguments_hash") != json_hash(arguments)
+                    or binding.identity.source != "builtin" or binding.identity.name != "create_ticket"
+                    or type(saved.get("execution_started")) is not bool):
+                raise ValueError("预览绑定不一致")
+            query = select(Message).where(Message.conversation_id == context.conversation_id,
+                Message.turn_id == context.turn_id, Message.role == "assistant", Message.tool_calls.is_not(None))
+            # 源行锁后使用当前读，不能在 MySQL 可重复读事务中复用等锁前快照。
+            rows = (await session.scalars(query.with_for_update() if lock else query)).all()
+            calls = [call for row in rows for call in row.tool_calls if isinstance(call, dict)
+                     and call.get("id") == context.tool_call_id]
+            if (len(calls) != 1 or calls[0].get("name") != "create_ticket" or calls[0].get("args") != arguments
+                    or calls[0].get("binding") != saved["binding"]):
+                raise ValueError("预览没有匹配的原工具申请")
+        except (ValueError, KeyError, TypeError) as error:
+            raise PersistenceUncertain("工单预览与保存申请不一致") from error
+        decision = saved.get("decision")
+        if decision is not None and decision != request.decision:
+            raise OrderSelectionConflict("此工单动作已保存另一项决定，请查看当前状态")
+        if decision is None and (saved.get("status") != "awaiting_input" or source.turn_status != "awaiting_input"):
+            raise OrderSelectionConflict("此工单预览已经失效，请查看当前状态")
+        return {"context": context, "action": action, "pending_ticket": saved, "source": source,
+                "turn_status": source.turn_status}
+
+    async def validate_ticket_resume(self, request: TicketResume) -> dict:
+        """只读核验原动作，供 HTTP 预检和重发使用。
+
+        参数：request 严格客户端恢复请求；返回：可信保存状态，不暴露 ORM；
+        异常：ActionNotFound、OrderSelectionConflict、PersistenceUncertain 或数据库错误。
+        """
+        async with self.factory() as session:
+            saved = await self._ticket_resume_source(session, request)
+            return {key: value for key, value in saved.items() if key != "source"}
+
+    @staticmethod
+    def _ticket_authorization(saved: dict) -> WriteAuthorization:
+        """将已提交决定转换为单一调用的授权凭据。
+
+        参数：saved 已核验并含首次决定的状态；返回：不可跨调用复用的 WriteAuthorization；异常：无。
+        """
+        context, action, pending = saved["context"], saved["action"], saved["pending_ticket"]
+        return WriteAuthorization(conversation_id=context.conversation_id, turn_id=context.turn_id,
+            action_id=action.action_id, tool_call_id=action.tool_call_id, arguments_hash=pending["arguments_hash"],
+            decision=pending["decision"], origin="chat")
+
+    async def accept_ticket_resume(self, request: TicketResume) -> WriteAuthorization:
+        """原子保存首个确认或取消，同决定重发回读，反向决定返回冲突。
+
+        参数：request 仅含原动作身份及决定；返回：从已提交来源构造的授权。
+        异常：身份不存在、决定冲突、持久化未知或数据库错误；绝不执行工具。
+        """
+        try:
+            async with self.factory.begin() as session:
+                saved = await self._ticket_resume_source(session, request, lock=True)
+                if saved["pending_ticket"].get("decision") is None:
+                    pending = {**saved["pending_ticket"], "decision": request.decision, "status": "accepted"}
+                    source = saved["source"]
+                    source.rag_metadata = {**(source.rag_metadata or {}), "pending_ticket": pending}
+                    saved["pending_ticket"] = pending
+                    await session.execute(update(Message).where(Message.conversation_id == saved["context"].conversation_id,
+                        Message.turn_id == request.source_turn_id).values(turn_status="running"))
+                authorization = self._ticket_authorization(saved)
+            return authorization
+        except (ActionNotFound, OrderSelectionConflict, PersistenceUncertain):
+            raise
+        except Exception:
+            # 提交响应丢失时仅用新事务回读第一次决定，不重新执行确认或写工具。
+            saved = await self.validate_ticket_resume(request)
+            if saved["pending_ticket"].get("decision") == request.decision:
+                return self._ticket_authorization(saved)
+            raise
+
+    async def get_chat_ticket_receipt(self, request: TicketResume) -> TicketReceipt | None:
+        """只读核对聊天原调用结果与真实工单，正文失败仍返回成功事实。
+
+        参数：request 原动作及已保存决定；返回：真实工单回执或 None；
+        异常：身份/冲突错误、成功事实不一致或数据库错误。
+        """
+        from app.repositories.chat import result_query
+        async with self.factory() as session:
+            saved = await self._ticket_resume_source(session, request)
+            context, action = saved["context"], saved["action"]
+            row = await session.scalar(result_query(context))
+            if row is None:
+                return None
+            result = ToolResult.model_validate_json(row.content)
+            if not result.ok:
+                return None
+            try:
+                receipt = TicketReceipt(action_id=action.action_id, **(result.data or {}))
+                ticket = await session.scalar(select(Ticket).where(Ticket.ticket_no == receipt.ticket_no))
+                if (result.is_mock or result.error is not None or ticket is None
+                        or receipt.ticket_no != ticket_number(context) or ticket.conversation_id != context.conversation_id
+                        or ticket.description != action.description or ticket.ticket_type != action.ticket_type
+                        or receipt.ticket_type != ticket.ticket_type or ticket.status != receipt.status):
+                    raise ValueError("回执不匹配真实工单")
+            except (ValueError, TypeError) as error:
+                raise PersistenceUncertain("工单成功事实待核实") from error
+            return receipt.model_copy(update={"audit_sync_pending": saved["turn_status"] != "completed"})
 
     async def accept_order_selection(self, request: OrderSelection) -> AcceptedOrderSelection:
         """来源行锁内接受原选单，仅首次选择可改变状态。

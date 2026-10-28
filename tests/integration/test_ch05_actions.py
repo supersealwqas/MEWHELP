@@ -1,10 +1,12 @@
 """CH05非破坏性真实MySQL确认验收：父持资源锁、真实硬退出与新进程恢复同票。
 
-只使用已准备的mewhelp_ch04_test；本模块不请求旧清库fixture、不建表、不接模型或Milvus。
+默认使用已准备的 mewhelp_ch04_test；显式动作验收可切换 mewhelp_test。
+本模块不请求旧清库fixture、不建表、不接模型或Milvus。
 """
 
 import argparse
 import asyncio
+from contextlib import asynccontextmanager
 import json
 import os
 from pathlib import Path
@@ -16,6 +18,7 @@ import pytest
 from sqlalchemy import delete, func, select, text
 
 from app.db.session import create_database
+from app.config import Settings
 from app.models.customer_service import Conversation, Message, Ticket
 from app.repositories.actions import ActionRepository
 from app.repositories.chat import ChatRepository
@@ -29,13 +32,42 @@ from app.tools.registry import build_ticket_registry
 from tests.verify_ch04_live import build_config, parser, resource_lock
 
 pytestmark = pytest.mark.mysql
-DATABASE = "mewhelp_ch04_test"
-LOCK_NAME = "mewhelp:ch04:live:exclusive"
+DATABASE = os.environ.get("MEWHELP_ACTIONS_TEST_DATABASE", "mewhelp_ch04_test")
+if DATABASE not in {"mewhelp_ch04_test", "mewhelp_test"}:
+    raise ValueError("动作验收仅允许具名测试数据库")
+LOCK_NAME = "mewhelp:ch04:live:exclusive" if DATABASE == "mewhelp_ch04_test" else "mewhelp:actions:mewhelp_test:exclusive"
 
 
 def _config(env_file: Path, report_dir: Path):
     """显式加载指定测试配置，不准备资源。参数：env_file用户配置路径、report_dir临时输出；返回：Settings；异常：配置错误。"""
+    if DATABASE == "mewhelp_test":
+        return Settings(_env_file=env_file, mysql_database=DATABASE)
     return build_config(parser().parse_args(["--test", "--env-file", str(env_file), "--report-dir", str(report_dir)]))
+
+
+@asynccontextmanager
+async def action_resource_lock(config):
+    """按显式目标持有父进程独占锁，旧知识验收保持原有资源锁。
+
+    参数：config 显式测试配置；返回：持锁连接；异常：目标不符、锁已占用或数据库错误。
+    """
+    if DATABASE == "mewhelp_ch04_test":
+        async with resource_lock(config, prepare=False) as connection:
+            yield connection
+        return
+    if DATABASE != "mewhelp_test" or config.mysql_database != DATABASE:
+        raise ValueError("拒绝在非指定测试库获得动作锁")
+    engine, _ = create_database(config, database=DATABASE)
+    try:
+        async with engine.connect() as connection:
+            assert await connection.scalar(text("SELECT DATABASE()")) == DATABASE
+            assert await connection.scalar(text("SELECT GET_LOCK(:name, 0)"), {"name": LOCK_NAME}) == 1
+            try:
+                yield connection
+            finally:
+                await connection.execute(text("SELECT RELEASE_LOCK(:name)"), {"name": LOCK_NAME})
+    finally:
+        await engine.dispose()
 
 
 async def _guard_database(factory, owner: int, allowed: list[int]):
@@ -82,7 +114,7 @@ async def isolated_action_mysql(tmp_path):
     registered = []
     engine, factory = create_database(config, database=DATABASE)
     try:
-        async with resource_lock(config, prepare=False) as checked:
+        async with action_resource_lock(config) as checked:
             owner = await checked.scalar(text("SELECT IS_USED_LOCK(:name)"), {"name": LOCK_NAME})
             assert owner is not None
             await _guard_database(factory, owner, [])

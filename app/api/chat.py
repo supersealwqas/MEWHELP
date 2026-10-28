@@ -5,7 +5,7 @@ import anyio
 from fastapi import APIRouter, Depends, Request, HTTPException
 from fastapi.responses import StreamingResponse
 from app.schemas.chat import ChatRequest
-from app.schemas.workflow import OrderSelection, OrderSelectionConflict
+from app.schemas.workflow import OrderSelection, OrderSelectionConflict, TicketResume
 from app.services.chat import ChatService
 
 router = APIRouter(prefix="/api", tags=["chat"])
@@ -38,7 +38,7 @@ async def chat(req: ChatRequest, service: ChatService = Depends(get_chat_service
 
 
 @router.post("/chat/resume")
-async def resume_chat(req: OrderSelection, service: ChatService = Depends(get_chat_service)) -> StreamingResponse:
+async def resume_chat(req: OrderSelection | TicketResume, service: ChatService = Depends(get_chat_service)) -> StreamingResponse:
     """预检来源后返回同轮续跑流。参数：req原动作、service共享服务；返回：SSE；异常：404/409预检错误或取消。"""
     try:
         await service.validate_resume(req)

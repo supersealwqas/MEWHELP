@@ -5,6 +5,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from app.schemas.history import StoredTurn
 from app.schemas.tools import ToolContext, ToolResult
+from app.tools.confirmation import TicketPreviewAction
 
 Intent = Literal["物流", "订单", "商品咨询", "退款退货", "售后", "投诉", "闲聊", "其他"]
 ActionKind = Literal["handoff", "create_ticket"]
@@ -81,6 +82,30 @@ class AcceptedOrderSelection(BaseModel):
     turn_status: str = Field(description="原轮当前持久化状态")
 
 
+class TicketResume(BaseModel):
+    """浏览器只能决定保存的工单预览，不能覆盖描述、类型或服务器授权身份。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    type: Literal["confirm_ticket"] = Field(description="必须显式指定工单恢复类型")
+    session_id: str = Field(min_length=1, max_length=64, description="预览所属会话")
+    user_id: str = Field(min_length=1, max_length=64, description="预览所属用户")
+    source_turn_id: str = Field(min_length=1, max_length=36, description="保存工具申请及预览的原轮")
+    action_id: str = Field(min_length=36, max_length=36, description="服务器冻结预览的 UUIDv5")
+    decision: Literal["confirm", "cancel"] = Field(description="用户首次确认或取消决定")
+
+    @field_validator("session_id", "user_id", "source_turn_id")
+    @classmethod
+    def normalize_identity(cls, value: str) -> str:
+        """在取得会话锁前统一身份空白。参数：value 严格字符串；返回：去空白标识；异常：ValueError，空标识。"""
+        return OrderSelection.normalize_nonblank(value)
+
+    @field_validator("action_id")
+    @classmethod
+    def validate_identifier(cls, value: str) -> str:
+        """拒绝非规范预览键。参数：value 动作标识；返回：原值；异常：ValueError，非法 UUIDv5。"""
+        return OrderSelection.validate_identifier(value)
+
+
 REFUND_REASONS = {"wrong_purchase": "不想要/买错了", "quality_issue": "商品质量问题",
                   "not_as_described": "收到商品与描述不符", "wrong_item": "发错商品", "missing_item": "少发漏发",
                   "shipping_damage": "运输破损", "other": "其他"}
@@ -128,6 +153,8 @@ class CurrentActions(BaseModel):
     refund_action: RefundAction | None = Field(default=None, description="独立已保存退款申请建议")
     refund_receipt: RefundReceipt | None = Field(default=None, description="同动作已提交的本地申请回执")
     ticket_receipt: "TicketReceipt | None" = Field(default=None, description="当前原问对应的真实工单回执，审计待同步仍保留成功事实")
+    ticket_confirmation: TicketPreviewAction | None = Field(default=None, description="服务器冻结的当前工单预览")
+    ticket_decision: Literal["confirm", "cancel"] | None = Field(default=None, description="已持久化且不可改变的首次工单决定")
 
 
 class HistoryDelta(BaseModel):

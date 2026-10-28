@@ -6,7 +6,7 @@ import logging
 from time import perf_counter
 from typing import AsyncIterator
 from contextlib import aclosing, asynccontextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from uuid import uuid4
 import anyio
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -23,7 +23,8 @@ from app.schemas.chat import ChatEvent, ChatRequest, InvalidToolDecision
 from app.schemas.tools import ToolContext, ToolResult
 from app.tools.executor import ToolExecutor
 from app.workflow.state import checkpoint_thread_id
-from app.schemas.workflow import CurrentActions, OrderSelection, OrderSelectionAction, OrderSelectionConflict
+from app.schemas.workflow import CurrentActions, OrderSelection, OrderSelectionAction, OrderSelectionConflict, TicketResume
+from app.tools.confirmation import TicketPreviewAction, ticket_preview
 
 logger = logging.getLogger(__name__)
 
@@ -602,7 +603,7 @@ class ChatService:
             state["messages"] = Overwrite(state["messages"])
         return state
 
-    def _waiting_action(self, snapshot, context: ToolContext) -> OrderSelectionAction | None:
+    def _waiting_action(self, snapshot, context: ToolContext) -> OrderSelectionAction | TicketPreviewAction | None:
         """核对官方待执行任务的interrupt与可信原轮，普通next不算等待。
 
         参数：snapshot官方StateSnapshot、context数据库原轮。
@@ -612,10 +613,16 @@ class ChatService:
         saved = snapshot.values.get("context", {})
         if any(saved.get(key) != getattr(context, key) for key in ("conversation_id", "session_id", "user_id", "turn_id", "user_message")):
             return None
-        interrupts = [item for task in getattr(snapshot, "tasks", ()) for item in task.interrupts]
+        interrupts = list(getattr(snapshot, "interrupts", ())) or [item for task in getattr(snapshot, "tasks", ()) for item in task.interrupts]
         if len(interrupts) != 1:
             return None
-        action = OrderSelectionAction.model_validate(interrupts[0].value)
+        payload = interrupts[0].value
+        if isinstance(payload, dict) and payload.get("type") == "confirm_ticket":
+            action = TicketPreviewAction.model_validate(payload)
+            call_context = context.model_copy(update={"tool_call_id": action.tool_call_id})
+            expected = ticket_preview(call_context, {"description": action.description, "ticket_type": action.ticket_type})
+            return action if action == expected else None
+        action = OrderSelectionAction.model_validate(payload)
         expected = str(uuid5(NAMESPACE_URL, f"mewhelp:ch06:{context.conversation_id}:{context.turn_id}:select_order"))
         return action if action.source_turn_id == context.turn_id and action.action_id == expected else None
 
@@ -635,6 +642,21 @@ class ChatService:
             resolved.append((row, self._waiting_action(snapshot, context)))
         for row, action in resolved:
             context, saved = row["context"], row["order_selection"]
+            ticket = row.get("pending_ticket")
+            if ticket is not None:
+                matches = isinstance(action, TicketPreviewAction) and action.model_dump(mode="json") == ticket.get("action")
+                if matches and not ticket.get("execution_started"):
+                    if (ticket.get("status") == "awaiting_input" and ticket.get("decision") is None
+                            or ticket.get("status") == "accepted" and ticket.get("decision") in {"confirm", "cancel"}):
+                        await self.chat.save_ticket_wait(context, action)
+                        continue
+                # 执行开始后重启只核对原结果；不把未知写入恢复成可点击的新建单。
+                call_context = context.model_copy(update={"tool_call_id": ticket["action"]["tool_call_id"]})
+                result = await self.chat.get_tool_result(call_context)
+                if result is not None or ticket.get("execution_started"):
+                    await self.chat.finish_ticket_preview(call_context, result)
+                await self.chat.mark_turn(context, "failed", include_waiting=True)
+                continue
             if action is not None:
                 if isinstance(saved, dict) and saved.get("status") == "accepted":
                     expected = {key: saved.get(key) for key in ("type", "action_id", "source_turn_id", "orders")}
@@ -670,8 +692,26 @@ class ChatService:
             from app.repositories.actions import ActionRepository
             refund_receipt = await ActionRepository(self.chat.factory).get_refund_receipt(session_id, user_id, refund_action["action_id"])
         ticket_receipt = None
+        ticket_confirmation, ticket_decision = None, None
+        pending_ticket = row.get("pending_ticket")
+        if isinstance(pending_ticket, dict):
+            candidate = TicketPreviewAction.model_validate(pending_ticket["action"])
+            ticket_decision = pending_ticket.get("decision")
+            config = {"configurable": {"thread_id": checkpoint_thread_id(row["context"].conversation_id)}}
+            pending = self._waiting_action(await self.graph.aget_state(config), row["context"])
+            if pending == candidate and row["turn_status"] in {"running", "awaiting_input"}:
+                ticket_confirmation = candidate
+                resume_required = ticket_decision is not None and not pending_ticket.get("execution_started")
+            elif ticket_decision is not None:
+                # 已决定卡片仍携带原动作，便于回读取消/未知/已提交事实；没有可恢复中断时不显示继续。
+                ticket_confirmation = candidate
+            if ticket_decision is not None:
+                from app.repositories.actions import ActionRepository
+                request = TicketResume(type="confirm_ticket", session_id=session_id, user_id=user_id,
+                    source_turn_id=row["context"].turn_id, action_id=candidate.action_id, decision=ticket_decision)
+                ticket_receipt = await ActionRepository(self.chat.factory).get_chat_ticket_receipt(request)
         for suggestion in metadata.get("suggested_actions", []) or []:
-            if suggestion.get("kind") == "create_ticket":
+            if suggestion.get("kind") == "create_ticket" and pending_ticket is None:
                 from app.repositories.actions import ActionRepository
                 ticket_receipt = await ActionRepository(self.chat.factory).get_ticket_receipt(
                     session_id, user_id, row["context"].turn_id, suggestion["action_id"])
@@ -679,7 +719,8 @@ class ChatService:
         return CurrentActions(source_turn_id=row["context"].turn_id, turn_status=row["turn_status"],
             order_selection=action, accepted_order_id=saved.get("accepted_order_id") if saved else None,
             answer=row["answer"], completion_metadata=row["completion_metadata"], resume_required=resume_required,
-            refund_action=refund_action, refund_receipt=refund_receipt, ticket_receipt=ticket_receipt)
+            refund_action=refund_action, refund_receipt=refund_receipt, ticket_receipt=ticket_receipt,
+            ticket_confirmation=ticket_confirmation, ticket_decision=ticket_decision)
 
     def _public_event(self, payload: dict, context: ToolContext) -> ChatEvent | None:
         """筛选并规范公开事件。参数：payload图custom帧、context原轮；返回：事件或None；异常：无。"""
@@ -728,7 +769,10 @@ class ChatService:
             if action is not None:
                 # SQLite已提交暂停，即使MySQL下一步失败也保留原轮，交启动对账修复。
                 outcome["paused"] = True
-                await self.chat.save_order_wait(context, action)
+                if isinstance(action, TicketPreviewAction):
+                    await self.chat.save_ticket_wait(context, action)
+                else:
+                    await self.chat.save_order_wait(context, action)
                 outcome["waiting"] = action.model_dump(mode="json")
                 await self._schedule_summary(final.values, context.conversation_id)
                 return
@@ -761,9 +805,14 @@ class ChatService:
         return ChatEvent(event="error", data={"error": message, "status_code": status,
             "retry_safe": not isinstance(error, PersistenceUncertain), "outcome": "unknown" if status == 503 else "not_started"})
 
-    async def validate_resume(self, request: OrderSelection) -> dict:
+    async def validate_resume(self, request: OrderSelection | TicketResume) -> dict:
         """只读核验选单请求，供HTTP预检及忙碌重试复用。参数：request原键；返回：可信保存行；异常：404/409语义异常。"""
         from app.repositories.actions import ActionNotFound
+        if isinstance(request, TicketResume):
+            from app.repositories.actions import ActionRepository
+            trusted = await ActionRepository(self.chat.factory).validate_ticket_resume(request)
+            row = await self.chat.get_workflow_turn(request.session_id, request.user_id, request.source_turn_id)
+            return {**row, **trusted}
         row = await self.chat.get_workflow_turn(request.session_id, request.user_id, request.source_turn_id)
         saved = row.get("order_selection") if row else None
         if not isinstance(saved, dict) or saved.get("action_id") != request.action_id:
@@ -777,7 +826,7 @@ class ChatService:
             raise OrderSelectionConflict("同一动作不能更换订单，请继续原订单")
         return row
 
-    async def stream_resume(self, request: OrderSelection) -> AsyncIterator[ChatEvent]:
+    async def stream_resume(self, request: OrderSelection | TicketResume) -> AsyncIterator[ChatEvent]:
         """取回原轮锁后以Command续跑，不创建用户消息或重置预算。
 
         参数：request冻结身份与原动作；返回：完成/等待/接受状态事件流。
@@ -785,6 +834,11 @@ class ChatService:
         """
         from langgraph.types import Command
         from app.repositories.actions import ActionRepository
+        if isinstance(request, TicketResume):
+            async with aclosing(self._stream_ticket_resume(request)) as stream:
+                async for event in stream:
+                    yield event
+            return
         outcome, context, terminal = {}, None, "cancelled"
         try:
             async with self.guard.hold(request.session_id):
@@ -842,7 +896,7 @@ class ChatService:
                         if context is not None:
                             await self._cleanup_turn(context, outcome, terminal)
             if outcome.get("waiting"):
-                yield ChatEvent(event="select_order", data=outcome["waiting"])
+                yield ChatEvent(event=outcome["waiting"]["type"], data=outcome["waiting"])
         except ConversationBusy as error:
             try:
                 row = await self.validate_resume(request)
@@ -852,6 +906,90 @@ class ChatService:
                     yield ChatEvent(event="done")
                 elif row["order_selection"].get("status") == "accepted":
                     yield ChatEvent(event="action_status", data={"action_id": request.action_id, "source_turn_id": request.source_turn_id, "status": "accepted"})
+                else:
+                    yield self._stream_error(error)
+            except Exception as invalid:
+                yield self._stream_error(invalid)
+
+    async def _ticket_replay(self, request: TicketResume, row: dict):
+        """只读回放已完成正文或真实工单回执，永不重新执行写入。
+
+        参数：request 原动作、row 核验后的原轮；返回：公开事件流；异常：缺少可靠结果时 PersistenceUncertain。
+        """
+        from app.repositories.actions import ActionRepository
+        if row["turn_status"] == "completed" and row.get("answer") is not None and row.get("completion_metadata"):
+            yield ChatEvent(event="delta", data={"delta": row["answer"]})
+            yield ChatEvent(event="answer_metadata", data=row["completion_metadata"])
+            yield ChatEvent(event="done")
+            return
+        receipt = await ActionRepository(self.chat.factory).get_chat_ticket_receipt(request)
+        if receipt is not None:
+            yield ChatEvent(event="delta", data={"delta": f"工单已创建，工单号：{receipt.ticket_no}，类型：{receipt.ticket_type}，状态：{receipt.status}。"})
+            yield ChatEvent(event="answer_metadata", data={"status": row["turn_status"], "turn_id": request.source_turn_id,
+                "ticket_receipt": receipt.model_dump(mode="json")})
+            yield ChatEvent(event="done")
+            return
+        result = await self.chat.get_tool_result(row["context"])
+        if result is not None and not result.ok:
+            message = "工单申请已取消，本次没有创建工单。" if result.error and result.error.code == "USER_CANCELLED" else "本次工单没有创建，请查看处理结果。"
+            yield ChatEvent(event="delta", data={"delta": message})
+            yield ChatEvent(event="action_status", data={"action_id": request.action_id,
+                "source_turn_id": request.source_turn_id, "status": "cancelled" if request.decision == "cancel" else "failed"})
+            yield ChatEvent(event="done")
+            return
+        raise PersistenceUncertain("原工单执行结果待核实，不能重新执行")
+
+    async def _stream_ticket_resume(self, request: TicketResume) -> AsyncIterator[ChatEvent]:
+        """取得共享会话锁后保存首次决定，并恢复同一检查点中的原工具调用。
+
+        参数：request 原预览身份和确认/取消；返回：公开 SSE 语义事件；
+        异常：取消向外传播；业务错误输出安全错误，提交决定后断流保留原决定。
+        """
+        from langgraph.types import Command
+        from app.repositories.actions import ActionRepository
+        outcome, context, terminal = {}, None, "cancelled"
+        try:
+            async with self.guard.hold(request.session_id):
+                try:
+                    row = await self.validate_resume(request)
+                    context = row["context"]
+                    pending = row["pending_ticket"]
+                    config = {"configurable": {"thread_id": checkpoint_thread_id(context.conversation_id)}}
+                    snapshot = await self.graph.aget_state(config)
+                    waiting = self._waiting_action(snapshot, context)
+                    if row["turn_status"] == "completed" or pending.get("execution_started") or waiting is None:
+                        async for event in self._ticket_replay(request, row):
+                            yield event
+                        return
+                    if not isinstance(waiting, TicketPreviewAction) or waiting.model_dump(mode="json") != pending["action"]:
+                        raise PersistenceUncertain("工单预览与暂停检查点不匹配")
+                    authorization = await ActionRepository(self.chat.factory).accept_ticket_resume(request)
+                    # 决定提交后的客户端断线不能把该动作改为取消，原键仍能再次续跑。
+                    outcome.update(started=True, paused=True)
+                    async with aclosing(self._run_graph(Command(resume=asdict(authorization)), context, outcome)) as stream:
+                        async for event in stream:
+                            outcome["paused"] = False
+                            yield event
+                except (asyncio.CancelledError, GeneratorExit):
+                    raise
+                except Exception as error:
+                    terminal = "failed"
+                    yield self._stream_error(error)
+                finally:
+                    with anyio.CancelScope(shield=True):
+                        if context is not None:
+                            await self._cleanup_turn(context, outcome, terminal)
+            if outcome.get("waiting"):
+                yield ChatEvent(event=outcome["waiting"]["type"], data=outcome["waiting"])
+        except ConversationBusy as error:
+            try:
+                row = await self.validate_resume(request)
+                if row["turn_status"] == "completed":
+                    async for event in self._ticket_replay(request, row):
+                        yield event
+                elif row["pending_ticket"].get("decision") is not None:
+                    yield ChatEvent(event="action_status", data={"action_id": request.action_id,
+                        "source_turn_id": request.source_turn_id, "status": "accepted"})
                 else:
                     yield self._stream_error(error)
             except Exception as invalid:
@@ -875,7 +1013,10 @@ class ChatService:
                         system_text=INTENT_PROMPT, tools=[intent_tool_schema()], request_max_tokens=self.settings.request_token_budget)
                     current = await self.get_current_actions(request.session_id, request.user_id)
                     if current.resume_required:
-                        raise OrderSelectionConflict("上一笔订单已经确认，请先点击继续处理")
+                        raise OrderSelectionConflict("上一项操作已经保存决定，请先点击继续处理")
+                    if current.ticket_confirmation is not None and (current.ticket_decision is None
+                            or current.ticket_decision == "confirm" and current.ticket_receipt is None):
+                        raise OrderSelectionConflict("当前工单仍待确认或核实，请先处理原工单动作")
                     await self.chat.cancel_order_wait(request.session_id, request.user_id)
                     context = await self.chat.start_turn(context, request.message)
                     outcome["started"] = True
@@ -908,6 +1049,6 @@ class ChatService:
                             await self._cleanup_turn(context, outcome, terminal)
             # 等待提交、图流关闭及guard释放全部完成后，才进入可能受网络背压影响的发送。
             if outcome.get("waiting"):
-                yield ChatEvent(event="select_order", data=outcome["waiting"])
+                yield ChatEvent(event=outcome["waiting"]["type"], data=outcome["waiting"])
         except ConversationBusy as error:
             yield self._stream_error(error)

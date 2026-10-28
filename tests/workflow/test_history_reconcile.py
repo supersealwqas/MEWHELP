@@ -50,7 +50,8 @@ async def test_service_checkpoint_uses_trusted_id_and_reopens_isolated_history(t
     first_config = {"configurable": {"thread_id": "mewhelp:ch05:1"}}
     second_config = {"configurable": {"thread_id": "mewhelp:ch05:2"}}
     # 客户端字符串刻意等于另一个会话的可信键，证明不能直接当作SQLite键。
-    async with service_runtime(tmp_path, intents=["物流", "闲聊"], decisions=[AgentDecision(kind="clarify")], answers=[["请给订单号"]]) as (service, _, _):
+    async with service_runtime(tmp_path, intents=["物流", "闲聊"], decisions=[AgentDecision(kind="clarify"),
+            AgentDecision(kind="answer")], answers=[["请给订单号"]]) as (service, _, _):
         first = await collect(service, "查物流", session="mewhelp:ch05:2")
         second = await collect(service, "你好", session="another-client-key")
         assert first[-1].event == second[-1].event == "done"
@@ -88,7 +89,8 @@ async def test_history_delta_reads_complete_affected_turn_and_refreshes_terminal
 async def test_next_input_merges_history_without_full_reload_and_understands_1001(tmp_path, monkeypatch):
     """后续全量查历史、丢已追问上下文或带入旧意图时失败。参数：tmp_path/monkeypatch；返回：None；异常：断言失败。"""
     async with service_runtime(tmp_path, intents=["物流", "物流", "闲聊"],
-            decisions=[AgentDecision(kind="clarify"), AgentDecision(kind="answer")], answers=[["请给订单号"], ["正在查询1001"]]) as (service, deps, _):
+            decisions=[AgentDecision(kind="clarify"), AgentDecision(kind="answer"), AgentDecision(kind="answer")],
+            answers=[["请给订单号"], ["正在查询1001"]]) as (service, deps, _):
         cursors = []
         original = deps.chat.load_history_delta
 

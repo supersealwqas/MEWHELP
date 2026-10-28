@@ -200,7 +200,8 @@ async def test_client_cannot_override_snapshot_or_receipt(tmp_path, extra):
 
 async def test_plain_chat_and_suggestions_do_not_write_then_old_action_uses_original(tmp_path):
     """普通建单话术写库、旧按钮取最新问题或顺便转人工会失败。参数：tmp_path；返回：None；异常：断言失败。"""
-    async with action_runtime(tmp_path, intents=["其他", "闲聊"], decisions=[AgentDecision(kind="answer", suggested_actions=["create_ticket"])], answers=[["请确认"]]) as (chat, _, client, factory):
+    async with action_runtime(tmp_path, intents=["其他", "闲聊"], decisions=[AgentDecision(kind="answer", suggested_actions=["create_ticket"]),
+            AgentDecision(kind="answer")], answers=[["请确认"]]) as (chat, _, client, factory):
         before = len((await records(factory))[2])
         events = await collect(chat, "  帮我建单，订单没收到  ")
         suggestion = events[-2].data["suggested_actions"][0]

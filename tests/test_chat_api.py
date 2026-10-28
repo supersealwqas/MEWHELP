@@ -113,7 +113,7 @@ def test_oversized_current_message_is_not_dropped(client, offline_chat_runtime, 
 def test_tool_named_event_precedes_text_and_is_not_text(client, offline_chat_runtime):
     """工具状态必须独立于回答流。参数：客户端、依赖；返回：None；异常：断言失败。"""
     offline_chat_runtime[-1].decisions.appendleft(AgentDecision(kind="tools", tool_calls=[
-        {"name": "query_logistics", "id": "c1", "args": {"tracking_no": "MOCK213502378238"}}]))
+        {"name": "query_order", "id": "c1", "args": {"order_id": "1001"}}]))
     response = send(client, "订单 1001 的物流到哪了")
     assert response.text.count("event: tool_status") == 2
     assert response.text.index("event: tool_status") < response.text.index('"delta"')
