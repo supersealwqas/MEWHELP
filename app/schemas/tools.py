@@ -6,7 +6,7 @@ Schema，避免各处自行约定字段名导致协议漂移。
 
 from typing import Annotated, Literal
 from langchain_core.tools import InjectedToolArg
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # 业务拒绝的统一字段名。工具返回业务失败时必须携带这两个键，执行器据此识别并转为失败事实。
 # 集中定义避免工具层与执行器各写一份字符串字面量。
@@ -80,6 +80,17 @@ class ToolError(BaseModel):
     """可安全回灌给模型的稳定错误，不包含原始异常。"""
     code: str = Field(description="稳定错误代码")
     message: str = Field(description="安全的中文错误提示")
+    category: Literal["invalid_arguments", "not_found", "permission_denied", "fault"] | None = Field(default=None, description="稳定业务分类；旧消息按错误码补齐")
+
+    @model_validator(mode="after")
+    def classify_legacy_error(self):
+        """兼容旧错误码的分类。参数：自身字段；返回：自身；异常：无。"""
+        if self.category is None:
+            code = self.code.upper()
+            self.category = ("invalid_arguments" if code in {"INVALID_ARGUMENTS", "INVALID_TICKET_ARGUMENTS"}
+                             else "permission_denied" if code in {"ORDER_NOT_OWNED", "PERMISSION_DENIED", "USER_CANCELLED", "NOT_CONFIRMED"}
+                             else "not_found" if code == "NOT_FOUND" else "fault")
+        return self
 
 
 class ToolResult(BaseModel):

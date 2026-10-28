@@ -98,7 +98,8 @@ async def test_executor_normalizes_business_dictionary(payload, ok):
         assert result.data == payload and result.error is None
     else:
         assert result.data is None
-        assert result.error.model_dump() == {"message": payload["error"], "code": payload["code"]}
+        assert result.error.model_dump() == {
+            "message": payload["error"], "code": payload["code"], "category": "permission_denied"}
 
 
 async def test_timeout_retry_once():
