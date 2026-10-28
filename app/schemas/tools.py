@@ -81,6 +81,8 @@ class ToolError(BaseModel):
     code: str = Field(description="稳定错误代码")
     message: str = Field(description="安全的中文错误提示")
     category: Literal["invalid_arguments", "not_found", "permission_denied", "fault"] | None = Field(default=None, description="稳定业务分类；旧消息按错误码补齐")
+    details: list[dict] | None = Field(default=None, max_length=5, exclude_if=lambda value: value is None,
+                                     description="最多五项安全参数错误，包含字段路径、违反规则和中文说明；为空时保持旧消息格式")
 
     @model_validator(mode="after")
     def classify_legacy_error(self):

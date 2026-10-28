@@ -10,6 +10,8 @@ from app.repositories.chat import PersistenceUncertain
 from app.schemas.tools import ToolContext
 from app.tools.registry import build_registry
 from app.tools.executor import ToolExecutor
+from app.tools.contracts import ToolExecutionScope
+from tests.test_tool_executor import confirmed_authorization
 
 pytestmark = pytest.mark.mysql
 
@@ -41,7 +43,8 @@ async def test_executor_reuses_ticket_after_commit_ack_lost(database, repositori
         raise OperationalError(None, None, RuntimeError("lost acknowledgement"), connection_invalidated=True)
     with monkeypatch.context() as patch:
         patch.setattr(AsyncSessionTransaction, "__aexit__", commit_then_fail)
-        result = await ToolExecutor(build_registry(), *repositories).execute(call, ctx, ignore_status)
+        result = await ToolExecutor(build_registry(), *repositories).execute(call, ctx, ignore_status,
+            scope=ToolExecutionScope(authorize_write=confirmed_authorization))
     assert result.ok and result.data["ticket_no"].startswith("T")
     # 第二个短事务只是结果复用；业务工单仍只有一张。
     async with database[1]() as session:
@@ -69,7 +72,8 @@ async def test_no_blind_retry_when_verification_unavailable(database, repositori
         patch.setattr(AsyncSessionTransaction, "__aexit__", commit_then_fail)
         patch.setattr(chat, "get_tool_result", unavailable_after_commit)
         with pytest.raises(PersistenceUncertain):
-            await ToolExecutor(build_registry(), chat, support).execute(call, ctx, ignore_status)
+            await ToolExecutor(build_registry(), chat, support).execute(call, ctx, ignore_status,
+                scope=ToolExecutionScope(authorize_write=confirmed_authorization))
     original_result = await chat.get_tool_result(ctx)
     assert original_result.ok
     async with database[1]() as session:
@@ -89,7 +93,8 @@ async def test_cancel_waits_for_commit_boundary(database, repositories, monkeypa
         return await original(transaction, *args)
     with monkeypatch.context() as patch:
         patch.setattr(AsyncSessionTransaction, "__aexit__", delayed_commit)
-        task = asyncio.create_task(ToolExecutor(build_registry(), *repositories).execute(call, ctx, ignore_status))
+        task = asyncio.create_task(ToolExecutor(build_registry(), *repositories).execute(call, ctx, ignore_status,
+            scope=ToolExecutionScope(authorize_write=confirmed_authorization)))
         await asyncio.wait_for(committing.wait(), 2)
         task.cancel()
         # 只检测是否在提交仍受阻时过早宣布清理完成，不依赖任意固定睡眠。
@@ -104,8 +109,8 @@ async def test_cancel_waits_for_commit_boundary(database, repositories, monkeypa
     assert (await repositories[0].get_tool_result(ctx)).ok
 
 
-async def test_retry_after_confirmed_rollback(database, repositories, monkeypatch):
-    """确认回滚后才重试整笔工单事务。参数：测试库与替换器；返回：None；异常：断言失败。"""
+async def test_no_retry_after_confirmed_rollback(database, repositories, monkeypatch):
+    """确认回滚后也不自动重试工单事务。参数：测试库与替换器；返回：None；异常：断言失败。"""
     from app.repositories import support as module
     ctx, call = await setup_call(repositories)
     original_message, attempts, states = module.Message, [], []
@@ -120,9 +125,10 @@ async def test_retry_after_confirmed_rollback(database, repositories, monkeypatc
         states.append(frame["status"])
     with monkeypatch.context() as patch:
         patch.setattr(module, "Message", fail_once)
-        result = await ToolExecutor(build_registry(), *repositories, retry_delay_seconds=0).execute(call, ctx, status)
-    assert result.ok and len(attempts) == 2
-    assert states == ["running", "retrying", "succeeded"]
+        result = await ToolExecutor(build_registry(), *repositories, retry_delay_seconds=0).execute(call, ctx, status,
+            scope=ToolExecutionScope(authorize_write=confirmed_authorization))
+    assert not result.ok and len(attempts) == 1
+    assert states == ["running", "failed"]
     async with database[1]() as session:
-        assert await session.scalar(select(func.count()).select_from(Ticket)) == 1
+        assert await session.scalar(select(func.count()).select_from(Ticket)) == 0
         assert await session.scalar(select(func.count()).select_from(Message).where(Message.role == "tool")) == 1

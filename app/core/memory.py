@@ -12,6 +12,9 @@ from langchain_core.tools import BaseTool
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from app.core.context_budget import ContextBudgetExceeded, TokenEstimator
 from app.schemas.history import StoredMessage, StoredTurn
+from app.schemas.tools import ToolResult
+from app.tools.contracts import ResultPolicy
+from app.tools.presentation import model_tool_result
 
 
 class SessionStore:
@@ -234,12 +237,13 @@ def _estimate_message_tokens(messages: list[BaseMessage]) -> int:
     return TokenEstimator().message_tokens(messages)
 
 
-def _model_message(message: BaseMessage) -> BaseMessage:
+def _model_message(message: BaseMessage, *, policy: ResultPolicy | None = None,
+                   max_tokens: int | None = None, estimator: TokenEstimator | None = None) -> BaseMessage:
     """为模型生成工具事实视图，隔离后台来源标记，不改写原消息。
 
-    参数：message 为当前或历史消息；仅处理字符串形式的工具结果。
-    返回：BaseMessage，移除结果外层 is_mock 的副本；其他消息原样返回。
-    异常：无主动抛出的业务异常；兼容历史中的非 JSON 工具正文。
+    参数：message当前或历史消息；policy可选本地结果规则；max_tokens可选正文预算；estimator统一估算器。
+    返回：BaseMessage，结果副本保留调用配对；默认仅移除is_mock，显式规则或预算启用统一投影。
+    异常：ContextBudgetExceeded，核心事实超预算；兼容历史非JSON或非统一结果正文。
     """
     if not isinstance(message, ToolMessage) or not isinstance(message.content, str):
         return message
@@ -247,7 +251,16 @@ def _model_message(message: BaseMessage) -> BaseMessage:
         payload = json.loads(message.content)
     except (ValueError, TypeError):
         return message
-    if not isinstance(payload, dict) or "is_mock" not in payload:
+    if not isinstance(payload, dict):
+        return message
+    if (policy is not None or max_tokens is not None) and type(payload.get("ok")) is bool:
+        estimator = estimator or TokenEstimator()
+        result = ToolResult.model_validate(payload)
+        payload = model_tool_result(result, policy or ResultPolicy(),
+            max_tokens=max_tokens if max_tokens is not None else max(1, estimator.value_tokens(payload) * 4),
+            estimator=estimator)
+        return message.model_copy(update={"content": json.dumps(payload, ensure_ascii=False, separators=(",", ":"))})
+    if "is_mock" not in payload:
         return message
     # 只移除协议外层的运行元数据，业务字段、错误事实和数据库审计均保持原样。
     payload.pop("is_mock")

@@ -102,3 +102,20 @@ async def test_denial_results_are_independent_copies(name, args):
     first["order_id"] = "注入字段"
     second = await tool.ainvoke({**args, "user_id": "demo-user"})
     assert second == {"error": "没有找到您的这笔订单", "code": "order_not_owned"}
+
+
+async def test_mcp_ownership_denial_happens_before_remote_handler(tmp_path):
+    """跨用户参数若发送远端再拒绝会失败。参数：临时规则目录；返回：None；异常：断言失败。"""
+    from tests.tools.test_execution import AuditSink, mcp_setup
+    from tests.test_tool_executor import ResultStore, call, context, ignore_status
+    from app.tools.contracts import ToolExecutionScope
+    from app.tools.executor import ToolExecutor
+
+    schema = {"type": "object", "properties": {"order_id": {"type": "string"}}, "required": ["order_id"]}
+    probe, registry, row, permissions, _, _ = mcp_setup(tmp_path, ownership="order_id", schema=schema)
+    audit = AuditSink()
+    ctx = context().model_copy(update={"user_id": "demo-user"})
+    result = await ToolExecutor(registry, ResultStore(), None, permissions=permissions, audit_repository=audit).execute(
+        call("probe", {"order_id": "2003"}), ctx, ignore_status, scope=ToolExecutionScope(binding=row.binding))
+    assert not probe.calls and result.error.category == "permission_denied"
+    assert audit.entries[0].status == "权限拒绝"

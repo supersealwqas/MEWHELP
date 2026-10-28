@@ -9,6 +9,7 @@ from app.repositories.chat import PersistenceUncertain
 from app.schemas.tools import BusinessArgs, ToolContext, ToolResult
 from app.tools.registry import ToolRegistry, build_registry
 from app.tools.executor import ToolExecutor
+from app.tools.contracts import ToolDefinition, ToolExecutionScope, ToolIdentity, WriteAuthorization, json_hash
 
 
 class ResultStore:
@@ -41,6 +42,12 @@ def call(name="slow", args=None):
 
 async def ignore_status(status):
     """测试无需展示状态。参数：状态字典；返回：None；异常：无。"""
+
+
+async def confirmed_authorization(binding, arguments, ctx):
+    """测试显式提供已核验的保存动作凭据。参数：来源/冻结参数/可信身份；返回：凭据；异常：无。"""
+    return WriteAuthorization(ctx.conversation_id, ctx.turn_id, "saved-action", ctx.tool_call_id,
+                              json_hash(arguments), "confirm", "action")
 
 
 class IdentityArgs(BusinessArgs):
@@ -253,47 +260,42 @@ async def test_create_ticket_failure_keeps_business_error_code():
 
     registry, store = ToolRegistry(), ResultStore()
     result = await ToolExecutor(build_registry(), store, FailingSupport()).execute(
-        call("create_ticket", {"description": "x", "ticket_type": "咨询"}), context(), ignore_status)
+        call("create_ticket", {"description": "x", "ticket_type": "咨询"}), context(), ignore_status,
+        scope=ToolExecutionScope(authorize_write=confirmed_authorization))
     assert result.ok is False and result.error.code == "TICKET_CONFLICT"
     assert result.error.message == "工单号冲突"
 
 
-async def test_write_tool_retries_only_after_confirmed_rollback():
-    """写操作在核实到未提交时才重试；核实到已提交则直接复用。参数：无；返回：None；异常：断言失败。"""
+async def test_write_tool_never_retries_even_after_confirmed_rollback():
+    """写操作即使查无已提交结果也不得自动再次调用。参数：无；返回：None；异常：断言失败。"""
     attempts = []
 
-    @tool
-    async def create_ticket(description: str) -> dict:
-        """模拟写操作瞬时故障后成功。参数：描述；返回：业务字典；异常：首次 TimeoutError。"""
+    async def create_ticket(arguments, ctx, scope):
+        """模拟写操作瞬时故障。参数：参数/身份/资源；返回：不返回；异常：TimeoutError。"""
         attempts.append(1)
-        if len(attempts) == 1:
-            raise TimeoutError()
-        return {"ticket_no": "T-1", "status": "待处理"}
-
-    create_ticket.tags = ["write"]
+        raise TimeoutError()
 
     registry, store = ToolRegistry(), ResultStore()
-    registry.register(create_ticket)
+    registry.register_definition(ToolDefinition(ToolIdentity("builtin", None, "create_ticket"), "测试工单写入",
+        {"type": "object", "properties": {"description": {"type": "string"}}}, create_ticket, "write"))
     result = await ToolExecutor(registry, store, None, max_retries=1, retry_delay_seconds=0).execute(
-        call("create_ticket", {"description": "x"}), context(), ignore_status)
-    # ResultStore 在重试前返回 None，说明本次确定未提交，重试是安全的。
-    assert len(attempts) == 2 and result.ok and result.data["ticket_no"] == "T-1"
+        call("create_ticket", {"description": "x"}), context(), ignore_status,
+        scope=ToolExecutionScope(authorize_write=confirmed_authorization))
+    assert len(attempts) == 1 and not result.ok and result.error.code == "TOOL_TIMEOUT"
 
 
 async def test_write_tool_timeout_message_warns_about_uncertain_state():
     """写操作最终超时时提示状态未确认，不能暗示可以安全重试。参数：无；返回：None；异常：断言失败。"""
-    @tool
-    async def create_ticket(description: str) -> dict:
-        """模拟持续超时。参数：描述；返回：不返回；异常：TimeoutError。"""
+    async def create_ticket(arguments, ctx, scope):
+        """模拟持续超时。参数：参数/身份/资源；返回：不返回；异常：TimeoutError。"""
         raise TimeoutError()
 
-    # 写操作语义由工具自身 tags 声明，测试探针必须与真实工具一致。
-    create_ticket.tags = ["write"]
-
     registry, store = ToolRegistry(), ResultStore()
-    registry.register(create_ticket)
+    registry.register_definition(ToolDefinition(ToolIdentity("builtin", None, "create_ticket"), "测试工单写入",
+        {"type": "object", "properties": {"description": {"type": "string"}}}, create_ticket, "write"))
     result = await ToolExecutor(registry, store, None, max_retries=0).execute(
-        call("create_ticket", {"description": "x"}), context(), ignore_status)
+        call("create_ticket", {"description": "x"}), context(), ignore_status,
+        scope=ToolExecutionScope(authorize_write=confirmed_authorization))
     assert result.ok is False and result.error.code == "TOOL_TIMEOUT"
     assert "状态未确认" in result.error.message
 

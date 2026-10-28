@@ -238,3 +238,17 @@ def test_default_budgets_fit_real_prompts_and_business_tools(scenario):
         system_text=CUSTOMER_SERVICE_SYSTEM + FINAL_ANSWER_SYSTEM,
         request_max_tokens=settings.request_token_budget)
     assert answer[1:] == current
+
+
+def test_argument_failure_remains_paired_in_recovered_history():
+    """业务参数失败被丢出历史会使模型无法针对原申请澄清。参数：无；返回：None；异常：断言失败。"""
+    from app.core.memory import assemble_turns
+    from app.schemas.tools import ToolError, ToolResult
+
+    turn = stored_turn("completed")
+    turn.messages[1].tool_calls[0]["args"] = {"ticket_type": "咨询"}
+    turn.messages[2].content = ToolResult(ok=False, error=ToolError(code="INVALID_ARGUMENTS", message="缺少问题描述",
+        details=[{"path": "/description", "rule": "required", "message": "请补充问题描述"}])).model_dump_json()
+    messages = assemble_turns([turn])[0]
+    assert messages[1].tool_calls[0]["id"] == messages[2].tool_call_id == "call1"
+    assert "invalid_arguments" in messages[2].content and "/description" in messages[2].content

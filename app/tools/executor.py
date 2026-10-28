@@ -1,353 +1,379 @@
-"""单工具执行、参数校验、有限重试及结果核实；不进行模型决策。
+"""统一工具生命周期：可信来源、严格参数、写确认、只读重试及独立终态审计。
 
-职责边界：
-- 本模块只负责「一次工具调用」的生命周期，不关心聊天编排、SSE 编码或模型选择。
-- 所有工具必须返回 dict；业务拒绝通过 error/code 两字段表达，由本模块转为失败事实。
-- 工具执行成功与否一律落库，异常不得覆盖已提交的成功事实。
+可靠工具消息保存完整业务事实；审计尽力写入，无法核实提交时不保存相反结果。
+确认等待与LangGraph控制信号独立于业务尝试期限，写入任何故障均不会自动再次执行。
 """
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from typing import Any
+from copy import deepcopy
+from dataclasses import dataclass, replace
+import logging
+import math
+import re
+import time
+
+import anyio
+import httpx
 from langchain_core.tools import BaseTool
+from langgraph.errors import GraphInterrupt
 from pydantic import ValidationError
 from sqlalchemy.exc import DBAPIError
+
 from app.repositories.chat import PersistenceUncertain
-from app.schemas.tools import CODE_FIELD, ERROR_FIELD, ToolContext, ToolResult, is_business_rejection
+from app.repositories.tool_audit import ToolAuditEntry
+from app.schemas.tools import ToolContext, ToolError, ToolResult
+from app.tools.contracts import ToolBinding, ToolDefinition, ToolExecutionScope, WriteAuthorization, json_hash
+from app.tools.validation import validate_arguments
 
-# 状态标签。running 阶段可按工具覆写，见 _status_label。
+logger = logging.getLogger(__name__)
 _LABELS = {"running": "正在查询", "retrying": "正在重试", "succeeded": "已完成", "failed": "未完成"}
-
-# 写操作的 running 文案与只读查询不同：用户需要知道系统正在建单而非查询。
-_WRITE_LABELS = {"running": "正在创建工单"}
-
-# 允许重试的数据库瞬时错误码：锁等待超时、死锁、连接类故障。
 _TRANSIENT_DB_CODES = frozenset({1205, 1213, 2003, 2006, 2013})
-
-# 需要在执行前由服务端注入、模型不可见的参数名。执行器按此判定是否注入身份。
-_INJECTED_IDENTITY_FIELD = "user_id"
-
-# 写操作标记，与工具定义处的 tags 对应。写操作只在核实到未提交后才重试。
-_WRITE_TAG = "write"
 
 
 def is_mock_tool(tool: BaseTool | None) -> bool:
-    """判定是否为演示工具。
-
-    演示语义的唯一真相来源是工具自身的 tags：标记了 'mock' 即为演示数据。
-    未标记的工具（含未知工具）一律按真实数据处理，避免把真实数据误标为演示。
-
-    参数:
-        tool: 待检查的 LangChain 工具对象；未知工具传入 None。
-    返回值:
-        bool: tags 含 'mock' 时为 True，否则为 False。
-    异常:
-        无主动抛出的业务异常。
-    """
-    if tool is None:
-        return False
-    return "mock" in (getattr(tool, "tags", None) or [])
+    """保留旧BaseTool演示标记查询。参数：工具或空；返回：是否有mock标签；异常：无。"""
+    return tool is not None and "mock" in (getattr(tool, "tags", None) or [])
 
 
-def _is_write_tool(tool: BaseTool | None) -> bool:
-    """判定是否为写操作工具。
+def _contains_control(error: BaseException) -> bool:
+    """识别组内暂停或取消信号。参数：异常树；返回：是否包含控制信号；异常：无。"""
+    if isinstance(error, (GraphInterrupt, asyncio.CancelledError)):
+        return True
+    return isinstance(error, BaseExceptionGroup) and any(_contains_control(child) for child in error.exceptions)
 
-    写操作会改变外部状态，因此重试策略与超时文案都需区别对待。
 
-    参数:
-        tool: 待检查的 LangChain 工具对象；未知工具传入 None。
-    返回值:
-        bool: tags 含 'write' 时为 True，否则为 False。
-    异常:
-        无主动抛出的业务异常。
-    """
-    if tool is None:
-        return False
-    return _WRITE_TAG in (getattr(tool, "tags", None) or [])
+def _contains_uncertain(error: BaseException) -> bool:
+    """识别组内任一未知提交状态。参数：异常树；返回：是否不能确认提交；异常：无。"""
+    if isinstance(error, PersistenceUncertain):
+        return True
+    return isinstance(error, BaseExceptionGroup) and any(_contains_uncertain(child) for child in error.exceptions)
 
 
 def _is_transient(error: Exception) -> bool:
-    """识别允许重试的网络或数据库瞬时故障。
-
-    参数:
-        error: 工具执行过程中捕获的异常。
-    返回值:
-        bool: 属于瞬时故障且值得重试时为 True。
-    异常:
-        无主动抛出的业务异常。
-    """
-    if isinstance(error, (TimeoutError, ConnectionError)):
+    """严格识别可重试的传输叶子。参数：异常树；返回：全部为瞬时故障才True；异常：无。"""
+    if isinstance(error, BaseExceptionGroup):
+        # AnyIO的异常组可能混入协议或业务错误，绝不能用any放行整个组。
+        return all(_is_transient(child) for child in error.exceptions)
+    if isinstance(error, (TimeoutError, ConnectionError, httpx.TimeoutException, httpx.NetworkError,
+                          httpx.RemoteProtocolError, anyio.EndOfStream, anyio.BrokenResourceError)):
         return True
     if isinstance(error, DBAPIError):
-        code = getattr(error.orig, "args", (None,))[0]
-        return error.connection_invalidated or code in _TRANSIENT_DB_CODES
+        codes = getattr(error.orig, "args", ())
+        return error.connection_invalidated or bool(codes and codes[0] in _TRANSIENT_DB_CODES)
+    # McpError数字码也可能来自远端业务错误，不能仅凭-32000或408重试。
     return False
 
 
+def _is_timeout(error: BaseException) -> bool:
+    """识别纯超时异常或异常组。参数：异常树；返回：是否全为超时；异常：无。"""
+    if isinstance(error, BaseExceptionGroup):
+        return all(_is_timeout(child) for child in error.exceptions)
+    return isinstance(error, (TimeoutError, httpx.TimeoutException))
+
+
+@dataclass
+class _Execution:
+    """单调用可变计量，与注册表和检查点隔离。"""
+
+    retries: int = 0  # 已实际开始的额外尝试。
+    started_at: float | None = None  # 确认结束后的首次尝试时刻。
+    duration_ms: int = 0  # 全部尝试及退避耗时。
+    recovery_note: str = ""  # 异常后核实提交的审计说明。
+
+
 class ToolExecutor:
-    """执行一次决策选中的工具，并保证成功事实优先于异常表象。"""
+    """执行已保存的单个业务申请，来源、授权和可靠事实均不由模型决定。"""
 
     def __init__(self, registry, chat_repository, support_repository, timeout_seconds=5,
-                 max_retries=1, retry_delay_seconds=0.2, *, knowledge_timeout_seconds=None):
-        """注入依赖及执行限制。
+                 max_retries=1, retry_delay_seconds=0.2, *, knowledge_timeout_seconds=None,
+                 permissions=None, audit_repository=None, audit_timeout_seconds=1):
+        """注入依赖及限制。
 
-        参数:
-            registry: 工具注册表，提供按名查找。
-            chat_repository: 工具结果读写仓储。
-            support_repository: 业务仓储，通过 RunnableConfig 传给工具。
-            timeout_seconds: 单次尝试超时秒数，必须为正。
-            max_retries: 允许的重试次数，只支持 0 或 1。
-            retry_delay_seconds: 重试前的退避秒数，不得为负。
-            knowledge_timeout_seconds: FAQ/退款独立期限；None 保持调用方原期限，生产配置默认 60 秒。
-        返回值:
-            None。
-        异常:
-            ValueError: 执行限制参数非法。
+        参数：registry唯一注册表；chat_repository可靠结果仓储；support_repository业务资源；
+            timeout_seconds每次尝试正秒数；max_retries只允许0或1且仅用于读取；retry_delay_seconds非负；
+            knowledge_timeout_seconds可选知识工具独立期限；permissions本地权限热加载服务；
+            audit_repository可选独立审计仓储；audit_timeout_seconds审计正期限。
+        返回：None；异常：ValueError，非有限或越界限制。
         """
-        if (timeout_seconds <= 0 or max_retries not in {0, 1} or retry_delay_seconds < 0
-                or (knowledge_timeout_seconds is not None and knowledge_timeout_seconds <= 0)):
+        durations = [timeout_seconds, audit_timeout_seconds]
+        if knowledge_timeout_seconds is not None:
+            durations.append(knowledge_timeout_seconds)
+        if (any(not math.isfinite(value) or value <= 0 for value in durations)
+                or max_retries not in {0, 1} or not math.isfinite(retry_delay_seconds) or retry_delay_seconds < 0):
             raise ValueError("非法工具执行限制")
         self.registry, self.chat, self.support = registry, chat_repository, support_repository
         self.timeout, self.retries, self.delay = timeout_seconds, max_retries, retry_delay_seconds
         self.knowledge_timeout = knowledge_timeout_seconds
+        self.permissions, self.audit = permissions, audit_repository
+        self.audit_timeout = audit_timeout_seconds
 
     async def execute(self, call: dict, context: ToolContext,
-                      on_status: Callable[[dict], Awaitable[None]]) -> ToolResult:
-        """执行并发布安全状态。
+                      on_status: Callable[[dict], Awaitable[None]], *,
+                      scope: ToolExecutionScope | None = None) -> ToolResult:
+        """校验、回放或执行一次申请，再保存事实与独立审计。
 
-        参数:
-            call: 模型的单条工具申请，必须含 id/name/args。
-            context: 可信调用身份，其 tool_call_id 必须与申请一致。
-            on_status: 异步状态回调，接收 running/retrying/succeeded/failed 帧。
-        返回值:
-            ToolResult: 已落库的工具结果；重复调用返回首次结果。
-        异常:
-            ValueError: 调用身份不匹配。
-            PersistenceUncertain: 结果保存状态无法确认。
+        参数：call含匹配id/name/args；context服务端可信身份；on_status异步状态回调；scope可信来源与授权资源。
+        返回：ToolResult，已可靠保存的原始业务结果。
+        异常：ValueError，调用协议/身份非法；PersistenceUncertain，不能核实提交；GraphInterrupt及取消原样透传。
         """
-        if not context.tool_call_id or call.get("id") != context.tool_call_id:
-            raise ValueError("工具调用身份不匹配")
-
-        name = call.get("name", "")
-        tool = self._lookup(name)
-        mock = is_mock_tool(tool)
+        scope = replace(scope or ToolExecutionScope(), support=self.support)
+        self._validate_identity(call, context, scope.binding)
+        name = call["name"]
+        binding = scope.binding or self._builtin_binding(name)
+        scope = replace(scope, binding=binding)
+        raw_args = deepcopy(call.get("args"))
+        metrics = _Execution()
+        mock, write = False, False
 
         async def emit(status: str) -> None:
-            """发布一帧工具状态。
+            """发布安全状态。参数：状态枚举；返回：None；异常：调用方回调异常。"""
+            label = "正在创建工单" if write and status == "running" else _LABELS[status]
+            await on_status({"tool_call_id": context.tool_call_id, "name": name,
+                             "status": status, "label": label, "is_mock": mock})
 
-            参数:
-                status: running/retrying/succeeded/failed 之一。
-            返回值:
-                None。
-            异常:
-                回调异常向外传播。
-            """
-            await on_status({"tool_call_id": context.tool_call_id, "name": name[:100],
-                             "status": status, "label": self._label(tool, status), "is_mock": mock})
-
-        await emit("running")
-
-        # 幂等：同键结果已存在时直接复用，绝不重复执行写操作。
-        existing = await self._read_result(context)
-        if existing is not None:
-            await emit("succeeded" if existing.ok else "failed")
-            return existing
-
-        result = await self._run(name, tool, call.get("args"), context, mock, emit)
-        result = await self._persist(context, result)
+        try:
+            # 回读优先于最新权限：已提交事实不能因撤权、撤下来源或schema变化被改写。
+            existing = await self._read_result(context)
+            if existing is not None:
+                mock = existing.is_mock
+                await emit("succeeded" if existing.ok else "failed")
+                return existing
+            if binding is None:
+                logger.warning("工具申请缺少可信来源 name=%s call=%s", name, context.tool_call_id)
+                result = ToolResult.failed("UNKNOWN_TOOL", "该申请没有可核实的工具来源，本次没有执行")
+            else:
+                row, arguments, result = self._preflight(binding, raw_args, context)
+                if row is not None:
+                    write, mock = row.access == "write", self._mock(row)
+                if result is None and scope.rejection is not None:
+                    result = scope.rejection.model_copy(deep=True)
+                if result is None and write:
+                    result = await self._authorize(raw_args, context, scope)
+                    if result is None:
+                        # interrupt恢复以及异步确认返回后必须重新读取最新定义/权限/参数。
+                        row, arguments, result = self._preflight(binding, raw_args, context)
+                        if row is not None:
+                            write, mock = row.access == "write", self._mock(row)
+                await emit("running")
+                if result is None:
+                    result = await self._invoke(row, arguments, context, scope, metrics, emit)
+                result = result.model_copy(update={"is_mock": mock})
+            result = await self._persist(context, result, metrics)
+        except (GraphInterrupt, asyncio.CancelledError):
+            # 暂停与取消是控制流，不能伪造一条终态结果或审计。
+            raise
+        except PersistenceUncertain:
+            await self._audit(binding, raw_args, context, None, metrics)
+            raise
+        except Exception as error:
+            if _contains_control(error):
+                raise
+            # 确认仓储等执行前故障仍需有界收尾，但不能保存一条未执行的业务失败事实。
+            await self._audit(binding, raw_args, context, self._classify_failure(error, is_write=write), metrics)
+            raise
+        await self._audit(binding, raw_args, context, result, metrics)
         await emit("succeeded" if result.ok else "failed")
         return result
 
-    def _lookup(self, name: str) -> BaseTool | None:
-        """按名查找工具，未注册返回 None 而不是抛异常。
+    @staticmethod
+    def _validate_identity(call: dict, context: ToolContext, binding: ToolBinding | None) -> None:
+        """阻止协议身份串用。参数：原申请/可信上下文/绑定；返回：None；异常：ValueError，协议非法。"""
+        identifier = context.tool_call_id
+        if (not isinstance(call, dict) or not isinstance(identifier, str) or not identifier
+                or identifier != identifier.strip() or len(identifier) > 64 or call.get("id") != identifier
+                or not all(isinstance(value, str) and value.strip() for value in
+                           (context.session_id, context.user_id, context.turn_id))
+                or not isinstance(call.get("name"), str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", call["name"])):
+            raise ValueError("工具调用身份或协议不匹配")
+        if binding is not None and (not isinstance(binding, ToolBinding) or binding.identity.name != call["name"]):
+            raise ValueError("工具申请与保存来源不匹配")
 
-        参数:
-            name: 模型给出的工具名。
-        返回值:
-            BaseTool | None: 已注册工具，未知工具为 None。
-        异常:
-            无主动抛出的业务异常。
+    def _builtin_binding(self, name: str) -> ToolBinding | None:
+        """仅为程序内置调用推导来源。参数：公开名；返回：内置绑定或空；异常：注册快照错误。"""
+        return next((row.binding for row in self.registry.snapshot()
+                     if row.name == name and row.identity.source == "builtin"), None)
+
+    def _preflight(self, binding: ToolBinding, raw_args: object, context: ToolContext) -> tuple:
+        """按原来源读取最新定义并完成校验/权限检查。
+
+        参数：binding保存来源；raw_args原始公开参数；context可信身份。
+        返回：(最新定义或空，规范化公开参数或空，拒绝结果或空)；异常：程序错误透传。
         """
         try:
-            return self.registry.get(name)
+            row = self.registry.get_definition(binding.identity)
         except KeyError:
-            return None
+            return None, None, ToolResult.failed("TOOL_UNAVAILABLE", "原工具来源当前不可用，本次没有执行")
+        errors = validate_arguments(row.parameters, raw_args)
+        if not isinstance(raw_args, dict) and not errors:
+            errors = [{"path": "", "rule": "type", "message": "工具参数必须为对象"}]
+        if errors:
+            return row, None, ToolResult(ok=False, error=ToolError(code="INVALID_ARGUMENTS",
+                message="工具参数不正确，请补充或修正对应字段", details=errors))
+        arguments = deepcopy(raw_args)
+        # 内置Pydantic业务规则补充JSON Schema无法表达的约束，例如纯空白工单描述。
+        if row.legacy_tool is not None:
+            fields = getattr(row.legacy_tool.args_schema, "model_fields", {})
+            if fields:
+                runtime = dict(arguments)
+                if "user_id" in fields and "user_id" not in row.parameters.get("properties", {}):
+                    runtime["user_id"] = context.user_id
+                try:
+                    values = row.legacy_tool.args_schema.model_validate(runtime).model_dump()
+                except ValidationError:
+                    return row, None, ToolResult.failed("INVALID_ARGUMENTS", "工具参数不正确，请补充有效信息")
+                arguments = {key: value for key, value in values.items()
+                             if key in row.parameters.get("properties", {})}
+        if self.permissions is not None:
+            denied = self.permissions.check(row.identity, arguments, context)
+            if denied is not None:
+                return row, None, denied
+        elif row.identity.source == "mcp":
+            return row, None, ToolResult.failed("PERMISSION_DENIED", "本地尚未授权此工具，本次没有执行")
+        # 外部写入以及其他内置写入即使被错误登记，也不能借确认回调放行。
+        if row.access == "write" and (row.identity.source != "builtin" or row.name != "create_ticket"):
+            return row, None, ToolResult.failed("PERMISSION_DENIED", "本次不允许执行此写入操作")
+        return row, arguments, None
 
-    def _label(self, tool: BaseTool | None, status: str) -> str:
-        """解析状态文案，写操作使用独立的 running 措辞。
+    def _mock(self, row: ToolDefinition) -> bool:
+        """从当前本地策略读取演示标记。参数：完整定义；返回：标记；异常：策略接口错误。"""
+        if row.identity.source == "mcp" and self.permissions is not None:
+            policy = self.permissions.policy(row.identity)
+            if policy is not None:
+                return bool(policy["result_policy"]["is_mock"])
+        return row.result_policy.is_mock
 
-        参数:
-            tool: 目标工具，用于判断是否写操作；未知工具为 None。
-            status: 状态名。
-        返回值:
-            str: 面向用户的中文状态文案。
-        异常:
-            无主动抛出的业务异常。
+    async def _authorize(self, arguments: dict, context: ToolContext, scope: ToolExecutionScope) -> ToolResult | None:
+        """在尝试计时前检查冻结动作确认。
+
+        参数：arguments冻结原参数；context可信身份；scope保存动作回调。
+        返回：拒绝结果或None；异常：GraphInterrupt、取消或确认仓储故障透传。
         """
-        if status == "running" and _is_write_tool(tool):
-            return _WRITE_LABELS["running"]
-        return _LABELS[status]
+        if scope.authorize_write is None:
+            return ToolResult.failed("NOT_CONFIRMED", "此写入尚未得到有效确认，本次没有执行")
+        authorization = await scope.authorize_write(scope.binding, deepcopy(arguments), context)
+        if (not isinstance(authorization, WriteAuthorization)
+                or authorization.conversation_id != context.conversation_id
+                or authorization.turn_id != context.turn_id or authorization.tool_call_id != context.tool_call_id
+                or authorization.arguments_hash != json_hash(arguments)
+                or authorization.origin not in {"chat", "action"}
+                or not isinstance(authorization.action_id, str) or not authorization.action_id.strip()
+                or len(authorization.action_id) > 64 or authorization.action_id != authorization.action_id.strip()
+                or authorization.decision not in {"confirm", "cancel"}):
+            return ToolResult.failed("NOT_CONFIRMED", "确认凭据与本次申请不匹配，本次没有执行")
+        if authorization.decision == "cancel":
+            return ToolResult.failed("USER_CANCELLED", "用户已取消，本次没有执行写入")
+        return None
 
-    async def _run(self, name: str, tool: BaseTool | None, raw_args: Any, context: ToolContext,
-                   mock: bool, emit: Callable[[str], Awaitable[None]]) -> ToolResult:
-        """执行工具并归一化所有可能的结局。
+    async def _invoke(self, row: ToolDefinition, arguments: dict, context: ToolContext, scope: ToolExecutionScope,
+                      metrics: _Execution, emit: Callable[[str], Awaitable[None]]) -> ToolResult:
+        """执行有界业务尝试，写入故障仅核实原键。
 
-        参数:
-            name: 工具名。
-            tool: 已解析的工具对象，未知工具为 None。
-            raw_args: 模型提交的原始参数，形状不可信。
-            context: 可信调用身份，提供注入的身份字段。
-            mock: 该工具是否为演示工具。
-            emit: 状态回调，用于发布重试帧。
-        返回值:
-            ToolResult: 成功、业务拒绝或执行失败的统一结果。
-        异常:
-            PersistenceUncertain: 结果核实过程中数据库不可用。
+        参数：最新定义/规范化参数/身份/资源/调用计量/状态回调。
+        返回：完整ToolResult；异常：PersistenceUncertain、GraphInterrupt或取消；所有程序错误转安全故障。
         """
-        if tool is None:
-            return ToolResult.failed("UNKNOWN_TOOL", "该工具不在可用范围内")
-        try:
-            arguments = self._prepare_arguments(tool, raw_args, context)
-        except (ValidationError, ValueError):
-            return ToolResult.failed("INVALID_ARGUMENTS", "工具参数不正确，请补充有效信息", is_mock=mock)
-        return await self._invoke(tool, arguments, context, mock, emit)
-
-    def _prepare_arguments(self, tool: BaseTool, raw_args: Any, context: ToolContext) -> dict:
-        """校验模型参数并注入服务端身份。
-
-        两件事必须同时成立：模型只能提交公开字段；身份只能由服务端注入。
-        完整 args_schema 而非可见子模型参与校验，因为可见子模型会丢失严格校验配置。
-
-        参数:
-            tool: 目标工具。
-            raw_args: 模型提交的原始参数。
-            context: 可信调用身份。
-        返回值:
-            dict: 已规范化、可直接传给工具的参数字典。
-        异常:
-            ValueError: 参数不是字典，或夹带了模型不可见的字段。
-            ValidationError: 参数不符合工具 Schema。
-        """
-        visible = tool.tool_call_schema.model_fields
-        if not isinstance(raw_args, dict) or raw_args.keys() - visible.keys():
-            raise ValueError("模型只能提交公开的业务参数")
-        arguments = dict(raw_args)
-        if _INJECTED_IDENTITY_FIELD in tool.args_schema.model_fields and _INJECTED_IDENTITY_FIELD not in visible:
-            arguments[_INJECTED_IDENTITY_FIELD] = context.user_id
-        return tool.args_schema.model_validate(arguments).model_dump()
-
-    async def _invoke(self, tool: BaseTool, arguments: dict, context: ToolContext,
-                      mock: bool, emit: Callable[[str], Awaitable[None]]) -> ToolResult:
-        """带超时与有限重试地调用工具，并把返回字典归一化。
-
-        重试策略按工具语义区分，两者都只重试瞬时故障：
-        - 只读工具：超时/网络抖动重试一次。
-        - 写操作：仅在核实到「本次未提交」后才重试；提交状态未知时绝不重试，
-          因为重复提交会产生第二张工单，比直接失败更糟。
-
-        参数:
-            tool: 目标工具。
-            arguments: 已校验的完整参数。
-            context: 可信调用身份，供工具读取。
-            mock: 是否为演示工具。
-            emit: 状态回调，重试前发布 retrying。
-        返回值:
-            ToolResult: 归一化后的结果。
-        异常:
-            PersistenceUncertain: 结果核实过程中数据库不可用。
-        """
-        config = {"configurable": {"context": context, "support_repository": self.support}}
-        is_write = _is_write_tool(tool)
-        timeout = (self.knowledge_timeout if tool.name in {"query_faq", "query_refund_policy"}
+        write = row.access == "write"
+        timeout = (self.knowledge_timeout if row.name in {"query_faq", "query_refund_policy"}
                    and self.knowledge_timeout is not None else self.timeout)
-        for attempt in range(self.retries + 1):
-            try:
-                async with asyncio.timeout(timeout):
-                    payload = await tool.ainvoke(arguments, config=config)
-                return self._normalize(payload, mock)
-            except PersistenceUncertain:
-                raise
-            except Exception as error:
-                # 异常不等于回滚：先核实是否已提交，再决定能否重试。
-                # 核实结果为空说明本次确定未提交，重试是安全的；核实失败会抛 PersistenceUncertain。
-                committed = await self._read_result(context)
-                if committed is not None:
-                    return committed
-                if _is_transient(error) and attempt < self.retries:
-                    await emit("retrying")
-                    await asyncio.sleep(self.delay)
-                    continue
-                return self._classify_failure(error, mock, is_write=is_write)
-        raise AssertionError("重试循环必须返回结果")
+        metrics.started_at = time.monotonic()
+        try:
+            for attempt in range((0 if write else self.retries) + 1):
+                metrics.retries = attempt
+                try:
+                    async with asyncio.timeout(timeout):
+                        result = await row.invoke(deepcopy(arguments), context, scope)
+                    if not isinstance(result, ToolResult):
+                        raise TypeError("注册处理器必须返回ToolResult")
+                    return result
+                except (GraphInterrupt, asyncio.CancelledError):
+                    raise
+                except Exception as error:
+                    if _contains_control(error):
+                        raise
+                    # 即使错误表示提交未知，也允许只读核实已提交回执；绝不再次调用写handler。
+                    committed = await self._read_result(context)
+                    if committed is not None:
+                        metrics.recovery_note = "超时后回读核实已提交结果" if _is_timeout(error) else "异常后回读核实已提交结果"
+                        return committed
+                    # 并发传输可能用异常组包装提交未知；任一叶子未知都不能保存相反的失败事实。
+                    if _contains_uncertain(error):
+                        raise PersistenceUncertain("工具提交状态未确认，请稍后核实，勿重复提交") from None
+                    if not write and _is_transient(error) and attempt < self.retries:
+                        await emit("retrying")
+                        await asyncio.sleep(self.delay)
+                        continue
+                    return self._classify_failure(error, is_write=write)
+        finally:
+            metrics.duration_ms = max(0, round((time.monotonic() - metrics.started_at) * 1000))
+        raise AssertionError("尝试循环必须返回")
 
     @staticmethod
-    def _normalize(payload: Any, mock: bool) -> ToolResult:
-        """把工具返回的业务字典归一化为统一结果。
-
-        参数:
-            payload: 工具返回值，协议要求必须是 dict。
-            mock: 是否为演示工具。
-        返回值:
-            ToolResult: 业务拒绝转为失败事实，其余视为成功数据。
-        异常:
-            TypeError: 返回类型或业务错误格式不符合协议。
-        """
-        if not isinstance(payload, dict):
-            raise TypeError("工具返回格式不合法，所有业务工具必须返回 dict")
-        if is_business_rejection(payload):
-            return ToolResult.failed(payload[CODE_FIELD], payload[ERROR_FIELD], is_mock=mock)
-        return ToolResult.success(payload, is_mock=mock)
-
-    @staticmethod
-    def _classify_failure(error: Exception, mock: bool, *, is_write: bool = False) -> ToolResult:
-        """把异常映射为安全的失败结果，不泄露异常原文。
-
-        参数:
-            error: 捕获的异常。
-            mock: 是否为演示工具。
-            is_write: 失败发生在写操作上，超时需要提示用户先核实而非直接重试。
-        返回值:
-            ToolResult: 带稳定错误码的失败结果。
-        异常:
-            无主动抛出的业务异常。
-        """
-        if isinstance(error, (ValidationError, ValueError)):
-            return ToolResult.failed("INVALID_ARGUMENTS", "工具参数不正确，请使用原话中的有效信息", is_mock=mock)
-        if isinstance(error, TimeoutError):
+    def _classify_failure(error: Exception, *, is_write: bool) -> ToolResult:
+        """隐藏异常细节且不把内部ValueError当用户参数错。参数：异常/写标记；返回：安全结果；异常：无。"""
+        if _is_timeout(error):
             message = "操作超时，状态未确认，请稍后核实后再决定是否重试" if is_write else "查询超时，请稍后再试"
-            return ToolResult.failed("TOOL_TIMEOUT", message, is_mock=mock)
-        return ToolResult.failed("TOOL_FAILED", "工具暂时无法完成，请稍后再试", is_mock=mock)
+            return ToolResult.failed("TOOL_TIMEOUT", message)
+        return ToolResult.failed("TOOL_FAILED", "工具暂时无法完成，请稍后再试")
 
     async def _read_result(self, context: ToolContext) -> ToolResult | None:
-        """用新会话核实已提交结果。
-
-        参数:
-            context: 调用身份。
-        返回值:
-            ToolResult | None: 已提交结果，或 None 表示尚未提交。
-        异常:
-            PersistenceUncertain: 数据库不可用，无法确认状态。
-        """
+        """用仓储新会话核实原三键。参数：可信身份；返回：原结果或空；异常：PersistenceUncertain、控制信号。"""
         try:
             return await self.chat.get_tool_result(context)
-        except Exception:
+        except GraphInterrupt:
+            raise
+        except Exception as error:
+            if _contains_control(error):
+                raise
             raise PersistenceUncertain("暂时无法核实工具处理状态，请稍后查看，勿重复提交") from None
 
-    async def _persist(self, context: ToolContext, result: ToolResult) -> ToolResult:
-        """保存结果，保存失败时改用核实路径。
-
-        参数:
-            context: 调用身份。
-            result: 待保存的结果。
-        返回值:
-            ToolResult: 真实落库的结果。
-        异常:
-            PersistenceUncertain: 保存与核实都无法确认。
-        """
+    async def _persist(self, context: ToolContext, result: ToolResult, metrics: _Execution) -> ToolResult:
+        """可靠保存，失败后只读核实真实结果。参数：身份/完整结果/计量；返回：已保存事实；异常：PersistenceUncertain。"""
         try:
             return await self.chat.save_tool_result(context, result)
-        except Exception:
+        except GraphInterrupt:
+            raise
+        except Exception as error:
+            if _contains_control(error):
+                raise
             stored = await self._read_result(context)
             if stored is None:
                 raise PersistenceUncertain("工具结果保存状态未能确认，请稍后核实") from None
+            metrics.recovery_note = "超时后回读核实已提交结果" if _is_timeout(error) else "异常后回读核实已提交结果"
             return stored
+
+    async def _audit(self, binding: ToolBinding | None, arguments: object, context: ToolContext,
+                     result: ToolResult | None, metrics: _Execution) -> None:
+        """独立有界尝试终态审计，失败只记日志。
+
+        参数：可信绑定/原始参数/身份/可靠结果或未知/计量。
+        返回：None；异常：外部取消或图控制信号透传，不泄露审计数据库错误。
+        """
+        if binding is None or self.audit is None:
+            return
+        try:
+            status = "失败"
+            if result is not None:
+                if result.ok:
+                    status = "成功"
+                elif result.error is not None:
+                    status = ({"invalid_arguments": "校验拦下", "permission_denied": "权限拒绝"}.get(
+                        result.error.category, "超时" if result.error.code == "TOOL_TIMEOUT" else "失败"))
+            summary = result.model_dump_json() if result is not None else "提交状态未确认，未保存失败结果"
+            if metrics.recovery_note:
+                summary = metrics.recovery_note + "；" + summary
+            error_message = (result.error.message if result is not None and result.error is not None
+                             else "提交状态未确认" if result is None else None)
+            entry = ToolAuditEntry(conversation_id=context.conversation_id or None, tool_call_id=context.tool_call_id,
+                tool_name=binding.identity.name, tool_source=binding.identity.source, mcp_server=binding.identity.server,
+                arguments=deepcopy(arguments) if isinstance(arguments, dict) else None, result_summary=summary,
+                status=status, error_message=error_message, retry_count=metrics.retries,
+                duration_ms=min(metrics.duration_ms, 4294967295))
+            async with asyncio.timeout(self.audit_timeout):
+                await self.audit.record(entry)
+        except GraphInterrupt:
+            raise
+        except Exception as error:
+            if _contains_control(error):
+                raise
+            logger.warning("工具审计保存失败 name=%s call=%s error=%s", binding.identity.name,
+                           context.tool_call_id, type(error).__name__)
