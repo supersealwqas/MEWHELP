@@ -51,6 +51,54 @@ def test_budget_too_small_for_core_receipt_is_explicit():
         project(ToolResult.success({"ticket_no": "T-real", "status": "待处理"}), budget=1)
 
 
+@pytest.mark.parametrize("facts", [
+    {"receipt": {"ticket_no": "T-real", "status": "待处理"}},
+    {"payload": {"items": [{"tracking_no": "SF-1", "status": "已签收"},
+                            {"tracking_no": "SF-2", "status": "运输中"}]}}
+])
+def test_field_selection_keeps_nested_fact_paths(facts):
+    """字段规则删除父容器并丢失嵌套回执或列表ID会失败。参数：事实结构；返回：None；异常：断言失败。"""
+    result = ToolResult.success({"message": "处理完成", **deepcopy(facts), "debug": "内部调试"})
+    original = deepcopy(result.model_dump())
+    expected = {"message": "处理完成", **facts}
+    budget = TokenEstimator().value_tokens({"ok": True, "data": expected, "error": None})
+    view = project(result, ResultPolicy(fields=("message",)), budget=budget)
+    assert view["data"] == expected and result.model_dump() == original
+    assert TokenEstimator().value_tokens(view) <= budget
+
+
+@pytest.mark.parametrize("facts", [
+    {"receipt": {"ticket_no": "T-real", "status": "待处理"}},
+    {"payload": {"items": [{"tracking_no": "SF-1", "status": "已签收"},
+                            {"tracking_no": "SF-2", "status": "运输中"}]}}
+])
+def test_nested_core_facts_over_budget_raise_instead_of_empty_success(facts):
+    """嵌套核心事实放不下却删除父容器或列表项返回空成功会失败。参数：事实结构；返回：None；异常：断言失败。"""
+    result = ToolResult.success(deepcopy(facts))
+    original = deepcopy(result.model_dump())
+    budget = TokenEstimator().value_tokens({"ok": True, "data": facts, "error": None}) - 1
+    with pytest.raises(ContextBudgetExceeded):
+        project(result, budget=budget)
+    assert result.model_dump() == original
+
+
+def test_nested_list_keeps_all_identifiers_while_trimming_descriptions():
+    """列表整体减半丢回执，或为保护父容器而不能裁剪内部描述都会失败。参数：无；返回：None；异常：断言失败。"""
+    facts = {"payload": {"items": [{"ticket_no": "T-1", "status": "待处理"},
+                                   {"ticket_no": "T-2", "status": "已受理"}]}}
+    data = deepcopy(facts)
+    for row in data["payload"]["items"]:
+        row["description"] = "这是一段可裁剪的详细描述" * 50
+        row["debug"] = "短说明"
+    result = ToolResult.success(data)
+    original = deepcopy(result.model_dump())
+    expected = {"ok": True, "data": facts, "error": None, "truncated": True}
+    budget = TokenEstimator().value_tokens(expected)
+    view = project(result, budget=budget)
+    assert view == expected and result.model_dump() == original
+    assert TokenEstimator().value_tokens(view) <= budget
+
+
 def test_failure_category_and_safe_explanation_are_preserved():
     """失败投影伪装成功或抹掉可行动说明会失败。参数：无；返回：None；异常：断言失败。"""
     view = project(ToolResult.failed("ORDER_NOT_OWNED", "没有找到您的这笔订单"))

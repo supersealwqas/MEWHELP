@@ -16,6 +16,15 @@ def _protected(key: str, value: object, policy: ResultPolicy) -> bool:
             or isinstance(value, (bool, int, float)))
 
 
+def _contains_facts(value: object, policy: ResultPolicy) -> bool:
+    """递归识别容器内不可丢失的事实。参数：结果子树/本地规则；返回：是否含关键事实；异常：无。"""
+    if isinstance(value, dict):
+        return any(_protected(key, item, policy) or _contains_facts(item, policy) for key, item in value.items())
+    if isinstance(value, list):
+        return any(_contains_facts(item, policy) for item in value)
+    return isinstance(value, (bool, int, float))
+
+
 def _translate(value: object, policy: ResultPolicy) -> object:
     """递归翻译本地声明的枚举。参数：结果树/本地规则；返回：独立中文视图；异常：无。"""
     if isinstance(value, list):
@@ -43,10 +52,28 @@ def _candidates(value: object, policy: ResultPolicy, estimator) -> list:
             continue
         if isinstance(item, str) and len(item) > 16:
             candidates.append((estimator.value_tokens(item), value, key, item[:len(item) // 2] + "…"))
-        elif isinstance(item, list) and len(item) > 1:
+        elif isinstance(item, list) and len(item) > 1 and not _contains_facts(item, policy):
+            # 有关键事实的列表保留全部来源位置，只向内部裁剪说明，不能整体减半丢掉其他回执。
             candidates.append((estimator.value_tokens(item), value, key, item[:max(1, len(item) // 2)]))
         if isinstance(item, (dict, list)):
             candidates.extend(_candidates(item, policy, estimator))
+    return candidates
+
+
+def _removable(value: object, policy: ResultPolicy, estimator) -> list:
+    """递归收集可删除的非关键字段，保留事实父路径与列表位置。参数：子树/规则/估算器；返回：候选；异常：非法JSON。"""
+    candidates = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if _protected(key, item, policy):
+                continue
+            if not _contains_facts(item, policy):
+                candidates.append((estimator.value_tokens(item), value, key))
+            else:
+                candidates.extend(_removable(item, policy, estimator))
+    elif isinstance(value, list):
+        for item in value:
+            candidates.extend(_removable(item, policy, estimator))
     return candidates
 
 
@@ -62,7 +89,8 @@ def model_tool_result(result: ToolResult, policy: ResultPolicy, *, max_tokens: i
     data = result.data
     if data is not None and policy.fields:
         selected = [key for key in policy.fields if key in data]
-        selected.extend(key for key, value in data.items() if key not in selected and _protected(key, value, policy))
+        selected.extend(key for key, value in data.items() if key not in selected
+                        and (_protected(key, value, policy) or _contains_facts(value, policy)))
         data = {key: data[key] for key in selected}
     view = {"ok": result.ok, "data": _translate(data, policy),
             "error": result.error.model_dump(exclude_none=True) if result.error is not None else None}
@@ -76,9 +104,9 @@ def model_tool_result(result: ToolResult, policy: ResultPolicy, *, max_tokens: i
             _, parent, key, replacement = max(candidates, key=lambda candidate: candidate[0])
             parent[key] = replacement
             continue
-        removable = [(estimator.value_tokens(value), key) for key, value in (view["data"] or {}).items()
-                     if not _protected(key, value, policy)]
+        removable = _removable(view["data"], policy, estimator)
         if not removable:
             raise ContextBudgetExceeded("工具关键事实超过模型结果预算，不能静默丢弃")
-        del view["data"][max(removable)[1]]
+        _, parent, key = max(removable, key=lambda candidate: candidate[0])
+        del parent[key]
     return view
