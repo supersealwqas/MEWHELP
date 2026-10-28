@@ -112,3 +112,5 @@ uv run --no-sync --offline pytest -q -m mysql \
 - 日志 `log/app.log` 含 `history_ctx`、`model_ctx` 和摘要阶段，保留业务正文且轮转；不输出连接串或密钥。查看真实请求时使用报告中的 `models.json`、`summary-models.json` 和 `turn-*.json` 相互核对。
 
 本章保留本地工作分支、原始验收证据和用户原有草稿；合并、推送和应用库部署不属于本次本地交付。
+
+全分支自查、已处理问题及保留边界见 [CH07最终审查](superpowers/reviews/2026-10-28-ch07-final-review.md)。
