@@ -64,13 +64,13 @@ function button(root, label) {
   return found;
 }
 /** 参数：完成快照/响应函数；返回：DOM和可观察输出；异常：生产实现错误。 */
-function setup(meta = metadata(), respond = async () => Response.json(receipt)) {
+function setup(meta = metadata(), respond = async () => Response.json(receipt), savedReceipt = null) {
   const doc = { createElement(tag) { return new Element(tag, doc); } };
   doc.body = doc.createElement("body");
   const container = doc.createElement("section");
   doc.body.append(container);
   const calls = [], messages = [], busy = [];
-  const options = { fetchImpl: async (...args) => { calls.push(args); return respond(...args); },
+  const options = { receipt: savedReceipt, fetchImpl: async (...args) => { calls.push(args); return respond(...args); },
     appendMessage: (role, text) => { assert.equal(role, "assistant"); messages.push(text); }, onBusy: (value) => busy.push(value) };
   actions.attachSuggestedActions(container, meta, options);
   return { doc, container, calls, messages, busy, options };
@@ -88,6 +88,39 @@ test("投诉回复装配两个按钮但不主动联网或打开弹窗", () => {
   assert.equal(all(f.container).filter((node) => node.tagName === "button").length, 2);
   assert.equal(f.calls.length, 0);
   assert.equal(all(f.doc.body).some((node) => node.open), false);
+});
+
+for (const pending of [false,true]) {
+  test(`刷新装配保存的工单回执，待同步=${pending}也不能再次创建`,()=>{
+    const f=setup(metadata(),undefined,{...receipt,audit_sync_pending:pending});
+    const saved=button(f.container,"工单已创建");
+    assert.equal(saved.disabled,true);saved.click();
+    assert.match(f.container.textContent,/T-REAL-123/);
+    assert.equal(/记录同步待恢复/.test(f.container.textContent),pending);
+    assert.equal(f.calls.length,0);
+    assert.equal(all(f.doc.body).some(node=>node.open),false);
+  });
+}
+
+test("重复回读更新同一工单按钮，不重置人工状态或主动建单",()=>{
+  const f=setup();button(f.container,"转人工客服").click();
+  const original=button(f.container,"创建工单");
+  actions.attachSuggestedActions(f.container,metadata(),{...f.options,receipt:{...receipt,audit_sync_pending:true}});
+  assert.equal(button(f.container,"工单已创建"),original);
+  assert.equal(original.disabled,true);
+  actions.attachSuggestedActions(f.container,metadata(),{...f.options,receipt:{...receipt,audit_sync_pending:false}});
+  actions.attachSuggestedActions(f.container,metadata(),f.options);
+  assert.equal(button(f.container,"工单已创建"),original);
+  assert.doesNotMatch(f.container.textContent,/记录同步待恢复/);
+  assert.equal(button(f.container,"已转接人工客服").disabled,true);
+  assert.equal(f.messages.length,2);assert.equal(f.calls.length,0);
+});
+
+test("其他动作的回执不能把当前建议标为已创建",()=>{
+  const f=setup(metadata(),undefined,{...receipt,action_id:handoffId});
+  assert.equal(button(f.container,"创建工单").disabled,false);
+  assert.doesNotMatch(f.container.textContent,/T-REAL-123/);
+  assert.equal(f.calls.length,0);
 });
 
 for (const field of ["session_id", "user_id"]) {

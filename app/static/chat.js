@@ -132,9 +132,12 @@ function newConversation({ restore = false } = {}) {
   let randomId = "";
   for (const byte of bytes) randomId += byte.toString(16).padStart(2, "0");
   sessionId = `web-${randomId}`;
+  let restoring = false;
   try {
     const stored = sessionStorage.getItem("mewhelp.session");
-    if (restore && typeof stored === "string" && stored.trim() && [...stored].length <= 64) sessionId = stored;
+    if (restore && typeof stored === "string" && stored.trim() && [...stored].length <= 64) {
+      sessionId = stored; restoring = true;
+    }
   } catch { /* 隐私模式禁用存储时仍可使用当前页面会话。 */ }
   rememberSession();
   conversationBrowser.startNew(sessionId);
@@ -148,10 +151,14 @@ function newConversation({ restore = false } = {}) {
   ui.historyStatus.textContent = "";
   followOutput = true;
   updateSendState();
-  if (restore) {
+  if (restoring) {
     const generation = requestGeneration;
+    ui.status.textContent = "正在回载历史，请稍候…";
     void conversationBrowser.restore(sessionId).then(loaded => {
-      if (!loaded && generation === requestGeneration) void syncCurrent(null, generation);
+      if (!loaded && generation === requestGeneration) {
+        ui.status.textContent = "历史暂未回载，可从侧栏重试或继续提问";
+        void syncCurrent(null, generation);
+      }
     });
   } else void conversationBrowser.refresh();
 }
@@ -386,20 +393,21 @@ async function sendMessage(event) {
 }
 
 /** 完成后装配独立动作和引用；参数为原气泡/正文/保存快照/可选回执；返回void；异常：非法元数据。 */
-function presentCompleted(reply, answer, metadata, receipt = null) {
-  if (reply.completed) return;
-  reply.card?.disable("原轮处理已完成。");
-  reply.card?.element.remove();
-  reply.bubble.innerHTML = renderMarkdown(answer);
-  reply.note.hidden = true;
-  reply.completed = true;
-  if (!reply.historyTools) attachAnswerTools(reply, answer, metadata);
-  else reply.bubble.innerHTML = renderMarkdown(answer, metadata.citations);
+function presentCompleted(reply, answer, metadata, receipt = null, ticketReceipt = null) {
+  if (!reply.completed) {
+    reply.card?.disable("原轮处理已完成。");
+    reply.card?.element.remove();
+    reply.bubble.innerHTML = renderMarkdown(answer);
+    reply.note.hidden = true;
+    reply.completed = true;
+    if (!reply.historyTools) attachAnswerTools(reply, answer, metadata);
+    else reply.bubble.innerHTML = renderMarkdown(answer, metadata.citations);
+  }
   const options = { appendMessage, onBusy: (busy) => {
     pendingActions = Math.max(0, pendingActions + (busy ? 1 : -1));
     setBusy(Boolean(activeController));
   } };
-  attachSuggestedActions(reply.actions, metadata, options);
+  attachSuggestedActions(reply.actions, metadata, { ...options, receipt: ticketReceipt });
   attachRefundAction(reply.actions, metadata, { ...options, receipt });
 }
 
@@ -431,7 +439,7 @@ async function syncCurrent(fallbackReply = null, generation = requestGeneration)
     reply.article.dataset.sourceTurnId = reply.turnId;
     replyByTurn.set(reply.turnId, reply);
     if (current.turn_status === "completed") {
-      presentCompleted(reply, current.answer ?? "", { ...current.completion_metadata, ...identity }, current.refund_receipt);
+      presentCompleted(reply, current.answer ?? "", { ...current.completion_metadata, ...identity }, current.refund_receipt, current.ticket_receipt);
       ui.status.textContent = "已恢复完成结果，可以继续提问";
     } else if (current.turn_status === "awaiting_input" && current.order_selection) {
       reply.bubble.textContent = "请选择本次要处理的订单。";

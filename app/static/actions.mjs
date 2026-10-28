@@ -2,7 +2,7 @@
 import { confirmTicket, validateSuggestedActions, validateOrderSelection, validateRefundAction,
   getRefundReasons, submitRefund, getCurrentActions } from "./chat-api.mjs";
 
-const attached = new WeakSet();
+const attached = new WeakMap();
 const refundAttached = new WeakSet();
 
 /** 创建纯文本DOM；参数为文档/标签/文本/类名；返回元素；异常：DOM错误。 */
@@ -163,9 +163,10 @@ export function attachRefundAction(container, metadata, { fetchImpl = globalThis
  * @returns {void} 创建按钮和独立状态；无建议时不产生界面或请求。
  * @throws {Error} 非法动作或完成身份在创建任何节点前被拒绝。
  */
-export function attachSuggestedActions(container, metadata, { fetchImpl = globalThis.fetch, appendMessage, onBusy = () => {} } = {}) {
+export function attachSuggestedActions(container, metadata, { fetchImpl = globalThis.fetch, appendMessage, onBusy = () => {}, receipt = null } = {}) {
   const suggested = validateSuggestedActions(metadata);
-  if (!suggested.length || attached.has(container)) return;
+  if (attached.has(container)) { attached.get(container)(receipt); return; }
+  if (!suggested.length) return;
   // 与确认客户端及后端统一按Unicode码点计数，避免将emoji代理对算成两个字符。
   if (metadata.status !== "completed" || typeof metadata.session_id !== "string" || !metadata.session_id ||
       Array.from(metadata.session_id).length > 64 || (metadata.user_id !== undefined &&
@@ -176,6 +177,7 @@ export function attachSuggestedActions(container, metadata, { fetchImpl = global
   const identity = { session_id: metadata.session_id, user_id: metadata.user_id ?? "demo-user" };
   const row = node("div", "", "suggested-actions");
   row.setAttribute("aria-label", "本条回复的建议操作");
+  let updateReceipt = () => {};
 
   /** 创建安全文本节点；参数为标签/文字/类名；返回DOM元素；异常：DOM创建失败。 */
   function node(tag, text = "", className = "") {
@@ -212,6 +214,20 @@ export function attachSuggestedActions(container, metadata, { fetchImpl = global
     const payload = Object.freeze({ ...identity, source_turn_id: action.source_turn_id, action_id: action.action_id, confirmed: true });
     let dialog = null;
     let state = "ready";
+
+    /** 回读或确认后更新同一原动作；参数已保存回执；返回void；异常无。 */
+    function showReceipt(saved) {
+      if (!saved || saved.action_id !== action.action_id || typeof saved.ticket_no !== "string"
+          || !saved.ticket_no.trim() || [...saved.ticket_no].length > 32 || saved.ticket_type !== action.ticket_type
+          || saved.status !== "待处理" || (saved.audit_sync_pending !== undefined && typeof saved.audit_sync_pending !== "boolean")) return;
+      state = "succeeded"; button.disabled = true; button.textContent = "工单已创建";
+      note.hidden = false;
+      note.textContent = `工单 ${saved.ticket_no} · ${saved.ticket_type} · ${saved.status}`;
+      if (saved.audit_sync_pending) note.textContent += "。工单已创建，记录同步待恢复，无需重复建单。";
+    }
+    // 重复核实仅更新工单回执，不重建按钮或重置已经显示的人工接入状态。
+    updateReceipt = showReceipt;
+    showReceipt(receipt);
 
     button.addEventListener("click", () => {
       if (dialog || !["ready", "unknown"].includes(state)) return;
@@ -257,10 +273,7 @@ export function attachSuggestedActions(container, metadata, { fetchImpl = global
         onBusy(true);
         try {
           const receipt = await confirmTicket(payload, { fetchImpl });
-          state = "succeeded";
-          button.textContent = "工单已创建";
-          note.textContent = `工单 ${receipt.ticket_no} · ${receipt.ticket_type} · ${receipt.status}`;
-          if (receipt.audit_sync_pending) note.textContent += "。工单已创建，记录同步待恢复，无需重复建单。";
+          showReceipt(receipt);
         } catch (error) {
           if (error.outcome === "failed") {
             state = "failed";
@@ -287,5 +300,5 @@ export function attachSuggestedActions(container, metadata, { fetchImpl = global
     });
   }
   container.append(row);
-  attached.add(container);
+  attached.set(container, updateReceipt);
 }

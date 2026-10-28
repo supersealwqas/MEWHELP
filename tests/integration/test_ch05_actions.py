@@ -196,6 +196,11 @@ async def test_mysql_double_click_identity_and_original_whitespace(isolated_acti
         assert sorted(item.status_code for item in pair) == [200, 409]
         repeated = await client.post("/api/actions/tickets", json=body)
         assert repeated.json() == next(item.json() for item in pair if item.status_code == 200)
+        before_read = await _snapshot(resource["factory"], body)
+        query = {key:value for key,value in body.items() if key != "confirmed"}
+        receipts = await asyncio.gather(*(ActionRepository(resource["factory"]).get_ticket_receipt(**query) for _ in range(2)))
+        assert [receipt.model_dump() for receipt in receipts] == [repeated.json(), repeated.json()]
+        assert await _snapshot(resource["factory"], body) == before_read
         for override in ({"user_id": other["user_id"]}, {"session_id": other["session_id"]},
                          {"user_id": other["user_id"], "session_id": other["session_id"]},
                          {"action_id": other["action_id"]}, {"source_turn_id": other["source_turn_id"]}):
@@ -236,6 +241,9 @@ async def _child(args):
         recovered_count = await actions.executor.chat.recover_interrupted_turns()
         cancelled = await _snapshot(factory, body)
         assert recovered_count == 1 and cancelled["action_statuses"] == ["cancelled"] * 3
+        pending = await actions.repository.get_ticket_receipt(**{key:value for key,value in body.items() if key != "confirmed"})
+        assert pending.audit_sync_pending is True and cancelled["ticket_numbers"] == [pending.ticket_no]
+        assert await _snapshot(factory, body) == cancelled
         receipt = await actions.confirm_ticket(TicketConfirmation(**body))
         retry = await actions.confirm_ticket(TicketConfirmation(**body))
         snapshot = await _snapshot(factory, body)

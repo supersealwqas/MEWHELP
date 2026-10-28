@@ -250,6 +250,37 @@ class ActionRepository:
             return action.model_copy(update={"turn_status": rows[0].turn_status,
                 "execution_started": rows[0].rag_metadata["execution_started"], "existing_result": result})
 
+    async def get_ticket_receipt(self, session_id: str, user_id: str, source_turn_id: str, action_id: str) -> TicketReceipt | None:
+        """只读回查原动作的已提交工单，不准备动作、不执行工具或补写审计。
+
+        参数：session_id/user_id为来源身份，source_turn_id为已完成原问，action_id为保存建议的稳定键。
+        返回：已核验真实工单的TicketReceipt；尚无成功工具结果或原问不能建单时返回None。
+        异常：ActionNotFound，身份/建议不符；PersistenceUncertain，工具事实或回执损坏；数据库错误。
+        """
+        request = TicketConfirmation(session_id=session_id, user_id=user_id, source_turn_id=source_turn_id,
+                                     action_id=action_id, confirmed=True)
+        async with self.factory.begin() as session:
+            try:
+                action = await self._trusted_action(session, request)
+            except InvalidTicketArguments:
+                # 超长原问仍可展示；它未能进入合法建单流程，回读不得因此让聊天恢复失败。
+                return None
+            rows = await self._action_rows(session, action)
+            if len(rows) < 3:
+                return None
+            result = ToolResult.model_validate_json(rows[2].content)
+            if not result.ok:
+                return None
+            receipt = await self._verify_success(session, action, result)
+            if len(rows) == 4:
+                expected = {"status":"completed", "turn_id":action.context.turn_id,
+                            "ticket_action":self._marker(action), "ticket_receipt":receipt.model_dump()}
+                if rows[3].rag_metadata != expected or any(row.turn_status != "completed" for row in rows):
+                    raise PersistenceUncertain("已保存工单回执与成功事实不一致")
+                return receipt
+            # cancelled/failed仅表示审计轮中断，不能覆盖真实工单已提交的事实。
+            return receipt.model_copy(update={"audit_sync_pending": True})
+
     async def _revalidate(self, session, action: PreparedTicketAction) -> list[Message]:
         """收尾或执行前重新核验全部稳定身份。参数：session事务、action传入动作；返回：独立消息；异常：一致性/身份/数据库错误。"""
         trusted = await self._trusted_action(session, action.request)

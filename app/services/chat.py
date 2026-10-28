@@ -669,10 +669,17 @@ class ChatService:
         if refund_action:
             from app.repositories.actions import ActionRepository
             refund_receipt = await ActionRepository(self.chat.factory).get_refund_receipt(session_id, user_id, refund_action["action_id"])
+        ticket_receipt = None
+        for suggestion in metadata.get("suggested_actions", []) or []:
+            if suggestion.get("kind") == "create_ticket":
+                from app.repositories.actions import ActionRepository
+                ticket_receipt = await ActionRepository(self.chat.factory).get_ticket_receipt(
+                    session_id, user_id, row["context"].turn_id, suggestion["action_id"])
+                break
         return CurrentActions(source_turn_id=row["context"].turn_id, turn_status=row["turn_status"],
             order_selection=action, accepted_order_id=saved.get("accepted_order_id") if saved else None,
             answer=row["answer"], completion_metadata=row["completion_metadata"], resume_required=resume_required,
-            refund_action=refund_action, refund_receipt=refund_receipt)
+            refund_action=refund_action, refund_receipt=refund_receipt, ticket_receipt=ticket_receipt)
 
     def _public_event(self, payload: dict, context: ToolContext) -> ChatEvent | None:
         """筛选并规范公开事件。参数：payload图custom帧、context原轮；返回：事件或None；异常：无。"""

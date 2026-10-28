@@ -30,12 +30,12 @@ const records=[{id:"1",role:"user",content:"第一条原问\n  ",turn_id:"first"
  {id:"4",role:"assistant",content:"新办理说明",turn_id:"second",turn_status:"completed",rag_metadata:{citations:[{n:1}],refund_action:{action_id:"current"}}}];
 
 /** 执行生产页面脚本，替换外部网络及已有动作渲染边界；参数响应函数；返回观察记录；异常：脚本或断言失败。 */
-function setup(respond=null) {
+function setup(respond=null, { storedSession="web-original", ticketReceipt=null } = {}) {
   const nodes=new Map(), mounted=[], citations=[], requests=[];
   const document=new EventTarget();
   document.querySelector=id=>{if(!nodes.has(id))nodes.set(id,new Element());return nodes.get(id);};
   document.createElement=tag=>new Element(tag);
-  const storage=new Map([["mewhelp.session","web-original"]]);
+  const storage=new Map(storedSession === null ? [] : [["mewhelp.session",storedSession]]);
   const sandbox={document, window:{matchMedia:()=>({matches:false})}, crypto:{getRandomValues:array=>array.fill(1)},Uint8Array,URLSearchParams,AbortController,
     sessionStorage:{getItem:key=>storage.get(key),setItem:(key,value)=>storage.set(key,value)},
     createConversationBrowser:options=>createConversationBrowser({...options,fetch:async(url,opts)=>{requests.push([url,opts]);return respond?respond(url):Response.json(url.includes("/messages")?{session_id:"web-original",items:records,next_after_id:null}:{items:[conversation],next_before_id:null});}}),
@@ -43,7 +43,7 @@ function setup(respond=null) {
     attachSuggestedActions:(container,metadata,options)=>mounted.push({kind:"suggested",metadata,options}),
     attachRefundAction:(container,metadata,options)=>mounted.push({kind:"refund",metadata,options}),
     getCurrentActions:async identity=>({source_turn_id:"second",turn_status:"completed",answer:"新办理说明",
-      completion_metadata:{turn_id:"second",citations:[{n:1}],refund_action:{action_id:"current"}},refund_receipt:{refund_no:"RF-SAVED"}}),
+      completion_metadata:{turn_id:"second",citations:[{n:1}],refund_action:{action_id:"current"}},refund_receipt:{refund_no:"RF-SAVED"},ticket_receipt:ticketReceipt}),
   };
   const context=vm.createContext(sandbox);
   vm.runInContext(script,context,{filename:"app/static/chat.js"});
@@ -76,4 +76,61 @@ test("旧历史失败晚到不能给新会话写错误状态",async()=>{
   f.node("#new-chat").click();reject(new Error("offline"));await setImmediate();
   assert.equal(f.node("#messages").children.length,0);
   assert.doesNotMatch(f.node("#history-status").textContent,/未能|失败|正在/);
+});
+
+test("刷新查找旧会话期间禁止发送，完整原文到齐后才解锁",async()=>{
+  let release;
+  const f=setup(url=>url.includes("/messages")?Response.json({session_id:"web-original",items:records,next_after_id:null}):new Promise(resolve=>release=resolve));
+  await setImmediate();
+  try {
+    f.node("#message-input").value="恢复期间的新问题";
+    f.node("#message-input").dispatchEvent(new Event("input"));
+    assert.equal(f.node("#message-input").readOnly,true);
+    assert.equal(f.node("#send-button").disabled,true);
+    assert.match(f.node("#request-status").textContent,/恢复|回载/);
+    f.node("#chat-form").dispatchEvent(new Event("submit",{cancelable:true}));
+    assert.equal(f.node("#messages").children.length,0);
+  } finally {
+    release(Response.json({items:[conversation],next_before_id:null}));
+    await setImmediate();await setImmediate();
+  }
+  assert.match(f.node("#messages").textContent,/第一条原问/);
+  assert.match(f.node("#messages").textContent,/新办理说明/);
+  assert.equal(f.node("#message-input").readOnly,false);
+});
+
+test("普通侧栏刷新等待不锁住已恢复会话的输入",async()=>{
+  let release,delay=false;
+  const f=setup(url=>delay?new Promise(resolve=>release=resolve):Response.json(url.includes("/messages")?{session_id:"web-original",items:records,next_after_id:null}:{items:[conversation],next_before_id:null}));
+  await setImmediate();await setImmediate();delay=true;
+  f.node("#refresh-conversations").click();await setImmediate();
+  f.node("#message-input").value="继续提问";
+  f.node("#message-input").dispatchEvent(new Event("input"));
+  assert.equal(f.node("#message-input").readOnly,false);
+  assert.equal(f.node("#send-button").disabled,false);
+  release(Response.json({items:[conversation],next_before_id:null}));await setImmediate();
+});
+
+test("没有保存会话时直接允许输入，不等待历史列表",async()=>{
+  let release;
+  const f=setup(()=>new Promise(resolve=>release=resolve),{storedSession:null});
+  await setImmediate();
+  try {
+    f.node("#message-input").value="首次提问";
+    f.node("#message-input").dispatchEvent(new Event("input"));
+    assert.equal(f.node("#message-input").readOnly,false);
+    assert.equal(f.node("#send-button").disabled,false);
+  } finally { release(Response.json({items:[],next_before_id:null}));await setImmediate(); }
+});
+
+test("刷新及再次核实状态都把服务端工单回执传给当前原动作",async()=>{
+  const receipt={action_id:"saved-ticket",ticket_no:"T-SAVED",ticket_type:"售后",status:"待处理",audit_sync_pending:true};
+  const f=setup(null,{ticketReceipt:receipt});await setImmediate();await setImmediate();
+  assert.equal(f.mounted.find(row=>row.kind==="suggested").options.receipt,receipt);
+  receipt.audit_sync_pending=false;
+  f.node("#refresh-status").click();await setImmediate();
+  const mounted=f.mounted.filter(row=>row.kind==="suggested");
+  assert.equal(mounted.length,2);
+  assert.equal(mounted[1].options.receipt.audit_sync_pending,false);
+  assert.equal(f.node("#messages").children.length,4);
 });

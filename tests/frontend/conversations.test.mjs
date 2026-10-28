@@ -76,3 +76,38 @@ test("刷新恢复可遍历第二页找到旧会话，旧退款元数据只作�
   assert.equal(await browser.restore("web-old"),true);
   assert.deepEqual(selected[0].messages[0].rag_metadata,metadata);
 });
+
+test("恢复锁覆盖第一列表页、后续列表页及全部原文页",async()=>{
+  const {createConversationBrowser}=await subject();const observed=[],selected=[];
+  const browser=createConversationBrowser({fetch:async url=>{
+    await setImmediate();observed.push(browser.snapshot().loading);
+    if(url.includes("/messages")) return url.includes("after_id=1")?page(old,[message("2")]):page(old,[message("1")],"1");
+    return Response.json({items:url.includes("before_id")?[old]:[newer],next_before_id:url.includes("before_id")?null:newer.id});
+  },onSelect:value=>selected.push(value)});
+  assert.equal(await browser.restore("web-old"),true);
+  assert.deepEqual(observed,[true,true,true,true]);
+  assert.deepEqual(selected[0].messages.map(row=>row.id),["1","2"]);
+  assert.equal(browser.snapshot().loading,false);
+});
+
+test("恢复列表失败释放输入锁，保留当前会话且不提交空历史",async()=>{
+  const {createConversationBrowser}=await subject();let release;const selected=[];
+  const browser=createConversationBrowser({fetch:()=>new Promise(resolve=>release=resolve),onSelect:value=>selected.push(value)});
+  browser.startNew("web-old");const restoring=browser.restore("web-old");
+  try {assert.equal(browser.snapshot().loading,true);}
+  finally {release(new Response("offline",{status:503}));await restoring;}
+  assert.equal(browser.snapshot().loading,false);
+  assert.equal(browser.snapshot().sessionId,"web-old");assert.deepEqual(selected,[]);
+});
+
+test("查找旧会话时新建可取消恢复，旧列表响应不回载原文",async()=>{
+  const {createConversationBrowser}=await subject();let release;const selected=[],requests=[];
+  const browser=createConversationBrowser({fetch:url=>{requests.push(url);return new Promise(resolve=>release=resolve);},onSelect:value=>selected.push(value)});
+  const restoring=browser.restore("web-old");
+  browser.startNew("web-empty");
+  assert.equal(browser.snapshot().loading,false);
+  release(Response.json({items:[old],next_before_id:null}));
+  assert.equal(await restoring,false);
+  assert.equal(browser.snapshot().sessionId,"web-empty");assert.deepEqual(selected,[]);
+  assert.equal(requests.length,1);
+});

@@ -90,13 +90,22 @@ export function createConversationBrowser({ fetch: fetchImpl = globalThis.fetch,
   function startNew(value) { if (busy) return false; invalidate(); sessionId = value; changed(); return true; }
   /** 从分页列表找到旧session再回载；参数会话标识；返回是否恢复；异常在内部隔离。 */
   async function restore(value) {
+    if (busy) return false;
+    invalidate();
     const epoch = historyEpoch;
-    if (!await loadList(false) || epoch !== historyEpoch || busy) return false;
-    while (!items.some(row => row.session_id === value) && nextBefore !== null) {
-      if (!await loadList(true) || epoch !== historyEpoch || busy) return false;
+    // 查找旧session也是恢复的一部分；普通侧栏refresh不进入此输入锁。
+    loading = true; onLoading(true); changed();
+    try {
+      if (!await loadList(false) || epoch !== historyEpoch || busy) return false;
+      while (!items.some(row => row.session_id === value) && nextBefore !== null) {
+        if (!await loadList(true) || epoch !== historyEpoch || busy) return false;
+      }
+      const found = items.find(row => row.session_id === value);
+      return found ? await select(found) : false;
+    } finally {
+      // select或新建已接管代次时，由它们释放锁，旧恢复不得解锁后来的请求。
+      if (epoch === historyEpoch) { loading = false; onLoading(false); changed(); }
     }
-    const found = items.find(row => row.session_id === value);
-    return found ? select(found) : false;
   }
   return { snapshot, refresh: () => loadList(false), more: () => loadList(true), select, startNew, setBusy, restore };
 }

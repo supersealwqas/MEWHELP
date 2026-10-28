@@ -54,6 +54,102 @@ async def records(factory):
         return tuple([list((await session.scalars(select(model).order_by(model.id if model is not Ticket else model.ticket_no))).all()) for model in (Conversation, Message, Ticket)])
 
 
+async def saved_action_rows(factory):
+    """快照消息和工单以检查GET无写入。参数：factory独占工厂；返回：行内容元组；异常：数据库错误。"""
+    _, messages, tickets = await records(factory)
+    return ([(row.id, row.content, row.turn_status, row.rag_metadata) for row in messages],
+            [(row.ticket_no, row.description, row.status) for row in tickets])
+
+
+@pytest.mark.parametrize("terminal", [None, "running", "cancelled", "failed"])
+async def test_current_ticket_receipt_preserves_committed_fact_without_writing(tmp_path, monkeypatch, terminal):
+    """回读漏掉已提交工单或顺手补写审计时失败。参数：目录/故障注入/动作终态；返回：None；异常：断言失败。"""
+    from app.schemas.workflow import TicketConfirmation
+    async with action_runtime(tmp_path) as (chat, actions, client, factory):
+        body = await saved_suggestion(chat.chat)
+        finish = actions.repository.finish_ticket_action
+
+        async def fail_finish(action, result):
+            """仅阻断审计收尾。参数：已提交动作和结果；返回：无；异常：OSError。"""
+            raise OSError("回执暂不可写")
+
+        if terminal is not None:
+            monkeypatch.setattr(actions.repository, "finish_ticket_action", fail_finish)
+        created = await client.post("/api/actions/tickets", json=body)
+        assert created.status_code == 200
+        if terminal in {"cancelled", "failed"}:
+            prepared = await actions.repository.prepare_ticket(TicketConfirmation(**body))
+            await chat.chat.mark_turn(prepared.context, terminal)
+        before = await saved_action_rows(factory)
+        for _ in range(2):
+            current = await client.get("/api/actions/current", params={"session_id":"s", "user_id":"demo-user"})
+            assert current.status_code == 200
+            assert current.json().get("ticket_receipt") == created.json()
+            assert await saved_action_rows(factory) == before
+        monkeypatch.setattr(actions.repository, "finish_ticket_action", finish)
+        repaired = await client.post("/api/actions/tickets", json=body)
+        assert repaired.json()["ticket_no"] == created.json()["ticket_no"]
+        current = await client.get("/api/actions/current", params={"session_id":"s"})
+        assert current.json()["ticket_receipt"] == repaired.json()
+        assert current.json()["ticket_receipt"]["audit_sync_pending"] is False
+        assert len((await records(factory))[2]) == 1
+
+
+async def test_current_ticket_receipt_survives_restart_but_does_not_attach_to_new_question(tmp_path):
+    """重开后漏回执或把旧工单套到新建议时失败。参数：独占目录；返回：None；异常：断言失败。"""
+    async with action_runtime(tmp_path) as (chat, _, client, _):
+        body = await saved_suggestion(chat.chat)
+        receipt = (await client.post("/api/actions/tickets", json=body)).json()
+    async with action_runtime(tmp_path) as (chat, _, client, factory):
+        before = await saved_action_rows(factory)
+        current = await client.get("/api/actions/current", params={"session_id":"s"})
+        assert current.json().get("ticket_receipt") == receipt
+        assert await saved_action_rows(factory) == before
+        await saved_suggestion(chat.chat, turn_id="new-question", question="另一个待处理问题")
+        current = await client.get("/api/actions/current", params={"session_id":"s"})
+        assert current.json()["source_turn_id"] == "new-question"
+        assert current.json()["ticket_receipt"] is None
+
+
+@pytest.mark.parametrize("question", ["未确认的工单建议", "字" * 3000])
+async def test_current_unexecuted_ticket_suggestion_does_not_prepare_action(tmp_path, question):
+    """读取普通或超长建议不得准备/执行动作或导致恢复失败。参数：目录/原问；返回：None；异常：断言失败。"""
+    async with action_runtime(tmp_path) as (chat, _, client, factory):
+        await saved_suggestion(chat.chat, question=question)
+        before = await saved_action_rows(factory)
+        response = await client.get("/api/actions/current", params={"session_id":"s"})
+        assert response.status_code == 200
+        assert response.json().get("ticket_receipt") is None
+        assert await saved_action_rows(factory) == before
+
+
+async def test_current_ticket_receipt_rejects_unbacked_success(tmp_path):
+    """仅伪造成功工具JSON却没有真实工单时不能显示成功。参数：独占目录；返回：None；异常：断言失败。"""
+    from app.schemas.workflow import TicketConfirmation
+    async with action_runtime(tmp_path) as (chat, actions, client, factory):
+        body = await saved_suggestion(chat.chat)
+        prepared = await actions.repository.prepare_ticket(TicketConfirmation(**body))
+        await chat.chat.save_tool_result(prepared.context, ToolResult.success({"ticket_no":"fake", "ticket_type":"售后", "status":"待处理"}))
+        before = await saved_action_rows(factory)
+        current = await client.get("/api/actions/current", params={"session_id":"s"})
+        assert current.status_code == 503
+        assert await saved_action_rows(factory) == before
+
+
+@pytest.mark.parametrize("overrides", [{"session_id":"other"}, {"user_id":"other"}, {"source_turn_id":"other"}, {"action_id":str(uuid5(NAMESPACE_URL,"other"))}])
+async def test_ticket_receipt_lookup_rejects_foreign_identity(tmp_path, overrides):
+    """回读放松原用户/会话/轮次/动作身份时失败。参数：目录及错误身份；返回：None；异常：断言失败。"""
+    from app.repositories.actions import ActionNotFound
+    async with action_runtime(tmp_path) as (chat, actions, client, factory):
+        body = await saved_suggestion(chat.chat)
+        assert (await client.post("/api/actions/tickets", json=body)).status_code == 200
+        query = {key:value for key,value in body.items() if key != "confirmed"}
+        before = await saved_action_rows(factory)
+        with pytest.raises(ActionNotFound):
+            await actions.repository.get_ticket_receipt(**{**query, **overrides})
+        assert await saved_action_rows(factory) == before
+
+
 @pytest.mark.parametrize("question", ["  原样提交  ", " " + "字" * 1998 + " "], ids=["raw", "raw-2000"])
 def test_ticket_args_preserve_raw_whitespace(question):
     """去首尾空白后入库会失败。参数：question原始描述；返回：None；异常：断言失败。"""

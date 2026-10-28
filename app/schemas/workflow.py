@@ -127,6 +127,7 @@ class CurrentActions(BaseModel):
     resume_required: bool = Field(default=False, description="已接受但仍停在匹配interrupt，需要原键继续")
     refund_action: RefundAction | None = Field(default=None, description="独立已保存退款申请建议")
     refund_receipt: RefundReceipt | None = Field(default=None, description="同动作已提交的本地申请回执")
+    ticket_receipt: "TicketReceipt | None" = Field(default=None, description="当前原问对应的真实工单回执，审计待同步仍保留成功事实")
 
 
 class HistoryDelta(BaseModel):
