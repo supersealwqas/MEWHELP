@@ -252,6 +252,13 @@ kbd { font: inherit; }
 .order-selection, .refund-action { margin-top: 14px; border: 1px solid #ceddcf; border-radius: 12px; padding: 16px; background: #f6faf5; }
 .order-selection h3, .refund-action h3 { margin: 0 0 10px; font-size: 15px; line-height: 1.5; overflow-wrap: anywhere; }
 .order-options { display: grid; gap: 8px; max-height: 320px; overflow-y: auto; }
+.ticket-preview { margin-top: 14px; padding: 16px; border: 1px solid #ceddcf; border-radius: 12px; background: #f6faf5; }
+.ticket-preview h3 { margin: 0 0 10px; font-size: 15px; }
+.ticket-type { font-size: 13px; color: #566257; }
+.ticket-description { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.75; margin: 12px 0 16px; }
+.ticket-controls { display: flex; flex-wrap: wrap; gap: 10px; }
+.ticket-controls .button { min-height: 44px; }
+@media (max-width: 540px) { .ticket-preview { padding: 12px; } .ticket-controls .button { flex: 1; min-width: 100px; } }
 .order-option { min-height: 44px; justify-content: flex-start; text-align: left; white-space: normal; line-height: 1.6; }
 .refund-form { display: flex; gap: 12px; align-items: end; flex-wrap: wrap; margin-top: 14px; }
 .refund-form label { display: grid; gap: 6px; flex: 1 1 190px; font-size: 13px; }

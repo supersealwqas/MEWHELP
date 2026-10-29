@@ -692,11 +692,18 @@ class ChatService:
             from app.repositories.actions import ActionRepository
             refund_receipt = await ActionRepository(self.chat.factory).get_refund_receipt(session_id, user_id, refund_action["action_id"])
         ticket_receipt = None
-        ticket_confirmation, ticket_decision = None, None
+        ticket_confirmation, ticket_decision, ticket_status = None, None, None
         pending_ticket = row.get("pending_ticket")
         if isinstance(pending_ticket, dict):
             candidate = TicketPreviewAction.model_validate(pending_ticket["action"])
             ticket_decision = pending_ticket.get("decision")
+            ticket_status = pending_ticket.get("status")
+            result_context = row["context"].model_copy(update={"tool_call_id": candidate.tool_call_id})
+            result = await self.chat.get_tool_result(result_context)
+            if result is not None and not result.ok:
+                # 已执行写工具的故障仍保守待核实；执行前拒绝则是可结束的确定结果。
+                ticket_status = ("unknown" if pending_ticket.get("execution_started") and result.error
+                                 and result.error.category == "fault" else "cancelled")
             config = {"configurable": {"thread_id": checkpoint_thread_id(row["context"].conversation_id)}}
             pending = self._waiting_action(await self.graph.aget_state(config), row["context"])
             if pending == candidate and row["turn_status"] in {"running", "awaiting_input"}:
@@ -720,7 +727,7 @@ class ChatService:
             order_selection=action, accepted_order_id=saved.get("accepted_order_id") if saved else None,
             answer=row["answer"], completion_metadata=row["completion_metadata"], resume_required=resume_required,
             refund_action=refund_action, refund_receipt=refund_receipt, ticket_receipt=ticket_receipt,
-            ticket_confirmation=ticket_confirmation, ticket_decision=ticket_decision)
+            ticket_confirmation=ticket_confirmation, ticket_decision=ticket_decision, ticket_status=ticket_status)
 
     def _public_event(self, payload: dict, context: ToolContext) -> ChatEvent | None:
         """筛选并规范公开事件。参数：payload图custom帧、context原轮；返回：事件或None；异常：无。"""
@@ -917,6 +924,9 @@ class ChatService:
         参数：request 原动作、row 核验后的原轮；返回：公开事件流；异常：缺少可靠结果时 PersistenceUncertain。
         """
         from app.repositories.actions import ActionRepository
+        if (row.get("pending_ticket") or {}).get("status") == "unknown":
+            # 即使原轮已生成正文，未知写入也不能回放成确定未创建或重新执行。
+            raise PersistenceUncertain("原工单执行结果待核实，不能重新执行")
         if row["turn_status"] == "completed" and row.get("answer") is not None and row.get("completion_metadata"):
             yield ChatEvent(event="delta", data={"delta": row["answer"]})
             yield ChatEvent(event="answer_metadata", data=row["completion_metadata"])
@@ -968,7 +978,8 @@ class ChatService:
                     outcome.update(started=True, paused=True)
                     async with aclosing(self._run_graph(Command(resume=asdict(authorization)), context, outcome)) as stream:
                         async for event in stream:
-                            outcome["paused"] = False
+                            # 前序查询的进度不代表建单已执行；已接受动作在断流时保留，
+                            # 后续请求/启动对账按持久化的执行边界和原结果恢复。
                             yield event
                 except (asyncio.CancelledError, GeneratorExit):
                     raise
@@ -1015,7 +1026,8 @@ class ChatService:
                     if current.resume_required:
                         raise OrderSelectionConflict("上一项操作已经保存决定，请先点击继续处理")
                     if current.ticket_confirmation is not None and (current.ticket_decision is None
-                            or current.ticket_decision == "confirm" and current.ticket_receipt is None):
+                            or current.ticket_decision == "confirm" and current.ticket_receipt is None
+                            and current.ticket_status != "cancelled"):
                         raise OrderSelectionConflict("当前工单仍待确认或核实，请先处理原工单动作")
                     await self.chat.cancel_order_wait(request.session_id, request.user_id)
                     context = await self.chat.start_turn(context, request.message)

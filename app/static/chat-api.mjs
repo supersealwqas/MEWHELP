@@ -129,7 +129,7 @@ export async function streamWorkflowChat(options, fetcher = globalThis.fetch) {
 
 /** 解码工作流流；参数为Response及冻结身份/原轮/回调；返回completed、awaiting_input或accepted；异常：非法帧或无终态EOF。 */
 export async function receiveWorkflowStream(response, { sessionId, userId = "demo-user", message, sourceTurnId,
-  signal, onDelta, onToolStatus, onAnswerMetadata, onStage, onSelectOrder } = {}) {
+  signal, onDelta, onToolStatus, onAnswerMetadata, onStage, onSelectOrder, onConfirmTicket } = {}) {
   if (!response.ok) {
     const error = new Error(await httpErrorMessage(response));
     // 参数校验失败发生在业务执行前，用户修改输入后可以重新发送。
@@ -159,7 +159,7 @@ export async function receiveWorkflowStream(response, { sessionId, userId = "dem
         const frame = buffer.slice(0, boundary.index);
         buffer = buffer.slice(boundary.index + boundary[0].length);
         const event = parseEvent(frame);
-        if (!event.data || !["message", "error", "tool_status", "answer_metadata", "workflow_stage", "select_order", "action_status"].includes(event.event)) continue;
+        if (!event.data || !["message", "error", "tool_status", "answer_metadata", "workflow_stage", "select_order", "confirm_ticket", "action_status"].includes(event.event)) continue;
         if (event.event === "message" && event.data === "[DONE]") {
           if (waiting || accepted) throw new Error("工作流终态冲突，请查询当前处理状态。");
           if (!answer.trim()) throw new Error("模型没有返回有效回复，请重新提问。");
@@ -193,6 +193,11 @@ export async function receiveWorkflowStream(response, { sessionId, userId = "dem
         if (event.event === "select_order") {
           if (waiting || accepted || metadata) throw new Error("选单终态重复或冲突。");
           waiting = validateOrderSelection(payload, sourceTurnId);
+          continue;
+        }
+        if (event.event === "confirm_ticket") {
+          if (waiting || accepted || metadata) throw new Error("工单确认状态重复或冲突。");
+          waiting = validateTicketPreview(payload, sourceTurnId);
           continue;
         }
         if (event.event === "action_status") {
@@ -240,7 +245,8 @@ export async function receiveWorkflowStream(response, { sessionId, userId = "dem
         if (signal?.aborted) throw new DOMException("请求已取消", "AbortError");
         if (buffer.trim()) throw new Error("连接在事件中途结束，未收到完成标识。请核实处理状态。");
         if (waiting) {
-          onSelectOrder?.(waiting);
+          if (waiting.type === "confirm_ticket") onConfirmTicket?.(waiting);
+          else onSelectOrder?.(waiting);
           return { status: "awaiting_input", answer, action: waiting };
         }
         if (accepted) return { status: "accepted", answer, action: accepted };
@@ -256,6 +262,30 @@ export async function receiveWorkflowStream(response, { sessionId, userId = "dem
 
 const UUID_V5 = /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const TICKET_TYPES = ["售后", "投诉", "咨询"];
+
+/** 校验服务端冻结工单预览；参数为载荷及原轮；返回冻结快照；异常：非法描述或身份。 */
+export function validateTicketPreview(action, sourceTurnId) {
+  if (!action || action.type !== "confirm_ticket" || Object.keys(action).length !== 6 ||
+      !UUID_V5.test(action.action_id) || !validText(action.source_turn_id, 36) ||
+      (sourceTurnId && action.source_turn_id !== sourceTurnId) || !validText(action.tool_call_id, 64) ||
+      !TICKET_TYPES.includes(action.ticket_type) || !validText(action.description, 2000)) {
+    throw new Error("工单预览不完整，请核实当前处理状态。");
+  }
+  return Object.freeze({ ...action });
+}
+
+/** 提交原动作决定；描述和类型始终由服务端保存，浏览器不得覆盖。参数为身份/预览/决定/回调；返回流终态；异常：协议或网络错误。 */
+export async function resumeTicketConfirmation(identity, action, decision, handlers = {}) {
+  validateTicketPreview(action);
+  if (!["confirm", "cancel"].includes(decision)) throw new Error("请选择确认提交或取消。");
+  const response = await (handlers.fetchImpl ?? globalThis.fetch)("/api/chat/resume", {
+    method: "POST", headers: { "Content-Type": "application/json", Accept: "text/event-stream" }, signal: handlers.signal,
+    body: JSON.stringify({ type: "confirm_ticket", session_id: identity.session_id, user_id: identity.user_id,
+      source_turn_id: action.source_turn_id, action_id: action.action_id, decision }),
+  });
+  return receiveWorkflowStream(response, { ...handlers, sessionId: identity.session_id,
+    userId: identity.user_id, sourceTurnId: action.source_turn_id });
+}
 
 /** 校验本人订单卡片最小快照；参数为载荷及可选原轮；返回冻结快照；异常：非法结构。 */
 export function validateOrderSelection(action, sourceTurnId) {
@@ -298,6 +328,9 @@ export async function getCurrentActions(identity, fetchImpl = globalThis.fetch) 
   if (!result || typeof result.resume_required !== "boolean" || (result.source_turn_id !== null && !validText(result.source_turn_id, 36)) ||
       ![null, "running", "awaiting_input", "completed", "failed", "cancelled"].includes(result.turn_status)) throw new Error("当前处理状态不完整。");
   if (result.order_selection) result.order_selection = validateOrderSelection(result.order_selection, result.source_turn_id);
+  if (result.ticket_confirmation) result.ticket_confirmation = validateTicketPreview(result.ticket_confirmation, result.source_turn_id);
+  if (result.ticket_decision != null && !["confirm", "cancel"].includes(result.ticket_decision)) throw new Error("工单处理决定不完整。");
+  if (result.ticket_status != null && !["awaiting_input", "accepted", "completed", "cancelled", "unknown"].includes(result.ticket_status)) throw new Error("工单处理状态不完整。");
   result.refund_action = validateRefundAction(result.refund_action, result.source_turn_id);
   return result;
 }

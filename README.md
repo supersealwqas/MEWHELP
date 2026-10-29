@@ -1,6 +1,6 @@
 # MewHelp
 
-喵购商城客服演示项目：CH05先识别诉求，再按固定流程检索知识、查询业务或给出投诉/闲聊回复。业务查询由模型分步选择只读工具；建单必须由用户点击确认。后端使用FastAPI、SQLAlchemy、MySQL和LangGraph，官方SQLite保存会话工作流；知识沿用BGE-M3、Milvus混合检索和本地重排。运行与验收见[CH05运行手册](docs/ch05-runbook.md)。
+喵购商城客服演示项目：CH08 由模型从动态工具清单选择订单、知识及 MCP 物流/售后查询；完整建单申请先显示预览，用户确认后才写入。后端使用 FastAPI、SQLAlchemy、MySQL 和 LangGraph，SQLite 保存可恢复的工作流；知识沿用 BGE-M3、Milvus 混合检索和本地重排。运行与验收见 [CH08 运行手册](docs/ch08-runbook.md)。
 
 ## 启动与演示
 
@@ -13,6 +13,9 @@ uv run python -m app.db.init_db
 # 显式补齐质量表和消息引用列；自定义库名时相应替换 mewhelp。
 uv run python -m app.db.migrate_rag_quality
 uv run python -m app.db.migrate_citations --database mewhelp
+# 已有库先预览 CH07/CH08 迁移，核对库名后分别加 --apply。
+uv run python -m app.db.migrate_ch07 --env-file .env --database mewhelp
+uv run python -m app.db.migrate_ch08 --env-file .env --database mewhelp
 # 新环境先建知识表/旧集合，再准备独立 CH04 集合并导入六份资料。
 uv run python -m app.knowledge.cli init
 uv run python -m app.knowledge.cli prepare-hybrid
@@ -21,7 +24,9 @@ uv run python -m app.knowledge.cli sync --mode hybrid
 uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
 ```
 
-浏览器访问 [客服聊天页](http://127.0.0.1:8000/)。页面与API同源，不需要npm或单独启动前端。CH05必须使用hybrid模式、单实例单worker及可写的`WORKFLOW_CHECKPOINT_PATH`，默认`.data/checkpoints/ch05.sqlite3`。上述初始化仅用于确认归属的新环境；已有环境按运行手册复用，不能为验收重复同步知识或清库。
+物流与售后还需在两个独立终端启动：`uv run python -m mcp_servers.logistics --port 8101`、`uv run python -m mcp_servers.after_sales --port 8102`。本地权限配置见 `data/tools/mcp-permissions.json`，未授权的 MCP 工具默认不可用。
+
+浏览器访问 [客服聊天页](http://127.0.0.1:8000/)。页面与API同源，不需要npm或单独启动前端。使用hybrid模式、单实例单worker及可写的`WORKFLOW_CHECKPOINT_PATH`，默认`.data/checkpoints/ch05.sqlite3`。上述初始化仅用于确认归属的新环境；已有环境按运行手册复用，不能为验收重复同步知识或清库。
 
 在线知识来自 `data/kb` 六份权威文档，不再使用 FAQ LIKE；FAQ 表保留为旧数据。已有 CH03 数据升级时先阅读 [CH04 运行手册](docs/ch04-runbook.md)，明确重新切分与旧索引的关系。显式旧 `dense` 模式仍需版本匹配的 `data/knowledge/retrieval-policy.json`，历史操作见 [CH03 runbook](docs/ch03-runbook.md)。已有聊天不会被普通初始化覆盖；修改种子代码不会自动刷新已保存的数据。手动 SQL 的用途与执行顺序见 [sql/README.md](sql/README.md)。
 
@@ -33,11 +38,13 @@ uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
 4. `邮费是多少`：经混合检索查询 6 元基础运费、满 99 元包邮，并保留偏远地区 12 元附加费不参与包邮的例外；不再要求“邮费零命中”。
 5. 对照 `运费是多少`：同样命中知识库，不再使用 10 元旧口径。
 6. `我要投诉你们客服态度太差！`：显示独立的“转人工”和“创建工单”建议；确认弹窗提交后才写MySQL并返回真实工单号。取消或Esc不会建单。
-7. `帮我查订单 2003`：该单属于另一个演示用户，工具返回 `order_not_owned`，页面直接回固定文本“没有找到您的这笔订单，请确认订单号或物流单号后重试。”，不经过模型改写。
+7. `帮我查订单 2003`：该单属于另一个演示用户，工具返回 `order_not_owned` 且不包含私人数据，模型根据拒绝结果说明或追问。
+8. `帮我建个工单`：先追问实际问题；补充 `订单1001收到时包装破损，猫粮撒漏了。` 后显示原文预览，确认才创建，取消不建单。
+9. `订单1001还在保修期内吗`、`订单1001的退货到哪一步了`：使用 MCP 售后查询，不用通用政策代替实际办理进度。
 
 订单、商品、物流在工具内部按入参生成可复现的演示数据，不连接公司业务系统，不建额外业务表。订单和物流共用以 `order:{order_id}` 为种子的独立 `random.Random`，商品使用 `product:{keyword}`；同一入参在相同代码和 Python 版本下，重复调用、交错查询、重启进程都返回相同数据。物流时间使用固定演示时间，不读取当前时钟；未发货订单没有承运方和物流单号。FAQ 来自 `data/kb` 构建的语义知识库；工单会真实写入本地数据库，但没有人工坐席自动接入。
 
-每条消息最多执行4个业务工具，`TOOL_MAX_CALLS_PER_TURN`可进一步降低上限。支持连续决策和同批多个独立查询，工具均按顺序执行；订单→物流等有依赖的步骤使用前一步的实际结果。`query_logistics`只接受`tracking_no`；用户只给订单号时先查订单。身份由执行器注入，模型看不到也填不了；夹带身份字段会被拒绝。归属不符与订单不存在都返回`order_not_owned`和相同固定回复，不泄露订单是否存在。
+每条消息最多执行4个业务工具，`TOOL_MAX_CALLS_PER_TURN`可进一步降低上限。支持连续决策和同批多个独立查询，工具均按顺序执行；订单→物流等有依赖的步骤使用前一步的实际结果。`query_logistics`只接受`tracking_no`；用户只给订单号时先查订单。身份由执行器注入，模型看不到也填不了；夹带身份字段会被拒绝。归属不符与订单不存在都返回相同的`order_not_owned`拒绝，不泄露订单是否存在。
 
 同轮相同工具和参数不会重复执行。普通聊天只允许查询，不执行建单；确认建议后使用稳定动作ID提交，重复确认返回同一张票。达到调用上限、工具失败或检测到重复时停止继续调用；批次中未执行的项目会留下明确的跳过结果。已经提交的工单编号始终保留，执行器原有同一调用的有限网络重试继续保留。
 
@@ -126,6 +133,7 @@ uv run python tests/verify_ch03_live.py recovery --test --report dev-notes/ch03-
 - [CH04 开发记录](dev-notes/ch04.md)、[CH04 运行手册](docs/ch04-runbook.md)、[CH04 题集](docs/ch04-evaluation-set.md)。
 - [CH05开发记录](dev-notes/ch05.md)、[CH05运行手册与真实验收](docs/ch05-runbook.md)。
 - [CH07开发记录](dev-notes/ch07.md)、[CH07上下文管理运行与验收](docs/ch07-runbook.md)：三层历史、后台追加摘要和多会话回载；已有应用库启用前需按手册增量迁移。
+- [CH08开发记录](dev-notes/ch08.md)、[CH08运行手册](docs/ch08-runbook.md)、[CH08页面验收](docs/ch08-browser-verification.md)：动态工具、热权限、独立审计与确认恢复。
 
 当前 embedding 使用本地 BGE-M3。`EMBED_BASE_URL`、`EMBED_MODEL`、`EMBED_API_KEY` 仍是预留配置，填写它们不会切换编码器；云端接入与配置切换后续单独实现。
 

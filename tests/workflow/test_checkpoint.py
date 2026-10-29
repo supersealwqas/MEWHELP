@@ -25,7 +25,7 @@ async def test_file_reopen_isolated_sessions_and_finish_before_final_checkpoint(
 
 async def test_new_dict_starts_new_turn_without_replaying_pending_tool(tmp_path):
     """重启后新轮恢复旧pending工具或旧意图/建议时失败。参数：tmp_path独占目录；返回：None；异常：断言失败。"""
-    deps = dependencies(intents=["订单", "闲聊"], decisions=[AgentDecision(kind="tools", tool_calls=[call("old")])],
+    deps = dependencies(intents=["订单", "闲聊"], decisions=[AgentDecision(kind="tools", tool_calls=[call("old")]), AgentDecision(kind="answer")],
         results=[PersistenceUncertain("结果未查清")])
     path, config = tmp_path / "workflow.sqlite3", {"configurable": {"thread_id": "one"}}
     async with workflow_runtime(deps, path) as graph:

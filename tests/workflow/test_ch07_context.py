@@ -160,7 +160,7 @@ def test_demo_budget_reserves_actual_protocol_retry_and_allows_one_turn():
     """补救消息也占瞬时窗口；空工具集合不能虚增固定成本。参数：无；返回：None；异常：断言失败。"""
     from app.workflow.context import shared_budget
     from app.workflow.prompts import DECISION_NUDGE
-    config = dependencies(model_context_window=18000, max_output_tokens=2000, max_agent_steps=3).settings
+    config = dependencies(model_context_window=24000, max_output_tokens=2000, max_agent_steps=3).settings
     budget = shared_budget(config)
     retry = TokenEstimator().message_tokens(convert_to_messages([{"role":"user", "content":DECISION_NUDGE}]))
     assert budget.current_peak_tokens == config.max_user_input_tokens + config.tool_max_calls_per_turn * (

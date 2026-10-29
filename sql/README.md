@@ -44,7 +44,7 @@ uv run python -m app.knowledge.cli import-docs --manifest data/kb/manifest.json
 | `ch04-ddl.sql` | 依赖第二章会话表，建立低置信度问题池和编造个案台账。 |
 | `ch06-ticket-type.sql` | 第六章再启用“退款”工单类型；当前代码只支持售后、投诉、咨询。 |
 | `ch07-ddl.sql`、`ch07-layers.sql` | CH07依赖会话/消息表；两份按顺序应用，增加摘要投影、两个锚点及只追加摘要表。已有部分结构时使用下方增量命令。 |
-| `ch08-ddl.sql` | 建工具审计表，当前工具执行器尚未写入该表。 |
+| `ch08-ddl.sql` | CH08 工具审计表；执行器以独立短事务写入五种中文状态。已有库使用下方增量迁移。 |
 | `ch09-ddl.sql` | 依赖第四章问题池，建审核队列、评估记录并补充关联字段。 |
 | `ch10-ddl.sql` | 依赖第四章问题池，建主题分类表。 |
 

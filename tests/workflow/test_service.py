@@ -153,9 +153,9 @@ async def test_failed_classification_keeps_diagnostic_without_exposing_it_to_use
 async def test_recovered_classification_diagnostic_stays_out_of_operational_log(tmp_path, caplog):
     """补救后账本诊断可查，但节点安全日志不能输出模型原文。参数：tmp_path/caplog；返回：None；异常：断言失败。"""
     from app.schemas.chat import InvalidToolDecision
-    from app.schemas.workflow import IntentResult
+    from app.schemas.workflow import IntentResult, AgentDecision
 
-    async with service_runtime(tmp_path) as (service, deps, _):
+    async with service_runtime(tmp_path, decisions=[AgentDecision(kind="answer")]) as (service, deps, _):
         async def classify(messages, ledger):
             """记录结构失败后成功分类。参数：messages与ledger契约；返回：闲聊分类；异常：预算错误。"""
             ledger.reserve("classify", 50, 128)

@@ -10,14 +10,19 @@ from tests.workflow.graph_fakes import NodeTrace, dependencies, turn, ranked, ca
 
 @pytest.mark.parametrize("question", ["支持哪些付款方式？", "商品的清洁注意事项有哪些？", "设备耗材的兼容规则在哪里？"])
 @pytest.mark.parametrize("decision", ["clarify", "answer"])
-async def test_misclassified_clarification_can_recover_with_knowledge(question, decision):
-    """业务分类不能封死无具体对象的知识问题。参数：question不同领域问题、decision拟澄清或回答；返回：None；异常：断言失败。"""
+async def test_business_answer_recovers_knowledge_but_explicit_clarify_stays_direct(question, decision):
+    """业务回答仍可补救检索；明确追问按CH08约定直接回答而不再检索。参数：原问和决定；返回：None；异常：断言失败。"""
     deps = dependencies(intents=["订单"], decisions=[AgentDecision(kind=decision)],
-                        ranked=[ranked(answer="本轮可用说明")], answers=[["依据资料回答[1]。"]])
+                        ranked=[ranked(answer="本轮可用说明")],
+                        answers=[["请补充具体问题。" if decision == "clarify" else "依据资料回答[1]。"]])
     state = await build_workflow(deps, checkpointer=None).ainvoke(turn(question))
-    assert deps.search.calls == [("retrieve", question)]
-    assert state["retrieval_attempted"] and state["evidence"] and state["stop_reason"] == "answer"
-    assert "本轮可用说明" in json.dumps(deps.model.inputs[-1]["messages"], ensure_ascii=False)
+    if decision == "clarify":
+        assert deps.search.calls == [] and not state["evidence"]
+        assert state["answer"] == "请补充具体问题。" and state["stop_reason"] == "clarify"
+    else:
+        assert deps.search.calls == [("retrieve", question)]
+        assert state["retrieval_attempted"] and state["evidence"] and state["stop_reason"] == "answer"
+        assert "本轮可用说明" in json.dumps(deps.model.inputs[-1]["messages"], ensure_ascii=False)
     assert len([row for row in deps.model.inputs if row["stage"] == "decide"]) == 1
     assert deps.executor.calls == []
 
@@ -71,7 +76,7 @@ async def test_policy_retrieval_failure_can_still_answer_verified_order():
 async def test_other_dependency_boundaries_keep_safe_completion(stage):
     """补全失败保留原话，补救检索失败或纯空白回答也可靠结束。参数：stage边界；返回：None；异常：断言失败。"""
     deps = dependencies(understandings=[ConnectionError("敏感信息")] if stage == "understand" else [],
-                        decisions=[AgentDecision(kind="clarify" if stage == "recover_knowledge" else "answer")],
+                        decisions=[AgentDecision(kind="answer")],
                         answers=[[" \n "]] if stage == "answer" else [["有效回复"]])
     if stage == "recover_knowledge":
         deps.search.error = TimeoutError("敏感信息")
@@ -207,7 +212,7 @@ async def test_weak_evidence_finishes_without_main_model_and_records_only_low_co
     assert "main_agent" not in trace.nodes and "log_turn" in trace.nodes
     assert state["stop_reason"] == "retrieval_low_conf"
     assert state["evidence"] == [] and not deps.executor.calls
-    assert [item["stage"] for item in deps.model.inputs] == ["understand", "classify"]
+    assert [item["stage"] for item in deps.model.inputs] == ["understand", "classify", "decide"]
     assert deps.chat.finished[0]["citations"] == []
     assert deps.chat.finished[0]["low_confidence"].source == "retrieval_low_conf"
 
@@ -365,7 +370,7 @@ async def test_fixed_exits_create_stable_suggestions_without_agent(intent, want)
     assert first["suggested_actions"] == second["suggested_actions"]
     assert all(x["question"] == "  服务很差  " and x["source_turn_id"] == "t" for x in first["suggested_actions"])
     assert all(x["ticket_type"] == ("投诉" if x["kind"] == "create_ticket" else None) for x in first["suggested_actions"])
-    assert [i["stage"] for i in deps.model.inputs] == ["understand", "classify", "understand", "classify"]
+    assert [i["stage"] for i in deps.model.inputs] == ["understand", "classify", "decide", "understand", "classify", "decide"]
 
 async def test_refund_queries_order_before_policy_gate():
     """退款必须在政策前确定性查询订单。参数：无；返回：None；异常：断言失败。"""

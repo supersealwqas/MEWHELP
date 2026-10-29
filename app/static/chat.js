@@ -2,10 +2,10 @@
  * MewHelp 聊天界面控制器：管理本页会话、消息气泡、逐字展示及请求状态。
  * 刷新保留本标签的会话标识并回读服务端动作；页面不读取密钥、不缓存聊天正文。
  */
-import { failurePresentation, streamWorkflowChat, resumeOrderSelection, getCurrentActions } from "./chat-api.mjs";
+import { failurePresentation, streamWorkflowChat, resumeOrderSelection, resumeTicketConfirmation, getCurrentActions } from "./chat-api.mjs";
 import { renderMarkdown } from "./markdown.mjs";
 import { attachAnswerTools } from "./citations.mjs";
-import { attachSuggestedActions, attachOrderSelection, attachRefundAction } from "./actions.mjs";
+import { attachSuggestedActions, attachOrderSelection, attachTicketPreview, attachRefundAction } from "./actions.mjs";
 import { createConversationBrowser } from "./conversations.mjs";
 
 const ui = {
@@ -427,6 +427,24 @@ function presentSelection(reply, identity, action, acceptedOrderId = null, resum
   orderCards.add(reply.card);
 }
 
+/** 恢复同一原轮工单卡片；参数为气泡、身份、冻结预览及服务端状态；返回void；异常：非法快照。 */
+function presentTicket(reply, identity, action, current = {}) {
+  reply.card?.disable();
+  reply.card?.element.remove();
+  reply.turnId = action.source_turn_id;
+  reply.article.dataset.sourceTurnId = reply.turnId;
+  replyByTurn.set(reply.turnId, reply);
+  reply.card = attachTicketPreview(reply.actions, identity, action, {
+    decision: current.ticket_decision, resumeRequired: current.resume_required, receipt: current.ticket_receipt,
+    ticketStatus: current.ticket_status,
+    onDecide: async (frozenIdentity, selectedAction, decision) => {
+      if (activeController || pendingActions || frozenIdentity.session_id !== sessionId) return;
+      await runReply(reply, frozenIdentity, { action: selectedAction, decision, message: reply.originalMessage });
+    },
+  });
+  orderCards.add(reply.card);
+}
+
 /** 服务端状态优先于缓存卡片，旧请求响应不能污染新问；参数为可选原气泡及代次；返回Promise；异常在当前页面显示。 */
 async function syncCurrent(fallbackReply = null, generation = requestGeneration) {
   const identity = currentIdentity();
@@ -440,7 +458,13 @@ async function syncCurrent(fallbackReply = null, generation = requestGeneration)
     replyByTurn.set(reply.turnId, reply);
     if (current.turn_status === "completed") {
       presentCompleted(reply, current.answer ?? "", { ...current.completion_metadata, ...identity }, current.refund_receipt, current.ticket_receipt);
-      ui.status.textContent = "已恢复完成结果，可以继续提问";
+      if (current.ticket_confirmation) presentTicket(reply, identity, current.ticket_confirmation, current);
+      ui.status.textContent = current.ticket_status === "unknown" ? "工单结果待核实，请先核实原操作" : "已恢复完成结果，可以继续提问";
+    } else if (current.ticket_confirmation) {
+      reply.bubble.textContent = current.ticket_receipt ? "已核实工单处理结果。" :
+        current.ticket_decision === "cancel" && !current.resume_required ? "已取消，未创建工单。" : "请核对下面的工单信息。";
+      presentTicket(reply, identity, current.ticket_confirmation, current);
+      ui.status.textContent = current.resume_required ? "可以继续原来的工单处理" : "已恢复工单状态";
     } else if (current.turn_status === "awaiting_input" && current.order_selection) {
       reply.bubble.textContent = "请选择本次要处理的订单。";
       presentSelection(reply, identity, current.order_selection);
@@ -463,7 +487,7 @@ async function syncCurrent(fallbackReply = null, generation = requestGeneration)
 }
 
 /** 新问或原轮续跑共用安全渲染，各回调和finally都核验请求代次；参数为气泡/身份/输入；返回Promise；异常在本气泡处理。 */
-async function runReply(reply, identity, { message, action = null, orderId = null }) {
+async function runReply(reply, identity, { message, action = null, orderId = null, decision = null }) {
   const generation = ++requestGeneration;
   const isCurrent = () => generation === requestGeneration && identity.session_id === sessionId;
   reply.article.classList.add("is-pending");
@@ -533,20 +557,28 @@ async function runReply(reply, identity, { message, action = null, orderId = nul
         }
         if (reply.resolvedQuestion) reply.stage.textContent += ` · 理解为：${reply.resolvedQuestion}`;
       } };
-    const result = action ? await resumeOrderSelection(identity, action, orderId, handlers) : await streamWorkflowChat(handlers);
+    const result = action?.type === "confirm_ticket" ? await resumeTicketConfirmation(identity, action, decision, handlers) :
+      action ? await resumeOrderSelection(identity, action, orderId, handlers) : await streamWorkflowChat(handlers);
     if (!isCurrent()) return;
     await renderer.finish();
     if (!isCurrent()) return;
     if (result.status === "awaiting_input") {
-      reply.bubble.textContent = "请选择本次要处理的订单。";
-      presentSelection(reply, identity, result.action);
-      ui.status.textContent = "等待选择订单，也可以发送新的问题";
+      if (result.action.type === "confirm_ticket") {
+        reply.bubble.textContent = "请核对工单信息，确认提交后才会创建。";
+        presentTicket(reply, identity, result.action);
+        ui.status.textContent = "等待确认或取消工单";
+      } else {
+        reply.bubble.textContent = "请选择本次要处理的订单。";
+        presentSelection(reply, identity, result.action);
+        ui.status.textContent = "等待选择订单，也可以发送新的问题";
+      }
     } else if (result.status === "accepted") {
-      reply.bubble.textContent = "订单已确认，正在核实处理状态…";
+      reply.bubble.textContent = "决定已保存，正在核实处理状态…";
       await syncCurrent(reply, generation);
     } else {
       if (result.metadata) presentCompleted(reply, result.answer, result.metadata);
-      ui.status.textContent = "回复完成，可以接着追问";
+      if (action?.type === "confirm_ticket") await syncCurrent(reply, generation);
+      else ui.status.textContent = "回复完成，可以接着追问";
     }
   } catch (error) {
     if (!isCurrent()) return;

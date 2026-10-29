@@ -12,7 +12,7 @@ from tests.workflow.service_fakes import collect, service_runtime
 @pytest.mark.parametrize("spec", ["2.0", "2.4"])
 async def test_send_failure_closes_suspended_model_and_releases_guard(tmp_path, spec):
     """网络send失败只等待GC清理时失败。参数：tmp_path目录、spec协议；返回：None；异常：受控网络错误。"""
-    async with service_runtime(tmp_path, intents=["订单", "闲聊"], decisions=[AgentDecision(kind="answer")]) as (service, deps, _):
+    async with service_runtime(tmp_path, intents=["订单", "闲聊"], decisions=[AgentDecision(kind="answer"), AgentDecision(kind="answer")]) as (service, deps, _):
         closed = asyncio.Event()
 
         async def waiting_answer(messages, ledger):

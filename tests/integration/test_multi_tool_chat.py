@@ -26,6 +26,31 @@ from app.services.chat import ChatService
 pytestmark = pytest.mark.mysql
 
 
+@pytest.fixture
+async def logistics_registry(tmp_path):
+    """提供真实独立 MCP 物流服务及授权注册表。
+
+    参数：tmp_path 为独占日志目录；返回：注册表、权限、发现管理器；异常：服务启动或传输错误。
+    """
+    from app.tools.registry import build_agent_registry
+    from app.tools.permissions import ToolPermissions
+    from app.tools.mcp import MCPToolManager
+    from tests.ch08_live_runtime import OwnedServer, free_port
+    server = OwnedServer("mcp_servers.logistics", free_port(), tmp_path, "logistics")
+    registry = build_agent_registry()
+    permissions = ToolPermissions(Path(__file__).resolve().parents[2] / "data/tools/mcp-permissions.json")
+    permissions.reload()
+    manager = MCPToolManager(registry, permissions, {"logistics": {
+        "transport": "streamable_http", "url": f"http://127.0.0.1:{server.port}/mcp"}}, timeout_seconds=10)
+    try:
+        await server.start()
+        await manager.refresh()
+        yield registry, permissions, manager
+    finally:
+        await manager.aclose()
+        await server.stop()
+
+
 async def _row_totals(session: AsyncSession) -> dict[str, int]:
     """读取三张测试涉及表的总行数。参数：session 只读会话；返回：表名与总数；异常：数据库读取错误。"""
     return {
@@ -64,8 +89,8 @@ async def isolated_multi_tool_mysql(request: pytest.FixtureRequest):
             # 只有确认本例标识不存在后才允许 finally 清理；不触发父目录的清库夹具。
             before = await _row_totals(session)
 
-        def build_service(decisions):
-            """构造真实新图服务和仓库。参数：decisions有限决策脚本；返回：服务/仓储/模型；异常：构造错误。"""
+        def build_service(decisions, *, tools=None):
+            """构造真实新图服务和仓库。参数：decisions有限决策脚本、tools可选真实MCP资源；返回：服务/仓储/模型；异常：构造错误。"""
             from langgraph.checkpoint.memory import InMemorySaver
             from app.schemas.workflow import AgentDecision
             from app.tools.executor import ToolExecutor
@@ -76,8 +101,10 @@ async def isolated_multi_tool_mysql(request: pytest.FixtureRequest):
             chat = ChatRepository(factory)
             model = ScriptedWorkflowModel(intents=["物流"], decisions=[*decisions, AgentDecision(kind="answer")],
                                           answers=[["已按工具结果处理。"]])
-            executor = ToolExecutor(build_agent_registry(), chat, SupportRepository(factory))
-            deps = WorkflowDependencies(model, StrictSearch(), executor, chat, config, StrictExpander())
+            registry, permissions, manager = tools or (build_agent_registry(), None, None)
+            executor = ToolExecutor(registry, chat, SupportRepository(factory), permissions=permissions)
+            deps = WorkflowDependencies(model, StrictSearch(), executor, chat, config, StrictExpander(),
+                                        registry=registry, permissions=permissions, mcp=manager)
             # 本例只验证业务MySQL配对；官方文件SQLite重开另由workflow专项与Task8覆盖。
             graph = build_workflow(deps, checkpointer=InMemorySaver())
             return ChatService(chat, graph, executor, config), chat, model
@@ -123,15 +150,15 @@ async def _read_records(factory, session_id: str) -> tuple[Conversation, list[Me
     return conversation, messages, tickets
 
 
-async def test_mysql_order_logistics_persist_and_restore_in_order(isolated_multi_tool_mysql):
-    """多次决策必须落库两组完整工具事实。参数：isolated_multi_tool_mysql 隔离资源；返回：None；异常：断言失败。"""
+async def test_mysql_order_logistics_persist_and_restore_in_order(isolated_multi_tool_mysql, logistics_registry):
+    """多次决策经真实 MCP 落库两组完整工具事实。参数：隔离MySQL与MCP资源；返回：None；异常：断言失败。"""
     factory, session_id, build_service = isolated_multi_tool_mysql
     from app.schemas.workflow import AgentDecision
     service, chat, model = build_service([
         AgentDecision(kind="tools", tool_calls=[{"id": "order", "name": "query_order", "args": {"order_id": "1001"}}]),
         # 本例模拟取用订单工具返回的当前单号；历史 MOCK 前缀兼容在专门用例中验证。
         AgentDecision(kind="tools", tool_calls=[{"id": "shipping", "name": "query_logistics", "args": {"tracking_no": "SF213502378238"}}]),
-    ])
+    ], tools=logistics_registry)
     events = [event async for event in service.stream_turn(
         ChatRequest(session_id=session_id, message="订单1001的物流到哪了")
     )]
@@ -149,7 +176,9 @@ async def test_mysql_order_logistics_persist_and_restore_in_order(isolated_multi
     assert shipping.data["latest_node"] == "包裹已到达杭州转运中心"
     assert rows[-1].content == "".join(event.data.get("delta", "") for event in events)
     # 审计载荷保留来源标记；模型输入仅去掉标记，全部订单业务事实必须完整保留。
-    order_messages = [message for message in model.inputs[2]["messages"]
+    shipping_decision = next(row for row in model.inputs if row["stage"] == "decide" and
+                             any(message.get("tool_call_id") == "order" for message in row["messages"]))
+    order_messages = [message for message in shipping_decision["messages"]
                       if message["role"] == "tool" and message["tool_call_id"] == "order"]
     assert len(order_messages) == 1
     model_order = json.loads(order_messages[0]["content"])

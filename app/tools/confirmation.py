@@ -23,6 +23,7 @@ _PUNCTUATION = " \t\r\n，,。.;；!！?？：:"
 _QUOTED = re.compile(r'“[^”]*”|‘[^’]*’|"[^"]*"|\x27[^\x27]*\x27|「[^」]*」|『[^』]*』')
 _CANCEL = re.compile(r"取消|算了|停止|不建了|(?:不要|不用|不必|别|无需|不想|不愿).{0,12}(?:建|创建|提交).{0,8}工单")
 _NONCURRENT = re.compile(r"如果|假如|假设|要是|万一|上次|之前|以前|曾经|(?:客服|有人|他|她|对方).{0,8}(?:说|让)|是什么意思|有什么用|怎么建|如何建|能.{0,12}工单[吗么]|可以.{0,12}工单[吗么]")
+_PROCESS_QUESTION = re.compile(r"(?:创建|提交|建立|建)(?:一个|个|一张|张)?(?:售后|投诉|咨询)?工单(?:前)?\s*(?:要收费[吗么]?|收费[吗么]|需要什么|要准备什么|有什么要求|多久|要多久)")
 _COMMAND = re.compile(
     r"(?P<boundary>^|[，,。.;；!！\n])\s*"
     r"(?:(?:请|麻烦|劳烦)\s*)?(?:(?:帮我|给我|为我|我要|我想|我想要)\s*)?"
@@ -32,7 +33,7 @@ _INDEPENDENT_QUERY = re.compile(r"查(?:询|一下|下)?|在不在保|还在保|
 _ACKNOWLEDGEMENT = re.compile(r"(?:谢谢(?:你|您)?(?:了)?|多谢|感谢|好的?|知道了|明白了|收到|嗯+|哦+|麻烦了|辛苦了|请|吧|了)+")
 _ORDER_ONLY = re.compile(r"(?:(?:订单|单号|订单号)(?:是|为)?[:：\s]*)?[A-Za-z0-9_-]+")
 _PROCESS_ONLY = re.compile(r"(?:请|麻烦)?(?:帮我)?(?:尽快|马上|加急|快点)?(?:处理|解决|回复|联系我|提交)(?:一下|下)?")
-_FOLLOWUP_FACT = re.compile(r"补充|问题|破|损|坏|故障|异常|划痕|漏|无法|不能|不[能行对好]|没|未|少|错|延迟|噪|响|态度|收费|退款|退货|售后|希望|需要|咨询")
+_FOLLOWUP_FACT = re.compile(r"补充|问题|破|损|坏|裂|故障|异常|划痕|漏|无法|不能|不[能行对好]|没|未|少|错|延迟|噪|响|态度|收费|退款|退货|售后|希望|需要|咨询")
 
 
 class TicketIntentState(BaseModel):
@@ -86,13 +87,15 @@ def _without_command(text: str) -> str:
 
     参数：text 为单条用户原话；返回：去命令后的文本；异常：无。
     """
-    text = _COMMAND.sub(r"\g<boundary>", text).strip(_PUNCTUATION)
+    text = _COMMAND.sub(r"\g<boundary>", text).lstrip(_PUNCTUATION).rstrip()
     parts = re.split(r"([，,。.;；!！\n])", text)
-    # 保留原句内部标点，只移除可以独立识别的礼貌片段。
+    # 每个实质片段保留自己的标点；删除命令/礼貌片段不能连带去掉问题句号。
+    kept = []
     for index in range(0, len(parts), 2):
-        if _ACKNOWLEDGEMENT.fullmatch(parts[index].strip(_PUNCTUATION)):
-            parts[index] = ""
-    return "".join(parts).strip(_PUNCTUATION)
+        clause = parts[index].strip(_PUNCTUATION)
+        if clause and not _ACKNOWLEDGEMENT.fullmatch(clause):
+            kept.append(parts[index] + (parts[index + 1] if index + 1 < len(parts) else ""))
+    return "".join(kept).lstrip(_PUNCTUATION).rstrip(" \t\r\n，,;；：:")
 
 
 def _is_problem(text: str) -> bool:
@@ -146,7 +149,7 @@ def advance_ticket_intent(previous: TicketIntentState | None, context: ToolConte
     if _CANCEL.search(text):
         return previous.model_copy(update={"status": "cancelled"}, deep=True) if previous else None
     unquoted = _QUOTED.sub("", text)
-    if _NONCURRENT.search(text) or ("工单" in text and "工单" not in unquoted):
+    if _NONCURRENT.search(text) or _PROCESS_QUESTION.search(unquoted) or ("工单" in text and "工单" not in unquoted):
         return previous.model_copy(update={"status": "closed"}, deep=True) if previous else None
     direct_request = _COMMAND.search(unquoted)
     if direct_request:

@@ -224,6 +224,33 @@ def make_chat_service(decision=None, chunks=None, *, decisions=None):
     return LegacyChatService(repository, support, model, build_registry(), config), repository, support, model
 
 
+def confirmed_legacy_ticket(service):
+    """为旧编排的回执测试提供明确的受信任确认边界，不改变生产授权规则。
+
+    参数：service 为仅测试使用的旧编排；返回：None；异常：生产执行器原异常。
+    本辅助只隔离用户确认步骤；校验、业务执行、结果回读和写次数保护仍运行真实代码。
+    聊天预览及真实确认协议由 test_ch08_resume 的真实仓储与图测试覆盖。
+    """
+    from dataclasses import replace
+    from app.tools.contracts import ToolExecutionScope, WriteAuthorization, json_hash
+    original = service.executor.execute
+
+    async def authorize(binding, arguments, context):
+        """模拟已完成的用户确认适配器。参数：冻结来源、参数、身份；返回：单次授权；异常：断言失败。"""
+        assert binding.identity.source == "builtin" and binding.identity.name == "create_ticket"
+        return WriteAuthorization(conversation_id=context.conversation_id, turn_id=context.turn_id,
+            tool_call_id=context.tool_call_id, action_id="test-confirmed-action",
+            arguments_hash=json_hash(arguments), decision="confirm", origin="action")
+
+    async def execute(call, context, on_status, *, scope=None):
+        """把明确测试确认交给真实执行器。参数：原执行契约；返回：真实结果；异常：原执行器异常。"""
+        if call["name"] == "create_ticket":
+            scope = replace(scope or ToolExecutionScope(), authorize_write=authorize)
+        return await original(call, context, on_status, scope=scope)
+
+    service.executor.execute = execute
+
+
 def make_workflow_service(*, intents=("订单",), decisions=None, answers=None, ranked=(), settings=None):
     """构造真实新图和执行器，内存保存器仅用于离线单测。
 

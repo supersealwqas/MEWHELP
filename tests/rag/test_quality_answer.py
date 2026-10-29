@@ -440,7 +440,7 @@ async def test_knowledge_backend_failure_is_not_completed_or_pooled(ticket):
 
     index.hybrid_search = unavailable
     service.executor.support = SupportRepository(None, search)
-    writes = install_ticket_store(repository, service.executor.support)
+    writes = install_ticket_store(repository, service.executor.support, service)
     events = [event async for event in service.stream_turn(ChatRequest(session_id="dependency-failure", message="请创建售后工单并查询政策"))]
     assert events[-1].event == "error" and not any(event.event == "done" for event in events)
     assert not repository.low_confidence
@@ -475,6 +475,8 @@ async def test_ticket_receipt_is_preserved_when_later_knowledge_self_check_refus
 
     service.model.decide = decide
     service.executor.support.create_ticket = create_ticket
+    from tests.chat_fakes import confirmed_legacy_ticket
+    confirmed_legacy_ticket(service)
     events = [event async for event in service.stream_turn(ChatRequest(session_id="ticket-refusal", message="请创建售后工单，并告诉我政策"))]
     visible = "".join(event.data["delta"] for event in events if event.event == "delta")
     assert "T-confirmed" in visible and FIXED_KNOWLEDGE_REFUSAL in visible

@@ -323,11 +323,14 @@ class ChatRepository:
             saved = metadata.get("pending_ticket")
             if saved is None or saved["action"]["tool_call_id"] != context.tool_call_id:
                 return saved
-            status = "unknown" if result is None else "completed" if result.ok else "cancelled"
+            # 写处理器开始后的故障不能证明没有业务副作用，保留未知供原键核实。
+            unknown = result is None or bool(saved.get("execution_started") and not result.ok
+                                            and result.error and result.error.category == "fault")
+            status = "unknown" if unknown else "completed" if result.ok else "cancelled"
             saved = {**saved, "status": status}
             intent = dict(metadata.get("ticket_intent") or {})
             if intent:
-                intent["status"] = "unknown" if result is None else "confirmed" if result.ok else "cancelled"
+                intent["status"] = "unknown" if unknown else "confirmed" if result.ok else "cancelled"
             source.rag_metadata = {**metadata, "pending_ticket": saved, "ticket_intent": intent or None,
                 "ticket_write_state": {"action_id": saved["action"]["action_id"], "tool_call_id": context.tool_call_id, "status": status}}
             if result is not None:

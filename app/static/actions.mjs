@@ -1,5 +1,5 @@
 /** 完成回复的独立建议按钮：转人工只显示固定话术，建单须经原生弹窗明确确认。 */
-import { confirmTicket, validateSuggestedActions, validateOrderSelection, validateRefundAction,
+import { confirmTicket, validateSuggestedActions, validateOrderSelection, validateTicketPreview, validateRefundAction,
   getRefundReasons, submitRefund, getCurrentActions } from "./chat-api.mjs";
 
 const attached = new WeakMap();
@@ -11,6 +11,63 @@ function textNode(doc, tag, text = "", className = "") {
   node.textContent = text;
   node.className = className;
   return node;
+}
+
+/** 展示完整工单描述及冻结的确认/取消动作；参数为容器、身份、预览和恢复状态；返回卡片控制器；异常：非法预览。 */
+export function attachTicketPreview(container, identity, payload, { decision = null, resumeRequired = false,
+  receipt = null, ticketStatus = null, onDecide } = {}) {
+  const action = validateTicketPreview(payload);
+  const frozenIdentity = Object.freeze({ ...identity });
+  const doc = container.ownerDocument;
+  const card = textNode(doc, "section", "", "ticket-preview");
+  card.dataset.actionId = action.action_id;
+  card.dataset.sourceTurnId = action.source_turn_id;
+  card.setAttribute("aria-label", "工单预览");
+  card.append(textNode(doc, "h3", "工单预览"), textNode(doc, "p", `类型：${action.ticket_type}`, "ticket-type"),
+    textNode(doc, "p", action.description, "ticket-description"));
+  const controls = textNode(doc, "div", "", "ticket-controls");
+  const note = textNode(doc, "p", "确认后将保存为待处理工单。", "action-note");
+  note.setAttribute("role", "status");
+  card.append(controls, note);
+  const buttons = [];
+  let disabled = false;
+
+  /** 同步禁用所有动作，连点只能发出一个请求。参数为提示；返回void；异常无。 */
+  function disable(message) {
+    disabled = true;
+    for (const button of buttons) button.disabled = true;
+    if (message) note.textContent = message;
+  }
+
+  const hasReceipt = receipt?.action_id === action.action_id && validReceipt(receipt);
+  if (hasReceipt) note.textContent = `工单已创建：${receipt.ticket_no} · ${receipt.status}`;
+  else if (ticketStatus === "cancelled" && decision === "confirm") note.textContent = "本次工单未创建，可以继续提问。";
+  else if (decision === "cancel" && !resumeRequired) note.textContent = "已取消，未创建工单。";
+  else if (decision === "confirm" && !resumeRequired) note.textContent = "确认决定已保存，正在核实处理结果。请通过“核实状态”查看，不要重复建单。";
+  else {
+    const choices = resumeRequired && decision ? [[decision, "继续处理"]] : [["confirm", "确认提交"], ["cancel", "取消"]];
+    if (resumeRequired) note.textContent = decision === "cancel" ? "取消决定已保存，继续完成原操作。" : "确认决定已保存，可以继续原来的处理。";
+    for (const [value, label] of choices) {
+      const button = textNode(doc, "button", label, `button ${value === "confirm" ? "button-primary" : "button-secondary"}`);
+      button.type = "button";
+      buttons.push(button);
+      controls.append(button);
+      button.addEventListener("click", async () => {
+        if (disabled || button.disabled) return;
+        disable(value === "confirm" ? "正在提交，请稍候…" : "正在取消，请稍候…");
+        try { await onDecide(frozenIdentity, action, value); }
+        catch (error) { note.textContent = error.message || "请核实原操作的处理状态。"; }
+      });
+    }
+  }
+  container.append(card);
+  return { disable, element: card };
+}
+
+/** 仅接受服务端实际回执的最小展示字段。参数为回执；返回布尔；异常无。 */
+function validReceipt(receipt) {
+  return typeof receipt.ticket_no === "string" && receipt.ticket_no.trim() && receipt.ticket_no.length <= 32 &&
+    receipt.status === "待处理";
 }
 
 /** 绑定本人订单选择，回调始终使用冻结身份；参数为容器/身份/卡片/续跑选项；返回禁用控制器；异常：非法快照。 */

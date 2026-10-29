@@ -49,7 +49,9 @@ class ControlledGenerator:
 def manager(factory, generator, **options):
     """使用演示预算创建管理器。参数：真实工厂、模型替身及控制选项；返回：管理器；异常：模块或配置错误。"""
     _, module = summary_modules()
-    config = dependencies(model_context_window=18000, max_output_tokens=2000, max_agent_steps=3).settings
+    # 摘要行为用例保留小历史层，但窗口必须容纳 CH08 完整工具及边界提示。
+    config = dependencies(model_context_window=24000, max_output_tokens=2000, max_agent_steps=3,
+                          context_target_turns=2, context_steady_turn_tokens=512).settings
     return module.SummaryManager(ContextRepository(factory), generator, config, **options)
 
 
@@ -94,14 +96,20 @@ async def test_duplicate_triggers_freeze_range_and_append_only(context_db):
 async def test_slow_summary_does_not_block_real_chat_or_write_active_checkpoint(tmp_path):
     """摘要一直pending时真实ChatService仍须完成，checkpoint不能被后台改写。参数：tmp_path；返回：None；异常：断言或超时。"""
     generator = ControlledGenerator(blocked=True)
-    async with service_runtime(tmp_path, intents=["闲聊"] * 6, model_context_window=18000,
+    async with service_runtime(tmp_path, intents=["闲聊"] * 6, model_context_window=24000,
+                               context_target_turns=2, context_steady_turn_tokens=512,
                                max_output_tokens=2000, max_agent_steps=3) as (service, deps, factory):
-        worker = manager(factory, generator)
+        # CH08工具定义增加固定开销；用够用的窗口及显式小历史预算触发摘要，
+        # 不把容量不足的固定兜底当成正常聊天，也不靠放宽等待时间掩盖问题。
+        _, summary_service = summary_modules()
+        worker = summary_service.SummaryManager(ContextRepository(factory), generator, deps.settings)
         service.summaries = worker
         try:
             for index in range(6):
                 events = await asyncio.wait_for(collect(service, f"第{index}轮" + "请记录这次咨询内容。" * 12), 2)
                 assert events[-1].event == "done"
+                metadata = next(event.data for event in events if event.event == "answer_metadata")
+                assert metadata["workflow"]["stop_reason"] == "chitchat"
             await asyncio.wait_for(generator.started.wait(), 2)
             assert not generator.release.is_set() and worker.active_count == 1
             key = {"configurable": {"thread_id":"mewhelp:ch05:1"}}

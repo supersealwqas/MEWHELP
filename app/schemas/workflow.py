@@ -155,6 +155,8 @@ class CurrentActions(BaseModel):
     ticket_receipt: "TicketReceipt | None" = Field(default=None, description="当前原问对应的真实工单回执，审计待同步仍保留成功事实")
     ticket_confirmation: TicketPreviewAction | None = Field(default=None, description="服务器冻结的当前工单预览")
     ticket_decision: Literal["confirm", "cancel"] | None = Field(default=None, description="已持久化且不可改变的首次工单决定")
+    ticket_status: Literal["awaiting_input", "accepted", "completed", "cancelled", "unknown"] | None = Field(
+        default=None, description="服务端核实的工单流程状态；确定失败与待核实结果分开，客户端不能据首次确认猜测")
 
 
 class HistoryDelta(BaseModel):

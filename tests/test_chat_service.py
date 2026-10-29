@@ -213,17 +213,22 @@ def owned_call(order_id="2003", call_id="c1"):
     return {"id": call_id, "name": "query_order", "args": {"order_id": order_id}}
 
 
-async def test_order_not_owned_bypasses_model_and_uses_fixed_reply():
-    """归属拒绝不得交给模型改写，且必须完成持久化后再 done。参数：无；返回：None；异常：断言失败。"""
-    service, repo, _, model = make_workflow_service(decisions=[AgentDecision(kind="tools", tool_calls=[owned_call()])])
+async def test_order_not_owned_returns_no_private_data_and_finishes_before_done():
+    """CH08归属拒绝回灌模型时不带他人数据，且必须完成持久化后再done。参数：无；返回：None；异常：断言失败。"""
+    reply = "没有找到您的这笔订单，请确认订单号或物流单号后重试。"
+    service, repo, _, model = make_workflow_service(decisions=[AgentDecision(kind="tools", tool_calls=[owned_call()]),
+        AgentDecision(kind="clarify")], answers=[[reply]])
     events = [e async for e in service.stream_turn(request())]
     events = [event for event in events if event.event != "workflow_stage"]
     # 仍保留 running/succeeded 之外的失败状态徽章，随后是固定回复与完成帧。
     assert [e.event for e in events] == ["tool_status", "tool_status", "delta", "answer_metadata", "done"]
     assert events[1].data["status"] == "failed"
     assert events[2].data["delta"] == "没有找到您的这笔订单，请确认订单号或物流单号后重试。"
-    # CH06先理解再分类/决策，归属拒绝仍跳过回答模型。
-    assert [row["stage"] for row in model.inputs] == ["understand", "classify", "decide"]
+    # CH08分类后的失败结果允许模型说明，但回灌只能包含相同的无归属拒绝。
+    assert [row["stage"] for row in model.inputs] == ["understand", "classify", "decide", "decide", "answer"]
+    facts = [json.loads(row["content"]) for row in model.inputs[-2]["messages"] if row["role"] == "tool"]
+    assert len(facts) == 1 and facts[0]["data"] is None
+    assert facts[0]["error"]["code"] == "order_not_owned"
     turn = next(iter(repo.turns.values()))
     assert turn.turn_status == "completed" and turn.messages[-1].content == events[2].data["delta"]
     stored = next(iter(repo.results.values()))
@@ -234,8 +239,10 @@ async def test_unknown_and_foreign_orders_produce_identical_reply():
     """未知订单与他人订单的回复必须逐字一致，不泄露存在性。参数：无；返回：None；异常：断言失败。"""
     replies = []
     for order_id in ("2003", "missing-order"):
-        service, _, _, _ = make_workflow_service(decisions=[AgentDecision(kind="tools", tool_calls=[owned_call(order_id)])])
+        service, _, _, _ = make_workflow_service(decisions=[AgentDecision(kind="tools", tool_calls=[owned_call(order_id)]),
+            AgentDecision(kind="clarify")], answers=[["没有找到您的这笔订单，请确认订单号或物流单号后重试。"]])
         events = [e async for e in service.stream_turn(request())]
+        assert events[-1].event == "done"
         replies.append("".join(event.data["delta"] for event in events if event.event == "delta"))
     assert replies[0] == replies[1]
     assert all("2003" not in text and "不存在" not in text for text in replies)
@@ -276,6 +283,8 @@ def ticket_service(chunks):
     decision = AIMessage(content="", tool_calls=[{"id": "ticket-call", "name": "create_ticket",
         "args": {"description": "订单未送达", "ticket_type": "售后"}}])
     service, repo, support, model = make_service(decision, chunks)
+    from tests.chat_fakes import confirmed_legacy_ticket
+    confirmed_legacy_ticket(service)
 
     async def create_ticket(context, description, ticket_type):
         """原子保存模拟工单事实。参数：上下文、描述、类型；返回：成功结果；异常：保存错误。"""

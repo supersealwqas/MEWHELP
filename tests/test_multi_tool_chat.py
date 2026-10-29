@@ -27,8 +27,10 @@ async def run(service, message="订单1001的物流到哪了") -> list:
     return [event async for event in service.stream_turn(ChatRequest(session_id="multi", message=message))]
 
 
-def install_ticket_store(repository, support) -> list:
-    """模拟数据库写入并记录实际创建次数。参数：两个仓库；返回：写入记录；异常：无。"""
+def install_ticket_store(repository, support, service) -> list:
+    """模拟已明确确认的旧流程数据库写入。参数：两个仓库与旧服务；返回：写入记录；异常：无。"""
+    from tests.chat_fakes import confirmed_legacy_ticket
+    confirmed_legacy_ticket(service)
     writes = []
 
     async def create_ticket(context, description, ticket_type):
@@ -124,7 +126,7 @@ async def test_new_call_id_cannot_create_second_ticket(same_batch):
     second = call("create_ticket", "t2", description="补充订单未送达", ticket_type="售后")
     decisions = [decision(first, second)] if same_batch else [decision(first), decision(second)]
     service, repository, support, _ = make_chat_service(decisions=decisions)
-    writes = install_ticket_store(repository, support)
+    writes = install_ticket_store(repository, support, service)
     events = await run(service, "请帮我创建工单")
     assert len(writes) == 1 and len(repository.results) == 2
     assert list(repository.results.values())[1].error.code == "WRITE_TOOL_LIMIT"
@@ -137,7 +139,7 @@ async def test_ticket_then_later_decision_failure_keeps_receipt_and_unsafe_retry
         decision(call("create_ticket", "ticket", description="订单未送达", ticket_type="售后")),
         decision(call("query_order", "order", order_id="1001")), RuntimeError("PRIVATE"),
     ])
-    install_ticket_store(repository, support)
+    install_ticket_store(repository, support, service)
     events = await run(service, "创建工单并查询订单1001")
     assert events[-1].event == "error" and events[-1].data["retry_safe"] is False
     assert "T-1" in events[-1].data["error"] and "PRIVATE" not in str(events)
@@ -149,7 +151,7 @@ async def test_cancel_after_ticket_keeps_partial_batch_in_history():
     service, repository, support, model = make_chat_service(decisions=[decision(
         call("create_ticket", "ticket", description="订单未送达", ticket_type="售后"),
         call("query_order", "order", order_id="1001"))])
-    install_ticket_store(repository, support)
+    install_ticket_store(repository, support, service)
     stream = service.stream_turn(ChatRequest(session_id="cancel", message="创建工单并查订单1001"))
     try:
         while (event := await anext(stream)).event != "delta":
@@ -168,7 +170,7 @@ async def test_foreign_order_stops_remaining_batch_with_fixed_reply():
     service, repository, support, model = make_chat_service(decisions=[decision(
         call("query_order", "foreign", order_id="2003"),
         call("create_ticket", "ticket", description="查询这笔订单", ticket_type="咨询"))])
-    writes = install_ticket_store(repository, support)
+    writes = install_ticket_store(repository, support, service)
     events = await run(service)
     assert not writes and len(repository.results) == 2
     assert list(repository.results.values())[1].error.code == "TOOL_CHAIN_STOPPED"
@@ -181,7 +183,7 @@ async def test_saved_ticket_is_not_lost_when_later_order_is_rejected():
     service, repository, support, _ = make_chat_service(decisions=[decision(
         call("create_ticket", "ticket", description="处理问题", ticket_type="咨询"),
         call("query_order", "foreign", order_id="2003"))])
-    install_ticket_store(repository, support)
+    install_ticket_store(repository, support, service)
     events = await run(service, "创建工单并查询订单2003")
     answer = "".join(event.data.get("delta", "") for event in events)
     assert "T-1" in answer and "没有找到您的这笔订单" in answer
@@ -202,7 +204,7 @@ async def test_second_decision_budget_overflow_preserves_committed_facts(is_tick
         decision(first), decision(call("query_product", "unused", keyword="猫粮")),
     ])
     if is_ticket:
-        install_ticket_store(repository, support)
+        install_ticket_store(repository, support, service)
     before_result = [HumanMessage(content=question), decision(first)]
     budget = _estimate_message_tokens(before_result)
     service.settings.token_budget = budget

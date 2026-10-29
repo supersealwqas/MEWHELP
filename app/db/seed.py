@@ -38,6 +38,9 @@ async def seed_database(factory) -> None:
     # 逐个补齐上次初始化已提交的前缀，保留已有消息内容和用户修改。
     if not any(message.role == "user" for message in messages):
         ctx = await chat.start_turn(ctx, ctx.user_message)
+    else:
+        # 中断后补齐沿用已提交原文；不能用默认种子原话覆盖可信上下文。
+        ctx = ctx.model_copy(update={"user_message": next(message.content for message in messages if message.role == "user")})
     if not any(message.tool_calls for message in messages):
         await chat.save_tool_calls(ctx, [{"id": ctx.tool_call_id, "name": "create_ticket",
                                          "args": {"description": "演示订单延迟", "ticket_type": "咨询"}}])

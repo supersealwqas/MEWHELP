@@ -20,6 +20,7 @@ def context(text: str, turn: str = "turn-1") -> ToolContext:
     "不要建工单", "订单1001坏了，但别给我建工单", "如果坏了再建工单",
     "客服说‘帮我建个工单’是什么意思", "有人让我说\"帮我建个工单\"，这是干什么",
     "建工单有什么用", "转人工", "我想投诉一下", "先不用建工单",
+    "建工单要收费吗", "建工单需要什么资料", "建工单前要准备什么",
 ])
 def test_denial_quote_hypothesis_or_complaint_does_not_authorize(text):
     """把否定、他人引用或仅投诉当作建单申请会失败。
@@ -51,6 +52,20 @@ def test_explicit_request_preserves_user_problem_without_command():
     module = importlib.import_module("app.tools.confirmation")
     intent = module.advance_ticket_intent(None, context("帮我建个工单，订单1001收到时破损"), "user-message-1")
     assert module.ticket_description(intent) == "订单1001收到时破损"
+
+
+@pytest.mark.parametrize("problem", ["订单1001收到时包装破损，猫粮撒漏了。", "商品有裂口！", "商品无法开机？"])
+def test_description_preserves_problem_sentence_punctuation(problem):
+    """完整问题保留用户句末标点，避免模型照抄原话却被拒绝。
+
+    参数：problem 为包含真实问题及标点的用户原文；返回：None；异常：断言失败。
+    """
+    module = importlib.import_module("app.tools.confirmation")
+    direct = module.advance_ticket_intent(None, context("帮我建个工单，" + problem), "message-1")
+    assert module.ticket_description(direct) == problem
+    prior = module.advance_ticket_intent(None, context("帮我建个工单。"), "message-1")
+    followup = module.advance_ticket_intent(prior, context(problem, "turn-2"), "message-2")
+    assert module.ticket_description(followup) == problem
 
 
 def test_next_user_turn_can_complete_collecting_intent():

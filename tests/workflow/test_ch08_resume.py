@@ -183,10 +183,11 @@ async def test_full_service_resumes_original_turn_once(tmp_path, decision):
             assert tickets[0][0] in "".join(event.data["delta"] for event in first if event.event == "delta")
 
 
-async def test_accepted_resume_can_recover_after_disconnect(tmp_path, monkeypatch):
-    """决定提交后、Command 开始前断线必须保留原决定并允许同键继续。
+@pytest.mark.parametrize("after_progress", [False, True])
+async def test_accepted_resume_can_recover_after_disconnect(tmp_path, monkeypatch, after_progress):
+    """决定提交后，进度帧前后断线都必须保留原决定并允许同键继续。
 
-    参数：tmp_path 独占目录、monkeypatch 仅注入图入口断线；返回：None；异常：断言失败。
+    参数：tmp_path 独占目录、monkeypatch 注入图流断线、after_progress 是否先发前序查询进度；返回：None；异常：断言失败。
     """
     import asyncio
     from app.schemas.workflow import AgentDecision, TicketResume
@@ -196,9 +197,10 @@ async def test_accepted_resume_can_recover_after_disconnect(tmp_path, monkeypatc
         original = service._run_graph
 
         async def disconnected(initial, context, outcome):
-            """模拟已经保存确认但尚未进入图时的客户端取消。参数：原图参数；返回：空流；异常：CancelledError。"""
+            """模拟确认已保存、建单执行前的取消。参数：原图参数；返回：可选查询进度；异常：CancelledError。"""
+            if after_progress:
+                yield ChatEvent(event="tool_status", data={"name": "query_order", "status": "succeeded"})
             raise asyncio.CancelledError()
-            yield
 
         monkeypatch.setattr(service, "_run_graph", disconnected)
         with pytest.raises(asyncio.CancelledError):
@@ -211,6 +213,35 @@ async def test_accepted_resume_can_recover_after_disconnect(tmp_path, monkeypatc
         result = [event async for event in service.stream_resume(TicketResume(**body))]
         assert result[-1].event == "done"
         assert len(await rows(factory, "SELECT ticket_no FROM tickets")) == 1
+
+
+async def test_definite_ticket_failure_allows_next_chat(tmp_path, monkeypatch):
+    """明确拒绝的已结束建单不能把下一句聊天永久拦截为结果未知。
+
+    参数：tmp_path 独占目录、monkeypatch 注入执行前确定拒绝；返回：None；异常：断言失败。
+    """
+    from app.schemas.tools import ToolResult
+    from app.schemas.workflow import AgentDecision, TicketResume
+    async with ticket_runtime(tmp_path, intents=["订单", "闲聊"], decisions=[AgentDecision(kind="tools", tool_calls=[ticket_call()]),
+            AgentDecision(kind="answer"), AgentDecision(kind="answer")],
+            answers=[["本次工单未创建。"], ["你好。"]]) as (service, deps, factory, _):
+        body = await open_preview(service)
+        # 仅替换权限依赖，冻结动作、执行器结果保存和服务收尾仍走生产实现。
+        class RevokedPermissions:
+            """模拟预览之后被撤销的本地建单许可。"""
+
+            def check(self, identity, arguments, context):
+                """拒绝本次写操作。参数：来源、参数、身份；返回：确定拒绝；异常：无。"""
+                return ToolResult.failed("PERMISSION_DENIED", "本地已撤销建单权限")
+
+        monkeypatch.setattr(deps.executor, "permissions", RevokedPermissions())
+        events = [event async for event in service.stream_resume(TicketResume(**body))]
+        assert events[-1].event == "done", [(event.event, event.data) for event in events]
+        assert await rows(factory, "SELECT ticket_no FROM tickets") == []
+        assert await rows(factory, "SELECT status FROM tool_audit_logs") == [("权限拒绝",)]
+        following = await collect(service, "你好", session="ticket-session")
+        assert not any(event.event == "error" for event in following), [(event.event, event.data) for event in following]
+        assert following[-1].event == "done"
 
 
 async def test_committed_receipt_survives_answer_failure(tmp_path):
@@ -282,6 +313,8 @@ async def test_started_without_result_is_never_reexecuted(tmp_path):
         assert current.ticket_receipt is None
         assert await rows(factory, "SELECT ticket_no FROM tickets") == []
         assert await rows(factory, "SELECT tool_call_id FROM tool_audit_logs") == []
+        following = await collect(service, "你好", session="ticket-session")
+        assert following[-1].event == "error" and following[-1].data["status_code"] == 409
 
 
 async def test_chat_receipt_is_not_replaced_by_later_button_suggestion(tmp_path):
@@ -299,3 +332,40 @@ async def test_chat_receipt_is_not_replaced_by_later_button_suggestion(tmp_path)
         current = await service.get_current_actions("ticket-session", "demo-user")
         assert current.ticket_receipt is not None
         assert current.ticket_receipt.ticket_no == ticket
+
+
+@pytest.mark.parametrize("failure", ["timeout", "exception"])
+async def test_started_write_fault_remains_unknown_on_replay(tmp_path, monkeypatch, failure):
+    """已经开始的写入故障不能在刷新或重发时变成确定未创建，更不能再次执行。
+
+    参数：tmp_path 独占目录、monkeypatch 注入写处理器故障、failure 为超时或普通故障；返回：None；异常：断言失败。
+    """
+    import asyncio
+    from app.schemas.workflow import AgentDecision, TicketResume
+    async with ticket_runtime(tmp_path, decisions=[AgentDecision(kind="tools", tool_calls=[ticket_call()])]) as (service, deps, factory, _):
+        body = await open_preview(service)
+        attempts = []
+
+        async def failed_write(context, description, ticket_type):
+            """在进入真实执行边界后中断处理器。参数：原建单参数；返回：无；异常：超时取消或RuntimeError。"""
+            attempts.append(context.tool_call_id)
+            if failure == "timeout":
+                await asyncio.sleep(1)
+            raise RuntimeError("write failure")
+
+        monkeypatch.setattr(deps.executor.support, "create_ticket", failed_write)
+        deps.executor.timeout = 0.01
+        request = TicketResume(**body)
+        first = [event async for event in service.stream_resume(request)]
+        saved = await service.chat.get_pending_ticket((await service.validate_resume(request))["context"])
+        assert saved["status"] == "unknown"
+        assert "待核实" in "".join(event.data.get("delta", "") for event in first)
+        for _ in range(2):
+            repeated = [event async for event in service.stream_resume(request)]
+            assert repeated[-1].event == "error" and repeated[-1].data["outcome"] == "unknown"
+            assert repeated[-1].data["retry_safe"] is False
+        current = await service.get_current_actions("ticket-session", "demo-user")
+        assert current.ticket_status == "unknown" and current.ticket_receipt is None
+        following = await collect(service, "你好", session="ticket-session")
+        assert following[-1].event == "error" and following[-1].data["status_code"] == 409
+        assert attempts == ["ticket-1"] and await rows(factory, "SELECT ticket_no FROM tickets") == []

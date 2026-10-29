@@ -39,6 +39,7 @@ _STOP_TEXT = {
     "invalid_decision": "抱歉，本次回复生成失败，请重试。",
     "tool_failed": "本轮查询未能完成，请稍后重试或选择人工客服协助。",
     "ticket_cancelled": "工单申请已取消，本次没有创建工单。",
+    "ticket_unknown": "本次工单处理结果待核实，请继续核实原操作，勿重新建单。",
     "model_unavailable": "本次暂时无法完成问题处理，请稍后重试；您的问题已保留在当前对话中。",
     "retrieval_unavailable": "资料查询暂时不可用，相关规则目前无法核实。您可以稍后重试或联系人工客服继续处理。",
     "answer_unavailable": "本次回答未能完整生成，尚未说明的内容暂无法确认。请稍后重试或继续补充问题。",
@@ -178,7 +179,8 @@ def build_agent_graph(deps: "WorkflowDependencies", *, decision=None):
                     ticket_write_state = {"action_id": pending_ticket["action"]["action_id"],
                         "tool_call_id": pending_ticket["action"]["tool_call_id"], "status": pending_ticket["status"]}
                     if ticket_intent and pending_ticket["action"]["tool_call_id"] == call["id"]:
-                        ticket_intent = ticket_intent.model_copy(update={"status": "confirmed" if result.ok else "cancelled"})
+                        ticket_intent = ticket_intent.model_copy(update={"status": "unknown" if pending_ticket["status"] == "unknown"
+                            else "confirmed" if result.ok else "cancelled"})
             if (result.verified_knowledge is not None and binding is not None
                     and binding.identity.source == "builtin" and call["name"] in {"query_faq", "query_refund_policy"}):
                 outcome = result.verified_knowledge
@@ -198,7 +200,8 @@ def build_agent_graph(deps: "WorkflowDependencies", *, decision=None):
                 except KeyError:
                     write = False
                 if result.error.code in {"USER_CANCELLED", "WRITE_RESULT_UNKNOWN"} or write and result.error.category == "fault":
-                    reason = "ticket_cancelled" if result.error.code == "USER_CANCELLED" else "tool_failed"
+                    reason = ("ticket_cancelled" if result.error.code == "USER_CANCELLED" else
+                              "ticket_unknown" if pending_ticket and pending_ticket.get("status") == "unknown" else "tool_failed")
             messages.append(message_row(context.turn_id, "tool", result.model_dump_json(), call_id=call["id"]))
         update = {"messages": messages, "pending_calls": [], "pending_bindings": {}, "pending_tool_bindings": {},
                   "pending_ticket": pending_ticket, "ticket_write_state": ticket_write_state,
