@@ -54,6 +54,37 @@ def test_explicit_request_preserves_user_problem_without_command():
     assert module.ticket_description(intent) == "订单1001收到时破损"
 
 
+@pytest.mark.parametrize("problem", [
+    "之前买的订单1001现在坏了", "上次买的商品现在无法开机", "以前购买的商品出现裂口",
+    "曾经购买的商品现在漏水", "之前反馈过订单1001破损，现在还没解决",
+])
+def test_current_request_can_include_historical_problem_facts(problem):
+    """历史词修饰购买或问题事实时不能否定当前明确申请。
+
+    参数：problem 历史业务事实与当前问题；返回：None；异常：断言失败。
+    """
+    module = importlib.import_module("app.tools.confirmation")
+    intent = module.advance_ticket_intent(None, context(problem + "，帮我建个工单"), "user-message-1")
+    assert intent is not None and intent.status == "collecting"
+    assert module.ticket_description(intent) == problem
+
+
+@pytest.mark.parametrize("text", [
+    "上次已经建了工单", "之前我说过，帮我建个工单", "我以前提过，帮我建个工单",
+    "之前客服说，帮我建个工单", "之前买的订单坏了，但不要建工单",
+    "如果之前买的东西坏了，帮我建个工单", "之前我说过‘帮我建个工单’",
+    "之前已经说过，帮我建个工单", "我之前就说了，帮我建个工单",
+])
+def test_historical_permission_or_noncurrent_request_still_cannot_authorize(text):
+    """放行历史事实不能连带放行历史同意、他人指令、否定或假设。
+
+    参数：text 无当前明确授权的原话；返回：None；异常：断言失败。
+    """
+    module = importlib.import_module("app.tools.confirmation")
+    intent = module.advance_ticket_intent(None, context(text), "user-message-1")
+    assert intent is None or intent.status in {"closed", "cancelled"}
+
+
 @pytest.mark.parametrize("problem", ["订单1001收到时包装破损，猫粮撒漏了。", "商品有裂口！", "商品无法开机？"])
 def test_description_preserves_problem_sentence_punctuation(problem):
     """完整问题保留用户句末标点，避免模型照抄原话却被拒绝。

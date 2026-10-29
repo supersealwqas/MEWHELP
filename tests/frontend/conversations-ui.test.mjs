@@ -5,18 +5,20 @@ import { readFileSync } from "node:fs";
 import vm from "node:vm";
 import { setImmediate } from "node:timers/promises";
 import { createConversationBrowser } from "../../app/static/conversations.mjs";
+import { attachOrderSelection, attachTicketPreview } from "../../app/static/actions.mjs";
 
 const script = readFileSync(new URL("../../app/static/chat.js", import.meta.url),"utf8").replace(/^import .*;\r?\n/gm, "");
 
 /** 最小DOM模拟真实事件派发，布局由浏览器验收。 */
 class Element extends EventTarget {
-  constructor(tag="div") { super(); Object.assign(this,{tagName:tag,children:[],dataset:{},attributes:{},value:"",_text:"",disabled:false,hidden:false,className:""}); this.classList={add(){},remove(){}}; }
+  constructor(tag="div",doc=null) { super(); Object.assign(this,{tagName:tag,ownerDocument:doc,children:[],dataset:{},attributes:{},value:"",_text:"",disabled:false,hidden:false,className:""}); this.classList={add(){},remove(){}}; }
   set textContent(value) { this._text=String(value); this.children=[]; }
   get textContent() { return this._text + this.children.map(row=>row.textContent).join(""); }
   set innerHTML(value) { this.textContent=value; }
   get innerHTML() { return this._text; }
   append(...rows) { for(const row of rows) { row.parentElement=this; this.children.push(row); } }
   replaceChildren(...rows) { this._text="";this.children=[];this.append(...rows); }
+  remove() { if(this.parentElement)this.parentElement.children=this.parentElement.children.filter(row=>row!==this); }
   setAttribute(key,value) { this.attributes[key]=value; }
   setCustomValidity() {}
   focus() {}
@@ -30,11 +32,11 @@ const records=[{id:"1",role:"user",content:"第一条原问\n  ",turn_id:"first"
  {id:"4",role:"assistant",content:"新办理说明",turn_id:"second",turn_status:"completed",rag_metadata:{citations:[{n:1}],refund_action:{action_id:"current"}}}];
 
 /** 执行生产页面脚本，替换外部网络及已有动作渲染边界；参数响应函数；返回观察记录；异常：脚本或断言失败。 */
-function setup(respond=null, { storedSession="web-original", ticketReceipt=null } = {}) {
+function setup(respond=null, { storedSession="web-original", ticketReceipt=null, currentActions=null } = {}) {
   const nodes=new Map(), mounted=[], citations=[], requests=[];
   const document=new EventTarget();
-  document.querySelector=id=>{if(!nodes.has(id))nodes.set(id,new Element());return nodes.get(id);};
-  document.createElement=tag=>new Element(tag);
+  document.querySelector=id=>{if(!nodes.has(id))nodes.set(id,new Element("div",document));return nodes.get(id);};
+  document.createElement=tag=>new Element(tag,document);
   const storage=new Map(storedSession === null ? [] : [["mewhelp.session",storedSession]]);
   const sandbox={document, window:{matchMedia:()=>({matches:false})}, crypto:{getRandomValues:array=>array.fill(1)},Uint8Array,URLSearchParams,AbortController,
     sessionStorage:{getItem:key=>storage.get(key),setItem:(key,value)=>storage.set(key,value)},
@@ -42,7 +44,8 @@ function setup(respond=null, { storedSession="web-original", ticketReceipt=null 
     renderMarkdown:value=>value,attachAnswerTools:(reply,answer,metadata)=>citations.push(metadata),
     attachSuggestedActions:(container,metadata,options)=>mounted.push({kind:"suggested",metadata,options}),
     attachRefundAction:(container,metadata,options)=>mounted.push({kind:"refund",metadata,options}),
-    getCurrentActions:async identity=>({source_turn_id:"second",turn_status:"completed",answer:"新办理说明",
+    attachOrderSelection,attachTicketPreview,
+    getCurrentActions:async identity=>currentActions??({source_turn_id:"second",turn_status:"completed",answer:"新办理说明",
       completion_metadata:{turn_id:"second",citations:[{n:1}],refund_action:{action_id:"current"}},refund_receipt:{refund_no:"RF-SAVED"},ticket_receipt:ticketReceipt}),
   };
   const context=vm.createContext(sandbox);
@@ -134,3 +137,28 @@ test("刷新及再次核实状态都把服务端工单回执传给当前原动�
   assert.equal(mounted[1].options.receipt.audit_sync_pending,false);
   assert.equal(f.node("#messages").children.length,4);
 });
+
+for (const accepted of [false,true]) {
+  test(`工单完成后刷新恢复${accepted?"已确认订单的继续按钮":"当前选单"}并保留票号`,async()=>{
+    const current={source_turn_id:"second",turn_status:accepted?"running":"awaiting_input",
+      resume_required:accepted,accepted_order_id:accepted?"1001":null,
+      order_selection:{type:"select_order",action_id:"00000000-0000-5000-8000-000000000001",source_turn_id:"second",
+        orders:[{order_id:"1001",product_name:"猫粮",status:"已发货"}]},
+      ticket_confirmation:{type:"confirm_ticket",action_id:"00000000-0000-5000-8000-000000000002",
+        source_turn_id:"second",tool_call_id:"ticket-1",ticket_type:"售后",description:"商品破损"},
+      ticket_decision:"confirm",ticket_status:"completed",
+      ticket_receipt:{action_id:"00000000-0000-5000-8000-000000000002",ticket_no:"T-SAVED",ticket_type:"售后",status:"待处理"}};
+    const f=setup(null,{currentActions:current});await setImmediate();await setImmediate();
+    // 使用真实动作组件；错误分支会只展示工单卡，或把订单续跑误接到旧建单动作。
+    const all=root=>[root,...root.children.flatMap(all)];
+    for (let refresh=0;refresh<2;refresh++) {
+      const buttons=all(f.node("#messages")).filter(row=>row.tagName==="button"&&!row.disabled);
+      assert.ok(buttons.some(row=>row.textContent===(accepted?"继续处理":"猫粮 · 订单 1001 · 已发货")));
+      assert.match(f.node("#messages").textContent,/T-SAVED/);
+      assert.doesNotMatch(f.node("#messages").textContent,/工单预览/);
+      assert.doesNotMatch(f.node("#messages").textContent,/继续原工单处理|确认并创建工单/);
+      assert.equal(f.node("#feedback").hidden,true);
+      f.node("#refresh-status").click();await setImmediate();
+    }
+  });
+}

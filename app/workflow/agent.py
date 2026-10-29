@@ -1,4 +1,4 @@
-"""由decision/tools/answer节点编排的只读ReAct子图，保留每个完整事实及停止边界。"""
+"""由decision/tools/answer节点编排的工具子图，核验建单确认并保留完整事实及停止边界。"""
 
 import asyncio
 import json

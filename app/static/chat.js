@@ -460,19 +460,18 @@ async function syncCurrent(fallbackReply = null, generation = requestGeneration)
       presentCompleted(reply, current.answer ?? "", { ...current.completion_metadata, ...identity }, current.refund_receipt, current.ticket_receipt);
       if (current.ticket_confirmation) presentTicket(reply, identity, current.ticket_confirmation, current);
       ui.status.textContent = current.ticket_status === "unknown" ? "工单结果待核实，请先核实原操作" : "已恢复完成结果，可以继续提问";
+    } else if (current.order_selection && (current.turn_status === "awaiting_input" || current.resume_required)) {
+      // 同轮已完成的工单回执仍需可见，但卡片与续跑必须对应当前等待的订单动作。
+      const ticketResult = current.ticket_receipt?.ticket_no ? `工单已创建，工单号：${current.ticket_receipt.ticket_no}。` : "";
+      reply.bubble.textContent = ticketResult + (current.resume_required
+        ? "订单已确认，点击继续处理即可接上原来的问题。" : "请选择本次要处理的订单。");
+      presentSelection(reply, identity, current.order_selection, current.accepted_order_id, Boolean(current.resume_required));
+      ui.status.textContent = current.resume_required ? "请继续处理已确认的订单" : "等待选择订单，也可以发送新的问题";
     } else if (current.ticket_confirmation) {
       reply.bubble.textContent = current.ticket_receipt ? "已核实工单处理结果。" :
         current.ticket_decision === "cancel" && !current.resume_required ? "已取消，未创建工单。" : "请核对下面的工单信息。";
       presentTicket(reply, identity, current.ticket_confirmation, current);
       ui.status.textContent = current.resume_required ? "可以继续原来的工单处理" : "已恢复工单状态";
-    } else if (current.turn_status === "awaiting_input" && current.order_selection) {
-      reply.bubble.textContent = "请选择本次要处理的订单。";
-      presentSelection(reply, identity, current.order_selection);
-      ui.status.textContent = "等待选择订单，也可以发送新的问题";
-    } else if (current.resume_required && current.order_selection) {
-      reply.bubble.textContent = "订单已确认，点击继续处理即可接上原来的问题。";
-      presentSelection(reply, identity, current.order_selection, current.accepted_order_id, true);
-      ui.status.textContent = "请继续处理已确认的订单";
     } else {
       reply.card?.disable("这张选单卡已失效，请以当前处理状态为准。");
       reply.note.hidden = false;

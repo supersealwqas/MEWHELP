@@ -66,6 +66,26 @@ async def test_invalid_arguments_returns_paired_error():
     assert audit.entries[0].status == "校验拦下" and audit.entries[0].tool_call_id == "call-1"
 
 
+async def test_composed_schema_missing_field_saves_rejection_and_audit():
+    """组合规则重复缺字段时仍须保存配对拒绝和审计，不能调用处理器。
+
+    参数：无；返回：None；异常：断言失败或生产校验异常。
+    """
+    async def handler(arguments, ctx, scope):
+        """缺参不应到达业务边界。参数：公开参数、身份、资源；返回：无；异常：AssertionError。"""
+        raise AssertionError("缺参申请不能执行业务")
+
+    registry, store, audit = ToolRegistry(), ResultStore(), AuditSink()
+    registry.register_definition(definition(handler, schema={"type": "object", "required": ["order_id"],
+                                                            "allOf": [{"required": ["order_id"]}]}))
+    result = await ToolExecutor(registry, store, None, audit_repository=audit).execute(
+        call("probe"), context(), ignore_status)
+    assert not result.ok and result.error.category == "invalid_arguments"
+    assert result.error.details[0]["path"] == "/order_id"
+    assert store.result == result and store.writes == 1
+    assert len(audit.entries) == 1 and audit.entries[0].status == "校验拦下"
+
+
 async def test_read_timeout_retries_once():
     """误删读重试或将两次尝试记成两条审计会失败。参数：无；返回：None；异常：断言失败。"""
     attempts = []

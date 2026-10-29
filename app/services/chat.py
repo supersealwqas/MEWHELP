@@ -642,6 +642,16 @@ class ChatService:
             resolved.append((row, self._waiting_action(snapshot, context)))
         for row, action in resolved:
             context, saved = row["context"], row["order_selection"]
+            # 当前选单可以晚于同轮已完成的工单；先恢复真正等待的动作，不能被旧回执覆盖。
+            if isinstance(action, OrderSelectionAction):
+                if isinstance(saved, dict) and saved.get("status") == "accepted":
+                    expected = {key: saved.get(key) for key in ("type", "action_id", "source_turn_id", "orders")}
+                    if (action.model_dump(mode="json") == expected and row["turn_status"] == "running"
+                            and saved.get("accepted_order_id") in {order.order_id for order in action.orders}):
+                        continue
+                elif saved is None or saved.get("status") == "awaiting_input":
+                    await self.chat.save_order_wait(context, action)
+                    continue
             ticket = row.get("pending_ticket")
             if ticket is not None:
                 matches = isinstance(action, TicketPreviewAction) and action.model_dump(mode="json") == ticket.get("action")
@@ -657,15 +667,6 @@ class ChatService:
                     await self.chat.finish_ticket_preview(call_context, result)
                 await self.chat.mark_turn(context, "failed", include_waiting=True)
                 continue
-            if action is not None:
-                if isinstance(saved, dict) and saved.get("status") == "accepted":
-                    expected = {key: saved.get(key) for key in ("type", "action_id", "source_turn_id", "orders")}
-                    if (action.model_dump(mode="json") == expected and row["turn_status"] == "running"
-                            and saved.get("accepted_order_id") in {order.order_id for order in action.orders}):
-                        continue
-                elif saved is None or saved.get("status") == "awaiting_input":
-                    await self.chat.save_order_wait(context, action)
-                    continue
             inconsistent = row["turn_status"] == "awaiting_input" or saved is not None
             if inconsistent:
                 logger.warning("选单等待与检查点不一致 turn=%s", context.turn_id)
@@ -962,7 +963,8 @@ class ChatService:
             async with self.guard.hold(request.session_id):
                 try:
                     row = await self.validate_resume(request)
-                    context = row["context"]
+                    # 原回执保留调用级身份；整轮运行及后续选单只能使用原用户轮身份。
+                    context = row["context"].model_copy(update={"tool_call_id": ""})
                     pending = row["pending_ticket"]
                     config = {"configurable": {"thread_id": checkpoint_thread_id(context.conversation_id)}}
                     snapshot = await self.graph.aget_state(config)

@@ -22,7 +22,9 @@ _MAX_DESCRIPTION_CHARACTERS = 2000
 _PUNCTUATION = " \t\r\n，,。.;；!！?？：:"
 _QUOTED = re.compile(r'“[^”]*”|‘[^’]*’|"[^"]*"|\x27[^\x27]*\x27|「[^」]*」|『[^』]*』')
 _CANCEL = re.compile(r"取消|算了|停止|不建了|(?:不要|不用|不必|别|无需|不想|不愿).{0,12}(?:建|创建|提交).{0,8}工单")
-_NONCURRENT = re.compile(r"如果|假如|假设|要是|万一|上次|之前|以前|曾经|(?:客服|有人|他|她|对方).{0,8}(?:说|让)|是什么意思|有什么用|怎么建|如何建|能.{0,12}工单[吗么]|可以.{0,12}工单[吗么]")
+_NONCURRENT = re.compile(r"如果|假如|假设|要是|万一|(?:客服|有人|他|她|对方).{0,8}(?:说|让)|是什么意思|有什么用|怎么建|如何建|能.{0,12}工单[吗么]|可以.{0,12}工单[吗么]")
+# 历史时间可以修饰购买或故障事实；只有紧接建单命令的旧话转述才否定当前申请。
+_HISTORICAL_QUOTE = re.compile(r"(?:上次|之前|以前|曾经)(?:我)?(?:已经|就|已)?(?:说|提|要求|申请)(?:过|了)?[\s，,。.;；!！：:]*$")
 _PROCESS_QUESTION = re.compile(r"(?:创建|提交|建立|建)(?:一个|个|一张|张)?(?:售后|投诉|咨询)?工单(?:前)?\s*(?:要收费[吗么]?|收费[吗么]|需要什么|要准备什么|有什么要求|多久|要多久)")
 _COMMAND = re.compile(
     r"(?P<boundary>^|[，,。.;；!！\n])\s*"
@@ -152,6 +154,8 @@ def advance_ticket_intent(previous: TicketIntentState | None, context: ToolConte
     if _NONCURRENT.search(text) or _PROCESS_QUESTION.search(unquoted) or ("工单" in text and "工单" not in unquoted):
         return previous.model_copy(update={"status": "closed"}, deep=True) if previous else None
     direct_request = _COMMAND.search(unquoted)
+    if direct_request and _HISTORICAL_QUOTE.search(unquoted[:direct_request.start()]):
+        return previous.model_copy(update={"status": "closed"}, deep=True) if previous else None
     if direct_request:
         # 新的明确申请可以另起诉求；尚在补充的同一诉求继续按原顺序收集。
         collecting = previous if previous and previous.status == "collecting" else None

@@ -42,7 +42,7 @@ class ConversationState(TypedDict, total=False):
     gate: dict | None  # GateDecision的JSON快照，未执行证据闸时为空。
     retrieval_attempted: bool  # 本轮是否已经尝试知识检索，防止分类补救重复检索。
     degradations: list[dict]  # 本轮外部故障的阶段和类型，不含错误原文。
-    pending_calls: list[dict]  # 本轮下一批待执行的只读工具申请。
+    pending_calls: list[dict]  # 本轮下一批工具申请；写入仍须经过服务端确认。
     pending_bindings: dict[str, dict]  # 决定时按调用ID冻结的工具来源与schema。
     pending_tool_bindings: dict[str, dict]  # CH08确认恢复公开状态名，与pending_bindings同步并兼容旧checkpoint。
     pending_ticket: dict | None  # 本原轮唯一冻结预览及用户决定，不由模型提供。

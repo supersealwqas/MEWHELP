@@ -111,8 +111,12 @@ def validate_arguments(schema: dict, arguments: object) -> list[dict]:
         path = list(error.absolute_path)
         if error.validator == "required" and isinstance(error.instance, dict):
             # 不解析依赖的英文错误字符串，直接从本字段schema找出缺项。
-            path.append(next(key for key in error.validator_value if key not in error.instance
-                             and not any(row["path"] == _pointer([*path, key]) and row["rule"] == "required" for row in rows)))
+            missing = next((key for key in error.validator_value if key not in error.instance
+                            and not any(row["path"] == _pointer([*path, key]) and row["rule"] == "required" for row in rows)), None)
+            # 根规则、allOf 或本地引用可能重复要求同一字段；已报告的缺项直接跳过。
+            if missing is None:
+                continue
+            path.append(missing)
         elif error.validator == "additionalProperties" and isinstance(error.instance, dict):
             extra = [key for key in error.instance.keys() - error.schema.get("properties", {}).keys()
                      if not any(re.search(pattern, key) for pattern in error.schema.get("patternProperties", {}))]

@@ -61,7 +61,7 @@ class WorkflowDependencies:
     """运行资源只留在依赖中，不写入图State。"""
     model: WorkflowModelAdapter  # 分类、决策与正文适配器。
     search: HybridKnowledgeSearch  # 知识检索器。
-    executor: ToolExecutor  # 既有只读工具执行器。
+    executor: ToolExecutor  # 统一工具执行器，读取与确认后写入共用。
     chat: ChatRepository  # 业务聊天仓储；Task5扩展完成事务。
     settings: Settings  # 本实例配置。
     query_expander: QueryExpander  # 同一上游和账本控制的政策扩写器。

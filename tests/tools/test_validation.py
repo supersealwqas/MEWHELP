@@ -99,6 +99,25 @@ def test_required_errors_have_distinct_paths():
     assert [row["path"] for row in errors] == ["/first", "/second"]
 
 
+@pytest.mark.parametrize("nested", [False, True])
+def test_repeated_required_rules_return_missing_paths_without_crashing(nested):
+    """同字段在组合规则中重复缺失不能抛异常或漏掉其他缺项。
+
+    参数：nested 是否把规则放到嵌套对象；返回：None；异常：断言失败或生产校验异常。
+    """
+    from app.tools.validation import validate_arguments
+    schema = {"type": "object", "required": ["order_id"],
+              "allOf": [{"required": ["order_id"]}, {"required": ["order_id", "reason"]}]}
+    arguments, prefix = {}, ""
+    if nested:
+        schema = {"type": "object", "properties": {"order": schema}}
+        arguments, prefix = {"order": {}}, "/order"
+    errors = validate_arguments(schema, arguments)
+    assert {(row["path"], row["rule"]) for row in errors} == {
+        (prefix + "/order_id", "required"), (prefix + "/reason", "required")}
+    assert len(errors) <= 5
+
+
 @pytest.mark.parametrize("value,valid", [("2026-10-28T10:00:00+08:00", True), ("2026-10-28T02:00:00Z", True),
                                         ("2026-10-28T02:00:00", False), ("not-a-date", False)])
 def test_date_time_never_silently_skips_format_check(value, valid):

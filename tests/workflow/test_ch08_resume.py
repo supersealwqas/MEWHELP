@@ -21,6 +21,84 @@ from tests.workflow.test_ch08_ticket_interrupt import ticket_call, rows
 from tests.workflow.service_fakes import collect
 
 
+POLICY_TICKET_QUERY = "商品收到时破损，帮我建个工单，我想了解退货条件"
+POLICY_TICKET_DESCRIPTION = "商品收到时破损，我想了解退货条件"
+
+
+async def test_confirmed_ticket_continues_to_order_selection_and_policy_answer(tmp_path):
+    """确认建单后必须发出真实选单，再完成政策回答且不重复建单。
+
+    参数：tmp_path 独占 SQLite 目录；返回：None；异常：断言、数据库或图错误。
+    """
+    from app.schemas.workflow import AgentDecision, OrderSelection, TicketResume
+    from tests.workflow.graph_fakes import ranked
+    async with ticket_runtime(tmp_path, intents=["售后"], decisions=[
+        AgentDecision(kind="tools", tool_calls=[ticket_call(description=POLICY_TICKET_DESCRIPTION)]),
+        AgentDecision(kind="answer"),
+    ], ranked=[ranked()], answers=[["退货政策说明[1]。"]]) as (service, deps, factory, _):
+        events = await collect(service, POLICY_TICKET_QUERY, session="policy-ticket")
+        preview = next(event.data for event in events if event.event == "confirm_ticket")
+        confirmation = TicketResume(type="confirm_ticket", session_id="policy-ticket", user_id="demo-user",
+            source_turn_id=preview["source_turn_id"], action_id=preview["action_id"], decision="confirm")
+        resumed = [event async for event in service.stream_resume(confirmation)]
+        assert not any(event.event == "error" for event in resumed), [(event.event, event.data) for event in resumed]
+        selection = next(event.data for event in resumed if event.event == "select_order")
+        current = await service.get_current_actions("policy-ticket", "demo-user")
+        assert current.turn_status == "awaiting_input" and current.order_selection.action_id == selection["action_id"]
+        assert current.ticket_receipt is not None and current.ticket_status == "completed"
+        request = OrderSelection(session_id="policy-ticket", user_id="demo-user", source_turn_id=selection["source_turn_id"],
+                                 action_id=selection["action_id"], order_id="1001")
+        final = [event async for event in service.stream_resume(request)]
+        assert final[-1].event == "done", [(event.event, event.data) for event in final]
+        answer = "".join(event.data.get("delta", "") for event in final)
+        assert current.ticket_receipt.ticket_no in answer and "退货政策说明" in answer
+        assert await rows(factory, "SELECT ticket_no FROM tickets") == [(current.ticket_receipt.ticket_no,)]
+        assert await rows(factory, "SELECT tool_name FROM tool_audit_logs WHERE tool_name='create_ticket'") == [("create_ticket",)]
+        assert len([row for row in deps.model.inputs if row["stage"] == "decide"]) == 2
+
+
+@pytest.mark.parametrize("accepted", [False, True])
+async def test_reopened_saver_keeps_order_wait_after_completed_ticket(tmp_path, accepted):
+    """重启后当前选单不能被同轮已完成工单覆盖，已接受订单也不得丢失。
+
+    参数：tmp_path 原 SQLite 目录，accepted 重启前是否保存选单决定；返回：None；异常：断言、数据库或图错误。
+    """
+    from langgraph.types import Command
+    from app.schemas.workflow import AgentDecision, OrderSelection
+    from tests.workflow.ch08_ticket_fakes import saved_decision
+    from tests.workflow.graph_fakes import ranked
+    from tests.workflow.test_ch08_ticket_interrupt import begin
+
+    async with ticket_runtime(tmp_path, intents=["售后"], decisions=[
+        AgentDecision(kind="tools", tool_calls=[ticket_call(description=POLICY_TICKET_DESCRIPTION)]),
+        AgentDecision(kind="answer"),
+    ]) as (service, _, factory, _):
+        context, config, preview = await begin(service.graph, service.chat, POLICY_TICKET_QUERY)
+        assert preview.interrupts[0].value["type"] == "confirm_ticket"
+        await service.graph.ainvoke(Command(resume=await saved_decision(factory, context)), config)
+        action = service._waiting_action(await service.graph.aget_state(config), context)
+        assert action.type == "select_order"
+        await service.chat.save_order_wait(context, action)
+        request = OrderSelection(session_id=context.session_id, user_id=context.user_id, source_turn_id=action.source_turn_id,
+                                 action_id=action.action_id, order_id="1001")
+        if accepted:
+            await ActionRepository(factory).accept_order_selection(request)
+        tickets = await rows(factory, "SELECT ticket_no FROM tickets")
+        assert len(tickets) == 1
+
+    async with ticket_runtime(tmp_path, ranked=[ranked()], answers=[["退货政策说明[1]。"]]) as (service, deps, factory, _):
+        await service.reconcile_waiting_turns()
+        current = await service.get_current_actions(context.session_id, context.user_id)
+        assert current.turn_status == ("running" if accepted else "awaiting_input")
+        assert current.order_selection.action_id == action.action_id and current.ticket_status == "completed"
+        assert current.resume_required is accepted
+        result = [event async for event in service.stream_resume(request)]
+        assert result[-1].event == "done", [(event.event, event.data) for event in result]
+        assert tickets[0][0] in "".join(event.data.get("delta", "") for event in result)
+        assert await rows(factory, "SELECT ticket_no FROM tickets") == tickets
+        assert [row["stage"] for row in deps.model.inputs] == ["answer"]
+
+
 class ResumeProtocolService:
     """HTTP 编码测试的明确服务边界，仅输出已经解析的动作类型和值。"""
 
