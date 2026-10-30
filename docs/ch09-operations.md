@@ -15,6 +15,8 @@ docker compose --env-file .env.langfuse -f docker-compose.langfuse.yml -p mewhel
 
 Web 地址为 `http://127.0.0.1:13000`，健康检查为 `/api/public/health`。首次启动会用本地环境文件中的管理员邮箱、密码创建 `MewHelp CH09` 项目。初始化后改环境值不会重置已有账号或项目密钥。
 
+验收时确认 `docker compose ps` 的六个组件都显示 `healthy`，并确认 Web 与 Worker 的健康接口成功；页面可打开不能代替容器健康检查通过。Web/Worker 的容器内探针使用实际容器主机名，设置4秒请求期限，失败返回非零并记录错误类型或HTTP状态。宿主机发布端口仍只绑定回环地址。
+
 3. 在应用 `.env` 中设置 `OBSERVABILITY_ENABLED=true`、`LANGFUSE_BASE_URL=http://127.0.0.1:13000`，并填入与初始化项目一致的 `LANGFUSE_PUBLIC_KEY`、`LANGFUSE_SECRET_KEY`。`OBSERVABILITY_SHUTDOWN_TIMEOUT_SECONDS=5` 是应用等待导出关闭的总时限。然后照常运行 `uv run uvicorn app.main:app --host 127.0.0.1 --port 8000`。
 
 Web / Worker 固定为服务端 `4.72.0`，Python SDK 固定 `4.15.4`，其 LangChain 集成必需主包固定 `1.4.6`，保持原有 core / openai / graph 版本。ClickHouse、PostgreSQL、Redis 与 MinIO 镜像同样显式固定；实际拉取 digest 和健康证据保存在 `reports/ch09/`。不要把 SDK 版本当成服务端版本，也不要用 `latest` 做验收。

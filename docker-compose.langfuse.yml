@@ -11,7 +11,15 @@ services:
       minio: {condition: service_healthy}
     ports: ["127.0.0.1:13030:3030"]
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3030/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      # 镜像服务监听容器网卡地址；使用实际主机名，不能假定容器回环也有监听。
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          fetch('http://'+require('node:os').hostname()+':3030/api/health',{signal:AbortSignal.timeout(4000)})
+          .then(r=>{if(!r.ok)console.error('healthcheck HTTP',r.status);process.exitCode=r.ok?0:1})
+          .catch(e=>{console.error('healthcheck',e.name,e.cause?.code??'request_failed');process.exitCode=1})
       interval: 10s
       timeout: 5s
       retries: 30
@@ -68,7 +76,14 @@ services:
       LANGFUSE_INIT_USER_NAME: MewHelp Local Admin
       LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:?}
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/public/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          fetch('http://'+require('node:os').hostname()+':3000/api/public/health',{signal:AbortSignal.timeout(4000)})
+          .then(r=>{if(!r.ok)console.error('healthcheck HTTP',r.status);process.exitCode=r.ok?0:1})
+          .catch(e=>{console.error('healthcheck',e.name,e.cause?.code??'request_failed');process.exitCode=1})
       interval: 10s
       timeout: 5s
       retries: 30
