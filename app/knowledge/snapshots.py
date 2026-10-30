@@ -1,9 +1,55 @@
 """原轮检索证据收集、幂等合并和历史只读恢复，不用当前知识补造旧事实。"""
 
 import json
+import math
 from hashlib import sha256
 
 from app.schemas.flywheel import RetrievalAttempt, RetrievalChunkSnapshot, RetrievalSnapshot
+
+
+def _scores_equivalent(saved: float | None, incoming: float | None) -> bool:
+    """仅容纳MySQL JSON已证实的单步浮点表示差异。
+
+    参数：saved/incoming 为已验证的可空有限分数；零不等价于非零。
+    返回：bool，相同值或相邻一个可表示浮点值；异常：无。
+    """
+    if saved is None or incoming is None:
+        return saved is incoming
+    if type(saved) is not float or type(incoming) is not float or not math.isfinite(saved) or not math.isfinite(incoming):
+        return False
+    if saved == incoming:
+        return True
+    # 不使用相对/绝对容差；缺失、零和非零事实不能因值很小而混同。
+    return saved != 0.0 and incoming != 0.0 and math.nextafter(saved, incoming) == incoming
+
+
+def _attempts_equivalent(saved: RetrievalAttempt, incoming: RetrievalAttempt) -> bool:
+    """精确比较尝试身份和原文，只有召回/重排分采用存储等价。
+
+    参数：saved/incoming 为经过严格schema验证的尝试。
+    返回：bool，全部非分数字段、块顺序及数量一致；异常：无。
+    """
+    if (saved.model_dump(exclude={"chunks"}) != incoming.model_dump(exclude={"chunks"})
+            or len(saved.chunks) != len(incoming.chunks)):
+        return False
+    scores = {"recall_score", "rerank_score"}
+    return all(old.model_dump(exclude=scores) == new.model_dump(exclude=scores)
+        and _scores_equivalent(old.recall_score, new.recall_score)
+        and _scores_equivalent(old.rerank_score, new.rerank_score)
+        for old, new in zip(saved.chunks, incoming.chunks))
+
+
+def snapshots_equivalent(saved: RetrievalSnapshot | None, incoming: RetrievalSnapshot | None) -> bool:
+    """判断完成重试是否提供同一份完整、有序的快照事实，不以可合并代替相同。
+
+    参数：saved/incoming 为严格验证的快照，None仅代表明确未检索。
+    返回：bool，版本/状态/尝试顺序与数量精确相同，两个分数字段允许单步存储差异；异常：无。
+    """
+    if saved is None or incoming is None:
+        return saved is incoming
+    return (saved.model_dump(exclude={"attempts"}) == incoming.model_dump(exclude={"attempts"})
+        and len(saved.attempts) == len(incoming.attempts)
+        and all(_attempts_equivalent(old, new) for old, new in zip(saved.attempts, incoming.attempts)))
 
 
 def merge_snapshots(saved: RetrievalSnapshot | None, incoming: RetrievalSnapshot) -> RetrievalSnapshot:
@@ -15,8 +61,11 @@ def merge_snapshots(saved: RetrievalSnapshot | None, incoming: RetrievalSnapshot
     attempts = {a.attempt_id: a.model_copy(deep=True) for a in saved.attempts} if saved else {}
     for attempt in incoming.attempts:
         previous = attempts.get(attempt.attempt_id)
-        if previous is not None and previous != attempt:
-            raise ValueError("同一次检索的历史快照不能被替换")
+        if previous is not None:
+            if not _attempts_equivalent(previous, attempt):
+                raise ValueError("同一次检索的历史快照不能被替换")
+            # 等价也保留原件，不能反复写入相邻分数造成累计漂移。
+            continue
         attempts[attempt.attempt_id] = attempt.model_copy(deep=True)
     statuses = {a.status for a in attempts.values()}
     statuses.update(s.status for s in (saved, incoming) if s is not None)

@@ -2,6 +2,7 @@
 
 import importlib
 import json
+import math
 
 import pytest
 
@@ -10,6 +11,103 @@ from app.schemas.tools import ToolContext
 from app.tools.knowledge import retrieve_verified_knowledge
 from app.workflow.state import new_turn_state
 from tests.rag.test_retrieval import _chunk, _search
+
+
+def scored_snapshot():
+    """创建含真实故障分数的两块原件。参数：无；返回：检索快照；异常：契约错误。"""
+    from app.knowledge.snapshots import chunk_snapshot
+    from app.schemas.flywheel import RetrievalAttempt, RetrievalSnapshot
+    return RetrievalSnapshot(status="ok", attempts=[RetrievalAttempt(attempt_id="first", query="退货条件",
+        status="ok", top_k=5, candidate_count=2, chunks=[
+            chunk_snapshot(_chunk(1), 1, recall_score=0.032522473484277725, rerank_score=0.9935368895530701),
+            chunk_snapshot(_chunk(2), 2, recall_score=0.01, rerank_score=0.6411977410316467)])])
+
+
+@pytest.mark.parametrize("field", ["recall_score", "rerank_score"])
+def test_score_roundtrip_merge_preserves_saved_original_without_drift(field):
+    """MySQL相邻浮点不能阻止追加，反复合并也不能漂移旧分。参数：分数字段；返回：None；异常：断言失败。"""
+    from app.schemas.flywheel import RetrievalAttempt, RetrievalSnapshot
+    module = snapshots()
+    saved = scored_snapshot()
+    setattr(saved.attempts[0].chunks[0], field, 0.99353688955307)
+    incoming = saved.model_copy(deep=True)
+    setattr(incoming.attempts[0].chunks[0], field, 0.9935368895530701)
+    incoming.attempts.append(RetrievalAttempt(attempt_id="second", query="退款时限", status="empty", top_k=5, candidate_count=0))
+    merged = module.merge_snapshots(saved, incoming)
+    assert [a.attempt_id for a in merged.attempts] == ["first", "second"]
+    assert getattr(merged.attempts[0].chunks[0], field) == 0.99353688955307
+    assert saved == RetrievalSnapshot(status="ok", attempts=[merged.attempts[0]])
+    drifting = incoming.model_copy(deep=True)
+    setattr(drifting.attempts[0].chunks[0], field, math.nextafter(0.9935368895530701, math.inf))
+    with pytest.raises(ValueError, match="历史快照"):
+        module.merge_snapshots(merged, drifting)
+
+
+@pytest.mark.parametrize("field", ["recall_score", "rerank_score"])
+@pytest.mark.parametrize("left,right", [(None, 0.0), (0.0, math.ulp(0.0)),
+    (0.9935368895530701, 0.9935368895530699), (0.9935368895530701, 0.99)])
+def test_score_roundtrip_rejects_missing_zero_and_real_changes(field, left, right):
+    """缺失、零和超过一步的分数差异仍是冲突。参数：字段及两值；返回：None；异常：断言失败。"""
+    saved, incoming = scored_snapshot(), scored_snapshot()
+    setattr(saved.attempts[0].chunks[0], field, left)
+    setattr(incoming.attempts[0].chunks[0], field, right)
+    with pytest.raises(ValueError, match="历史快照"):
+        snapshots().merge_snapshots(saved, incoming)
+
+
+@pytest.mark.parametrize("field", ["recall_score", "rerank_score"])
+@pytest.mark.parametrize("value", [True, "0.5", math.nan, math.inf, -math.inf])
+def test_score_roundtrip_keeps_strict_snapshot_schema(field, value):
+    """兼容存储末位不能接受伪数字和非有限数。参数：字段与非法值；返回：None；异常：断言失败。"""
+    from pydantic import ValidationError
+    from app.schemas.flywheel import RetrievalSnapshot
+    raw = scored_snapshot().model_dump()
+    raw["attempts"][0]["chunks"][0][field] = value
+    with pytest.raises(ValidationError):
+        RetrievalSnapshot.model_validate(raw)
+
+
+@pytest.mark.parametrize("part,field,value", [
+    ("attempt", "query", "其他政策"), ("attempt", "status", "fault"),
+    ("attempt", "candidate_count", 3), ("attempt", "top_k", 4), ("attempt", "fault", "ConnectionError"),
+    ("chunk", "chunk_id", 9), ("chunk", "source_key", "other"), ("chunk", "content_hash", "other"),
+    ("chunk", "embedding_revision", "other"), ("chunk", "question", "其他问题"),
+    ("chunk", "answer", "不同原文"), ("chunk", "rank", 2)])
+def test_score_roundtrip_does_not_relax_other_attempt_facts(part, field, value):
+    """只有两个分数字段可等价，真实事实变化必须拒绝。参数：变更位置/字段/值；返回：None；异常：断言失败。"""
+    saved, incoming = scored_snapshot(), scored_snapshot()
+    setattr(incoming.attempts[0] if part == "attempt" else incoming.attempts[0].chunks[0], field, value)
+    with pytest.raises(ValueError, match="历史快照"):
+        snapshots().merge_snapshots(saved, incoming)
+
+
+@pytest.mark.parametrize("change", ["version", "status", "attempt_id", "attempt_order", "attempt_removed", "attempt_added",
+    "chunk_order", "chunk_removed", "chunk_added"])
+def test_snapshot_equivalence_requires_complete_ordered_facts(change):
+    """完成重试不能把可合并的增删或重排当相同。参数：变更种类；返回：None；异常：断言失败。"""
+    from app.schemas.flywheel import RetrievalAttempt
+    saved = scored_snapshot()
+    saved.attempts.append(RetrievalAttempt(attempt_id="second", query="退款时限", status="empty", top_k=5, candidate_count=0))
+    incoming = saved.model_copy(deep=True)
+    if change == "version":
+        incoming.schema_version = 2
+    elif change == "status":
+        incoming.status = "fault"
+    elif change == "attempt_id":
+        incoming.attempts[0].attempt_id = "changed"
+    elif change == "attempt_order":
+        incoming.attempts.reverse()
+    elif change == "attempt_removed":
+        incoming.attempts.pop()
+    elif change == "attempt_added":
+        incoming.attempts.append(incoming.attempts[1].model_copy(update={"attempt_id": "third"}))
+    elif change == "chunk_order":
+        incoming.attempts[0].chunks.reverse()
+    elif change == "chunk_removed":
+        incoming.attempts[0].chunks.pop()
+    else:
+        incoming.attempts[0].chunks.append(incoming.attempts[0].chunks[1].model_copy(update={"chunk_id": 3, "rank": 3}))
+    assert not snapshots().snapshots_equivalent(saved, incoming)
 
 
 def snapshots():

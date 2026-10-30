@@ -12,7 +12,7 @@ from app.schemas.history import StoredMessage, StoredTurn
 from app.schemas.tools import ToolContext, ToolError, ToolResult
 from app.schemas.workflow import HistoryDelta, RetrievalLowConfidence, SuggestedAction, OrderSelectionAction, RefundAction
 from app.schemas.flywheel import FeedbackReceipt, PoolSignal, RetrievalSnapshot, TurnPoolState
-from app.knowledge.snapshots import merge_snapshots, recover_legacy_snapshot
+from app.knowledge.snapshots import merge_snapshots, recover_legacy_snapshot, snapshots_equivalent
 
 
 async def owned_source(session, session_id: str, user_id: str, turn_id: str | None = None, *, lock=False):
@@ -778,8 +778,15 @@ class ChatRepository:
                     and saved.get("workflow") == workflow_metadata and saved.get("low_confidence") == low_snapshot \
                     and saved.get("refund_action") == refund_snapshot
                 stored_inputs = (user.rag_metadata or {}).get("completion_inputs")
-                same_extra = same_extra and (stored_inputs == completion_inputs if stored_inputs is not None
-                    else retrieval_snapshot is None and pool_signals is None)
+                if stored_inputs is not None:
+                    # 只为原快照的两个分数兼容存储末位，其余完成输入及键集合仍须精确一致。
+                    same_inputs = ({**stored_inputs, "retrieval_snapshot": snapshot_input} == completion_inputs
+                        and "retrieval_snapshot" in stored_inputs
+                        and snapshots_equivalent(RetrievalSnapshot.model_validate(stored_inputs["retrieval_snapshot"])
+                            if stored_inputs["retrieval_snapshot"] is not None else None, retrieval_snapshot))
+                else:
+                    same_inputs = retrieval_snapshot is None and pool_signals is None
+                same_extra = same_extra and same_inputs
                 if existing is None or existing.content != content or not same_extra or not same:
                     raise PersistenceUncertain("轮次已完成但结果不同，需核查")
                 return existing.rag_metadata

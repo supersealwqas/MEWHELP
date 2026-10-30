@@ -76,6 +76,54 @@ async def prepare_feedback(engine):
         await connection.run_sync(lambda sync: Message.__table__.create(sync))
 
 
+async def test_mysql_score_roundtrip_append_restore_and_finish_retry(isolated_mysql):
+    """真实MySQL末位变化不能阻断累计保存、恢复和完成回放。参数：空专库；返回：None；异常：断言失败。"""
+    from sqlalchemy import select
+    from app.models.customer_service import Message
+    from app.repositories.chat import ChatRepository, PersistenceUncertain
+    from app.schemas.flywheel import RetrievalAttempt, RetrievalSnapshot
+    from app.tools.knowledge import restore_turn_knowledge
+    from app.workflow.state import new_turn_state
+    from tests.flywheel.test_pool import start
+    from tests.flywheel.test_snapshots import scored_snapshot
+    _, engine, factory, _ = isolated_mysql
+    await prepare_feedback(engine)
+    chat = ChatRepository(factory)
+    ctx = await start(chat)
+    original = scored_snapshot()
+    await chat.save_retrieval_snapshot(ctx, original)
+    first = (await chat.get_workflow_turn("s", "u", "first"))["retrieval_snapshot"]
+    assert first["attempts"][0]["chunks"][0]["rerank_score"] == 0.99353688955307
+    original.attempts.append(RetrievalAttempt(attempt_id="second", query="退款时限", status="empty", top_k=5, candidate_count=0))
+    await chat.save_retrieval_snapshot(ctx, original)
+    stored = (await chat.get_workflow_turn("s", "u", "first"))["retrieval_snapshot"]
+    assert [a["attempt_id"] for a in stored["attempts"]] == ["first", "second"]
+    assert stored["attempts"][0] == first["attempts"][0]
+    restored = await restore_turn_knowledge(new_turn_state(ctx, [], 0), chat)
+    assert restored["retrieval_snapshot"] == stored
+    completed = await chat.finish_turn(ctx, "政策原答", retrieval_snapshot=original)
+    assert await chat.finish_turn(ctx, "政策原答", retrieval_snapshot=original) == completed
+    await chat.save_retrieval_snapshot(ctx, original)
+    assert (await chat.get_workflow_turn("s", "u", "first"))["retrieval_snapshot"] == stored
+    # 相对数据库原件0.99353688955307正好差两步；0699/0698实际都只差一步。
+    for field, value in (("rerank_score", 0.9935368895530697), ("answer", "不同原文"),
+                         ("chunk_id", 99), ("rank", 2)):
+        changed = original.model_copy(deep=True)
+        setattr(changed.attempts[0].chunks[0], field, value)
+        with pytest.raises(ValueError, match="历史快照"):
+            await chat.save_retrieval_snapshot(ctx, changed)
+        with pytest.raises(PersistenceUncertain):
+            await chat.finish_turn(ctx, "政策原答", retrieval_snapshot=changed)
+    with pytest.raises(PersistenceUncertain):
+        await chat.finish_turn(ctx, "政策原答", retrieval_snapshot=RetrievalSnapshot(status="ok", attempts=original.attempts[:1]))
+    async with factory() as session:
+        assert len((await session.scalars(select(Message).where(Message.role == "assistant"))).all()) == 1
+    async with engine.connect() as connection:
+        version = await connection.scalar(text("SELECT VERSION()"))
+        assert await connection.scalar(text("SELECT DATABASE()")) == TEST_DATABASE
+    print(f"MySQL {version}：真实分数首存→追加→恢复→完成重试通过；旧原件不变；真实分数/正文/身份/排名变化拒绝")
+
+
 async def test_same_source_concurrent_retry_keeps_one_pool_row(isolated_mysql):
     """真实MySQL行锁必须串行化同一原轮的并发反馈。参数：空专库；返回：None；异常：断言失败。"""
     import asyncio
