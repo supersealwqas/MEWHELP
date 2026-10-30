@@ -35,7 +35,8 @@ from app.knowledge.pipeline import understand_query
 from app.tools.business import list_user_orders, owns_order
 from app.workflow.state import ConversationState, full_history_messages, message_row
 from app.workflow.stages import publish_stage
-from app.workflow.policy_context import policy_query, verified_business_prefix, optional_probe_miss, knowledge_retrieval_fault
+from app.workflow.policy_context import (policy_query, verified_business_prefix, optional_probe_miss,
+    knowledge_retrieval_fault, knowledge_failure_reason)
 from app.workflow.resilience import DEPENDENCY_ERRORS, degradation
 from app.workflow.routing import original_understanding
 from app.workflow.context import history_snapshot, log_history
@@ -271,7 +272,11 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
             update = fixed_reply(reply_kind)
             update["stop_reason"] = kind if state["stop_reason"] in {None, "answer", "clarify"} else state["stop_reason"]
         # 建单可以先于政策检索完成，故障或弱证据出口也必须保留原调用的成功事实。
-        if state.get("gate") is not None and not state["gate"]["passed"]:
+        failure_reason = knowledge_failure_reason(state)
+        if failure_reason is not None:
+            update = {**stopped_state(failure_reason), "evidence": [], "pool_signals": []}
+            update["answer"] = await verified_business_prefix(state, deps.chat) + update["answer"]
+        elif state.get("gate") is not None and not state["gate"]["passed"]:
             from app.knowledge.answering import FIXED_KNOWLEDGE_REFUSAL
             update["answer"] = await verified_business_prefix(state, deps.chat) + FIXED_KNOWLEDGE_REFUSAL
             update["evidence"] = []

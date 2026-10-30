@@ -290,8 +290,49 @@ async def test_failed_second_knowledge_query_cannot_become_self_check(tmp_path, 
             assert (await session.scalars(select(LowConfidenceQuestion))).all() == []
 
 
+@pytest.mark.parametrize("with_order,first_score", [(False, 0.9), (True, 0.9), (False, 0.01), (True, 0.01)])
+async def test_evidence_budget_failure_after_capture_blocks_stale_gate(tmp_path, sdk_runtime, with_order, first_score):
+    """原文成功后预算失败不能沿用旧gate自评或入池，可信订单仍须保留。参数：目录/SDK/订单与先前分数；返回：None；异常：断言失败。"""
+    from app.models.customer_service import Message
+    from tests.workflow.ch08_ticket_fakes import ticket_runtime
+    sdk_runtime.responses.append(response())
+    calls = [{"id": str(i), "name": "query_faq", "args": {"keyword": query}}
+             for i, query in enumerate(("会员条件", "退款时限"))]
+    if with_order:
+        calls.insert(0, {"id": "order", "name": "query_order", "args": {"order_id": "1001"}})
+    async with ticket_runtime(tmp_path, intents=["其他"], context_evidence_max_tokens=256, decisions=[
+            AgentDecision(kind="tools", tool_calls=calls), AgentDecision(kind="answer")]) as (service, deps, factory, _):
+        original = deps.search.retrieve
+        async def retrieve(query, **kwargs):
+            """只控制上游原文，预算选择及capture仍走生产流程。参数：原检索输入；返回：实际排名；异常：原检索错误。"""
+            deps.search.ranked = [ranked(first_score)] if query == "会员条件" else [ranked(answer="政策原文" * 200)]
+            return await original(query, **kwargs)
+        deps.search.retrieve = retrieve
+        install_answer_adapter(deps, sdk_runtime)
+        events = await collect(service, ("订单1001，" if with_order else "") + "会员条件和退款时限是什么？")
+        answer = "".join(item.data["delta"] for item in events if item.event == "delta")
+        metadata = next(item.data for item in events if item.event == "answer_metadata")
+        async with factory() as session:
+            rows = (await session.scalars(select(Message).order_by(Message.id))).all()
+            pool = (await session.scalars(select(LowConfidenceQuestion))).all()
+            attempts = next(row for row in rows if row.role == "user").rag_metadata["retrieval_snapshot"]["attempts"]
+            tool_results = {row.tool_call_id: json.loads(row.content) for row in rows if row.role == "tool"}
+            (tmp_path / "i1-observed.json").write_text(json.dumps({"answer": answer, "metadata": metadata,
+                "tool_results": tool_results, "attempts": attempts, "knowledge_requests": len(sdk_runtime.requests),
+                "pool_sources": [row.source for row in pool]}, ensure_ascii=False, indent=2), encoding="utf-8")
+        assert events[-1].event == "done" and tool_results["1"]["error"]["category"] == "fault"
+        assert [item["status"] for item in attempts] == ["ok", "ok"]
+        assert attempts[-1]["chunks"][0]["answer"] == "政策原文" * 200
+        assert sdk_runtime.requests == [] and pool == []
+        assert metadata["workflow"]["stop_reason"] == "budget_exceeded"
+        assert "处理额度" in answer and not answer.endswith(FIXED_KNOWLEDGE_REFUSAL)
+        if with_order:
+            assert "订单：1001" in answer and "状态：" in answer
+
+
+@pytest.mark.parametrize("failure_kind", ["retrieval", "evidence_budget"])
 @pytest.mark.parametrize("retry_kind", ["same", "different_query", "different_filters"])
-async def test_retrieval_recovery_only_clears_same_request_responsibility(tmp_path, sdk_runtime, retry_kind):
+async def test_retrieval_recovery_only_clears_same_request_responsibility(tmp_path, sdk_runtime, retry_kind, failure_kind):
     """同查询同范围成功可恢复；其他查询或同字不同范围不能掩盖故障。参数：目录/SDK/重试类型；返回：None；异常：断言失败。"""
     from app.tools.knowledge import retrieve_verified_knowledge
     from app.workflow.agent import build_agent_graph
@@ -303,16 +344,21 @@ async def test_retrieval_recovery_only_clears_same_request_responsibility(tmp_pa
         state.update(context=context.model_dump(mode="json"), resolved_query=context.user_message,
             standard_query=context.user_message, intent="商品咨询", route="knowledge", route_ready=True, stop_reason="answer")
         ledger = BudgetLedger.from_settings(deps.settings)
-        deps.search.error = OSError("真实检索故障")
-        with pytest.raises(OSError):
+        from app.core.memory import ContextBudgetExceeded
+        deps.search.error = OSError("真实检索故障") if failure_kind == "retrieval" else None
+        if failure_kind == "evidence_budget":
+            deps.search.ranked = [ranked(answer="政策原文" * 10000)]
+        with pytest.raises(OSError if failure_kind == "retrieval" else ContextBudgetExceeded):
             await retrieve_verified_knowledge(state, ledger, search=deps.search, settings=deps.settings,
                 query_expander=deps.query_expander, query="会员规则", filters={"category": "规则"}, chat=deps.chat)
         deps.search.error = None
+        deps.search.ranked = [ranked()]
         outcome = await retrieve_verified_knowledge(state, ledger, search=deps.search, settings=deps.settings,
             query_expander=deps.query_expander, query="其他规则" if retry_kind == "different_query" else "会员规则",
             filters={"category": "其他" if retry_kind == "different_filters" else "规则"}, chat=deps.chat)
         state.update(outcome.model_dump(mode="json"), budget=ledger.snapshot())
-        assert [item["status"] for item in state["retrieval_snapshot"]["attempts"]] == ["fault", "ok"]
+        assert [item["status"] for item in state["retrieval_snapshot"]["attempts"]] == [
+            "fault" if failure_kind == "retrieval" else "ok", "ok"]
         assert knowledge_retrieval_fault(state) is (retry_kind != "same")
         if retry_kind == "same":
             sdk_runtime.responses.append(response())
@@ -324,6 +370,86 @@ async def test_retrieval_recovery_only_clears_same_request_responsibility(tmp_pa
                 for item in result["pool_signals"]], retrieval_snapshot=outcome.retrieval_snapshot)
             async with factory() as session:
                 assert len((await session.scalars(select(LowConfidenceQuestion))).all()) == 1
+
+
+@pytest.mark.parametrize("failure_kind", ["input_budget", "prepared_budget", "expand_budget", "invalid_filters"])
+async def test_preparation_failure_blocks_stale_knowledge_without_fake_snapshot(tmp_path, failure_kind):
+    """前置输入/准备失败也须阻止旧证据入池，且异常原样传播。参数：目录/故障阶段；返回：None；异常：断言失败。"""
+    from app.core.memory import ContextBudgetExceeded
+    from app.tools.knowledge import retrieve_verified_knowledge
+    from app.workflow.agent import build_agent_graph
+    from tests.flywheel.test_pool import start
+    async with service_runtime(tmp_path, ranked=[ranked()]) as (_, deps, _):
+        context = await start(deps.chat)
+        state = turn(context.user_message, turn_id=context.turn_id)
+        state.update(context=context.model_dump(mode="json"), intent="商品咨询", route="knowledge",
+            route_ready=True, stop_reason="answer", gate={"passed": True})
+        options = {"query": "会员条件", "filters": {}, "policy": False}
+        ledger = BudgetLedger.from_settings(deps.settings)
+        if failure_kind == "input_budget":
+            options["query"] = "条" * 2001
+        elif failure_kind == "prepared_budget":
+            state["standard_query"] = "条" * 2001
+        elif failure_kind == "expand_budget":
+            options["policy"] = True
+            ledger = BudgetLedger(total_token_budget=1)
+        else:
+            options["filters"] = {"unknown": "非法字段"}
+        error_type = WorkflowBudgetExceeded if failure_kind == "expand_budget" else (
+            ValueError if failure_kind == "invalid_filters" else ContextBudgetExceeded)
+        with pytest.raises(error_type):
+            await retrieve_verified_knowledge(state, ledger, search=deps.search, settings=deps.settings,
+                query_expander=deps.query_expander, chat=deps.chat, **options)
+        assert state["retrieval_snapshot"] is None
+        result = await build_agent_graph(deps).ainvoke(state)
+        assert result["pool_signals"] == []
+        assert result["stop_reason"] == ("retrieval_unavailable" if failure_kind == "invalid_filters" else "budget_exceeded")
+        assert result["answer"] != FIXED_KNOWLEDGE_REFUSAL
+
+
+@pytest.mark.parametrize("retry_kind", ["same", "different_query", "different_filters"])
+async def test_policy_preparation_fault_recovers_only_after_same_scope_success(tmp_path, retry_kind):
+    """策略还没读出时的准备失败不能借别的范围成功清除。参数：目录/重试范围；返回：None；异常：断言失败。"""
+    from app.tools.knowledge import retrieve_verified_knowledge
+    from app.workflow.policy_context import knowledge_retrieval_fault
+    from app.knowledge.confidence import EvidencePolicyUnavailable
+    async with service_runtime(tmp_path, ranked=[ranked()]) as (_, deps, _):
+        state, ledger = turn("会员条件"), BudgetLedger.from_settings(deps.settings)
+        original_path = deps.settings.evidence_policy_path
+        deps.settings.evidence_policy_path = str(tmp_path / "missing-policy.json")
+        with pytest.raises(EvidencePolicyUnavailable):
+            await retrieve_verified_knowledge(state, ledger, search=deps.search, settings=deps.settings,
+                query_expander=deps.query_expander, query="会员条件", filters={"category": "规则"})
+        assert state["retrieval_snapshot"] is None and knowledge_retrieval_fault(state)
+        deps.settings.evidence_policy_path = original_path
+        await retrieve_verified_knowledge(state, ledger, search=deps.search, settings=deps.settings,
+            query_expander=deps.query_expander, query="其他条件" if retry_kind == "different_query" else "会员条件",
+            filters={"category": "其他" if retry_kind == "different_filters" else "规则"})
+        assert knowledge_retrieval_fault(state) is (retry_kind != "same")
+
+
+@pytest.mark.parametrize("failure_kind", ["dependency", "program", "cancel"])
+async def test_post_capture_failure_preserves_original_exception(tmp_path, failure_kind):
+    """成功capture之后取消或依赖/程序错误必须原样抛出，不能静默返回自评。参数：目录/错误种类；返回：None；异常：断言失败。"""
+    import asyncio
+    from app.tools.knowledge import retrieve_verified_knowledge
+    from app.workflow.policy_context import knowledge_retrieval_fault
+    async with service_runtime(tmp_path, ranked=[ranked()]) as (_, deps, _):
+        state, ledger = turn("会员条件"), BudgetLedger.from_settings(deps.settings)
+        failure = {"dependency": OSError("后置依赖失败"), "program": ValueError("原文一致性错误"),
+                   "cancel": asyncio.CancelledError()}[failure_kind]
+        original = deps.search.retrieve
+        async def retrieve(query, **kwargs):
+            """取得真实原件后触发受控错误。参数：原请求；返回：无；异常：指定原始异常。"""
+            await original(query, **kwargs)
+            raise failure
+        deps.search.retrieve = retrieve
+        with pytest.raises(type(failure)) as caught:
+            await retrieve_verified_knowledge(state, ledger, search=deps.search, settings=deps.settings,
+                query_expander=deps.query_expander, query="会员条件")
+        assert caught.value is failure
+        assert knowledge_retrieval_fault(state) and state["pool_signals"] == []
+        assert [item["status"] for item in state["retrieval_snapshot"]["attempts"]] == ["ok"]
 
 
 async def test_old_checkpoint_recovers_fault_before_tool_subgraph(tmp_path):

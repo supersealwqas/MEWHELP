@@ -23,7 +23,7 @@ from app.workflow.model import decision_tool_schemas
 from app.workflow.prompts import ANSWER_PROMPT, DECISION_PROMPT
 from app.workflow.state import ConversationState, message_row
 from app.workflow.stages import publish_stage
-from app.workflow.policy_context import verified_business_prefix, optional_probe_miss, knowledge_retrieval_fault
+from app.workflow.policy_context import verified_business_prefix, optional_probe_miss, knowledge_failure_reason
 from app.workflow.routing import _active_order_tokens, knowledge_input_stop_reason, _trusted_history
 from app.workflow.resilience import DEPENDENCY_ERRORS, degradation
 from app.workflow.model import WorkflowOutputError
@@ -261,8 +261,9 @@ def build_agent_graph(deps: "WorkflowDependencies", *, decision=None):
         action_text = ("本轮回复后可用按钮的操作说明如下：\n" +
             "\n".join(instructions[kind] for kind in state["suggested_kinds"])) if state["suggested_kinds"] else "本轮回复后没有可操作的按钮，请按已有事实回答或追问。"
         answer_state = {**state, "context_notes": [*state.get("context_notes", []), action_text]}
-        if knowledge_retrieval_fault(state):
-            update = stopped_state("retrieval_unavailable")
+        failure_reason = knowledge_failure_reason(state)
+        if failure_reason is not None:
+            update = stopped_state(failure_reason)
             update.update(answer=await verified_business_prefix(state, deps.chat) + update["answer"],
                           evidence=[], pool_signals=[])
             writer({"event": "delta", "data": {"delta": update["answer"]}})

@@ -30,12 +30,24 @@ def optional_probe_miss(state: ConversationState) -> bool:
 
 
 def knowledge_retrieval_fault(state: ConversationState) -> bool:
-    """识别未恢复的真实检索责任，不让历史故障永久阻断同请求成功重试。
+    """识别未恢复的知识处理责任（含预算），不让历史故障永久阻断同请求成功重试。
 
     参数：state服务端责任字典及快照；返回：仍有未恢复故障时为True；异常：无。
     """
     from app.tools.knowledge import unresolved_knowledge_faults
     return bool(unresolved_knowledge_faults(state))
+
+
+def knowledge_failure_reason(state: ConversationState) -> str | None:
+    """从未恢复责任保留预算停止语义，不把完整知识处理失败视为资料缺口。
+
+    参数：state原轮责任字典；返回：预算/依赖停止原因或None；异常：无。
+    """
+    from app.tools.knowledge import unresolved_knowledge_faults
+    faults = unresolved_knowledge_faults(state)
+    if "budget_exceeded" in faults.values():
+        return "budget_exceeded"
+    return "retrieval_unavailable" if faults else None
 
 
 def policy_query(state: ConversationState) -> str:

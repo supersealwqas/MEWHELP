@@ -5,7 +5,7 @@ from copy import deepcopy
 from pathlib import Path
 
 from app.core.memory import ContextBudgetExceeded
-from app.core.model_budget import BudgetLedger
+from app.core.model_budget import BudgetLedger, WorkflowBudgetExceeded
 from app.schemas.tools import ToolContext, ToolResult, VerifiedKnowledgeOutcome
 from app.tools.contracts import ToolExecutionScope, json_hash
 from app.knowledge.snapshots import RetrievalCapture, merge_snapshots, recover_legacy_snapshot
@@ -17,7 +17,7 @@ ORDER_POLICY_SOURCES = ("doc:returns-policy.md", "doc:after-sales-manual.md",
 
 
 def unresolved_knowledge_faults(state: dict) -> dict[str, str]:
-    """读取责任键故障表，旧检查点没有范围信息时保守保留历史故障。
+    """读取完整知识处理责任故障表，旧检查点没有范围信息时保守保留历史故障。
 
     参数：state服务端原轮；返回：独立故障字典；异常：无。
     """
@@ -88,56 +88,63 @@ async def retrieve_verified_knowledge(state: dict, ledger: BudgetLedger, *, sear
     from app.knowledge.pipeline import ProductionKnowledgePipeline, production_protocols
 
     source_query = state.get("resolved_query") or state["raw_query"]
-    if any(knowledge_input_stop_reason(value) for value in (state["raw_query"], source_query, query)):
-        raise ContextBudgetExceeded("本轮知识输入超出可处理范围")
-    evidence_policy = load_evidence_policy(Path(settings.evidence_policy_path), protocols=production_protocols(settings))
-    key = json_hash({"turn_id": state["context"]["turn_id"], "query": query, "source_query": source_query,
-                     "filters": filters or {}, "policy": policy,
-                     "prepared_queries": prepared_queries, "evidence_policy_version": evidence_policy.version})
     state["knowledge_faults"] = unresolved_knowledge_faults(state)
-    cached = state.get("knowledge_cache", {}).get(key)
-    saved = RetrievalSnapshot.model_validate(state["retrieval_snapshot"]) if state.get("retrieval_snapshot") else None
-    if cached is not None:
-        outcome = VerifiedKnowledgeOutcome.model_validate(cached)
-        state["knowledge_faults"].pop(key, None)
-        merged = merge_snapshots(saved, outcome.retrieval_snapshot) if outcome.retrieval_snapshot else saved
-        state["retrieval_snapshot"] = merged.model_dump(mode="json") if merged else None
-        if stage_callback is not None:
-            stage_callback("policy", "running")
-            stage_callback("policy", "completed")
-        return outcome.model_copy(update={"budget": merge_knowledge_budget(ledger.snapshot(), outcome.budget),
-                                          "retrieval_snapshot": merged}, deep=True)
-    # 缓存重放没有新尝试；真正重新执行时以原轮已保存次数区分故障后的再次检索。
-    capture = RetrievalCapture(state["context"]["turn_id"], json_hash([key, len(saved.attempts) if saved else 0]))
+    responsibility = {"turn_id": state["context"]["turn_id"], "query": query, "source_query": source_query,
+                      "filters": filters or {}, "policy": policy, "prepared_queries": prepared_queries}
+    # 策略尚未读出时也保留当前范围的准备责任；只有该范围完整成功后才解除。
+    preparation_key = "prepare:" + json_hash(responsibility)
+    key = preparation_key
+    try:
+        evidence_policy = load_evidence_policy(Path(settings.evidence_policy_path), protocols=production_protocols(settings))
+        key = json_hash({**responsibility, "evidence_policy_version": evidence_policy.version})
+        if any(knowledge_input_stop_reason(value) for value in (state["raw_query"], source_query, query)):
+            raise ContextBudgetExceeded("本轮知识输入超出可处理范围")
+        cached = state.get("knowledge_cache", {}).get(key)
+        saved = RetrievalSnapshot.model_validate(state["retrieval_snapshot"]) if state.get("retrieval_snapshot") else None
+        if cached is not None:
+            outcome = VerifiedKnowledgeOutcome.model_validate(cached)
+            merged = merge_snapshots(saved, outcome.retrieval_snapshot) if outcome.retrieval_snapshot else saved
+            state["retrieval_snapshot"] = merged.model_dump(mode="json") if merged else None
+            if stage_callback is not None:
+                stage_callback("policy", "running")
+                stage_callback("policy", "completed")
+            outcome = outcome.model_copy(update={"budget": merge_knowledge_budget(ledger.snapshot(), outcome.budget),
+                                                "retrieval_snapshot": merged}, deep=True)
+        else:
+            # 缓存重放没有新尝试；真正重新执行时以原轮已保存次数区分故障后的再次检索。
+            capture = RetrievalCapture(state["context"]["turn_id"], json_hash([key, len(saved.attempts) if saved else 0]))
 
-    async def save_snapshot(incoming):
-        """每次子查询完成或故障立即保存原轮。参数：本请求快照；返回：None；异常：仓储或冲突错误。"""
-        current = RetrievalSnapshot.model_validate(state["retrieval_snapshot"]) if state.get("retrieval_snapshot") else None
-        merged = merge_snapshots(current, incoming)
-        state["retrieval_snapshot"] = merged.model_dump(mode="json")
-        faults = [item for item in incoming.attempts if item.status == "fault"]
-        if faults:
-            state["knowledge_faults"][key] = faults[-1].fault or "retrieval_fault"
-        if chat is not None:
-            await chat.save_retrieval_snapshot(ToolContext.model_validate(state["context"]), merged)
+            async def save_snapshot(incoming):
+                """每次子查询完成或故障立即保存原轮。参数：本请求快照；返回：None；异常：仓储或冲突错误。"""
+                current = RetrievalSnapshot.model_validate(state["retrieval_snapshot"]) if state.get("retrieval_snapshot") else None
+                merged = merge_snapshots(current, incoming)
+                state["retrieval_snapshot"] = merged.model_dump(mode="json")
+                if chat is not None:
+                    await chat.save_retrieval_snapshot(ToolContext.model_validate(state["context"]), merged)
 
-    capture.on_update = save_snapshot
-    async with asyncio.timeout(settings.knowledge_timeout_seconds):
-        pipeline = ProductionKnowledgePipeline(search, settings, query_expander=query_expander,
-            state=state, policy=policy, prepared_queries=prepared_queries, stage_callback=stage_callback)
-        prepared = await pipeline.prepare(query, filters or {}, messages=[], budget=ledger)
-        result = await pipeline.retrieve(prepared, capture=capture)
-    ranked, selected, prepared_queries = result["ranked"], result["selected"], result["queries"]
-    gate = assess_evidence(ranked, selected, evidence_policy)
-    # 整个同责任检索成功后才解除该键；其他范围/查询的故障与全部历史attempt继续保留。
+            capture.on_update = save_snapshot
+            async with asyncio.timeout(settings.knowledge_timeout_seconds):
+                pipeline = ProductionKnowledgePipeline(search, settings, query_expander=query_expander,
+                    state=state, policy=policy, prepared_queries=prepared_queries, stage_callback=stage_callback)
+                prepared = await pipeline.prepare(query, filters or {}, messages=[], budget=ledger)
+                result = await pipeline.retrieve(prepared, capture=capture)
+            ranked, selected, actual_queries = result["ranked"], result["selected"], result["queries"]
+            gate = assess_evidence(ranked, selected, evidence_policy)
+            evidence = [item.model_dump(mode="json") for item in selected] if gate.passed else []
+            outcome = VerifiedKnowledgeOutcome(evidence=evidence, gate=gate.model_dump(mode="json"),
+                evidence_scores=[item.score for item in ranked], expanded_queries=actual_queries, budget=ledger.snapshot(),
+                retrieval_snapshot=RetrievalSnapshot.model_validate(state["retrieval_snapshot"]) if state.get("retrieval_snapshot") else None)
+            if stage_callback is not None:
+                stage_callback("policy", "completed")
+            state["knowledge_cache"] = {**state.get("knowledge_cache", {}), key: outcome.model_dump(mode="json")}
+    except (Exception, asyncio.CancelledError) as error:
+        # raw快照只描述实际检索；输入、准备、选择、门闸失败另记责任，不篡改成功原件。
+        # 只记录类别并原样上抛；执行器即使把错误转安全回执，回答也不能借旧gate入池。
+        state["knowledge_faults"][key] = ("budget_exceeded" if isinstance(error,
+            (ContextBudgetExceeded, WorkflowBudgetExceeded)) else type(error).__name__)
+        raise
     state["knowledge_faults"].pop(key, None)
-    evidence = [item.model_dump(mode="json") for item in selected] if gate.passed else []
-    outcome = VerifiedKnowledgeOutcome(evidence=evidence, gate=gate.model_dump(mode="json"),
-        evidence_scores=[item.score for item in ranked], expanded_queries=prepared_queries, budget=ledger.snapshot(),
-        retrieval_snapshot=RetrievalSnapshot.model_validate(state["retrieval_snapshot"]) if state.get("retrieval_snapshot") else None)
-    state["knowledge_cache"] = {**state.get("knowledge_cache", {}), key: outcome.model_dump(mode="json")}
-    if stage_callback is not None:
-        stage_callback("policy", "completed")
+    state["knowledge_faults"].pop(preparation_key, None)
     return outcome
 
 
