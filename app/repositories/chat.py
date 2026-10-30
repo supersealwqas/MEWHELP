@@ -210,12 +210,40 @@ class ChatRepository:
                 Message.turn_id == source.turn_id, Message.role == "assistant", Message.tool_calls.is_(None),
                 Message.turn_status == "completed").order_by(Message.id.desc()).limit(1))
             return {"context": source_context(conversation, source), "turn_status": source.turn_status,
+                    "trace_identity": (source.rag_metadata or {}).get("trace_identity"),
                     "order_selection": (source.rag_metadata or {}).get("order_selection"),
                     "pending_ticket": (source.rag_metadata or {}).get("pending_ticket"),
                     "ticket_intent": (source.rag_metadata or {}).get("ticket_intent"),
                     "ticket_write_state": (source.rag_metadata or {}).get("ticket_write_state"),
                     "answer": answer.content if answer is not None else None,
                     "completion_metadata": answer.rag_metadata if answer is not None else None}
+
+    async def save_trace_identity(self, context: ToolContext, identity: dict) -> dict:
+        """在首次模型调用前锁原用户行保存追踪根，重试复用已有根。
+
+        参数：context 可信原轮及原问，identity 仅含字符串身份与根 ID 的 JSON 字典。
+        返回：dict，已经保存的原轮身份；异常：ValueError，来源/字段不符；数据库错误原样传播。
+        """
+        import re
+        expected = {"trace_id", "session_id", "user_id", "turn_id", "root_observation_id"}
+        if (set(identity) != expected or any(not isinstance(value, str) for value in identity.values())
+                or not re.fullmatch(r"[0-9a-f]{32}", identity["trace_id"])
+                or not re.fullmatch(r"[0-9a-f]{16}", identity["root_observation_id"])
+                or any(identity[key] != getattr(context, key) for key in ("session_id", "user_id", "turn_id"))):
+            raise ValueError("追踪身份必须属于当前原轮")
+        async with self.factory.begin() as session:
+            conversation, source = await owned_source(session, context.session_id, context.user_id, context.turn_id, lock=True)
+            if source is None or source_context(conversation, source) != context.model_copy(update={"tool_call_id": ""}):
+                raise ValueError("追踪身份缺少匹配的原始用户消息")
+            metadata = dict(source.rag_metadata or {})
+            if metadata.get("trace_identity") is not None:
+                saved = metadata["trace_identity"]
+                if any(saved.get(key) != identity[key] for key in expected - {"root_observation_id"}):
+                    raise ValueError("原轮追踪身份不能被替换")
+                return dict(saved)
+            # JSON整体赋值使SQLAlchemy可靠标记脏字段，其他原轮数据保持完整。
+            source.rag_metadata = {**metadata, "trace_identity": dict(identity)}
+            return dict(identity)
 
     async def save_ticket_intent(self, context: ToolContext, intent) -> None:
         """把当前诉求保存到原用户行，不修改原始聊天正文。

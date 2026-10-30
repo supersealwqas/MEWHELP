@@ -24,7 +24,7 @@ from sqlalchemy.exc import DBAPIError
 from app.repositories.chat import PersistenceUncertain
 from app.repositories.tool_audit import ToolAuditEntry
 from app.schemas.tools import ToolContext, ToolError, ToolResult
-from app.tools.contracts import ToolBinding, ToolDefinition, ToolExecutionScope, WriteAuthorization, WriteAuthorizationRejected, json_hash
+from app.tools.contracts import ToolBinding, ToolDefinition, ToolExecutionScope, WriteAuthorization, WriteAuthorizationRejected, binding_dict, json_hash
 from app.tools.validation import validate_arguments
 
 logger = logging.getLogger(__name__)
@@ -112,9 +112,24 @@ class ToolExecutor:
     async def execute(self, call: dict, context: ToolContext,
                       on_status: Callable[[dict], Awaitable[None]], *,
                       scope: ToolExecutionScope | None = None) -> ToolResult:
+        """统一观测真实工具执行，保留MCP自身回调且不另建模型消费。
+
+        参数：原始申请/可信身份/状态回调/权限资源；返回：可靠ToolResult；异常：原业务错误与取消透传。
+        """
+        from app.observability.runtime import observe
+        with observe("tool.execute", kind="tool", input={"call": call, "context": context.model_dump(mode="json"),
+                "binding": binding_dict(scope.binding) if scope and scope.binding else None}) as observation:
+            result = await self._execute(call, context, on_status, scope=scope, observation=observation)
+            observation.update(output=result.model_dump(mode="json"),
+                               metadata={"result_ok": result.ok, "error_code": result.error.code if result.error else None})
+            return result
+
+    async def _execute(self, call: dict, context: ToolContext,
+                       on_status: Callable[[dict], Awaitable[None]], *, scope: ToolExecutionScope | None,
+                       observation) -> ToolResult:
         """校验、回放或执行一次申请，再保存事实与独立审计。
 
-        参数：call含匹配id/name/args；context服务端可信身份；on_status异步状态回调；scope可信来源与授权资源。
+        参数：call含匹配id/name/args；context服务端可信身份；on_status异步状态回调；scope可信来源与授权资源；observation当前观测。
         返回：ToolResult，已可靠保存的原始业务结果。
         异常：ValueError，调用协议/身份非法；PersistenceUncertain，不能核实提交；GraphInterrupt及取消原样透传。
         """
@@ -137,6 +152,7 @@ class ToolExecutor:
             # 回读优先于最新权限：已提交事实不能因撤权、撤下来源或schema变化被改写。
             existing = await self._read_result(context)
             if existing is not None:
+                observation.update(metadata={"replay": True, "attempts": 0})
                 mock = existing.is_mock
                 await emit("succeeded" if existing.ok else "failed")
                 return existing
@@ -145,12 +161,14 @@ class ToolExecutor:
                 result = ToolResult.failed("UNKNOWN_TOOL", "该申请没有可核实的工具来源，本次没有执行")
             else:
                 row, arguments, result = self._preflight(binding, raw_args, context)
+                observation.update(metadata={"source": binding.identity.source, "preflight_allowed": result is None})
                 if row is not None:
                     write, mock = row.access == "write", self._mock(row)
                 if result is None and scope.rejection is not None:
                     result = scope.rejection.model_copy(deep=True)
                 if result is None and write:
                     result = await self._authorize(raw_args, context, scope)
+                    observation.update(metadata={"write_authorized": result is None})
                     if result is None:
                         # interrupt恢复以及异步确认返回后必须重新读取最新定义/权限/参数。
                         row, arguments, result = self._preflight(binding, raw_args, context)
@@ -158,7 +176,7 @@ class ToolExecutor:
                             write, mock = row.access == "write", self._mock(row)
                 await emit("running")
                 if result is None:
-                    result = await self._invoke(row, arguments, context, scope, metrics, emit)
+                    result = await self._invoke(row, arguments, context, scope, metrics, emit, observation)
                 result = result.model_copy(update={"is_mock": mock})
             result = await self._persist(context, result, metrics)
         except (GraphInterrupt, asyncio.CancelledError):
@@ -174,6 +192,8 @@ class ToolExecutor:
             await self._audit(binding, raw_args, context, self._classify_failure(error, is_write=write), metrics)
             raise
         await self._audit(binding, raw_args, context, result, metrics)
+        observation.update(metadata={"retries": metrics.retries, "duration_ms": metrics.duration_ms,
+                                     "recovery_note": metrics.recovery_note})
         await emit("succeeded" if result.ok else "failed")
         return result
 
@@ -276,10 +296,10 @@ class ToolExecutor:
         return None
 
     async def _invoke(self, row: ToolDefinition, arguments: dict, context: ToolContext, scope: ToolExecutionScope,
-                      metrics: _Execution, emit: Callable[[str], Awaitable[None]]) -> ToolResult:
+                      metrics: _Execution, emit: Callable[[str], Awaitable[None]], observation) -> ToolResult:
         """执行有界业务尝试，写入故障仅核实原键。
 
-        参数：最新定义/规范化参数/身份/资源/调用计量/状态回调。
+        参数：最新定义/规范化参数/身份/资源/调用计量/状态回调/当前观测。
         返回：完整ToolResult；异常：PersistenceUncertain、GraphInterrupt或取消；所有程序错误转安全故障。
         """
         write = row.access == "write"
@@ -289,6 +309,7 @@ class ToolExecutor:
         try:
             for attempt in range((0 if write else self.retries) + 1):
                 metrics.retries = attempt
+                observation.update(metadata={"attempts": attempt + 1, "arguments": arguments})
                 try:
                     async with asyncio.timeout(timeout):
                         result = await row.invoke(deepcopy(arguments), context, scope)
@@ -298,6 +319,7 @@ class ToolExecutor:
                 except (GraphInterrupt, asyncio.CancelledError):
                     raise
                 except Exception as error:
+                    observation.update(metadata={"last_attempt_error": type(error).__name__})
                     if _contains_control(error):
                         raise
                     # 即使错误表示提交未知，也允许只读核实已提交回执；绝不再次调用写handler。

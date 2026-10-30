@@ -11,6 +11,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
 from app.config import Settings
+from app.observability.runtime import ObservabilityRuntime
 from app.core.memory import ContextBudgetExceeded
 from app.core.model_budget import BudgetLedger, WorkflowBudgetExceeded, budget_summary
 from app.knowledge.answering import EvidenceCitation
@@ -68,6 +69,7 @@ class WorkflowDependencies:
     registry: ToolRegistry | None = None  # 应用级唯一可动态变更清单。
     permissions: ToolPermissions | None = None  # 本地授权热加载器。
     mcp: MCPToolManager | None = None  # 同清单的MCP发现生命周期。
+    observability: ObservabilityRuntime | None = None  # 应用级可观测运行时，不进入State。
 
     def __post_init__(self):
         """只在依赖建立时提供兼容清单，不在构图或决定时复制。参数：自身；返回：None；异常：无。"""
@@ -133,6 +135,8 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
         update = {"intent": result.intent, "intent_confidence": result.confidence}
         publish_stage(state, "classify", "completed", intent=result.intent, confidence=result.confidence)
         route = route_by_intent({**state, **update})
+        if deps.observability is not None:
+            deps.observability.record_intent(result.intent, result.confidence, route)
         logger.info("workflow intent=%s route=%s", result.intent, route)
         return {**update, "route": route, "budget": ledger.snapshot()}
 
@@ -366,4 +370,5 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
     for node in ("complaint_reply", "chitchat_reply", "fallback_reply"):
         graph.add_edge(node, "log_turn")
     graph.add_edge("log_turn", END)
-    return graph.compile(checkpointer=checkpointer).with_config({"recursion_limit": 64})
+    callbacks = [deps.observability.callback_handler] if deps.observability is not None else []
+    return graph.compile(checkpointer=checkpointer).with_config({"recursion_limit": 64, "callbacks": callbacks})

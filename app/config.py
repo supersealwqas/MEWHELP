@@ -23,6 +23,13 @@ class Settings(BaseSettings):
     )
 
     # 对话模型配置项
+    observability_enabled: bool = Field(default=False, description="显式启用本机 Langfuse；开发验收固定全量采样")
+    langfuse_base_url: str = Field(default="http://127.0.0.1:13000", description="只允许本机回环的 Langfuse Web 地址")
+    langfuse_public_key: str = Field(default="", description="本机 Langfuse 项目公钥，只放本地环境配置")
+    langfuse_secret_key: SecretStr = Field(default=SecretStr(""), description="本机 Langfuse 项目密钥，不写入日志或前端")
+    observability_shutdown_timeout_seconds: float = Field(default=5, gt=0, le=30,
+        description="应用等待观测导出关闭的总秒数，超时明确记录未完成导出")
+
     chat_base_url: str = Field(
         min_length=1,
         description="对话模型上游兼容端点地址（支持 OpenAI 协议）",

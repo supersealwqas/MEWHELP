@@ -195,6 +195,15 @@ class BgeReranker:
         return sorted(ranked, key=lambda item: (-item.score, item.chunk.id))[:top_n]
 
     async def rank(self, query: str, chunks: list[ChunkSnapshot], *, top_n: int = 10) -> list[RankedChunk]:
+        """观测本地精排实际输入输出及耗时，不当作LLM消费。参数：查询/完整候选/上限；返回：排名；异常：原推理错误透传。"""
+        from app.observability.runtime import observe
+        with observe("knowledge.rerank", kind="span", input={"query": query, "top_n": top_n,
+                "chunks": [chunk.model_dump(mode="json") for chunk in chunks]}) as observation:
+            ranked = await self._rank(query, chunks, top_n=top_n)
+            observation.update(output={"ranked": [item.model_dump(mode="json") for item in ranked]})
+            return ranked
+
+    async def _rank(self, query: str, chunks: list[ChunkSnapshot], *, top_n: int = 10) -> list[RankedChunk]:
         """按原 query 对完整 chunk 重排，默认最多 10。
 
         参数：query 非空完整查询；chunks 权威快照；top_n 为 1–50 正整数。

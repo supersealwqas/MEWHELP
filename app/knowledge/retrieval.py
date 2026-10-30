@@ -137,9 +137,22 @@ class HybridKnowledgeSearch:
     async def _retrieve_one(self, query: str, top_k: int,
                             scope: dict[int, ChunkSnapshot] | None = None, *,
                             bm25_query: str | None = None, rerank_query: str | None = None) -> list[RankedChunk]:
+        """记录一次实际查询、召回候选及最终精排。参数：查询/上限/范围及阶段查询；返回：真实排名；异常：检索错误透传。"""
+        from app.observability.runtime import observe
+        with observe("knowledge.retrieve", kind="retriever", input={"query": query, "top_k": top_k,
+                "scope_ids": sorted(scope) if scope is not None else None,
+                "bm25_query": bm25_query, "rerank_query": rerank_query}) as observation:
+            ranked = await self._retrieve_one_observed(query, top_k, scope, bm25_query=bm25_query,
+                                                       rerank_query=rerank_query, observation=observation)
+            observation.update(output={"ranked": [item.model_dump(mode="json") for item in ranked]})
+            return ranked
+
+    async def _retrieve_one_observed(self, query: str, top_k: int,
+                                     scope: dict[int, ChunkSnapshot] | None = None, *,
+                                     bm25_query: str | None, rerank_query: str | None, observation) -> list[RankedChunk]:
         """执行一次完整混合召回、权威回读、原 chunk 重排。
 
-        参数：query 标准子句；top_k 结果上限；scope 权威筛选快照；bm25_query/rerank_query 各阶段完整文本。
+        参数：query 标准子句；top_k 结果上限；scope 权威筛选快照；bm25_query/rerank_query 各阶段完整文本；observation 当前观测。
         返回：list[RankedChunk]，最多 top_k 权威块；候选默认最多 50。
         异常：KnowledgeSearchUnavailable，空索引或权威状态失配；编码/索引/重排依赖异常。
         """
@@ -152,6 +165,8 @@ class HybridKnowledgeSearch:
         options = {"filter_ids": sorted(scope)} if scope is not None else {}
         hits = await self.index.hybrid_search(vectors[0], bm25_query if bm25_query is not None else query, dense_limit=recall,
                                               sparse_limit=recall, limit=recall, **options)
+        observation.update(metadata={"recall_candidates": [hit.model_dump(mode="json") for hit in hits],
+                                     "candidate_count": len(hits)})
         if not hits:
             # 真空库允许零结果；仍有有效原文却没有 Dense 候选属于同步故障。
             if scope or await self.store.active_page(after_id=0, limit=1):
@@ -176,6 +191,7 @@ class HybridKnowledgeSearch:
             chunks.append(row)
         if not chunks:
             raise KnowledgeSearchUnavailable("知识混合索引与 MySQL 权威状态不一致")
+        observation.update(metadata={"verified_candidates": [chunk.model_dump(mode="json") for chunk in chunks]})
         ranked = await self.reranker.rank(rerank_query if rerank_query is not None else query, chunks, top_n=top_k)
         expected = {row.id: row for row in chunks}
         ids = [item.chunk.id for item in ranked]

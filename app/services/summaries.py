@@ -2,7 +2,13 @@
 
 import asyncio
 import logging
+from contextvars import Context
+from contextlib import nullcontext
 from time import monotonic
+from uuid import uuid4
+
+from langchain_core.runnables import RunnableLambda
+from app.observability.runtime import TraceIdentity
 
 from app.core.context_budget import TokenEstimator
 from app.core.context_layers import build_context_snapshot, history_blocks, project_summaries
@@ -17,8 +23,8 @@ class SummaryManager:
     """应用级单实例任务池；不持聊天锁、请求session或checkpoint引用。"""
 
     def __init__(self, repository: ContextRepository, generator, settings, *, retry_seconds=60.0,
-                 close_seconds=5.0, timeout_seconds=90.0, concurrency=2, max_pending=32):
-        """参数：独立仓储/生成器/窗口配置、退避/关闭/单批超时秒数、并发及排队上限；返回：None；异常：ValueError。"""
+                 close_seconds=5.0, timeout_seconds=90.0, concurrency=2, max_pending=32, observability=None):
+        """参数：独立仓储/生成器/窗口配置、退避/关闭/单批超时秒数、并发/排队上限、可选观测运行时；返回：None；异常：ValueError。"""
         if min(retry_seconds, timeout_seconds) <= 0 or close_seconds < 0 or not 1 <= concurrency <= max_pending:
             raise ValueError("摘要任务池需合法的有界并发与时间限制")
         self.repository, self.generator = repository, generator
@@ -28,6 +34,13 @@ class SummaryManager:
         self.max_pending, self._slots = max_pending, asyncio.Semaphore(concurrency)
         self._tasks, self._retry_after, self._dirty = {}, {}, set()
         self._closing, self._recovery = False, None
+        self.observability = observability
+        self._generation = RunnableLambda(self._generate_batch).with_config(
+            callbacks=[observability.callback_handler] if observability is not None else [])
+
+    async def _generate_batch(self, batch):
+        """让后台模型继承唯一回调。参数：含messages/background的本批输入；返回：摘要草稿；异常：模型错误原样传播。"""
+        return await self.generator.generate(batch["messages"], batch["background"])
 
     @property
     def active_count(self) -> int:
@@ -51,7 +64,8 @@ class SummaryManager:
             logger.info("summary skip conversation=%s range=unloaded reason=%s elapsed_ms=0", conversation_id, reason)
             return False
         # 此前没有await，同事件循环内检查与登记不可被另一聊天请求插入。
-        self._tasks[conversation_id] = asyncio.create_task(self._run(conversation_id))
+        # 后台工作不能继承触发它的客服trace或LangChain回调上下文。
+        self._tasks[conversation_id] = asyncio.create_task(self._run(conversation_id), context=Context())
         return True
 
     async def _run(self, conversation_id: int) -> None:
@@ -95,7 +109,11 @@ class SummaryManager:
                     logger.info("summary start conversation=%s from=%s upto=%s elapsed_ms=%.1f",
                                 conversation_id, first, last, (monotonic()-started)*1000)
                     async with asyncio.timeout(self.timeout_seconds):
-                        draft = await self.generator.generate(batch, background)
+                        identity = TraceIdentity(uuid4().hex, f"conversation:{conversation_id}",
+                                                 f"summary:{first}:{last}", "background")
+                        boundary = self.observability.execution(identity, kind="summary") if self.observability else nullcontext()
+                        with boundary:
+                            draft = await self._generation.ainvoke({"messages": batch, "background": background})
                     validate_summary(draft, batch)
                     saved = await self.repository.append_summary(conversation_id, expected_summary_upto=anchor,
                         from_msg_id=first, upto_msg_id=last, content=draft.content,

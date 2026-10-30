@@ -24,6 +24,7 @@ def test_new_turn_replaces_every_runtime_field_and_retains_history():
     ]}]
     previous = new_turn_state(_context("查物流", "prior"), history, 11)
     previous.update(resolved_query="旧问题", messages=[{"role": "tool", "content": "旧事实"}],
+                    trace_identity={"trace_id": "旧轮追踪", "root_observation_id": "旧根"},
                     intent="物流", standard_query="旧检索问题", intent_confidence=0.9, order_id="1001",
                     order_data={"order_id": "1001"}, expanded_queries=["旧扩写"], selection_action={"action_id": "old"}, route="business", evidence=[{"chunk_id": 9}], evidence_scores=[0.9],
                     gate={"passed": True}, retrieval_attempted=True, degradations=[{"stage": "answer", "error_type": "ConnectionError"}],
@@ -43,6 +44,7 @@ def test_new_turn_replaces_every_runtime_field_and_retains_history():
     expected = {
         "context": {"conversation_id": 42, "session_id": "session", "user_id": "user",
                     "turn_id": "new-turn", "tool_call_id": "", "user_message": "1001"},
+        "trace_identity": None,
         "raw_query": "1001", "resolved_query": "", "history_turns": history, "audit_cursor": 13,
         "messages": [
             {"id": "turn:prior:user", "role": "user", "content": "查物流", "additional_kwargs": {"turn_id": "prior"}},

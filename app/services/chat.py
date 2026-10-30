@@ -5,8 +5,8 @@ import json
 import logging
 from time import perf_counter
 from typing import AsyncIterator
-from contextlib import aclosing, asynccontextmanager, suppress
-from dataclasses import asdict, dataclass
+from contextlib import aclosing, asynccontextmanager, nullcontext, suppress
+from dataclasses import asdict, dataclass, replace
 from uuid import uuid4
 import anyio
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -23,6 +23,7 @@ from app.schemas.chat import ChatEvent, ChatRequest, InvalidToolDecision
 from app.schemas.tools import ToolContext, ToolResult
 from app.tools.executor import ToolExecutor
 from app.workflow.state import checkpoint_thread_id
+from app.observability.runtime import TraceIdentity
 from app.schemas.workflow import CurrentActions, OrderSelection, OrderSelectionAction, OrderSelectionConflict, TicketResume
 from app.tools.confirmation import TicketPreviewAction, ticket_preview
 
@@ -516,11 +517,13 @@ class _WorkflowTrace(BaseCallbackHandler):
 class ChatService:
     """显式消费真实编译图的在线入口；完成事务和最终checkpoint均成功后才发布完成帧。"""
 
-    def __init__(self, chat_repository, graph, executor, settings, *, guard: ConversationGuard | None = None, summaries=None):
-        """注入共享资源。参数：仓储/编译图/执行器/配置、可选互斥和应用摘要管理器；返回：None；异常：无。"""
+    def __init__(self, chat_repository, graph, executor, settings, *, guard: ConversationGuard | None = None, summaries=None,
+                 observability=None):
+        """注入共享资源。参数：仓储/编译图/执行器/配置、可选互斥/摘要管理器/观测运行时；返回：None；异常：无。"""
         self.chat, self.graph, self.executor, self.settings = chat_repository, graph, executor, settings
         self.guard = guard if guard is not None else ConversationGuard()
         self.summaries = summaries
+        self.observability = observability
 
     async def _schedule_summary(self, values: dict, conversation_id: int) -> None:
         """登记已有积压，不等待后台模型。参数：最终State/可信会话；返回：None；异常：调度错误隔离并留痕。"""
@@ -531,10 +534,11 @@ class ChatService:
         except Exception as error:
             logger.warning("summary fail conversation=%s reason=schedule type=%s", conversation_id, type(error).__name__)
 
-    async def _stream_workflow(self, state: dict, config: dict):
+    async def _stream_workflow(self, state: dict, config: dict, *, identity=None, context=None, trace_state=None):
         """由独占asyncio任务拥有整个图，隔离ASGI取消域的重复取消。
 
-        参数：state本轮初态、config图配置；返回：原namespace/custom事件流。
+        参数：state本轮初态、config图配置、identity原轮身份、context可信来源、trace_state已保存分类。
+        返回：原namespace/custom事件流。
         异常：图错误原样传播；消费者取消时只取消生产任务一次，等待节点和模型关闭后才退出。
         """
         queue = asyncio.Queue()
@@ -543,10 +547,27 @@ class ChatService:
         async def produce():
             """完整消费原图并在所有出口唤醒消费者。参数：无；返回：None；异常：原图错误/取消。"""
             try:
-                async with aclosing(self.graph.astream(state, config, stream_mode="custom", subgraphs=True,
-                                                       durability="sync")) as upstream:
-                    async for item in upstream:
-                        queue.put_nowait(item)
+                kind = "chat" if isinstance(state, dict) else "resume"
+                boundary = self.observability.execution(identity, kind=kind) if identity else nullcontext()
+                # 同一生产任务进入/退出上下文，避免ASGI在其他任务关闭异步生成器时重置错误token。
+                with boundary as root:
+                    initial = state
+                    if identity is not None:
+                        saved = await self.chat.save_trace_identity(context, asdict(identity))
+                        if saved != asdict(identity):
+                            raise PersistenceUncertain("原轮追踪根已被另一执行保存")
+                        initial = {**state, "trace_identity": saved} if isinstance(state, dict) else replace(
+                            state, update={**(state.update or {}), "trace_identity": saved})
+                        if (trace_state or {}).get("intent") is not None:
+                            self.observability.record_intent(trace_state["intent"], trace_state["intent_confidence"], trace_state["route"])
+                    async with aclosing(self.graph.astream(initial, config, stream_mode="custom", subgraphs=True,
+                                                           durability="sync")) as upstream:
+                        async for item in upstream:
+                            queue.put_nowait(item)
+                    if root is not None:
+                        final = await self.graph.aget_state(config)
+                        root.update(output={"status": "paused" if final.next else "completed",
+                                            "stop_reason": final.values.get("stop_reason")})
             finally:
                 queue.put_nowait(finished)
 
@@ -766,7 +787,14 @@ class ChatService:
         异常：图/存储/取消错误；已确认暂停后不改原轮终态。
         """
         config = {"configurable": {"thread_id": checkpoint_thread_id(context.conversation_id)}}
-        stream = self._stream_workflow(initial, {**config, "callbacks": [_WorkflowTrace()]})
+        identity, trace_state = None, None
+        if self.observability is not None and self.observability.enabled:
+            row = await self.chat.get_workflow_turn(context.session_id, context.user_id, context.turn_id)
+            saved = row.get("trace_identity") if row else None
+            identity = TraceIdentity(**saved) if saved else self.observability.identity_for(context)
+            trace_state = initial if isinstance(initial, dict) else (await self.graph.aget_state(config)).values
+        stream = self._stream_workflow(initial, {**config, "callbacks": [_WorkflowTrace()]},
+                                       identity=identity, context=context, trace_state=trace_state)
         try:
             async for namespace, payload in stream:
                 event = self._public_event(payload, context)

@@ -43,6 +43,7 @@ from app.repositories.tool_audit import ToolAuditRepository
 from app.workflow.graph import WorkflowDependencies
 from app.workflow.model import WorkflowModelAdapter
 from app.workflow.runtime import workflow_runtime
+from app.observability.runtime import ObservabilityRuntime
 
 # 在应用创建前初始化业务日志，确保所有模块的 logger 都使用统一格式输出。
 setup_logging()
@@ -133,7 +134,9 @@ async def database_runtime():
     engine, factory = create_database()
     lease_engine = None
     mcp = None
+    observability = None
     try:
+        observability = ObservabilityRuntime(settings)
         repository = ChatRepository(factory)
         lease_engine = create_async_engine(
             engine.url,
@@ -156,11 +159,12 @@ async def database_runtime():
                 audit_repository=ToolAuditRepository(factory), audit_timeout_seconds=settings.tool_audit_timeout_seconds)
             from app.knowledge.query_rewrite import QueryExpander
             deps = WorkflowDependencies(WorkflowModelAdapter(), search, executor, repository, settings,
-                QueryExpander(request_budget=settings.request_token_budget), registry=registry, permissions=permissions, mcp=mcp)
+                QueryExpander(request_budget=settings.request_token_budget), registry=registry, permissions=permissions, mcp=mcp,
+                observability=observability)
             async with workflow_runtime(deps, Path(settings.workflow_checkpoint_path)) as graph:
-                summaries = SummaryManager(ContextRepository(factory), SummaryGenerator(settings), settings)
+                summaries = SummaryManager(ContextRepository(factory), SummaryGenerator(settings), settings, observability=observability)
                 try:
-                    service = ChatService(repository, graph, executor, settings, summaries=summaries)
+                    service = ChatService(repository, graph, executor, settings, summaries=summaries, observability=observability)
                     await service.reconcile_waiting_turns()
                     await summaries.recover()
                     yield service
@@ -176,7 +180,11 @@ async def database_runtime():
                 if lease_engine is not None:
                     await lease_engine.dispose()
             finally:
-                await engine.dispose()
+                try:
+                    await engine.dispose()
+                finally:
+                    if observability is not None:
+                        await observability.aclose()
 
 
 # 运行时工厂可在测试边界替换，生产默认始终连接 MySQL，不提供内存后备。
