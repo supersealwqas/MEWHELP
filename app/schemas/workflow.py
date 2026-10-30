@@ -314,6 +314,15 @@ class TicketReceipt(BaseModel):
     status: Literal["待处理"] = Field(description="创建时确定的处理状态，不代表人工接入")
     audit_sync_pending: bool = Field(default=False, description="工单已提交但独立动作审计收尾仍待修复")
 
+    def answer_prefix(self) -> str:
+        """生成真实工单回执在普通回答与固定兜底中共用的正文前缀。
+
+        参数：无，使用当前回执已核验的工单号与创建状态。
+        返回：str，包含工单号、状态及两个换行的固定前缀。
+        异常：无；调用方必须先通过仓储核验本回执的成功事实。
+        """
+        return f"工单已创建，工单号：{self.ticket_no}，状态：{self.status}。\n\n"
+
 
 class PreparedTicketAction(BaseModel):
     """仓储从已完成来源验证后派生的独立动作，不接受HTTP直接构造。"""

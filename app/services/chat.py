@@ -936,17 +936,20 @@ class ChatService:
         receipt = await ActionRepository(self.chat.factory).get_chat_ticket_receipt(request)
         if receipt is not None:
             yield ChatEvent(event="delta", data={"delta": f"工单已创建，工单号：{receipt.ticket_no}，类型：{receipt.ticket_type}，状态：{receipt.status}。"})
-            yield ChatEvent(event="answer_metadata", data={"status": row["turn_status"], "turn_id": request.source_turn_id,
-                "ticket_receipt": receipt.model_dump(mode="json")})
-            yield ChatEvent(event="done")
+            # 工单完成不等于整轮完成；让页面沿既有 accepted + EOF 协议核实后续动作。
+            yield ChatEvent(event="action_status", data={"action_id": request.action_id,
+                "source_turn_id": request.source_turn_id, "status": "accepted"})
             return
         result = await self.chat.get_tool_result(row["context"])
         if result is not None and not result.ok:
+            if (row["pending_ticket"].get("execution_started") and result.error
+                    and result.error.category == "fault"):
+                # 断流可能早于预览收尾：处理器已开始的故障不能证明工单没有写入。
+                raise PersistenceUncertain("原工单执行结果待核实，不能重新执行")
             message = "工单申请已取消，本次没有创建工单。" if result.error and result.error.code == "USER_CANCELLED" else "本次工单没有创建，请查看处理结果。"
             yield ChatEvent(event="delta", data={"delta": message})
             yield ChatEvent(event="action_status", data={"action_id": request.action_id,
-                "source_turn_id": request.source_turn_id, "status": "cancelled" if request.decision == "cancel" else "failed"})
-            yield ChatEvent(event="done")
+                "source_turn_id": request.source_turn_id, "status": "accepted"})
             return
         raise PersistenceUncertain("原工单执行结果待核实，不能重新执行")
 
@@ -969,7 +972,9 @@ class ChatService:
                     config = {"configurable": {"thread_id": checkpoint_thread_id(context.conversation_id)}}
                     snapshot = await self.graph.aget_state(config)
                     waiting = self._waiting_action(snapshot, context)
-                    if row["turn_status"] == "completed" or pending.get("execution_started") or waiting is None:
+                    if (row["turn_status"] == "completed" or pending.get("execution_started")
+                            or pending.get("status") in {"completed", "cancelled", "unknown"} or waiting is None):
+                        # 执行前取消或权限拒绝也已有确定结果，不再向旧暂停点重复发送决定。
                         async for event in self._ticket_replay(request, row):
                             yield event
                         return

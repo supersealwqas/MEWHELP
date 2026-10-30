@@ -69,6 +69,35 @@ def test_current_request_can_include_historical_problem_facts(problem):
     assert module.ticket_description(intent) == problem
 
 
+@pytest.mark.parametrize("problem", ["订单1001取消后退款未到账", "设备停止工作"])
+def test_current_request_can_include_business_cancellation_or_stoppage(problem):
+    """把业务取消或设备停止误判为撤销建单时，本轮实际问题收集会失败。
+
+    参数：problem 含取消或停止的业务原话；返回：None；异常：断言失败。
+    """
+    module = importlib.import_module("app.tools.confirmation")
+    text = problem + "，帮我建个工单"
+    intent = module.advance_ticket_intent(None, context(text), "message-1")
+    assert intent is not None and intent.status == "collecting"
+    assert intent.user_texts == [text]
+    assert module.ticket_description(intent) == problem
+
+
+@pytest.mark.parametrize("problem", ["订单1001取消后退款未到账", "设备停止工作"])
+def test_collecting_accepts_business_cancellation_or_stoppage_followup(problem):
+    """把待补问题里的业务取消或设备停止误判为撤销时，相邻原话收集会失败。
+
+    参数：problem 紧接建单申请补充的业务事实；返回：None；异常：断言失败。
+    """
+    module = importlib.import_module("app.tools.confirmation")
+    prior = module.advance_ticket_intent(None, context("帮我建个工单"), "message-1")
+    current = module.advance_ticket_intent(prior, context(problem, "turn-2"), "message-2")
+    assert current.status == "collecting"
+    assert current.source_message_ids == ["message-1", "message-2"]
+    assert current.user_texts == ["帮我建个工单", problem]
+    assert module.ticket_description(current) == problem
+
+
 @pytest.mark.parametrize("text", [
     "上次已经建了工单", "之前我说过，帮我建个工单", "我以前提过，帮我建个工单",
     "之前客服说，帮我建个工单", "之前买的订单坏了，但不要建工单",
@@ -111,7 +140,8 @@ def test_next_user_turn_can_complete_collecting_intent():
     assert current.source_message_ids == ["user-message-1", "user-message-2"]
 
 
-@pytest.mark.parametrize("text", ["算了，不建了", "先查订单1002在不在保", "查一下订单1001的物流"])
+@pytest.mark.parametrize("text", ["算了，不建了", "先查订单1002在不在保", "查一下订单1001的物流",
+                                 "取消工单", "算了", "停止建单", "不要建工单", "取消", "停止"])
 def test_cancel_or_independent_query_closes_previous_collecting(text):
     """取消或开始独立查询之后不能继续沿用旧建单许可。
 
@@ -121,6 +151,43 @@ def test_cancel_or_independent_query_closes_previous_collecting(text):
     prior = module.advance_ticket_intent(None, context("帮我建个工单"), "user-message-1")
     current = module.advance_ticket_intent(prior, context(text, "turn-2"), "user-message-2")
     assert current is None or current.status in {"closed", "cancelled"}
+
+
+@pytest.mark.parametrize("withdrawal", ["取消工单", "算了", "停止建单", "不要建工单",
+                                       "取消工单，先查订单1002的物流"])
+def test_withdrawal_ends_permission_before_later_business_facts(withdrawal):
+    """收窄业务取消误拒不能让明确撤销后的新问题重新获得旧建单许可。
+
+    参数：withdrawal 用户明确撤销当前建单的原话；返回：None；异常：断言失败。
+    """
+    module = importlib.import_module("app.tools.confirmation")
+    prior = module.advance_ticket_intent(None, context("帮我建个工单"), "message-1")
+    withdrawn = module.advance_ticket_intent(prior, context(withdrawal, "turn-2"), "message-2")
+    current = module.advance_ticket_intent(withdrawn, context("订单1001取消后退款未到账", "turn-3"), "message-3")
+    assert current.status == "cancelled"
+    assert current.source_message_ids == ["message-1"]
+    assert module.ticket_description(current) is None
+
+
+@pytest.mark.parametrize("withdrawal", [
+    "取消吧，问题已经解决了", "请取消，退款已到账", "先取消吧，订单问题已解决",
+    "请停止，退款我自己解决",
+])
+def test_polite_withdrawal_with_business_facts_cannot_keep_ticket_permission(withdrawal):
+    """漏掉带礼貌词或语气词的撤销时，同条及后续业务事实会沿用旧建单许可。
+
+    参数：withdrawal 明确撤销且附带业务事实的用户原话；返回：None；异常：断言失败。
+    """
+    from app.tools.confirmation import advance_ticket_intent, ticket_description, ticket_write_rejection
+    prior = advance_ticket_intent(None, context("帮我建个工单"), "message-1")
+    withdrawn = advance_ticket_intent(prior, context(withdrawal, "turn-2"), "message-2")
+    assert withdrawn.status == "cancelled"
+    assert ticket_description(withdrawn) is None
+    followup_context = context("订单1001取消后退款未到账", "turn-3")
+    current = advance_ticket_intent(withdrawn, followup_context, "message-3")
+    assert current.status == "cancelled" and current.source_message_ids == ["message-1"]
+    rejected = ticket_write_rejection(current, {"description": "订单1001取消后退款未到账"}, followup_context, None)
+    assert rejected is not None and rejected.error.code == "NOT_CONFIRMED"
 
 
 def test_description_over_limit_is_not_silently_truncated():

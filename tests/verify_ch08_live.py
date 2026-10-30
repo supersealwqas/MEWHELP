@@ -78,16 +78,157 @@ def require(condition: bool, message: str) -> None:
         raise ValueError(message)
 
 
-def validate_model_evidence(source: Path, model: str) -> dict:
+def _rebuild_model_turn(row: dict, *, history: list, previous, tools: list, config, outputs: list):
+    """从冻结历史和已核验原始决定重建答复来源，不信任报告自述的故障或历史。
+
+    参数：row原始记录、history已核验历史、previous可信意图、tools目录、config当前配置、outputs原始分片聚合。
+    返回：重建对话与下一轮可信意图；异常：ValueError，消息、模拟事实、决定或来源不一致。
+    """
+    from copy import deepcopy
+    from langchain_core.messages import HumanMessage, SystemMessage, convert_to_messages
+    from app.core.llm import decision_message
+    from app.core.prompts import ANSWER_NUDGE
+    from app.schemas.chat import InvalidToolDecision
+    from app.schemas.tools import ToolContext
+    from app.schemas.workflow import AgentDecision
+    from app.tools.confirmation import advance_ticket_intent, ticket_description, ticket_context_notes
+    from app.tools.registry import ToolRegistry
+    from app.tools.validation import validate_arguments
+    from app.workflow.agent import model_messages
+    from app.workflow.answer_policy import query_fault_answer
+    from app.workflow.model import _parse_terminal_decision, _text, decision_tool_schemas
+    from app.workflow.prompts import ANSWER_PROMPT, DECISION_PROMPT, DECISION_NUDGE
+    from app.workflow.state import message_row, new_turn_state
+    from tests import eval_ch08_tools as evaluation
+    registry = ToolRegistry()
+    catalog = {tool.name: tool for tool in tools}
+    for tool in tools:
+        if tool.identity.source == "builtin":
+            registry.register_definition(tool)
+    for server in {tool.identity.server for tool in tools if tool.identity.source == "mcp"}:
+        registry.replace_source(server, [tool for tool in tools if tool.identity.server == server])
+    context = ToolContext(conversation_id=1, session_id=f"ch08-eval-{row['case_id']}-{row['repetition']}",
+        user_id="demo-user", turn_id=row["id"], user_message=row["query"])
+    state = new_turn_state(context, evaluation._history_turns(history), 0)
+    previous = advance_ticket_intent(previous, context, state["current_message_id"])
+    description = ticket_description(previous) if previous is not None else None
+    state["ticket_intent"] = previous.model_dump(mode="json") if previous is not None else None
+    require(row.get("trusted_intent") == state["ticket_intent"] and row.get("trusted_description") == description,
+            "可信建单意图或描述与冻结用户原话不一致")
+    decisions, calls, feedback, answers = [], [], [], []
+    terminal, correcting, preview = False, False, False
+    fixed_answer, terminal_kind = None, None
+    for record, output in zip(row["models"], outputs, strict=True):
+        stage = record["stage"]
+        if stage == "decide":
+            require(not terminal and not answers, "终止后混入额外模型决定")
+            current = {**state, "context_notes": [*state.get("context_notes", []), *ticket_context_notes(previous)]}
+            prepared = [SystemMessage(content=DECISION_PROMPT), *convert_to_messages(model_messages(current,
+                config, DECISION_PROMPT, decision_tool_schemas(tools), registry=registry))]
+            if correcting:
+                prepared.append(HumanMessage(content=DECISION_NUDGE))
+        else:
+            require(terminal and not preview and fixed_answer is None and len(answers) < 2 and not any(answers),
+                    "程序答复、预览或已有正文后混入模型答复记录")
+            current = {**state, "context_notes": [*state.get("context_notes", []),
+                evaluation.answer_button_note(state.get("suggested_kinds", []))]}
+            prepared = [SystemMessage(content=ANSWER_PROMPT), *convert_to_messages(model_messages(current,
+                config, ANSWER_PROMPT, registry=registry))]
+            if answers:
+                prepared.append(HumanMessage(content=ANSWER_NUDGE))
+            require(record.get("tool_schemas") == [], "正文阶段绑定了工具")
+        require(record["inputs"] == [message.model_dump(mode="json") for message in prepared],
+                "原始模型请求与冻结历史、当前原问或可信工具事实不一致")
+        if stage == "answer":
+            answers.append(_text(output) if not output.tool_calls and _text(output).strip() else "")
+            continue
+        try:
+            message = decision_message(output)
+        except InvalidToolDecision:
+            chunks = output.tool_call_chunks or []
+            control = chunks[0] if len(chunks) == 1 else {}
+            require(not correcting and control.get("name") == "submit_decision" and
+                isinstance(control.get("id"), str) and bool(control["id"].strip()), "模型决定不满足生产纠正规则")
+            correcting = True
+            continue
+        require(not message.invalid_tool_calls, "模型决定含非法工具申请")
+        raw_calls = message.tool_calls
+        if not raw_calls:
+            require(not correcting, "模型纠正仍未提交终止决定")
+            correcting = True
+            continue
+        ids = [call.get("id") for call in raw_calls]
+        require(all(isinstance(value, str) and value.strip() for value in ids) and len(set(ids)) == len(ids)
+                and all(call["name"] in {*catalog, "submit_decision"} for call in raw_calls), "模型工具名称或身份非法")
+        if any(call["name"] == "submit_decision" for call in raw_calls):
+            require(len(raw_calls) == 1, "终止控制与业务调用混合")
+            try:
+                selected = _parse_terminal_decision(raw_calls[0]["args"])
+            except InvalidToolDecision:
+                require(not correcting, "模型终止纠正仍然非法")
+                correcting = True
+                continue
+            decisions.append(selected.model_dump(mode="json"))
+            state["suggested_kinds"] = selected.suggested_actions
+            terminal, terminal_kind = True, selected.kind
+            fixed_answer = query_fault_answer(state, registry=registry)
+            continue
+        require(not correcting, "纠正轮不能发起业务申请")
+        selected = AgentDecision(kind="tools", tool_calls=[{key: call[key] for key in ("id", "name", "args")}
+                                                          for call in raw_calls])
+        decisions.append(selected.model_dump(mode="json"))
+        source_messages = evaluation._plain_messages(state["messages"])
+        # 只从已核验工具定义重建服务器快照，不采用报告自填的 access 或轮次。
+        state["tool_call_facts"] = {**state.get("tool_call_facts", {}), **{
+            call["id"]: {"turn_id": row["id"], "binding": asdict(catalog[call["name"]].binding),
+                         "access": catalog[call["name"]].access} for call in selected.tool_calls}}
+        state["messages"].append(message_row(row["id"], "assistant", "", calls=selected.tool_calls,
+            bindings={call["id"]: asdict(catalog[call["name"]].binding) for call in selected.tool_calls}))
+        for call in selected.tool_calls:
+            definition = catalog[call["name"]]
+            calls.append({**deepcopy(call), "argument_sources": evaluation.argument_sources(call, source_messages, description),
+                          "binding": asdict(definition.binding)})
+            if (definition.access == "write" and definition.name == "create_ticket" and description
+                    and call["args"].get("description") == description and not validate_arguments(definition.parameters, call["args"])):
+                preview, terminal, terminal_kind = True, True, "preview_candidate"
+                break
+            result = evaluation.simulated_feedback(definition, call["args"])
+            feedback.append({"tool_call_id": call["id"], "name": call["name"], "origin": "simulation", "result": result})
+            state["messages"].append(message_row(row["id"], "tool", json.dumps(result, ensure_ascii=False), call_id=call["id"]))
+    require(terminal and row.get("terminal_kind") == terminal_kind and row.get("preview_candidate") == preview,
+            "终止状态与原始模型决定不一致")
+    require(row.get("decisions") == decisions and row.get("calls") == calls, "决定、参数来源或工具绑定与原始记录不一致")
+    require(row.get("tool_call_facts") == state.get("tool_call_facts", {}), "原调用读写快照与可信工具定义不一致")
+    require(row.get("feedback") == feedback, "工具故障事实或simulation反馈被篡改")
+    origin = None if preview else "program" if fixed_answer is not None else "model"
+    policy = {"rule": "query_fault_answer", "reason": "current_read_fault_without_verified_facts"} if origin == "program" else None
+    answer = "" if preview else fixed_answer if origin == "program" else "".join(answers)
+    require(row.get("answer_origin") == origin and row.get("answer_policy") == policy and row.get("answer") == answer,
+            "答复来源、程序理由或正文与可信事实不一致")
+    require(bool(answers) and bool(answer) if origin == "model" else not answers, "正文模型记录缺失或伪造")
+    if not preview:
+        state["messages"].append(message_row(row["id"], "assistant", answer))
+    dialogue = evaluation._plain_messages(state["messages"])
+    require(row.get("dialogue") == dialogue, "完整对话与冻结历史或重建工具链不一致")
+    budget = row.get("budget") or {}
+    require(budget.get("model_calls") == len(row["models"]) and
+            [record.get("stage") for record in budget.get("records", [])] == [record["stage"] for record in row["models"]],
+            "调用预算与原始模型记录数量或阶段不一致")
+    return dialogue, previous
+
+
+def validate_model_evidence(source: Path, model: str, *, config=None) -> dict:
     """重新核验冻结题集、当前源码、逐轮原始模型与署名审阅，不相信摘要passed。
 
-    参数：source模型评估目录、model本次真实模型名称；返回：重新计算的通过证据。
+    参数：source模型评估目录、model本次真实模型名称、config本次配置，默认应用配置；返回：重新计算的通过证据。
     异常：ValueError/文件或JSON错误，缺失、旧版、控制模型及错绑证据；审阅者可明确署名为AI。
     """
     from langchain_core.messages import AIMessageChunk
-    from app.workflow.model import _text
-    from app.tools.contracts import json_hash
+    from app.config import settings
+    from app.workflow.model import _text, decision_tool_schemas
+    from app.tools.contracts import ToolDefinition, ToolIdentity, ResultPolicy, json_hash
     from tests import eval_ch08_tools as evaluation
+    config = settings if config is None else config
     metadata = json.loads((source / "summary.json").read_text(encoding="utf-8"))
     cases, fingerprint = evaluation.load_cases(source / "frozen-cases.json")
     require(metadata.get("case_sha256") == fingerprint and metadata.get("model") == model, "模型或冻结题集不匹配")
@@ -105,18 +246,31 @@ def validate_model_evidence(source: Path, model: str) -> dict:
             (catalog[name]["identity"]["source"], catalog[name]["identity"]["server"]) == origin
             for name, origin in evaluation.REQUIRED_TOOLS.items()), "模型报告缺少完整可信来源工具清单")
     require(all(definition["schema_hash"] == json_hash(definition["parameters"]) and
+            definition["identity"]["name"] == name and isinstance(definition.get("result_policy"), dict) and
             definition["access"] == ("write" if name == "create_ticket" else "read")
             for name, definition in catalog.items()), "模型清单schema或读写类型不符")
+
+    async def forbidden(arguments, context, scope):
+        """阻止证据重建误调用业务。参数：申请/身份/资源；返回：无；异常：RuntimeError，任何调用都拒绝。"""
+        raise RuntimeError("模型证据核验禁止执行业务工具")
+
+    tools = [ToolDefinition(ToolIdentity(**definition["identity"]), definition["description"],
+        definition["parameters"], forbidden, definition["access"], ResultPolicy(**definition["result_policy"]))
+        for definition in catalog_rows]
     expected = {f"{case['id']}.{repeat}.{number}": (case, number, turn)
                 for repeat in range(1, metadata["repetitions"] + 1) for case in cases
                 for number, turn in enumerate(case["turns"], 1)}
     rows = json.loads((source / "results.json").read_text(encoding="utf-8"))
     require(isinstance(rows, list) and len(rows) == len(expected) and
             {row.get("id") for row in rows} == set(expected), "模型逐轮记录不完整或重复")
-    calls = 0
-    for row in rows:
+    calls, histories, intents = 0, {}, {}
+    indexed = {row["id"]: row for row in rows}
+    # 按冻结题集推进，每个重复独立；报告行顺序或自述历史不能改变可信前序对话。
+    for identifier in expected:
+        row = indexed[identifier]
         case, number, turn = expected[row["id"]]
         require(row.get("case_id") == case["id"] and row.get("turn") == number and
+                type(row.get("repetition")) is int and row["id"] == f"{case['id']}.{row['repetition']}.{number}" and
                 row.get("query") == turn["query"] and row.get("expected") == turn["expected"], "模型题目或标注被替换")
         require(row.get("actual_preview_executed") is False and row.get("database_used") is False and
                 row.get("business_tools_executed") == 0 and
@@ -124,7 +278,7 @@ def validate_model_evidence(source: Path, model: str) -> dict:
         require(evaluation.inspect_turn(turn["expected"], row)["structural_status"] == "passed", "重算模型结构核验失败")
         records = row.get("models")
         require(isinstance(records, list) and bool(records), "逐轮缺少真实模型请求和原始分片")
-        observed_calls, answers = [], []
+        observed_calls, answers, outputs = [], [], []
         for record in records:
             require(record.get("closed") is True and not record.get("error_type") and
                     record.get("turn_id") == row["id"] and record.get("stage") in {"decide", "answer"}, "模型调用未结束或身份错配")
@@ -137,6 +291,7 @@ def validate_model_evidence(source: Path, model: str) -> dict:
                 parsed = AIMessageChunk.model_validate({key: value for key, value in chunk.items() if key != "clock"})
                 gathered = parsed if gathered is None else gathered + parsed
             output = gathered.model_dump(mode="json")
+            outputs.append(gathered)
             require(output == record["output"], "原始分片与保存模型输出不一致")
             require(output.get("response_metadata", {}).get("finish_reason") in {"stop", "tool_calls"}, "模型未正常结束")
             if record["stage"] == "decide":
@@ -146,6 +301,7 @@ def validate_model_evidence(source: Path, model: str) -> dict:
                         all(bound[name].get("parameters") == definition["parameters"] and
                             bound[name].get("description") == definition["description"] for name, definition in catalog.items()),
                         "模型实际绑定工具与发现清单不一致")
+                require(record["tool_schemas"] == decision_tool_schemas(tools), "模型控制schema与当前协议不一致")
                 observed_calls.extend({key: call[key] for key in ("id", "name", "args")}
                                       for call in output.get("tool_calls", []) if call["name"] != "submit_decision")
             elif not gathered.tool_calls and _text(gathered).strip():
@@ -153,8 +309,10 @@ def validate_model_evidence(source: Path, model: str) -> dict:
             calls += 1
         require(any(record["stage"] == "decide" for record in records) and observed_calls ==
                 [{key: call[key] for key in ("id", "name", "args")} for call in row["calls"]], "工具申请与原始模型输出不一致")
-        require((not answers and row.get("answer") == "") if row["preview_candidate"] else
-                bool(answers) and row.get("answer") == "".join(answers), "模型正文缺失或与原始回答流不一致")
+        history_key = (row["case_id"], row["repetition"])
+        dialogue, intent = _rebuild_model_turn(row, history=histories.get(history_key, evaluation.model_inputs(case)["history"]),
+            previous=intents.get(history_key), tools=tools, config=config, outputs=outputs)
+        histories[history_key], intents[history_key] = dialogue, intent
     reviews = json.loads((source / "semantic-review-applied.json").read_text(encoding="utf-8"))
     # 清掉行内自报结论后再应用完整署名审阅，缺一条不能复用旧semantic_status。
     unsigned = [{key: value for key, value in row.items() if key != "semantic_review"} for row in rows]
@@ -670,7 +828,7 @@ async def run_suite(args) -> int:
                 if args.model_report is None:
                     raise ValueError("缺少46轮模型及逐条语义复核报告")
                 source = args.model_report.resolve()
-                model_summary = validate_model_evidence(source, config.chat_model)
+                model_summary = validate_model_evidence(source, config.chat_model, config=config)
                 shutil.copytree(source, report / "model-evaluation")
                 return model_summary
             await record("annotated_dialogues", model_evidence)

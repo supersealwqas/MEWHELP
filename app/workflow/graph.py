@@ -25,7 +25,7 @@ from app.tools.permissions import ToolPermissions
 from app.tools.mcp import MCPToolManager
 from app.tools.contracts import ToolExecutionScope, binding_dict
 from app.tools.knowledge import ORDER_POLICY_SOURCES, retrieve_verified_knowledge
-from app.workflow.agent import build_agent_decision, build_agent_graph, model_messages, stopped_state
+from app.workflow.agent import build_agent_decision, build_agent_graph, confirmed_ticket_prefix, model_messages, stopped_state
 from app.workflow.model import WorkflowModelAdapter, intent_tool_schema, understanding_tool_schema
 from app.workflow.prompts import INTENT_PROMPT, UNDERSTANDING_PROMPT
 from app.workflow.routing import assess_evidence, fixed_reply, knowledge_input_stop_reason, route_by_intent, order_candidate
@@ -249,8 +249,11 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
                 update["stop_reason"] = "retrieval_low_conf"
         return update
 
-    def fixed_node(state: ConversationState, kind: str) -> ConversationState:
-        """固定出口直接发布正文。参数：state当前轮、kind出口；返回：固定更新；异常：未知出口。"""
+    async def fixed_node(state: ConversationState, kind: str) -> ConversationState:
+        """固定出口保留真实工单回执后发布正文。
+
+        参数：state 当前轮、kind 固定出口；返回：与事件流一致的正文更新；异常：未知出口或回执读取错误。
+        """
         if state.get("answer"):
             update = {"answer": state["answer"]}
         elif state["stop_reason"] in {"budget_exceeded", "tool_failed"}:
@@ -259,20 +262,22 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
             reply_kind = "input_limit" if state["stop_reason"] == "input_limit" else kind
             update = fixed_reply(reply_kind)
             update["stop_reason"] = kind if state["stop_reason"] in {None, "answer", "clarify"} else state["stop_reason"]
+        # 建单可以先于政策检索完成，故障或弱证据出口也必须保留原调用的成功事实。
+        update["answer"] = await confirmed_ticket_prefix(state, deps.chat) + update["answer"]
         get_stream_writer()({"event": "delta", "data": {"delta": update["answer"]}})
         return update
 
-    def complaint_node(state: ConversationState) -> ConversationState:
-        """参数：state当前轮；返回：投诉固定正文和建议类型；异常：无。"""
-        return fixed_node(state, "complaint")
+    async def complaint_node(state: ConversationState) -> ConversationState:
+        """参数：state 当前轮；返回：投诉固定正文和建议类型；异常：回执读取错误。"""
+        return await fixed_node(state, "complaint")
 
-    def chitchat_node(state: ConversationState) -> ConversationState:
-        """参数：state当前轮；返回：闲聊固定正文；异常：无。"""
-        return fixed_node(state, "chitchat")
+    async def chitchat_node(state: ConversationState) -> ConversationState:
+        """参数：state 当前轮；返回：闲聊固定正文；异常：回执读取错误。"""
+        return await fixed_node(state, "chitchat")
 
-    def fallback_node(state: ConversationState) -> ConversationState:
-        """参数：state当前轮；返回：证据/输入/预算固定出口；异常：无。"""
-        return fixed_node(state, "fallback")
+    async def fallback_node(state: ConversationState) -> ConversationState:
+        """参数：state 当前轮；返回：证据/输入/预算固定出口；异常：回执读取错误。"""
+        return await fixed_node(state, "fallback")
 
     async def log_node(state: ConversationState) -> ConversationState:
         """按最终仓储契约完成本轮；完成元数据只随成功返回写入checkpoint。

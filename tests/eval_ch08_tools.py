@@ -206,7 +206,7 @@ def validate_catalog(tools) -> list[dict]:
         raise ValueError("生产/MCP清单出现未经评估支持的写工具或读写类型错误")
     return [{"name": tool.name, "identity": asdict(tool.identity), "access": tool.access,
              "schema_hash": tool.binding.schema_hash, "parameters": deepcopy(tool.parameters),
-             "description": tool.description} for tool in tools]
+             "description": tool.description, "result_policy": asdict(tool.result_policy)} for tool in tools]
 
 
 def simulated_feedback(definition, arguments: dict) -> dict:
@@ -275,6 +275,7 @@ async def sample_model_turn(state: dict, *, config, tools, model_factory, identi
     from tests.ch05_live_runtime import RecordingChat
     from app.core.model_budget import BudgetLedger
     from app.workflow.agent import model_messages
+    from app.workflow.answer_policy import query_fault_answer
     from app.workflow.model import WorkflowModelAdapter, decision_tool_schemas
     from app.workflow.prompts import ANSWER_PROMPT, DECISION_PROMPT
     from app.workflow.state import message_row
@@ -291,7 +292,8 @@ async def sample_model_turn(state: dict, *, config, tools, model_factory, identi
     row = {"id": identifier, "query": state["raw_query"], "calls": [], "decisions": [], "feedback": [],
            "preview_candidate": False, "actual_preview_executed": False, "business_tools_executed": 0,
            "database_used": False, "trusted_intent": state.get("ticket_intent"),
-           "trusted_description": trusted_description, "answer": "", "errors": [], "failures": [], "models": []}
+           "trusted_description": trusted_description, "answer": "", "answer_origin": None,
+           "answer_policy": None, "errors": [], "failures": [], "models": []}
     ledger = BudgetLedger.from_settings(config)
     started, stage = time.monotonic(), "decide"
     catalog = {tool.name: tool for tool in tools}
@@ -319,6 +321,10 @@ async def sample_model_turn(state: dict, *, config, tools, model_factory, identi
                 break
             calls = selected.tool_calls
             source_messages = _plain_messages(state["messages"])
+            # 与生产决定节点一样冻结服务器核实的读写类型；后续清单卸载不抹除原调用事实。
+            state["tool_call_facts"] = {**state.get("tool_call_facts", {}), **{
+                call["id"]: {"turn_id": state["context"]["turn_id"], "binding": asdict(catalog[call["name"]].binding),
+                             "access": catalog[call["name"]].access} for call in calls}}
             state["messages"].append(message_row(state["context"]["turn_id"], "assistant", "", calls=calls,
                 bindings={call["id"]: asdict(catalog[call["name"]].binding) for call in calls}))
             for call in calls:
@@ -358,23 +364,32 @@ async def sample_model_turn(state: dict, *, config, tools, model_factory, identi
             row["failures"].append("decision_limit")
         if terminal and not row["preview_candidate"] and not row["failures"]:
             stage = "answer"
-            instructions = {"create_ticket": "请点击本条回复后的“创建工单”按钮，在弹窗中确认后提交。",
-                            "handoff": "如需人工协助，可点击本条回复后的“转人工”按钮。"}
-            kinds = state.get("suggested_kinds", [])
-            note = ("本轮回复后可用按钮的操作说明如下：\n" + "\n".join(instructions[kind] for kind in kinds)
-                    if kinds else "本轮回复后没有可操作的按钮，请按已有事实回答或追问。")
-            state["context_notes"] = [*state.get("context_notes", []), note]
-            async with aclosing(adapter.stream_answer(model_messages(state, config, ANSWER_PROMPT, registry=registry), ledger)) as stream:
-                async for text in stream:
-                    row["answer"] += text
+            fixed_answer = query_fault_answer(state, registry=registry)
+            if fixed_answer is not None:
+                row.update(answer=fixed_answer, answer_origin="program", answer_policy={
+                    "rule": "query_fault_answer", "reason": "current_read_fault_without_verified_facts"})
+            else:
+                row["answer_origin"] = "model"
+                state["context_notes"] = [*state.get("context_notes", []), answer_button_note(state.get("suggested_kinds", []))]
+                async with aclosing(adapter.stream_answer(model_messages(state, config, ANSWER_PROMPT, registry=registry), ledger)) as stream:
+                    async for text in stream:
+                        row["answer"] += text
             state["messages"].append(message_row(state["context"]["turn_id"], "assistant", row["answer"]))
     except Exception as error:
         row["errors"].append(_exception_record(error, stage))
         if getattr(error, "audit_record", None):
             row["invalid_decision"] = deepcopy(error.audit_record)
-    row.update(dialogue=_plain_messages(state["messages"]), budget=ledger.snapshot(),
+    row.update(dialogue=_plain_messages(state["messages"]), tool_call_facts=deepcopy(state.get("tool_call_facts", {})), budget=ledger.snapshot(),
                elapsed_seconds=round(time.monotonic() - started, 3))
     return row
+
+
+def answer_button_note(kinds: list[str]) -> str:
+    """生成采样与证据重建共用的按钮说明。参数：已验证建议类型；返回：说明文本；异常：KeyError，未知类型。"""
+    instructions = {"create_ticket": "请点击本条回复后的“创建工单”按钮，在弹窗中确认后提交。",
+                    "handoff": "如需人工协助，可点击本条回复后的“转人工”按钮。"}
+    return ("本轮回复后可用按钮的操作说明如下：\n" + "\n".join(instructions[kind] for kind in kinds)
+            if kinds else "本轮回复后没有可操作的按钮，请按已有事实回答或追问。")
 
 
 class WaitingDependencies(RuntimeError):
@@ -480,12 +495,15 @@ def write_report(report: Path, metadata: dict, rows: list[dict]) -> dict:
             if message.get("tool_calls"):
                 text.extend(["```json", json.dumps(message["tool_calls"], ensure_ascii=False, indent=2), "```", ""])
         text.extend(["### 工具与评分证据", "", "```json", json.dumps({key: row.get(key) for key in
-            ("expected", "trusted_intent", "trusted_description", "preview_candidate", "calls", "feedback", "errors")},
+            ("expected", "trusted_intent", "trusted_description", "preview_candidate", "calls", "tool_call_facts", "feedback", "errors")},
             ensure_ascii=False, indent=2), "```", ""])
         if row.get("preview_candidate"):
             text.extend(["此处仅观察到符合可信描述的工具申请；没有执行真实预览、确认或创建。", ""])
-        text.extend(["### 原始模型输出（包括失败和部分正文）", "", "```json",
-                     json.dumps({"answer": row.get("answer"), "models": [{key: record.get(key) for key in
+        text.extend(["### 最终答复与来源", "", "```json",
+                     json.dumps({key: row.get(key) for key in ("answer", "answer_origin", "answer_policy")},
+                                ensure_ascii=False, indent=2), "```", "",
+                     "### 原始模型记录（包括失败和部分正文）", "", "```json",
+                     json.dumps({"models": [{key: record.get(key) for key in
                          ("stage", "output", "error_type", "closed")} for record in row.get("models", [])]},
                          ensure_ascii=False, indent=2), "```", ""])
     (report / "dialogue.md").write_text("\n".join(text), encoding="utf-8")
@@ -509,7 +527,8 @@ def finalize_semantic_review(report: Path, review_file: Path) -> int:
 
 def _source_hashes() -> dict:
     """冻结生产实现和评估代码指纹。参数：无；返回：路径到SHA256；异常：文件错误。"""
-    paths = [*sorted((ROOT / "app").rglob("*.py")), ROOT / "uv.lock", Path(__file__)]
+    paths = [*sorted((ROOT / "app").rglob("*.py")), ROOT / "uv.lock", Path(__file__),
+             ROOT / "tests/verify_ch08_live.py"]
     return {path.relative_to(ROOT).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
 
 

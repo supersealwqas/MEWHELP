@@ -49,6 +49,64 @@ def test_local_ref_and_oneof():
     assert validate_arguments(schema, {"items": [{"qty": 0}]})[0]["path"] == "/items/0/qty"
 
 
+@pytest.mark.parametrize("schema", [
+    {"properties": {"value": {"$ref": "#/$defs/missing"}}},
+    {"properties": {"value": {"$ref": "#missing"}}},
+    {"properties": {"value": {"$dynamicRef": "#missing"}}},
+    {"$defs": {"row": {"properties": {"value": {"$ref": "#/$defs/missing"}}}}},
+    {"$defs": {"row": {"$id": "nested", "properties": {"value": {"$ref": "#missing"}}}}},
+    {"$ref": "#/custom", "custom": {"$ref": "#missing"}},
+    {"$defs": {"row": {"maxLength": 3}}, "properties": {"value": {"$ref": "#/$defs/row/maxLength/missing"}}},
+])
+def test_unresolvable_local_reference_is_rejected_before_use(schema):
+    """漏掉本地指针、锚点或嵌套引用检查会让坏定义进入注册表。
+
+    参数：schema 含不存在目标的定义；返回：None；异常：断言失败。
+    """
+    from app.tools.validation import check_schema
+    with pytest.raises(ValueError):
+        check_schema({"type": "object", **schema})
+
+
+@pytest.mark.parametrize("draft", ["http://json-schema.org/draft-07/schema#",
+                                   "https://json-schema.org/draft/2019-09/schema",
+                                   "https://json-schema.org/draft/2020-12/schema"])
+@pytest.mark.parametrize("target", [{"properties": 1}, {"type": 42}])
+def test_malformed_reference_target_is_rejected_as_schema_error(draft, target):
+    """只核实引用目标存在而忽略其结构时，坏配置会逃过登记的 ValueError 隔离。
+
+    参数：draft 支持的根草案，target 扩展位置中的坏规则；返回：None；异常：断言失败。
+    """
+    from app.tools.validation import check_schema
+    with pytest.raises(ValueError):
+        check_schema({"$schema": draft, "type": "object", "$ref": "#/custom", "custom": target})
+
+
+@pytest.mark.parametrize("schema,arguments", [
+    ({"$defs": {"a/b~c": {"type": "string"}}, "properties": {"value": {"$ref": "#/$defs/a~1b~0c"}}}, {"value": "x"}),
+    ({"$defs": {"row": {"$anchor": "row", "type": "string"}}, "properties": {"value": {"$ref": "#row"}}}, {"value": "x"}),
+    ({"properties": {"child": {"$ref": "#"}}}, {"child": {"child": {}}}),
+    ({"$dynamicAnchor": "node", "properties": {"child": {"$dynamicRef": "#node"}}}, {"child": {}}),
+    ({"$schema": "https://json-schema.org/draft/2019-09/schema", "$recursiveAnchor": True,
+      "properties": {"child": {"$recursiveRef": "#"}}}, {"child": {}}),
+    ({"$schema": "http://json-schema.org/draft-07/schema#", "definitions": {"row": {"$id": "#row", "type": "string"}},
+      "properties": {"value": {"$ref": "#row"}}}, {"value": "x"}),
+    ({"$schema": "http://json-schema.org/draft-07/schema#", "custom": {"type": "array", "items": [{"type": "integer"}]},
+      "properties": {"value": {"$ref": "#/custom"}}}, {"value": [1]}),
+    ({"$id": "https://schemas.invalid/root", "properties": {"value": {"$id": "nested", "type": "object",
+      "$defs": {"leaf": {"type": "string"}}, "properties": {"leaf": {"$ref": "#/$defs/leaf"}}}}}, {"value": {"leaf": "x"}}),
+])
+def test_resolvable_local_references_keep_their_scope_and_recursion(schema, arguments):
+    """把合法锚点、嵌套资源或递归一律拒绝会破坏原有合法参数。
+
+    参数：schema 合法本地引用定义，arguments 有限合法实例；返回：None；异常：断言失败或生产校验异常。
+    """
+    from app.tools.validation import check_schema, validate_arguments
+    schema = {"type": "object", **schema}
+    check_schema(schema)
+    assert validate_arguments(schema, arguments) == []
+
+
 @pytest.mark.parametrize("fragment", [
     {"$ref": "https://example.invalid/private"}, {"$dynamicRef": "file:///private.json"},
     {"$schema": "https://example.invalid/schema"}, {"format": "unknown-format"},

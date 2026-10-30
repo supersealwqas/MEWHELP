@@ -18,6 +18,7 @@ from app.tools.confirmation import TicketIntentState, request_ticket_authorizati
 from app.tools.contracts import KnowledgeCallContext, ToolExecutionScope, binding_dict, binding_from_dict
 from app.tools.knowledge import merge_knowledge_budget, retrieve_verified_knowledge
 from app.workflow.citations import CitationStreamFilter
+from app.workflow.answer_policy import query_fault_answer
 from app.workflow.model import decision_tool_schemas
 from app.workflow.prompts import ANSWER_PROMPT, DECISION_PROMPT
 from app.workflow.state import ConversationState, message_row
@@ -52,6 +53,27 @@ def stopped_state(reason: str, ledger: BudgetLedger | None = None) -> Conversati
     if ledger is not None:
         update["budget"] = ledger.snapshot()
     return update
+
+
+async def confirmed_ticket_prefix(state: ConversationState, chat) -> str:
+    """从已完成建单的原调用回读票号，供普通答复与固定出口共用。
+
+    参数：state 当前可信工作流状态；chat 保存原工具结果的聊天仓储。
+    返回：str，成功回执前缀；没有已确认的成功结果时为空串。
+    异常：数据库读取错误或回执字段校验错误；不重试写入。
+    """
+    from app.schemas.workflow import TicketReceipt
+    pending = state.get("pending_ticket")
+    if not pending or pending.get("status") != "completed":
+        return ""
+    # 使用原轮、原调用的持久化结果，模型正文和后续订单选择均不能提供票号。
+    action = pending["action"]
+    context = ToolContext.model_validate(state["context"]).model_copy(update={"tool_call_id": action["tool_call_id"]})
+    result = await chat.get_tool_result(context)
+    if result is None or not result.ok or not result.data:
+        return ""
+    return TicketReceipt(action_id=action["action_id"], ticket_no=result.data["ticket_no"],
+        ticket_type=result.data["ticket_type"], status=result.data["status"]).answer_prefix()
 
 
 def model_messages(state: ConversationState, settings, prompt: str, tools: list | None = None, *, registry=None) -> list[dict]:
@@ -103,10 +125,16 @@ def build_agent_decision(deps: "WorkflowDependencies"):
                     "decision_count": state["decision_count"] + 1}
         by_name = {tool.name: tool for tool in tools}
         frozen = {call["id"]: binding_dict(by_name[call["name"]].binding) for call in calls}
+        # 原允许清单的读写属性随决定进入检查点；后续发现失败不能撤销已经发生的查询事实。
+        call_facts = deepcopy(state.get("tool_call_facts", {}))
+        for call in calls:
+            call_facts.setdefault(call["id"], {"turn_id": state["context"]["turn_id"],
+                "binding": deepcopy(frozen[call["id"]]), "access": by_name[call["name"]].access})
         suggested = [kind for kind in selected.suggested_actions
                      if kind != "create_ticket" or not state.get("ticket_write_state")]
         return {"budget": ledger.snapshot(), "decision_count": state["decision_count"] + 1,
                 "pending_calls": calls, "pending_bindings": frozen, "pending_tool_bindings": frozen,
+                "tool_call_facts": call_facts,
                 "suggested_kinds": suggested,
                 "stop_reason": selected.kind if selected.kind != "tools" else None}
     return decision
@@ -217,21 +245,17 @@ def build_agent_graph(deps: "WorkflowDependencies", *, decision=None):
         """推送并累计相同正文，外部断流追加说明。参数：state事实；返回：完整正文和账本；异常：取消及程序错误。"""
         writer = get_stream_writer()
         publish_stage(state, "answer", "running")
-        receipt_prefix = ""
-        pending = state.get("pending_ticket")
-        if pending and pending.get("status") == "completed":
-            # 真实工单回执优先于模型正文，外部模型断流不能隐藏已经提交的工单号。
-            from app.schemas.workflow import TicketReceipt
-            action = pending["action"]
-            original_context = ToolContext.model_validate(state["context"]).model_copy(update={"tool_call_id": action["tool_call_id"]})
-            result = await deps.chat.get_tool_result(original_context)
-            if result is not None and result.ok and result.data:
-                receipt = TicketReceipt(action_id=action["action_id"], ticket_no=result.data["ticket_no"],
-                    ticket_type=result.data["ticket_type"], status=result.data["status"])
-                receipt_prefix = f"工单已创建，工单号：{receipt.ticket_no}，状态：{receipt.status}。\n\n"
+        receipt_prefix = await confirmed_ticket_prefix(state, deps.chat)
         if state["answer"]:
             answer = receipt_prefix + state["answer"]
             writer({"event": "delta", "data": {"delta": answer}})
+            return {"answer": answer}
+        fault_answer = query_fault_answer(state, registry=deps.registry)
+        if fault_answer is not None:
+            # 固定正文与已提交票号累计同一份字符串，后续仍由根图统一保存和完成。
+            answer = receipt_prefix + fault_answer
+            writer({"event": "delta", "data": {"delta": answer}})
+            publish_stage(state, "answer", "completed")
             return {"answer": answer}
         ledger = BudgetLedger.from_snapshot(state["budget"])
         parts = []

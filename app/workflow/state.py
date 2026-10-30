@@ -45,6 +45,7 @@ class ConversationState(TypedDict, total=False):
     pending_calls: list[dict]  # 本轮下一批工具申请；写入仍须经过服务端确认。
     pending_bindings: dict[str, dict]  # 决定时按调用ID冻结的工具来源与schema。
     pending_tool_bindings: dict[str, dict]  # CH08确认恢复公开状态名，与pending_bindings同步并兼容旧checkpoint。
+    tool_call_facts: dict[str, dict]  # 服务器按原允许清单冻结的调用轮次/绑定/读写属性，仅作事实分类，不授予执行权限。
     pending_ticket: dict | None  # 本原轮唯一冻结预览及用户决定，不由模型提供。
     ticket_intent: dict | None  # 当前未完成诉求的有界真实用户来源。
     ticket_write_state: dict | None  # 原工具轮已占用的唯一流程状态，新轮重置。
@@ -139,6 +140,7 @@ def new_turn_state(context: ToolContext, history_turns: list[dict], audit_cursor
         "intent": None, "intent_confidence": None, "route": None, "evidence": [], "evidence_scores": [], "gate": None,
         "retrieval_attempted": False, "degradations": [],
         "pending_calls": [], "pending_bindings": {}, "pending_tool_bindings": {},
+        "tool_call_facts": {},
         "pending_ticket": None, "ticket_intent": previous, "ticket_write_state": None,
         "knowledge_cache": {}, "route_ready": False,
         "seen_call_ids": [], "seen_call_signatures": [],

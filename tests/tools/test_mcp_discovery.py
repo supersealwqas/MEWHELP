@@ -142,7 +142,7 @@ async def test_cross_owner_never_reaches_mcp(tmp_path):
     await runtime.aclose()
 
 
-@pytest.mark.parametrize("invalid", ["schema", "description"])
+@pytest.mark.parametrize("invalid", ["schema", "description", "local_reference"])
 async def test_bad_schema_is_isolated_without_losing_good_tools(tmp_path, invalid):
     """远端坏定义只隔离自身，不能使整轮发现抛异常。参数：隔离目录/坏字段；返回：None；异常：断言失败。"""
     bad = remote_tool("query_logistics", schema={"type": "object", "properties": {
@@ -150,10 +150,28 @@ async def test_bad_schema_is_isolated_without_losing_good_tools(tmp_path, invali
     if invalid == "description":
         bad = remote_tool("query_logistics")
         bad.description = " "
+    if invalid == "local_reference":
+        bad = remote_tool("query_logistics", schema={"type": "object", "properties": {
+            "tracking_no": {"$ref": "#/$defs/missing"}}})
     runtime, registry, _ = manager(tmp_path, {"logistics": [bad], "after_sales": [remote_tool()]})
     await runtime.refresh()
     assert [row.name for row in registry.snapshot()] == ["query_warranty"]
     await runtime.aclose()
+
+
+async def test_malformed_reference_target_keeps_later_tool_in_same_source(tmp_path):
+    """坏引用目标若越过逐工具隔离，同一来源中排在它后面的正常工具会被一起撤下。
+
+    参数：tmp_path 独立权限文件目录；返回：None；异常：断言失败或测试 I/O 错误。
+    """
+    bad = remote_tool("broken", schema={"type": "object", "$ref": "#/custom", "custom": {"properties": 1}})
+    runtime, registry, _ = manager(tmp_path, {"after_sales": [bad, remote_tool()]})
+    write_policy(runtime.permissions.path, rule(), rule("broken"))
+    try:
+        await runtime.refresh()
+        assert [row.name for row in registry.snapshot()] == ["query_warranty"]
+    finally:
+        await runtime.aclose()
 
 
 @pytest.mark.parametrize("sources", [("logistics", "after_sales"), ("after_sales", "logistics")])

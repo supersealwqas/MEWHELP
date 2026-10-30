@@ -183,6 +183,52 @@ class ControlledChat:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name,args,program", [
+    ("query_faq", {"keyword": "退货"}, True),
+    ("query_order", {"order_id": "1001"}, False),
+    ("query_product", {"keyword": "猫粮"}, False),
+    ("query_order", {"order_id": "2003"}, False),
+    (None, {}, False),
+])
+async def test_answer_origin_uses_production_fault_policy(tool_name, args, program):
+    """当前查询故障由程序答复，成功、落空、拒绝和未查询仍保留真实正文模型。
+
+    参数：tool_name工具名、args参数、program预期程序来源；返回：None；异常：断言失败。
+    """
+    from langchain_core.messages import AIMessageChunk
+    from app.config import settings
+    from app.schemas.tools import ToolContext
+    from app.tools.registry import build_registry
+    from app.workflow.state import new_turn_state
+    responses = []
+    if tool_name:
+        responses.append(AIMessageChunk(content="", tool_calls=[{"id": "query", "name": tool_name,
+            "args": args}], response_metadata={"finish_reason": "tool_calls"}))
+    responses.append(AIMessageChunk(content="", tool_calls=[{"id": "done", "name": "submit_decision",
+        "args": {"kind": "answer", "suggested_actions": []}}], response_metadata={"finish_reason": "tool_calls"}))
+    responses.append(AIMessageChunk(content="真实正文模型答复", response_metadata={"finish_reason": "stop"}))
+    chat = ControlledChat(responses)
+    state = new_turn_state(ToolContext(conversation_id=1, session_id="eval", user_id="demo-user",
+        turn_id="fault.1.1", user_message="查一下订单1001、2003和猫粮退货信息"), [], 0)
+    row = await evaluator().sample_model_turn(state, config=settings, tools=build_registry().snapshot(),
+        model_factory=lambda **options: chat, identifier="fault.1.1", trusted_description=None)
+    assert not row["errors"]
+    assert row["tool_call_facts"] == ({"query": {"turn_id": "fault.1.1", "binding": row["calls"][0]["binding"],
+                                               "access": "read"}} if tool_name else {})
+    assert row["answer_origin"] == ("program" if program else "model")
+    assert row["answer_policy"] == ({"rule": "query_fault_answer", "reason": "current_read_fault_without_verified_facts"}
+                                     if program else None)
+    assert sum(record["stage"] == "answer" for record in row["models"]) == (0 if program else 1)
+    assert row["budget"]["model_calls"] == len(row["models"])
+    if program:
+        assert row["answer"] == "本次查询未能完成，暂时无法核实相关信息。请稍后重试。"
+        assert len(chat.responses) == 1
+        assert row["feedback"][0]["origin"] == "simulation"
+    else:
+        assert row["answer"] == "真实正文模型答复"
+
+
+@pytest.mark.asyncio
 async def test_real_adapter_records_controlled_tool_chain_without_business_execution():
     """防止模型评估绕过生产适配器或实际执行工具。参数：无；返回：None；异常：断言失败。"""
     from langchain_core.messages import AIMessageChunk

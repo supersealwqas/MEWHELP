@@ -127,27 +127,39 @@ class ActionRepository:
         参数：request 原动作及已保存决定；返回：真实工单回执或 None；
         异常：身份/冲突错误、成功事实不一致或数据库错误。
         """
-        from app.repositories.chat import result_query
         async with self.factory() as session:
-            saved = await self._ticket_resume_source(session, request)
-            context, action = saved["context"], saved["action"]
-            row = await session.scalar(result_query(context))
-            if row is None:
-                return None
-            result = ToolResult.model_validate_json(row.content)
-            if not result.ok:
-                return None
-            try:
-                receipt = TicketReceipt(action_id=action.action_id, **(result.data or {}))
-                ticket = await session.scalar(select(Ticket).where(Ticket.ticket_no == receipt.ticket_no))
-                if (result.is_mock or result.error is not None or ticket is None
-                        or receipt.ticket_no != ticket_number(context) or ticket.conversation_id != context.conversation_id
-                        or ticket.description != action.description or ticket.ticket_type != action.ticket_type
-                        or receipt.ticket_type != ticket.ticket_type or ticket.status != receipt.status):
-                    raise ValueError("回执不匹配真实工单")
-            except (ValueError, TypeError) as error:
-                raise PersistenceUncertain("工单成功事实待核实") from error
-            return receipt.model_copy(update={"audit_sync_pending": saved["turn_status"] != "completed"})
+            return await self._chat_ticket_receipt(session, request)
+
+    async def _chat_ticket_receipt(self, session, request: TicketResume, *, lock: bool = False) -> TicketReceipt | None:
+        """在调用方现有会话中核验原调用与真实工单，供正文保存事务复用。
+
+        参数：session 当前数据库会话，request 原动作与保存决定，lock 是否对关联事实使用当前读行锁。
+        返回：TicketReceipt，真实工单回执；没有确定成功结果时返回 None。
+        异常：身份或决定冲突、PersistenceUncertain，成功事实不一致；数据库错误。
+        """
+        from app.repositories.chat import result_query
+        saved = await self._ticket_resume_source(session, request, lock=lock)
+        context, action = saved["context"], saved["action"]
+        query = result_query(context)
+        row = await session.scalar(query.with_for_update() if lock else query)
+        if row is None:
+            return None
+        result = ToolResult.model_validate_json(row.content)
+        if not result.ok:
+            return None
+        try:
+            receipt = TicketReceipt(action_id=action.action_id, **(result.data or {}))
+            query = select(Ticket).where(Ticket.ticket_no == receipt.ticket_no)
+            # 用户行锁内继续当前读，避免 MySQL 可重复读快照漏掉已提交的业务事实。
+            ticket = await session.scalar(query.with_for_update() if lock else query)
+            if (result.is_mock or result.error is not None or ticket is None
+                    or receipt.ticket_no != ticket_number(context) or ticket.conversation_id != context.conversation_id
+                    or ticket.description != action.description or ticket.ticket_type != action.ticket_type
+                    or receipt.ticket_type != ticket.ticket_type or ticket.status != receipt.status):
+                raise ValueError("回执不匹配真实工单")
+        except (ValueError, TypeError) as error:
+            raise PersistenceUncertain("工单成功事实待核实") from error
+        return receipt.model_copy(update={"audit_sync_pending": saved["turn_status"] != "completed"})
 
     async def accept_order_selection(self, request: OrderSelection) -> AcceptedOrderSelection:
         """来源行锁内接受原选单，仅首次选择可改变状态。

@@ -86,6 +86,51 @@ async def test_composed_schema_missing_field_saves_rejection_and_audit():
     assert len(audit.entries) == 1 and audit.entries[0].status == "校验拦下"
 
 
+@pytest.mark.parametrize("access", ["read", "write"])
+@pytest.mark.parametrize("schema,legacy_check", [
+    ({"type": "object", "properties": {"value": {"$ref": "#/$defs/missing"}}}, False),
+    ({"type": "object", "properties": {"value": {"$ref": "#/$defs/missing"}}}, True),
+    ({"type": "object", "$ref": "#/custom", "custom": {"properties": 1}}, False),
+])
+async def test_damaged_runtime_schema_saves_fault_without_invocation(access, schema, legacy_check, monkeypatch):
+    """旧注册快照带入坏引用时仍须保存配对故障，且不得执行业务或自动重试。
+
+    参数：access 读写权限，schema 坏规则，legacy_check 是否模拟旧检查，monkeypatch 注入兼容边界；返回：None；异常：断言失败。
+    """
+    attempts = []
+
+    async def handler(arguments, ctx, scope):
+        """记录不应触发的业务调用。参数：参数、身份、运行域；返回：成功结果；异常：无。"""
+        attempts.append(arguments)
+        return ToolResult.success({"receipt": "unexpected"})
+
+    name = "create_ticket" if access == "write" else "probe"
+    registry, store, audit = ToolRegistry(), ResultStore(), AuditSink()
+    registry.register_definition(definition(handler, name=name, access=access))
+    read_definition = registry.get_definition
+
+    def stale_definition(identity):
+        """模拟升级前已登记的坏定义；解析与执行器仍使用真实实现。
+
+        参数：identity 可信来源；返回：带失效引用的定义；异常：KeyError，来源不存在。
+        """
+        return replace(read_definition(identity), parameters=schema)
+
+    monkeypatch.setattr(registry, "get_definition", stale_definition)
+    if legacy_check:
+        from jsonschema import Draft202012Validator
+        # 使用原先只核实规则结构的真实库方法，使异常来自参数校验时的实际引用解析。
+        monkeypatch.setattr("app.tools.validation.check_schema", Draft202012Validator.check_schema)
+    result = await ToolExecutor(registry, store, None, retry_delay_seconds=0, audit_repository=audit).execute(
+        call(name, {"value": "x"}), context(), ignore_status,
+        scope=ToolExecutionScope(authorize_write=authorize))
+    assert not result.ok and result.error.code == "TOOL_UNAVAILABLE"
+    assert result.error.category == "fault" and attempts == []
+    assert store.result == result and store.writes == 1
+    assert len(audit.entries) == 1 and audit.entries[0].retry_count == 0
+    assert audit.entries[0].tool_call_id == "call-1"
+
+
 async def test_read_timeout_retries_once():
     """误删读重试或将两次尝试记成两条审计会失败。参数：无；返回：None；异常：断言失败。"""
     attempts = []

@@ -9,7 +9,9 @@ from typing import Any
 from jsonschema import Draft7Validator, Draft201909Validator, Draft202012Validator, FormatChecker
 from jsonschema.exceptions import SchemaError
 from langchain_core.tools import BaseTool
-from referencing import Registry
+from referencing import Registry, Resource
+from referencing.exceptions import Unresolvable
+from referencing.jsonschema import specification_with
 
 _DRAFTS = {
     "http://json-schema.org/draft-07/schema": Draft7Validator,
@@ -92,9 +94,57 @@ def check_schema(schema: dict) -> None:
         raise ValueError("工具参数定义必须是JSON对象")
     _check_references(schema)
     try:
-        _validator_class(schema).check_schema(schema)
-    except SchemaError as error:
-        raise ValueError("工具参数schema不合法") from error
+        validator_class = _validator_class(schema)
+        validator_class.check_schema(schema)
+        specification = specification_with(validator_class.META_SCHEMA["$id"])
+        resource = Resource.from_contents(schema, default_specification=specification)
+        resolver = Registry().resolver_with_root(resource)
+        _check_resolved_references(resource, resolver, validator_class, set())
+    except (SchemaError, Unresolvable) as error:
+        raise ValueError("工具参数schema不合法或本地引用无法解析") from error
+
+
+def _check_resolved_references(resource, resolver, validator_class, visited: set[int]) -> None:
+    """使用草案对应的本地解析器检查引用图，保留资源作用域和递归定义。
+
+    参数：resource 当前规则资源，resolver 已进入该资源的解析器，validator_class 继承的草案校验器，
+        visited 已检查的对象标识集合；返回：None；异常：ValueError/SchemaError，非法规则；Unresolvable，引用失效。
+    """
+    value = resource.contents
+    if isinstance(value, bool):
+        return
+    if not isinstance(value, dict):
+        raise ValueError("工具schema引用目标必须是对象或布尔规则")
+    if id(value) in visited:
+        # 只核实引用目标，不展开无限实例；合法的自引用与互相引用均可结束检查。
+        return
+    visited.add(id(value))
+    if "$schema" in value:
+        validator_class = _validator_class(value)
+    specification = specification_with(validator_class.META_SCHEMA["$id"])
+    for key in ("$ref", "$dynamicRef", "$recursiveRef"):
+        if key not in value:
+            continue
+        reference = value[key]
+        if not isinstance(reference, str) or not reference.startswith("#"):
+            raise ValueError("工具schema只允许文档内引用")
+        try:
+            resolved = resolver.lookup(reference)
+        except (TypeError, ValueError) as error:
+            # 指针穿过标量或使用非法数组下标时，依赖也可能抛普通 Python 异常。
+            raise ValueError("工具schema本地引用路径无效") from error
+        if not isinstance(resolved.contents, (dict, bool)):
+            raise ValueError("工具schema引用目标必须是对象或布尔规则")
+        target_validator = (_validator_class(resolved.contents)
+                            if isinstance(resolved.contents, dict) and "$schema" in resolved.contents else validator_class)
+        # 扩展位置不会被根元规则检查；引用使其成为实际规则后，先按继承草案校验结构再遍历。
+        target_validator.check_schema(resolved.contents)
+        _check_references(resolved.contents)
+        target = Resource.from_contents(resolved.contents, default_specification=specification)
+        _check_resolved_references(target, resolved.resolver, target_validator, visited)
+    # 库按草案识别子规则，自动遵守嵌套 $id；examples/default 等普通数据不参与解析。
+    for child in resource.subresources():
+        _check_resolved_references(child, resolver.in_subresource(child), validator_class, visited)
 
 
 def _pointer(parts: list) -> str:

@@ -570,6 +570,8 @@ async function runReply(reply, identity, { message, action = null, orderId = nul
         reply.bubble.textContent = "请选择本次要处理的订单。";
         presentSelection(reply, identity, result.action);
         ui.status.textContent = "等待选择订单，也可以发送新的问题";
+        // 选单卡替换工单卡后，回读原轮真实回执，避免已创建的票号随旧卡消失。
+        if (action?.type === "confirm_ticket") await syncCurrent(reply, generation);
       }
     } else if (result.status === "accepted") {
       reply.bubble.textContent = "决定已保存，正在核实处理状态…";

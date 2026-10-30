@@ -1,6 +1,6 @@
 # CH08 工具系统运行手册
 
-CH08 已于 2026-10-29 完成开发与验收：[最终总报告](../.superpowers/sdd/2026-10-28-ch08-tools/live-final-4/summary.json)九项全部通过，包含八项 Codex 内置浏览器操作和 46 条真实模型结构/语义复核。实际操作与证据边界见[页面验收记录](ch08-browser-verification.md)。
+CH08 已完成开发与复审修复，当前交付结论以 [2026-10-30 最终复审报告](superpowers/reviews/2026-10-30-ch08-rereview.md) 为准。2026-10-29 的 `live-final-4` 保留九项端到端检查及八项 Codex 内置浏览器操作的历史证据；修复后的模型验收和增补页面另行记录，不能用旧源码指纹证明新版本。实际操作与证据边界见[页面验收记录](ch08-browser-verification.md)。
 
 ## 运行环境
 
@@ -55,13 +55,15 @@ uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
 
 ## 错误与回执
 
-参数校验错误、空结果、权限拒绝和真实故障分别回灌给模型。只有明确的瞬时读取故障最多额外尝试一次；写工具不自动重试。LangGraph 暂停、取消及提交未知不能被当成普通失败吞掉。
+参数校验错误、空结果、权限拒绝和真实故障分别保存为结构化结果。当前轮的可信读查询明确故障、且没有成功查询事实时，由程序直接说明查询未完成，不调用正文模型。判定使用服务器保存的原调用事实，来源随后下线或规则更新不会抹掉原故障；正常空结果、权限或参数拒绝、未执行调用及历史故障不会触发这一出口。成功查询与故障混合、或旧检查点缺少调用事实快照时，仍沿用原答复流程。
+
+只有明确的瞬时读取故障最多额外尝试一次；写工具不自动重试。LangGraph 暂停、取消及提交未知不能被当成普通失败吞掉。已确认创建的真实工单号在后续选单、查询故障和恢复时继续保留；整轮未真正完成时，不发送伪造的完成元数据。
 
 完整工具结果保存在消息流水，模型只使用预算内的结果副本。嵌套工单号、状态及必要父路径必须保留；核心回执本身放不下则明确报预算不足。审计采用独立短事务，审计故障不能覆盖已经提交的工单号。
 
 ## 验收入口
 
-模型评估先固定 20 组、23 轮标注，每组至少重复两次；评估器不写业务库、不执行业务处理器，只读工具反馈明确标记为模拟。逐条语义复核完成前保持待审：
+模型评估先固定 20 组、23 轮标注，每组至少重复两次；评估器不写业务库、不执行业务处理器，只读工具反馈明确标记为模拟。模型正文、程序固定答复和预览候选分别记录；程序答复不算模型原始输出。逐条语义复核完成前保持待审：
 
 ```bash
 uv run python -m tests.eval_ch08_tools --env-file .env --report <新的模型报告目录>
@@ -85,12 +87,12 @@ env MEWHELP_TEST_ENV_FILE=D:/AI/my_AI_project/MEWHELP/.env \
   MEWHELP_RUN_QUALITY_MODEL=1 MEWHELP_RUN_QUALITY_MYSQL=1 \
   MEWHELP_RUN_RAG_INTEGRATION=1 MEWHELP_RUN_RERANK_LIVE=1 \
   uv run --no-sync --offline pytest -q -o addopts= --run-knowledge-integration \
-  --basetemp=.superpowers/sdd/2026-10-28-ch08-tools/tmp-final-all3
+  --basetemp=.pytest-tmp/ch08-full
 node --test tests/frontend/*.test.mjs
 uv lock --check --offline
 uv pip check
 ```
 
-2026-10-29 上述全开关回归为 **2252 passed、零跳过**，前端为 **128 passed**。原始日志为本章证据目录的 `final-all3.log`、`final-node4.log`。随后修正验收器对默认用户的判断，验收器与模型评估器 **80 passed**，产品代码未再改变。最终端到端目录为 `live-final-4`，模型目录为 `model-final-4`，均通过源码及证据门禁。
+2026-10-30 修复后的全开关回归为 **2411 passed、零失败零跳过**，前端为 **132 passed**；日志保存在 `.superpowers/sdd/2026-10-30-ch08-review-fixes/closeout-final-regression.log` 和 `program-node.log`。最终模型目录为同目录的 `model-closeout-final/evaluation`，46 条结构与语义均通过，原件核验覆盖 108 次真实模型调用及当前源码。46 条中包含 38 条模型正文、4 条程序固定答复和 4 条预览候选，模拟反馈不证明真实写库。增补页面使用独占 SQLite 和有限脚本模型，详细限制见最终复审报告。旧批次与失败记录保留，不作为当前版本的通过证据。
 
 内置浏览器截图原件为 JPEG；本轮另存像素相同的 PNG，哈希对应关系见 `screenshot-exports.json`。证据目录保留在本机且被 Git 忽略，不随源码提交上传。

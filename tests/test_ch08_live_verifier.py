@@ -85,61 +85,71 @@ def evidence_file(root, name, value):
     return {"path": name, "sha256": hashlib.sha256(raw).hexdigest()}
 
 
-def model_report(root):
+def model_report(root, *, repairs=False):
     """构造有完整原始形状的离线报告，用于损坏证据测试，不声称真实联网。
 
-    参数：root测试目录；返回：报告目录；异常：固定题集或文件错误。
+    参数：root测试目录、repairs是否包含合法控制纠正与空正文补救；返回：报告目录；异常：固定题集或文件错误。
     """
-    from langchain_core.messages import AIMessageChunk, HumanMessage
+    import asyncio
+    from langchain_core.messages import AIMessageChunk
     from tests import eval_ch08_tools as evaluation
-    from app.tools.contracts import json_hash
+    from tests.test_eval_ch08_tools import ControlledChat
+    from app.config import settings
+    from app.tools.contracts import ToolDefinition, ToolIdentity
+    from app.tools.registry import build_agent_registry
     cases, fingerprint = evaluation.load_cases()
-    catalog = [{"name": name, "identity": {"name": name, "source": origin[0], "server": origin[1]},
-                "access": "write" if name == "create_ticket" else "read", "description": "离线协议样例工具",
-                "parameters": {"type": "object", "properties": {}}} for name, origin in evaluation.REQUIRED_TOOLS.items()]
-    for definition in catalog:
-        definition["schema_hash"] = json_hash(definition["parameters"])
-    schemas = [{"type": "function", "function": {key: definition[key] for key in ("name", "description", "parameters")}}
-               for definition in catalog] + [{"type": "function", "function": {"name": "submit_decision"}}]
-    rows = []
-    for repetition in (1, 2):
-        for case in cases:
-            for number, turn in enumerate(case["turns"], 1):
-                expected = turn["expected"]
-                identifier = f"{case['id']}.{repetition}.{number}"
-                calls = []
-                for name in expected["required_tools"]:
-                    args = ({"description": expected["description"], "ticket_type": expected["ticket_types"][0]}
-                            if name == "create_ticket" else {"order_id": "1001"})
-                    calls.append({"id": name, "name": name, "args": args, "argument_sources":
-                                  {key: [{"kind": "fixture"}] for key in args}})
-                raw_calls = [{key: call[key] for key in ("id", "name", "args")} for call in calls]
-                if not raw_calls:
-                    raw_calls = [{"id": "terminal", "name": "submit_decision",
-                                  "args": {"kind": "answer", "suggested_actions": []}}]
-                output = AIMessageChunk(content="", tool_calls=raw_calls,
-                                        response_metadata={"finish_reason": "tool_calls"}).model_dump(mode="json")
-                record = {"stage": "decide", "turn_id": identifier, "started": 1, "ended": 2, "closed": True,
-                          "inputs": [HumanMessage(content=turn["query"]).model_dump(mode="json")],
-                          "tool_schemas": deepcopy(schemas),
-                          "chunks": [{"clock": 1.5, **output}], "output": output}
-                records = [record]
-                if not expected["preview"]:
-                    answer = AIMessageChunk(content="已按原问核对本次事实。",
-                        response_metadata={"finish_reason": "stop"}).model_dump(mode="json")
-                    records.append({**record, "stage": "answer", "tool_schemas": [],
-                                    "chunks": [{"clock": 1.5, **answer}], "output": answer})
-                observation = {"id": identifier, "case_id": case["id"], "repetition": repetition, "turn": number,
-                    "query": turn["query"], "calls": calls, "errors": [], "failures": [], "models": records,
-                    "answer": "" if expected["preview"] else "已按原问核对本次事实。",
-                    "preview_candidate": expected["preview"], "trusted_description": expected.get("description"),
-                    "trusted_intent": {"status": "collecting"} if expected.get("collecting") else None,
-                    "feedback": [], "actual_preview_executed": False, "business_tools_executed": 0, "database_used": False}
-                rows.append(evaluation.inspect_turn(expected, observation))
+    tools = list(build_agent_registry().snapshot())
+
+    async def forbidden(arguments, context, scope):
+        """阻止夹具执行业务。参数：申请、身份和资源；返回：无；异常：AssertionError，总是拒绝。"""
+        raise AssertionError("证据夹具不能执行业务")
+
+    for name, server in (("query_logistics", "logistics"), ("query_warranty", "after_sales"),
+                         ("query_return_progress", "after_sales")):
+        field = "tracking_no" if name == "query_logistics" else "order_id"
+        tools.append(ToolDefinition(ToolIdentity("mcp", server, name), "离线协议样例查询",
+            {"type": "object", "properties": {field: {"type": "string"}}, "required": [field]}, forbidden, "read"))
+
+    async def sample():
+        """用生产采样器生成完整离线证据。参数：无；返回：46行；异常：夹具响应或结构错误。"""
+        from app.tools.mock_data import order_snapshot
+        rows = []
+        for repetition in (1, 2):
+            for case in cases:
+                responses = []
+                for turn in case["turns"]:
+                    expected = turn["expected"]
+                    names = expected["required_tools"] or (["query_faq"] if case["id"] == "ticket_information" else [])
+                    for name in names:
+                        order_id = "1002" if "1002" in turn["query"] else "1001"
+                        args = ({"description": expected["description"], "ticket_type": expected["ticket_types"][0]}
+                                if name == "create_ticket" else {"tracking_no": order_snapshot(order_id)["tracking_no"]}
+                                if name == "query_logistics" else {"keyword": "建工单用途"} if name == "query_faq"
+                                else {"order_id": order_id})
+                        responses.append(AIMessageChunk(content="", tool_calls=[{"id": name, "name": name, "args": args}],
+                            response_metadata={"finish_reason": "tool_calls"}))
+                    if not expected["preview"]:
+                        if repairs and case["id"] == "missing_description":
+                            responses.append(AIMessageChunk(content="", tool_calls=[{"id": "bad-terminal", "name": "submit_decision",
+                                "args": {"kind": "answer", "suggested_actions": "[]"}}], response_metadata={"finish_reason": "tool_calls"}))
+                        responses.append(AIMessageChunk(content="", tool_calls=[{"id": "terminal", "name": "submit_decision",
+                            "args": {"kind": "answer", "suggested_actions": []}}], response_metadata={"finish_reason": "tool_calls"}))
+                        if case["id"] != "ticket_information":
+                            if repairs and case["id"] == "missing_description":
+                                responses.append(AIMessageChunk(content="", response_metadata={"finish_reason": "stop"}))
+                            responses.append(AIMessageChunk(content="已按原问核对本次事实。", response_metadata={"finish_reason": "stop"}))
+                chat = ControlledChat(responses)
+                rows.extend([row async for row in evaluation.evaluate_dialogue(case, repetition, config=settings,
+                    tools=tools, model_factory=lambda **options: chat, intent_api=evaluation.load_intent_api())])
+                assert not chat.responses
+        assert all(row["structural_status"] == "passed" for row in rows)
+        return rows
+
+    rows = asyncio.run(sample())
     metadata = {"suite": "ch08_tools_model_evaluation", "model": "review-model", "case_sha256": fingerprint,
         "model_origin": "configured_chat_openai", "feedback_origin": "simulation", "business_execution": "none",
         "actual_interrupt": False, "repetitions": 2, "expected_rows": 46, "suite_errors": [],
-        "catalog": catalog,
+        "catalog": evaluation.validate_catalog(tools),
         "source_sha256": evaluation._source_hashes(), "source_sha256_after": evaluation._source_hashes()}
     reviews = [{"id": row["id"], "evidence_sha256": evaluation.evidence_hash(row), "reviewer": "Codex (AI reviewer)",
                 "verdict": "passed", "reason": "仅测试报告协议的离线样例", "violations": []} for row in rows]
@@ -202,6 +212,74 @@ def test_model_import_recomputes_complete_evidence_and_accepts_ai_reviewer(tmp_p
     assert callable(getattr(module, "validate_model_evidence", None)), "导入模型证据缺少逐项重验门禁"
     result = module.validate_model_evidence(model_report(tmp_path), "review-model")
     assert result["passed"] is True and result["verified_rows"] == 46
+
+
+def test_answer_source_verifier_accepts_recorded_control_and_empty_answer_repairs(tmp_path):
+    """合法控制纠正与空正文补救保留全部原件，不应被误判为额外伪造记录。
+
+    参数：tmp_path临时目录；返回：None；异常：断言失败。
+    """
+    module = importlib.import_module("tests.verify_ch08_live")
+    source = model_report(tmp_path, repairs=True)
+    assert module.validate_model_evidence(source, "review-model")["passed"]
+    rows = json.loads((source / "results.json").read_text(encoding="utf-8"))
+    repaired = next(row for row in rows if row["case_id"] == "missing_description")
+    assert [record["stage"] for record in repaired["models"]] == ["decide", "decide", "answer", "answer"]
+
+
+@pytest.mark.parametrize("defect", ["origin", "reason", "fault", "dialogue", "history", "decision",
+    "fake_answer_record", "delete_answer_record", "budget", "binding", "snapshot_access", "snapshot_turn", "snapshot_binding"])
+def test_answer_policy_evidence_rejects_resigned_forgery(tmp_path, defect):
+    """即使重新署名审阅，来源、故障、历史或模型记录篡改也必须拒绝。
+
+    参数：tmp_path临时目录、defect单项篡改；返回：None；异常：断言失败。
+    """
+    from tests import eval_ch08_tools as evaluation
+    module = importlib.import_module("tests.verify_ch08_live")
+    source = model_report(tmp_path)
+    assert module.validate_model_evidence(source, "review-model")["passed"]
+    rows = json.loads((source / "results.json").read_text(encoding="utf-8"))
+    program = next(row for row in rows if row["answer_origin"] == "program")
+    model = next(row for row in rows if row["answer_origin"] == "model")
+    if defect == "origin":
+        program["answer_origin"] = "model"
+    elif defect == "reason":
+        program["answer_policy"]["reason"] = "模型自己判断"
+    elif defect == "fault":
+        program["feedback"][0]["result"] = {"ok": True, "data": {"found": True}, "is_mock": True, "error": None}
+    elif defect == "dialogue":
+        program["dialogue"].insert(0, {"role": "assistant", "content": "伪造历史事实"})
+    elif defect == "history":
+        program["models"][0]["inputs"].insert(1, {"type": "ai", "content": "伪造历史事实"})
+    elif defect == "decision":
+        program["decisions"][-1]["kind"] = "clarify"
+    elif defect == "fake_answer_record":
+        record = deepcopy(next(record for record in model["models"] if record["stage"] == "answer"))
+        record["turn_id"] = program["id"]
+        program["models"].append(record)
+    elif defect == "delete_answer_record":
+        model["models"] = [record for record in model["models"] if record["stage"] != "answer"]
+        model.update(answer_origin="program", answer_policy=deepcopy(program["answer_policy"]), answer=program["answer"])
+        model["budget"]["records"] = [record for record in model["budget"]["records"] if record["stage"] != "answer"]
+        model["budget"]["model_calls"] = len(model["models"])
+    elif defect == "budget":
+        program["budget"]["records"].append({"stage": "answer"})
+    elif defect.startswith("snapshot_"):
+        saved = program["tool_call_facts"][program["calls"][0]["id"]]
+        if defect == "snapshot_access":
+            saved["access"] = "write"
+        elif defect == "snapshot_turn":
+            saved["turn_id"] = "另一轮"
+        else:
+            saved["binding"]["schema_hash"] = "0" * 64
+    else:
+        program["calls"][0]["binding"]["schema_hash"] = "0" * 64
+    evidence_file(source, "results.json", rows)
+    reviews = [{"id": row["id"], "evidence_sha256": evaluation.evidence_hash(row), "reviewer": "离线AI测试",
+        "verdict": "passed", "reason": "故意重签篡改后的记录", "violations": []} for row in rows]
+    evidence_file(source, "semantic-review-applied.json", reviews)
+    with pytest.raises(ValueError):
+        module.validate_model_evidence(source, "review-model")
 
 
 @pytest.mark.asyncio

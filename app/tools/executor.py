@@ -18,6 +18,7 @@ import httpx
 from langchain_core.tools import BaseTool
 from langgraph.errors import GraphInterrupt
 from pydantic import ValidationError
+from referencing.exceptions import Unresolvable
 from sqlalchemy.exc import DBAPIError
 
 from app.repositories.chat import PersistenceUncertain
@@ -204,7 +205,12 @@ class ToolExecutor:
             row = self.registry.get_definition(binding.identity)
         except KeyError:
             return None, None, ToolResult.failed("TOOL_UNAVAILABLE", "原工具来源当前不可用，本次没有执行")
-        errors = validate_arguments(row.parameters, raw_args)
+        try:
+            errors = validate_arguments(row.parameters, raw_args)
+        except (ValueError, Unresolvable):
+            # 旧快照或运行时规则解析故障属于工具配置，必须保存配对失败，不能要求用户改参。
+            logger.warning("工具参数规则不可用 name=%s call=%s", row.name, context.tool_call_id, exc_info=True)
+            return row, None, ToolResult.failed("TOOL_UNAVAILABLE", "工具参数规则当前不可用，本次没有执行")
         if not isinstance(raw_args, dict) and not errors:
             errors = [{"path": "", "rule": "type", "message": "工具参数必须为对象"}]
         if errors:

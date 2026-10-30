@@ -52,7 +52,7 @@ def test_new_turn_replaces_every_runtime_field_and_retains_history():
         "intent": None, "standard_query": "", "intent_confidence": None,
         "order_id": None, "order_data": None, "expanded_queries": [], "selection_action": None, "route": None, "evidence": [], "evidence_scores": [],
         "gate": None, "retrieval_attempted": False, "degradations": [], "pending_calls": [], "seen_call_ids": [], "seen_call_signatures": [],
-        "pending_bindings": {}, "pending_tool_bindings": {}, "pending_ticket": None, "ticket_intent": None,
+        "pending_bindings": {}, "pending_tool_bindings": {}, "tool_call_facts": {}, "pending_ticket": None, "ticket_intent": None,
         "ticket_write_state": None, "knowledge_cache": {}, "route_ready": False,
         "tool_count": 0, "decision_count": 0, "suggested_kinds": [], "suggested_actions": [],
         "refund_action": None, "answer": "", "stop_reason": None, "completion_metadata": {},

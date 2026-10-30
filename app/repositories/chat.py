@@ -450,11 +450,7 @@ class ChatRepository:
         """
         if isinstance(low_confidence, SelfCheckFailure) and not content.endswith(FIXED_KNOWLEDGE_REFUSAL):
             raise ValueError("自评不足入池必须与固定知识拒答一起保存")
-        if isinstance(low_confidence, RetrievalLowConfidence):
-            from app.workflow.routing import fixed_reply
-            if content != fixed_reply("fallback")["answer"]:
-                raise ValueError("检索弱证据入池必须与固定兜底一起保存")
-        elif low_confidence is not None and not isinstance(low_confidence, SelfCheckFailure):
+        if low_confidence is not None and not isinstance(low_confidence, (SelfCheckFailure, RetrievalLowConfidence)):
             raise ValueError("未知的低证据入口")
         if len(content.encode("utf-8")) > 65535:
             raise ValueError("回答正文过长，无法保存")
@@ -473,6 +469,23 @@ class ChatRepository:
             conversation = await session.get(Conversation, context.conversation_id)
             if conversation is None or conversation.user_id != context.user_id or conversation.session_id != context.session_id:
                 raise ValueError("完成轮次会话身份不匹配")
+            if isinstance(low_confidence, RetrievalLowConfidence):
+                from app.repositories.actions import ActionRepository
+                from app.schemas.workflow import TicketResume
+                from app.workflow.routing import fixed_reply
+                fallback = fixed_reply("fallback")["answer"]
+                if content != fallback:
+                    pending = (user.rag_metadata or {}).get("pending_ticket")
+                    if (not isinstance(pending, dict) or pending.get("decision") != "confirm"
+                            or not isinstance(pending.get("action"), dict)):
+                        raise ValueError("检索弱证据入池必须与固定兜底或本轮真实回执一起保存")
+                    request = TicketResume(type="confirm_ticket", session_id=context.session_id,
+                        user_id=context.user_id, source_turn_id=context.turn_id,
+                        action_id=pending["action"].get("action_id"), decision="confirm")
+                    # 复用已锁定用户行的事务，不能另开会话；正文必须精确等于可信前缀与固定答复。
+                    receipt = await ActionRepository(self.factory)._chat_ticket_receipt(session, request, lock=True)
+                    if receipt is None or content != receipt.answer_prefix() + fallback:
+                        raise ValueError("检索弱证据入池必须与固定兜底或本轮真实回执一起保存")
             if user.turn_status == "completed":
                 existing = await session.scalar(select(Message).where(
                     Message.conversation_id == context.conversation_id, Message.turn_id == context.turn_id,

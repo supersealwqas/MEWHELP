@@ -1,6 +1,8 @@
 """CH08 恢复协议与持久化决定测试，隔离外部模型并保留真实 HTTP 和仓储边界。"""
 
 from dataclasses import asdict
+import json
+import subprocess
 from uuid import NAMESPACE_URL, uuid5
 
 import httpx
@@ -9,6 +11,7 @@ from fastapi import FastAPI
 from sqlalchemy import select
 
 from app.api.chat import router
+from app.api.actions import router as actions_router
 from app.models.customer_service import Message
 from app.repositories.actions import ActionNotFound, ActionRepository
 from app.schemas.chat import ChatEvent
@@ -23,6 +26,152 @@ from tests.workflow.service_fakes import collect
 
 POLICY_TICKET_QUERY = "商品收到时破损，帮我建个工单，我想了解退货条件"
 POLICY_TICKET_DESCRIPTION = "商品收到时破损，我想了解退货条件"
+
+
+@pytest.mark.parametrize("failure", ["timeout", "low_evidence", "budget"])
+async def test_confirmed_ticket_receipt_survives_policy_fixed_exit(tmp_path, failure):
+    """政策超时、弱证据或预算固定出口丢票号、漏保存正文或重复写入时失败。
+
+    参数：tmp_path 独占数据库目录，failure 政策失败分支；返回：None；异常：断言或数据库错误。
+    """
+    from app.schemas.workflow import AgentDecision, OrderSelection, TicketResume
+    from tests.workflow.graph_fakes import ranked
+    async with ticket_runtime(tmp_path, intents=["售后"], decisions=[
+        AgentDecision(kind="tools", tool_calls=[ticket_call(description=POLICY_TICKET_DESCRIPTION)]),
+        AgentDecision(kind="answer"),
+    ], ranked=[ranked(0.1)], answers=[["目前无法核实退货政策，请稍后再查。"]]) as (service, deps, factory, _):
+        if failure == "timeout":
+            deps.search.error = TimeoutError("受控政策查询超时")
+        elif failure == "budget":
+            from app.core.model_budget import WorkflowBudgetExceeded
+            deps.search.error = WorkflowBudgetExceeded("受控政策预算不足")
+        events = await collect(service, POLICY_TICKET_QUERY, session="policy-fixed-ticket")
+        preview = next(event.data for event in events if event.event == "confirm_ticket")
+        resumed = [event async for event in service.stream_resume(TicketResume(
+            type="confirm_ticket", session_id="policy-fixed-ticket", user_id="demo-user",
+            source_turn_id=preview["source_turn_id"], action_id=preview["action_id"], decision="confirm"))]
+        selection = next(event.data for event in resumed if event.event == "select_order")
+        final = [event async for event in service.stream_resume(OrderSelection(
+            session_id="policy-fixed-ticket", user_id="demo-user", source_turn_id=selection["source_turn_id"],
+            action_id=selection["action_id"], order_id="1001"))]
+        assert final[-1].event == "done", [(event.event, event.data) for event in final]
+        ticket_no = (await rows(factory, "SELECT ticket_no FROM tickets"))[0][0]
+        streamed = "".join(event.data.get("delta", "") for event in final)
+        assert ticket_no in streamed
+        current = await service.get_current_actions("policy-fixed-ticket", "demo-user")
+        assert current.answer == streamed and current.turn_status == "completed"
+        assert "退货政策说明" not in streamed
+        assert await rows(factory, "SELECT ticket_no FROM tickets") == [(ticket_no,)]
+        assert await rows(factory, "SELECT tool_name FROM tool_audit_logs WHERE tool_name='create_ticket'") == [("create_ticket",)]
+
+
+async def test_confirmed_ticket_with_weak_knowledge_preserves_receipt_and_pool(tmp_path):
+    """固定知识兜底补票号后违反真实仓储入池契约，或漏记原问时失败。
+
+    参数：tmp_path 独占数据库目录；返回：None；异常：断言、数据库或图错误。
+    """
+    from app.schemas.workflow import AgentDecision, TicketResume
+    from tests.workflow.graph_fakes import ranked
+    query = "猫粮保存条件不清楚，帮我建个工单"
+    async with ticket_runtime(tmp_path, intents=["商品咨询"], decisions=[
+        AgentDecision(kind="tools", tool_calls=[ticket_call(description="猫粮保存条件不清楚")]),
+        AgentDecision(kind="answer"),
+    ], ranked=[ranked(0.1)]) as (service, _, factory, _):
+        events = await collect(service, query, session="weak-knowledge-ticket")
+        preview = next(event.data for event in events if event.event == "confirm_ticket")
+        final = [event async for event in service.stream_resume(TicketResume(type="confirm_ticket",
+            session_id="weak-knowledge-ticket", user_id="demo-user", source_turn_id=preview["source_turn_id"],
+            action_id=preview["action_id"], decision="confirm"))]
+        assert final[-1].event == "done", [(event.event, event.data) for event in final]
+        ticket_no = (await rows(factory, "SELECT ticket_no FROM tickets"))[0][0]
+        streamed = "".join(event.data.get("delta", "") for event in final)
+        assert ticket_no in streamed
+        current = await service.get_current_actions("weak-knowledge-ticket", "demo-user")
+        assert current.answer == streamed and current.turn_status == "completed"
+        assert await rows(factory, "SELECT raw_question, source FROM low_confidence_questions") == [(query, "retrieval_low_conf")]
+        assert await rows(factory, "SELECT tool_name FROM tool_audit_logs WHERE tool_name='create_ticket'") == [("create_ticket",)]
+
+
+def decode_production_sse(response, body):
+    """把真实 HTTP 回放交给生产 Node SSE 解码器，完成状态不能靠 Python 自行解析。
+
+    参数：response HTTP 响应，body 冻结恢复身份；返回：公开解码结果；异常：Node 错误或非法 JSON。
+    """
+    script = '''
+import {readFileSync} from "node:fs";
+import {receiveWorkflowStream} from "./app/static/chat-api.mjs";
+const input = JSON.parse(readFileSync(0, "utf8"));
+const result = await receiveWorkflowStream(new Response(input.sse, {headers:{"Content-Type":"text/event-stream"}}),
+    {sessionId:input.session,sourceTurnId:input.turn});
+console.log(JSON.stringify(result));
+'''
+    result = subprocess.run(["node", "--input-type=module", "-e", script],
+        input=json.dumps({"sse": response.text, "session": body["session_id"], "turn": body["source_turn_id"]}),
+        text=True, encoding="utf-8", capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+@pytest.mark.parametrize("outcome", ["succeeded", "cancelled", "rejected", "completed"])
+async def test_public_http_ticket_replay_uses_truthful_frontend_terminal(tmp_path, monkeypatch, outcome):
+    """写入后断流的回放伪造完成、使用非法动作终态或再次写入时失败。
+
+    参数：tmp_path 独占目录，monkeypatch 替换外部权限，outcome 成功/取消/确定拒绝/完成；返回：None；异常：断言。
+    """
+    from app.schemas.tools import ToolResult
+    from app.schemas.workflow import AgentDecision, TicketResume
+
+    class RevokedPermissions:
+        """预览后撤销许可，只隔离外部权限决定，保留生产结果保存和审计。"""
+
+        def check(self, identity, arguments, context):
+            """拒绝本次申请。参数：来源、参数、原身份；返回：确定拒绝结果；异常：无。"""
+            return ToolResult.failed("PERMISSION_DENIED", "本地已撤销建单权限")
+
+    async with ticket_runtime(tmp_path, decisions=[AgentDecision(kind="tools", tool_calls=[ticket_call()]),
+            AgentDecision(kind="answer")], answers=[["本次处理结果已记录。"]]) as (service, deps, factory, _):
+        body = await open_preview(service)
+        if outcome == "cancelled":
+            body["decision"] = "cancel"
+        elif outcome == "rejected":
+            monkeypatch.setattr(deps.executor, "permissions", RevokedPermissions())
+        stream = service.stream_resume(TicketResume(**body))
+        async for event in stream:
+            if outcome == "succeeded" and event.event == "tool_status" and event.data.get("status") == "succeeded":
+                break
+            if outcome in {"cancelled", "rejected"} and event.event == "delta":
+                break
+        await stream.aclose()
+        before = await rows(factory, "SELECT ticket_no FROM tickets")
+        audit = await rows(factory, "SELECT status FROM tool_audit_logs")
+        app = FastAPI()
+        app.include_router(router)
+        app.include_router(actions_router)
+        app.state.chat_service = service
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            for _ in range(2):
+                response = await client.post("/api/chat/resume", json=body)
+                assert response.status_code == 200
+                decoded = decode_production_sse(response, body)
+                assert decoded["status"] == ("completed" if outcome == "completed" else "accepted")
+                if outcome != "completed":
+                    assert "event: answer_metadata" not in response.text
+                    assert "data: [DONE]" not in response.text
+                if outcome in {"succeeded", "completed"}:
+                    assert before[0][0] in decoded["answer"]
+                else:
+                    assert "没有创建" in decoded["answer"]
+                current_response = await client.get("/api/actions/current", params={
+                    "session_id": body["session_id"], "user_id": body["user_id"]})
+                assert current_response.status_code == 200
+                current = current_response.json()
+                assert current["ticket_receipt"] is not None if before else current["ticket_receipt"] is None
+                assert (current["turn_status"] == "completed") == (outcome == "completed")
+            foreign = await client.post("/api/chat/resume", json={**body, "session_id": "another-session"})
+            assert foreign.status_code == 404
+        assert len(before) == (1 if outcome in {"succeeded", "completed"} else 0)
+        assert await rows(factory, "SELECT ticket_no FROM tickets") == before
+        assert len(audit) == 1 and await rows(factory, "SELECT status FROM tool_audit_logs") == audit
 
 
 async def test_confirmed_ticket_continues_to_order_selection_and_policy_answer(tmp_path):
@@ -447,3 +596,53 @@ async def test_started_write_fault_remains_unknown_on_replay(tmp_path, monkeypat
         following = await collect(service, "你好", session="ticket-session")
         assert following[-1].event == "error" and following[-1].data["status_code"] == 409
         assert attempts == ["ticket-1"] and await rows(factory, "SELECT ticket_no FROM tickets") == []
+
+
+async def test_http_replay_keeps_write_fault_unknown_when_disconnect_precedes_preview_finish(tmp_path, monkeypatch):
+    """故障结果已保存但预览尚未收尾时断流，重发不能谎称未创建或再次执行。
+
+    参数：tmp_path 独占数据库目录，monkeypatch 注入外部写处理器故障。
+    返回：None，验证公开 HTTP 错误语义及工单、审计、调用次数不变。
+    异常：断言失败或数据库错误。
+    """
+    from app.schemas.workflow import AgentDecision, TicketResume
+    async with ticket_runtime(tmp_path, decisions=[AgentDecision(kind="tools", tool_calls=[ticket_call()])]) as (service, deps, factory, _):
+        body = await open_preview(service)
+        attempts = []
+
+        async def failed_write(context, description, ticket_type):
+            """进入写边界后模拟故障；参数为原调用及工单字段；返回无；异常：RuntimeError。"""
+            attempts.append(context.tool_call_id)
+            raise RuntimeError("controlled write failure")
+
+        monkeypatch.setattr(deps.executor.support, "create_ticket", failed_write)
+        request = TicketResume(**body)
+        stream = service.stream_resume(request)
+        try:
+            async for event in stream:
+                if event.event == "tool_status" and event.data.get("status") == "failed":
+                    break
+        finally:
+            await stream.aclose()
+        # 工具失败事实已提交，但关闭流打断了随后将预览标为 unknown 的事务。
+        pending = (await service.validate_resume(request))["pending_ticket"]
+        assert pending["status"] == "accepted" and pending["execution_started"] is True
+        tickets = await rows(factory, "SELECT ticket_no FROM tickets")
+        audit = await rows(factory, "SELECT status FROM tool_audit_logs")
+        app = FastAPI()
+        app.include_router(router)
+        app.state.chat_service = service
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            for _ in range(2):
+                response = await client.post("/api/chat/resume", json=body)
+                assert response.status_code == 200
+                assert "没有创建" not in response.text
+                assert "event: error" in response.text and "data: [DONE]" not in response.text
+                payload = json.loads(next(line.removeprefix("data: ") for line in response.text.splitlines()
+                    if line.startswith("data: ")))
+                assert payload["outcome"] == "unknown" and payload["retry_safe"] is False
+        current = await service.get_current_actions(body["session_id"], body["user_id"])
+        assert current.ticket_status == "unknown" and current.ticket_receipt is None
+        assert attempts == ["ticket-1"]
+        assert tickets == [] and await rows(factory, "SELECT ticket_no FROM tickets") == tickets
+        assert len(audit) == 1 and await rows(factory, "SELECT status FROM tool_audit_logs") == audit

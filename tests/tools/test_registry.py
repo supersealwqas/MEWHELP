@@ -108,3 +108,16 @@ def test_invalid_registration_does_not_change_existing_snapshot():
     with pytest.raises(ValueError):
         registry.register_definition(definition("x" * 65))
     assert len(registry.snapshot()) == 1
+
+
+def test_unresolvable_schema_cannot_enter_registry():
+    """未解析本地引用时，坏工具会进入公开快照并威胁后续调用。
+
+    参数：无；返回：None；异常：断言失败。
+    """
+    registry = ToolRegistry()
+    registry.register_definition(definition())
+    with pytest.raises(ValueError):
+        registry.register_definition(definition("broken", schema={"type": "object", "properties": {
+            "value": {"$ref": "#/$defs/missing"}}}))
+    assert [row.name for row in registry.snapshot()] == ["query_hours"]
