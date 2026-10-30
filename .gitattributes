@@ -1,0 +1,2 @@
+# 冻结题集按原始字节校验，检出时必须保留 LF，避免系统换行转换改变摘要。
+tests/fixtures/ch08/dialogue_cases.json text eol=lf
