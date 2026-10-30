@@ -50,6 +50,10 @@ def test_lifespan_recovery_failure_blocks_startup(monkeypatch, tmp_path, offline
             disposed.append("search")
 
     offline_settings.workflow_checkpoint_path = str(tmp_path / "startup.sqlite")
+    async def checked_schema(config):
+        """隔离新增 MySQL 核验边界，保留恢复流程。参数：配置；返回：None；异常：无。"""
+
+    monkeypatch.setattr(main, "check_ch09_tables", checked_schema)
     monkeypatch.setattr(main, "create_database", lambda: (Engine("business"), None))
     monkeypatch.setattr(main, "create_async_engine", lambda *args, **kwargs: Engine("lease"))
     monkeypatch.setattr(main, "online_search_runtime", search)

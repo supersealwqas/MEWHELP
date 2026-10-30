@@ -12,6 +12,7 @@ from sqlalchemy.dialects.mysql import BIGINT, DATETIME, INTEGER
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from app.models.customer_service import Conversation, TABLE_OPTIONS
+from app.models.flywheel import ReviewQueue
 
 
 class QualityBase(DeclarativeBase):
@@ -23,6 +24,7 @@ class LowConfidenceQuestion(QualityBase):
 
     __tablename__ = "low_confidence_questions"
     __table_args__ = (Index("idx_source", "source"), Index("idx_created_at", "created_at"),
+                      Index("idx_matched_review_id", "matched_review_id"),
                       {**TABLE_OPTIONS, "comment": "低置信度问题池"})
 
     id: Mapped[int] = mapped_column(BIGINT(unsigned=True), primary_key=True, autoincrement=True, comment="主键")
@@ -33,6 +35,11 @@ class LowConfidenceQuestion(QualityBase):
     source: Mapped[str] = mapped_column(Enum("retrieval_low_conf", "self_check", "user_feedback"), nullable=False,
         comment="入池入口:检索证据低 / 生成自评不足 / 用户反馈未解决")
     reason: Mapped[str | None] = mapped_column(Text, nullable=True, comment="判不能的原因,留作复盘")
+    retrieved_chunks: Mapped[dict | None] = mapped_column(JSON(none_as_null=True), nullable=True,
+        comment="落池时的召回片段快照:Top 几条的原文与得分,审核页展示用;没走检索为 NULL")
+    matched_review_id: Mapped[int | None] = mapped_column(BIGINT(unsigned=True),
+        ForeignKey(ReviewQueue.__table__.c.id, name="fk_lcq_review", ondelete="SET NULL"), nullable=True,
+        comment="查重后归并到的缺口,指向 review_queue.id")
     created_at: Mapped[datetime] = mapped_column(DATETIME, nullable=False, server_default=text("CURRENT_TIMESTAMP"), comment="入池时间")
 
 

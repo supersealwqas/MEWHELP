@@ -81,12 +81,16 @@ class RecoveryRuntimeBoundary:
         self.settings = Settings(_env_file=None, **values)
         monkeypatch.setattr(main, "settings", self.settings)
         monkeypatch.setattr(main, "create_database", self.create_database)
+        monkeypatch.setattr(main, "check_ch09_tables", self.check_ch09_tables)
         monkeypatch.setattr(main, "create_async_engine", self.create_lease_engine)
         monkeypatch.setattr(main, "online_search_runtime", self.search_runtime)
         monkeypatch.setattr(main, "create_job_manager", self.create_job_manager)
         # 模型必须在根图闭包创建前注入；当前ChatService不读取service.model属性。
         monkeypatch.setattr(main, "WorkflowModelAdapter", self.create_model)
         monkeypatch.setattr(workflow_model, "get_chat_model", self.forbid_external_model)
+
+    async def check_ch09_tables(self, config):
+        """恢复测试隔离新增外部 MySQL 核验。参数：配置；返回：None；异常：无。"""
 
     def forbid_external_model(self, *args, **kwargs):
         """阻断遗漏注入后的外部模型。参数：模型工厂原参数；返回：不返回；异常：AssertionError。"""

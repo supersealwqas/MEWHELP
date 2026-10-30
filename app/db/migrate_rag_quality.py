@@ -11,12 +11,28 @@ import argparse
 import asyncio
 
 import anyio
-from sqlalchemy import inspect, text
+from sqlalchemy import Column, Enum, ForeignKey, Index, MetaData, Table, Text, UniqueConstraint, inspect, text
 from sqlalchemy.dialects import mysql
 
 from app.config import Settings
 from app.db.session import create_database
 from app.models.rag_quality import QUALITY_TABLES
+from app.models.customer_service import Conversation, TABLE_OPTIONS
+
+
+# CH04 的首次建表定义固定在本章版本，不随后续 ORM 新字段或跨元数据外键演进。
+CH04_LOW_CONFIDENCE = Table(
+    "low_confidence_questions", MetaData(),
+    Column("id", mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True, comment="主键"),
+    Column("conversation_id", mysql.BIGINT(unsigned=True), ForeignKey(Conversation.__table__.c.id, name="fk_lcq_conversation"), nullable=True, comment="来源会话"),
+    Column("raw_question", Text, nullable=False, comment="用户原话,带情绪口语"),
+    Column("source", Enum("retrieval_low_conf", "self_check", "user_feedback"), nullable=False, comment="入池入口:检索证据低 / 生成自评不足 / 用户反馈未解决"),
+    Column("reason", Text, nullable=True, comment="判不能的原因,留作复盘"),
+    Column("created_at", mysql.DATETIME(), nullable=False, server_default=text("CURRENT_TIMESTAMP"), comment="入池时间"),
+    Index("idx_source", "source"), Index("idx_created_at", "created_at"),
+    **TABLE_OPTIONS, comment="低置信度问题池",
+)
+CH04_QUALITY_TABLES = (CH04_LOW_CONFIDENCE, QUALITY_TABLES[1])
 
 
 class QualitySchemaError(RuntimeError):
@@ -27,26 +43,28 @@ def _default(value: object) -> str | None:
     """统一 MySQL 反射默认值写法。参数：value 默认表达式；返回：规范字符串或 None；异常：无。"""
     if value is None:
         return None
-    return str(value).strip().strip("'").lower().removesuffix("()")
+    return " ".join(str(value).strip().strip("'").lower().replace("()", "").split())
 
 
-def _validate_table(inspector, table) -> None:
+def _validate_table(inspector, table, *, optional_columns=(), optional_indexes=(), optional_foreign_keys=()) -> None:
     """检查一张已有表与用户定义逐字段兼容。
 
-    参数：inspector 同步 SQLAlchemy Inspector；table 为两张质量表之一。
+    参数：inspector 同步反射对象；table 期望表；optional_* 为 CH09 续迁时可暂缺的新增约束名称。
     返回：None，结构满足约束。
     异常：QualitySchemaError，列/类型/索引/枚举/默认/编码/外键不一致；底层反射错误。
     """
     name = table.name
     columns = {column["name"]: column for column in inspector.get_columns(name)}
-    if set(columns) != set(table.columns.keys()):
+    if not set(table.columns.keys()) - set(optional_columns) <= set(columns) <= set(table.columns.keys()):
         raise QualitySchemaError(f"{name} 字段集合不兼容，不自动修改已有表")
     for expected in table.columns:
+        if expected.name not in columns:
+            continue
         actual = columns[expected.name]
         actual_type, wanted = actual["type"], expected.type
         actual_compiled = str(actual_type.compile(dialect=mysql.dialect())).upper()
         wanted_compiled = str(wanted.compile(dialect=mysql.dialect())).upper()
-        if actual_compiled != wanted_compiled or actual["nullable"] != expected.nullable:
+        if actual_compiled != wanted_compiled or actual["nullable"] != expected.nullable or actual.get("computed"):
             raise QualitySchemaError(f"{name}.{expected.name} 类型/长度/空值约束不兼容")
         if hasattr(wanted, "enums") and actual_type.enums != wanted.enums:
             raise QualitySchemaError(f"{name}.{expected.name} 中文枚举不兼容")
@@ -58,20 +76,47 @@ def _validate_table(inspector, table) -> None:
     if inspector.get_pk_constraint(name).get("constrained_columns") != ["id"]:
         raise QualitySchemaError(f"{name} 主键不兼容")
     indexes = {index["name"]: index for index in inspector.get_indexes(name)}
-    for expected in table.indexes:
-        actual = indexes.get(expected.name)
-        if (actual is None or actual.get("column_names") != [column.name for column in expected.columns]
-                or bool(actual.get("unique")) != expected.unique):
-            raise QualitySchemaError(f"{name} 缺少兼容索引 {expected.name}")
-    if name == "faith_cases":
-        unique = [*inspector.get_unique_constraints(name), *[index for index in indexes.values() if index.get("unique")]]
-        if not any(item.get("name") == "uk_eval_id" and item.get("column_names") == ["eval_id"] for item in unique):
-            raise QualitySchemaError("faith_cases 缺少 uk_eval_id 唯一约束")
-    if name == "low_confidence_questions":
-        foreign = inspector.get_foreign_keys(name)
-        if not any(item.get("name") == "fk_lcq_conversation" and item.get("constrained_columns") == ["conversation_id"]
-                   and item.get("referred_table") == "conversations" and item.get("referred_columns") == ["id"] for item in foreign):
-            raise QualitySchemaError("low_confidence_questions 会话外键不兼容")
+    expected_indexes = {index.name: (list(index.columns.keys()), index.unique) for index in table.indexes}
+    expected_unique = {item.name: list(item.columns.keys()) for item in table.constraints if isinstance(item, UniqueConstraint)}
+    expected_indexes.update({key: (value, True) for key, value in expected_unique.items()})
+    implicit_indexes = set()
+    for foreign_key in table.foreign_key_constraints:
+        foreign_columns = list(foreign_key.columns.keys())
+        if not any(columns[:len(foreign_columns)] == foreign_columns for columns, _ in expected_indexes.values()):
+            # InnoDB 会为未被显式索引覆盖的外键生成同名普通索引；仍逐项核对列与属性。
+            expected_indexes[foreign_key.name] = (foreign_columns, False)
+            implicit_indexes.add(foreign_key.name)
+    if not set(expected_indexes) - set(optional_indexes) - implicit_indexes <= set(indexes) <= set(expected_indexes):
+        raise QualitySchemaError(f"{name} 索引集合不兼容")
+    for key, actual in indexes.items():
+        wanted_columns, unique = expected_indexes[key]
+        options = actual.get("dialect_options", {})
+        if (actual.get("column_names") != wanted_columns or bool(actual.get("unique")) != unique
+                or options.get("mysql_length") or options.get("mysql_prefix")
+                or str(options.get("mysql_using", "BTREE")).upper() != "BTREE"):
+            raise QualitySchemaError(f"{name} 索引 {key} 不兼容")
+    actual_unique = {item["name"]: item["column_names"] for item in inspector.get_unique_constraints(name)}
+    if actual_unique != expected_unique:
+        raise QualitySchemaError(f"{name} 唯一约束不兼容")
+    foreign = {item["name"]: item for item in inspector.get_foreign_keys(name)}
+    wanted_foreign = {item.name: item for item in table.foreign_key_constraints}
+    if not set(wanted_foreign) - set(optional_foreign_keys) <= set(foreign) <= set(wanted_foreign):
+        raise QualitySchemaError(f"{name} 外键集合不兼容")
+    for key, actual in foreign.items():
+        expected = wanted_foreign[key]
+        actions = actual.get("options", {})
+        # MySQL 未指定动作与 RESTRICT/NO ACTION 等价；SET NULL 必须明确保留。
+        ondelete = str(actions.get("ondelete", "RESTRICT")).upper()
+        onupdate = str(actions.get("onupdate", "RESTRICT")).upper()
+        if (actual.get("constrained_columns") != list(expected.columns.keys())
+                or actual.get("referred_table") != expected.referred_table.name
+                or actual.get("referred_columns") != [item.column.name for item in expected.elements]
+                or actual.get("referred_schema") != expected.referred_table.schema
+                or ondelete not in ({expected.ondelete} if expected.ondelete else {"RESTRICT", "NO ACTION"})
+                or onupdate not in {"RESTRICT", "NO ACTION"}):
+            raise QualitySchemaError(f"{name} 外键 {key} 不兼容")
+    if hasattr(inspector, "get_check_constraints") and inspector.get_check_constraints(name):
+        raise QualitySchemaError(f"{name} 含固定 DDL 未规定的检查约束")
     options = inspector.get_table_options(name)
     charset = options.get("mysql_default charset") or options.get("mysql_charset")
     if str(options.get("mysql_engine", "")).lower() != "innodb" or str(charset).lower() != "utf8mb4":
@@ -87,6 +132,9 @@ def validate_quality_schema(inspector, *, require_all: bool = True) -> None:
     """
     for table in QUALITY_TABLES:
         if inspector.has_table(table.name):
+            if (table.name == "low_confidence_questions"
+                    and {item["name"] for item in inspector.get_columns(table.name)} == set(CH04_LOW_CONFIDENCE.c.keys())):
+                table = CH04_LOW_CONFIDENCE
             _validate_table(inspector, table)
         elif require_all:
             raise QualitySchemaError(f"缺少 {table.name}，请显式运行质量表迁移")
@@ -104,7 +152,7 @@ def _migrate(connection) -> list[str]:
         raise QualitySchemaError("缺少 conversations，请先初始化业务表；本迁移不创建无关表")
     validate_quality_schema(inspector, require_all=False)
     created = []
-    for table in QUALITY_TABLES:
+    for table in CH04_QUALITY_TABLES:
         if not inspector.has_table(table.name):
             table.create(connection, checkfirst=True)
             created.append(table.name)

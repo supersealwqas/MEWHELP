@@ -88,7 +88,8 @@ def test_low_confidence_orm_exact_fields_no_useful_or_turn_id() -> None:
     from app.models.rag_quality import LowConfidenceQuestion
 
     table = LowConfidenceQuestion.__table__
-    assert set(table.columns.keys()) == {"id", "conversation_id", "raw_question", "source", "reason", "created_at"}
+    assert set(table.columns.keys()) == {"id", "conversation_id", "raw_question", "source", "reason", "created_at",
+                                         "retrieved_chunks", "matched_review_id"}
     assert table.c.conversation_id.nullable
     assert table.c.source.type.enums == ["retrieval_low_conf", "self_check", "user_feedback"]
     ddl = str(CreateTable(table).compile(dialect=mysql.dialect()))
@@ -115,6 +116,17 @@ def test_valid_existing_quality_schema_is_idempotently_accepted() -> None:
     from app.db.migrate_rag_quality import validate_quality_schema
 
     validate_quality_schema(SchemaInspector())
+
+
+def test_quality_validator_accepts_only_old_or_complete_new_shape() -> None:
+    """CH04 接受完整升级但拒绝半迁移的形状。参数：无；返回：None；异常：断言失败。"""
+    from app.db.migrate_rag_quality import QualitySchemaError, validate_quality_schema
+    from tests.flywheel.test_migration import FlywheelInspector
+
+    validate_quality_schema(FlywheelInspector(6))
+    for steps in (3, 4, 5):
+        with pytest.raises(QualitySchemaError):
+            validate_quality_schema(FlywheelInspector(steps))
 
 
 @pytest.mark.parametrize("fault", ["column", "nullable", "enum", "length", "unsigned", "default", "index", "foreign", "charset"])

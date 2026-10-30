@@ -26,6 +26,7 @@ from app.api.rageval import create_job_manager
 from app.core.logging import setup_logging
 from app.config import settings
 from app.db.session import create_database
+from app.db.migrate_ch09 import check_ch09_tables
 from app.knowledge.runtime import online_search_runtime
 from app.api.kb import router as kb_router
 from app.knowledge.store import KnowledgeStore
@@ -136,6 +137,8 @@ async def database_runtime():
     mcp = None
     observability = None
     try:
+        # 新章启动只核验完整结构；DDL 必须通过显式具名迁移完成。
+        await check_ch09_tables(settings)
         observability = ObservabilityRuntime(settings)
         repository = ChatRepository(factory)
         lease_engine = create_async_engine(
