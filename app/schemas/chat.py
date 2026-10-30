@@ -5,7 +5,18 @@
 """
 
 from typing import Literal
+from copy import deepcopy
 from pydantic import BaseModel, Field, ValidationInfo, field_validator
+
+
+def public_rag_metadata(metadata: dict) -> dict:
+    """只投影既有公开完成字段，阻止检索原文、问题池和追踪身份外泄。
+
+    参数：metadata 服务端内部元数据；返回：独立的公开字典；异常：无。
+    """
+    allowed = {"session_id", "turn_id", "status", "citations", "citation_inputs", "suggested_actions",
+               "workflow", "refund_action", "low_confidence"}
+    return {key: deepcopy(value) for key, value in (metadata or {}).items() if key in allowed}
 
 
 class ChatRequest(BaseModel):

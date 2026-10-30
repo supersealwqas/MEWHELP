@@ -1,5 +1,7 @@
 """会话上下文仓储：原文只读、边界单调推进、摘要段和投影在同一短事务提交。"""
 
+import json
+
 from sqlalchemy import select, text
 
 from app.core.context_budget import TokenEstimator
@@ -7,6 +9,7 @@ from app.core.context_layers import _safe_to_demote, history_blocks, project_sum
 from app.core.memory import assemble_turns
 from app.models.customer_service import Conversation, ConversationSummary, Message
 from app.repositories.chat import stored_turns
+from app.schemas.chat import public_rag_metadata
 
 
 class ContextNotFound(LookupError):
@@ -193,5 +196,16 @@ class ContextRepository:
             rows = (await session.scalars(select(Message).where(Message.conversation_id == conversation_id, Message.id > after_id)
                 .order_by(Message.id).limit(limit + 1))).all()
             items = [{column.name: getattr(row, column.name) for column in Message.__table__.columns} for row in rows[:limit]]
+            for item in items:
+                item["rag_metadata"] = public_rag_metadata(item["rag_metadata"]) if item["rag_metadata"] is not None else None
+                if item["role"] == "tool":
+                    try:
+                        result = json.loads(item["content"])
+                    except (TypeError, ValueError):
+                        continue
+                    # 仅投影服务端工具结构；原库和内部历史仍保存原始字节，不扫描用户/助手正文。
+                    if isinstance(result, dict) and "verified_knowledge" in result:
+                        item["content"] = json.dumps({key: value for key, value in result.items()
+                            if key != "verified_knowledge"}, ensure_ascii=False)
             return {"items": items, "session_id": conv.session_id,
                     "next_after_id": items[-1]["id"] if len(rows) > limit else None}

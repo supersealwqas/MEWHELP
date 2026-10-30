@@ -90,6 +90,7 @@ class KnowledgeCallContext:
     search: Any = None  # 本实例权威检索器，不进入检查点。
     settings: Any = None  # 本实例证据和预算配置。
     query_expander: Any = None  # 本实例政策扩写器。
+    chat: Any = None  # 原轮快照的短事务仓储，不进入检查点。
 
 
 @dataclass

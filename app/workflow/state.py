@@ -21,6 +21,8 @@ class ConversationState(TypedDict, total=False):
 
     context: dict  # ToolContext的JSON快照，身份只由服务端提供。
     trace_identity: dict | None  # 原轮追踪身份JSON，禁止保存活跃SDK对象。
+    retrieval_snapshot: dict | None  # 原轮全部闸前检索证据；新轮清空。
+    pool_signals: list[dict]  # 同轮固定三个来源的入池理由。
     raw_query: str  # 当前用户完整原话，保留首尾空白。
     resolved_query: str  # 一次理解补全的完整问题，未执行时为空。
     standard_query: str  # 同次理解的标准问法；优化失败保留完整原句。
@@ -133,6 +135,7 @@ def new_turn_state(context: ToolContext, history_turns: list[dict], audit_cursor
     # 新input必须显式覆盖每个字段，防止同thread的旧checkpoint残留运行数据。
     return {
         "context": context.model_dump(mode="json"), "trace_identity": None,
+        "retrieval_snapshot": None, "pool_signals": [],
         "raw_query": query, "resolved_query": "", "standard_query": "",
         "order_id": None, "order_data": None, "expanded_queries": [], "selection_action": None,
         "history_turns": deepcopy(history_turns), "audit_cursor": audit_cursor,

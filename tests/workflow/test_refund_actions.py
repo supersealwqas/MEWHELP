@@ -57,10 +57,14 @@ async def test_finish_retry_compares_refund_snapshot(tmp_path):
         ctx = await deps.chat.get_turn_context("s", "demo-user", metadata["turn_id"])
         action = workflow.RefundAction.model_validate(metadata["refund_action"])
         answer = "".join(event.data["delta"] for event in events if event.event == "delta")
+        from app.schemas.flywheel import RetrievalSnapshot
+        row = await deps.chat.get_workflow_turn("s", "demo-user", metadata["turn_id"])
+        snapshot = RetrievalSnapshot.model_validate(row["retrieval_snapshot"])
         assert await deps.chat.finish_turn(ctx, answer, citations=[], suggested_actions=[],
-            workflow_metadata=metadata["workflow"], refund_action=action) == metadata
+            workflow_metadata=metadata["workflow"], refund_action=action, retrieval_snapshot=snapshot, pool_signals=[]) == metadata
         with pytest.raises(PersistenceUncertain):
-            await deps.chat.finish_turn(ctx, answer, citations=[], suggested_actions=[], workflow_metadata=metadata["workflow"])
+            await deps.chat.finish_turn(ctx, answer, citations=[], suggested_actions=[], workflow_metadata=metadata["workflow"],
+                retrieval_snapshot=snapshot, pool_signals=[])
 
 
 @pytest.mark.parametrize("override", [{"confirmed": False}, {"confirmed": 1}, {"amount": 1}, {"order_id": "1002"},

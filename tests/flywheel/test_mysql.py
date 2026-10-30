@@ -17,7 +17,7 @@ from app.models.customer_service import Conversation
 pytestmark = [pytest.mark.mysql, pytest.mark.skipif(
     os.getenv("MEWHELP_RUN_CH09_MYSQL") != "1", reason="需要显式 MEWHELP_RUN_CH09_MYSQL=1")]
 TEST_DATABASE = "mewhelp_ch09_test"
-OWNED_TABLES = ("low_confidence_questions", "faith_cases", "eval_runs", "review_queue", "conversations")
+OWNED_TABLES = ("messages", "low_confidence_questions", "faith_cases", "eval_runs", "review_queue", "conversations")
 
 
 @pytest.fixture
@@ -64,6 +64,130 @@ async def prepare_ch04(engine):
     async with engine.begin() as connection:
         await connection.run_sync(lambda sync: Conversation.__table__.create(sync))
         await connection.run_sync(_migrate)
+
+
+async def prepare_feedback(engine):
+    """在具名空专库准备原轮反馈依赖。参数：引擎；返回：None；异常：DDL错误。"""
+    from app.db.migrate_ch09 import migrate_connection
+    from app.models.customer_service import Message
+    await prepare_ch04(engine)
+    async with engine.begin() as connection:
+        await connection.run_sync(lambda sync: migrate_connection(sync, apply=True))
+        await connection.run_sync(lambda sync: Message.__table__.create(sync))
+
+
+async def test_same_source_concurrent_retry_keeps_one_pool_row(isolated_mysql):
+    """真实MySQL行锁必须串行化同一原轮的并发反馈。参数：空专库；返回：None；异常：断言失败。"""
+    import asyncio
+    from sqlalchemy import select
+    from app.repositories.chat import ChatRepository
+    from app.models.rag_quality import LowConfidenceQuestion
+    from tests.flywheel.test_pool import start
+    _, engine, factory, _ = isolated_mysql
+    await prepare_feedback(engine)
+    chat = ChatRepository(factory)
+    ctx = await start(chat)
+    await chat.finish_turn(ctx, "服务端原答")
+    receipts = await asyncio.gather(*(chat.record_unresolved_feedback("s", "u", "first") for _ in range(8)))
+    assert all(receipt == receipts[0] for receipt in receipts)
+    async with factory() as session:
+        rows = (await session.scalars(select(LowConfidenceQuestion))).all()
+        assert len(rows) == 1 and receipts[0].pool_id == str(rows[0].id)
+    async with engine.connect() as connection:
+        assert await connection.scalar(text("SELECT retrieved_chunks IS NULL FROM low_confidence_questions")) == 1
+    print("8个独立session并发反馈：池中1行，回执完全一致，确认无检索保存SQL NULL")
+
+
+async def test_mysql_pool_failure_rolls_back_and_lost_response_is_idempotent(isolated_mysql):
+    """真实提交前后故障分别要求完整回滚及重发幂等。参数：空专库；返回：None；异常：断言失败。"""
+    from contextlib import asynccontextmanager
+    from sqlalchemy import select
+    from app.models.customer_service import Message
+    from app.models.rag_quality import LowConfidenceQuestion
+    from app.repositories.chat import ChatRepository
+    from app.schemas.flywheel import PoolSignal
+    from app.workflow.routing import fixed_reply
+    from tests.flywheel.test_pool import start
+    _, engine, factory, _ = isolated_mysql
+    await prepare_feedback(engine)
+    chat = ChatRepository(factory)
+    ctx = await start(chat)
+    def fail(connection, cursor, statement, parameters, context, executemany):
+        """在真实入池SQL前模拟失败。参数：数据库事件；返回：None；异常：RuntimeError。"""
+        if statement.startswith("INSERT INTO low_confidence_questions"):
+            raise RuntimeError("pool failed")
+    event.listen(engine.sync_engine, "before_cursor_execute", fail)
+    try:
+        with pytest.raises(RuntimeError, match="pool failed"):
+            await chat.finish_turn(ctx, fixed_reply("fallback")["answer"],
+                pool_signals=[PoolSignal(source="retrieval_low_conf", reason="证据不足")])
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", fail)
+    async with factory() as session:
+        rows = (await session.scalars(select(Message))).all()
+        assert len(rows) == 1 and rows[0].turn_status == "running"
+        assert (await session.scalars(select(LowConfidenceQuestion))).all() == []
+    await chat.finish_turn(ctx, "完成答复")
+    class LostResponse:
+        """在数据库成功提交后模拟HTTP返回中断。"""
+        @asynccontextmanager
+        async def begin(self):
+            """参数：无；返回：事务；异常：ConnectionError。"""
+            async with factory.begin() as session:
+                yield session
+            raise ConnectionError("lost response")
+    with pytest.raises(ConnectionError):
+        await ChatRepository(LostResponse()).record_unresolved_feedback("s", "u", "first")
+    receipt = await chat.record_unresolved_feedback("s", "u", "first")
+    async with factory() as session:
+        rows = (await session.scalars(select(LowConfidenceQuestion))).all()
+        assert len(rows) == 1 and receipt.pool_id == str(rows[0].id)
+    print("真实MySQL：入池异常完整回滚；提交响应丢失重发仍为1条同ID回执")
+
+
+async def test_multiple_sources_share_counted_review_and_preserve_source_metadata(isolated_mysql):
+    """同轮新入口不可重复计数，下一轮命中同问题只加一次。参数：专库；返回：None；异常：断言失败。"""
+    import asyncio
+    from sqlalchemy import select
+    from app.knowledge.answering import FIXED_KNOWLEDGE_REFUSAL, SelfCheckFailure
+    from app.models.customer_service import Message
+    from app.models.flywheel import ReviewQueue
+    from app.models.rag_quality import LowConfidenceQuestion
+    from app.repositories.chat import ChatRepository
+    from tests.flywheel.test_pool import start
+    _, engine, factory, _ = isolated_mysql
+    await prepare_feedback(engine)
+    chat = ChatRepository(factory)
+    first = await start(chat)
+    await chat.finish_turn(first, FIXED_KNOWLEDGE_REFUSAL, low_confidence=SelfCheckFailure(reason="原轮自评不足"))
+    async with factory.begin() as session:
+        review = ReviewQueue(normalized_question="原问题", occurrence_count=1)
+        session.add(review)
+        await session.flush()
+        source = await session.scalar(select(Message).where(Message.role == "user", Message.turn_id == "first"))
+        pool = await session.scalar(select(LowConfidenceQuestion))
+        pool.matched_review_id = review.id
+        source.rag_metadata = {**source.rag_metadata, "trace_identity": {"trace_id": "保留"},
+            "ticket_intent": {"status": "confirmed"}, "knowledge_pool": {**source.rag_metadata["knowledge_pool"],
+                "matched_review_id": review.id, "counted_review_id": review.id}}
+    receipts = await asyncio.gather(*(chat.record_unresolved_feedback("s", "u", "first") for _ in range(5)))
+    async with factory() as session:
+        assert (await session.get(ReviewQueue, review.id)).occurrence_count == 1
+        source = await session.scalar(select(Message).where(Message.role == "user", Message.turn_id == "first"))
+        assert set(source.rag_metadata["knowledge_pool"]["pool_ids"]) == {"self_check", "user_feedback"}
+        assert source.rag_metadata["trace_identity"] == {"trace_id": "保留"}
+        assert source.rag_metadata["ticket_intent"] == {"status": "confirmed"}
+        assert all(r == receipts[0] and r.matched_review_id == str(review.id) for r in receipts)
+    second = await start(chat, turn="second", question="同义的第二轮问题")
+    await chat.finish_turn(second, "原答")
+    async with factory.begin() as session:
+        source = await session.scalar(select(Message).where(Message.role == "user", Message.turn_id == "second"))
+        source.rag_metadata = {**source.rag_metadata, "knowledge_pool": {"matched_review_id": review.id}}
+    await asyncio.gather(*(chat.record_unresolved_feedback("s", "u", "second") for _ in range(5)))
+    async with factory() as session:
+        assert (await session.get(ReviewQueue, review.id)).occurrence_count == 2
+        assert len((await session.scalars(select(LowConfidenceQuestion))).all()) == 3
+    print("同轮self_check+feedback共2条池记录但只计1次；新轮同义命中并发重试只加1次；原工单/trace字段保留")
 
 
 async def test_empty_database_ch04_then_ch09_succeeds(isolated_mysql):

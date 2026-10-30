@@ -21,6 +21,7 @@ from app.api.actions import router as actions_router
 from app.api.citations import router as citations_router
 from app.api.conversations import router as conversations_router
 from app.api.extract import router as extract_router
+from app.api.feedback import router as feedback_router
 from app.api.rageval import router as rageval_router
 from app.api.rageval import create_job_manager
 from app.core.logging import setup_logging
@@ -219,6 +220,7 @@ def create_app(runtime_factory=None) -> FastAPI:
     application.add_middleware(SecurityHeadersMiddleware)
     application.include_router(extract_router)
     application.include_router(chat_router)
+    application.include_router(feedback_router)
     application.include_router(actions_router)
     application.include_router(citations_router)
     application.include_router(conversations_router)

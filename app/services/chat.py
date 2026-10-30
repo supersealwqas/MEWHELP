@@ -19,7 +19,7 @@ from app.knowledge.answering import (
     has_failed_knowledge_result, KnowledgeAnswerError, knowledge_answer_handoff, number_knowledge_results,
 )
 from app.repositories.chat import PersistenceUncertain
-from app.schemas.chat import ChatEvent, ChatRequest, InvalidToolDecision
+from app.schemas.chat import ChatEvent, ChatRequest, InvalidToolDecision, public_rag_metadata
 from app.schemas.tools import ToolContext, ToolResult
 from app.tools.executor import ToolExecutor
 from app.workflow.state import checkpoint_thread_id
@@ -369,7 +369,7 @@ class LegacyChatService:
                 stage = "finish"
                 metadata = await self.chat.finish_turn(context, chain.ticket_receipt + chain.rejection)
                 completed = True
-                yield ChatEvent(event="answer_metadata", data=metadata)
+                yield ChatEvent(event="answer_metadata", data=public_rag_metadata(metadata))
                 yield ChatEvent(event="done")
                 return
             stage = "answer"
@@ -399,7 +399,7 @@ class LegacyChatService:
                                                        low_confidence=low_confidence, citations=citations)
                 completed = True
                 yield ChatEvent(event="delta", data={"delta": answer})
-                yield ChatEvent(event="answer_metadata", data=metadata)
+                yield ChatEvent(event="answer_metadata", data=public_rag_metadata(metadata))
                 yield ChatEvent(event="done")
                 return
             # 回答阶段没有工具定义，必须改用不含决策指令的 ANSWER_SYSTEM；
@@ -419,7 +419,7 @@ class LegacyChatService:
             stage = "finish"
             metadata = await self.chat.finish_turn(context, answer)
             completed = True
-            yield ChatEvent(event="answer_metadata", data=metadata)
+            yield ChatEvent(event="answer_metadata", data=public_rag_metadata(metadata))
             yield ChatEvent(event="done")
         except (asyncio.CancelledError, GeneratorExit):
             raise
@@ -747,7 +747,7 @@ class ChatService:
                 break
         return CurrentActions(source_turn_id=row["context"].turn_id, turn_status=row["turn_status"],
             order_selection=action, accepted_order_id=saved.get("accepted_order_id") if saved else None,
-            answer=row["answer"], completion_metadata=row["completion_metadata"], resume_required=resume_required,
+            answer=row["answer"], completion_metadata=public_rag_metadata(row["completion_metadata"]) if row["completion_metadata"] else None, resume_required=resume_required,
             refund_action=refund_action, refund_receipt=refund_receipt, ticket_receipt=ticket_receipt,
             ticket_confirmation=ticket_confirmation, ticket_decision=ticket_decision, ticket_status=ticket_status)
 
@@ -788,8 +788,17 @@ class ChatService:
         """
         config = {"configurable": {"thread_id": checkpoint_thread_id(context.conversation_id)}}
         identity, trace_state = None, None
+        row = await self.chat.get_workflow_turn(context.session_id, context.user_id, context.turn_id)
+        if row and row.get("retrieval_snapshot") is not None:
+            from app.knowledge.snapshots import merge_snapshots
+            from app.schemas.flywheel import RetrievalSnapshot
+            prior = initial if isinstance(initial, dict) else (await self.graph.aget_state(config)).values
+            incoming = RetrievalSnapshot.model_validate(row["retrieval_snapshot"])
+            merged = merge_snapshots(RetrievalSnapshot.model_validate(prior["retrieval_snapshot"])
+                if prior.get("retrieval_snapshot") else None, incoming).model_dump(mode="json")
+            initial = {**initial, "retrieval_snapshot": merged} if isinstance(initial, dict) else replace(
+                initial, update={**(initial.update or {}), "retrieval_snapshot": merged})
         if self.observability is not None and self.observability.enabled:
-            row = await self.chat.get_workflow_turn(context.session_id, context.user_id, context.turn_id)
             saved = row.get("trace_identity") if row else None
             identity = TraceIdentity(**saved) if saved else self.observability.identity_for(context)
             trace_state = initial if isinstance(initial, dict) else (await self.graph.aget_state(config)).values
@@ -817,7 +826,7 @@ class ChatService:
                 raise PersistenceUncertain("工作流最终状态尚未确认")
             outcome["completed"] = True
             await self._schedule_summary(final.values, context.conversation_id)
-            yield ChatEvent(event="answer_metadata", data=metadata)
+            yield ChatEvent(event="answer_metadata", data=public_rag_metadata(metadata))
             yield ChatEvent(event="done")
         finally:
             with anyio.CancelScope(shield=True):
@@ -885,7 +894,7 @@ class ChatService:
                         if row["answer"] is None or not row["completion_metadata"]:
                             raise PersistenceUncertain("完成回执缺失")
                         yield ChatEvent(event="delta", data={"delta": row["answer"]})
-                        yield ChatEvent(event="answer_metadata", data=row["completion_metadata"])
+                        yield ChatEvent(event="answer_metadata", data=public_rag_metadata(row["completion_metadata"]))
                         yield ChatEvent(event="done")
                         return
                     config = {"configurable": {"thread_id": checkpoint_thread_id(context.conversation_id)}}
@@ -938,7 +947,7 @@ class ChatService:
                 row = await self.validate_resume(request)
                 if row["turn_status"] == "completed" and row["answer"] is not None and row["completion_metadata"]:
                     yield ChatEvent(event="delta", data={"delta": row["answer"]})
-                    yield ChatEvent(event="answer_metadata", data=row["completion_metadata"])
+                    yield ChatEvent(event="answer_metadata", data=public_rag_metadata(row["completion_metadata"]))
                     yield ChatEvent(event="done")
                 elif row["order_selection"].get("status") == "accepted":
                     yield ChatEvent(event="action_status", data={"action_id": request.action_id, "source_turn_id": request.source_turn_id, "status": "accepted"})
@@ -958,7 +967,7 @@ class ChatService:
             raise PersistenceUncertain("原工单执行结果待核实，不能重新执行")
         if row["turn_status"] == "completed" and row.get("answer") is not None and row.get("completion_metadata"):
             yield ChatEvent(event="delta", data={"delta": row["answer"]})
-            yield ChatEvent(event="answer_metadata", data=row["completion_metadata"])
+            yield ChatEvent(event="answer_metadata", data=public_rag_metadata(row["completion_metadata"]))
             yield ChatEvent(event="done")
             return
         receipt = await ActionRepository(self.chat.factory).get_chat_ticket_receipt(request)

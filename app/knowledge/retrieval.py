@@ -21,6 +21,8 @@ from app.knowledge.rerank import RankedChunk, RerankUnavailable
 from app.knowledge.schemas import ChunkSnapshot
 from app.knowledge.search import KnowledgeSearchUnavailable
 from app.knowledge.store import KnowledgeStore
+from app.knowledge.snapshots import RetrievalCapture, chunk_snapshot
+from app.schemas.flywheel import RetrievalAttempt
 
 if TYPE_CHECKING:
     from app.core.model_budget import BudgetLedger
@@ -126,37 +128,64 @@ class HybridKnowledgeSearch:
         if not isinstance(query, str) or not query.strip() or len(query) > _MAX_QUERY_CHARACTERS:
             raise ValueError("检索 query 必须为 1–2000 字符的非空文本，请拆分超长问题")
 
-    async def _filter_scope(self, filters: dict) -> dict[int, ChunkSnapshot]:
-        """分页取得权威白名单。参数：filters 已验证元数据；返回：主键快照；异常：存储故障。"""
+    async def _filter_scope(self, filters: dict, *, query: str, capture: RetrievalCapture | None = None) -> dict[int, ChunkSnapshot]:
+        """分页取得权威白名单。参数：filters 已验证元数据、query 实际查询、capture 请求收集器；返回：主键快照；异常：存储故障。"""
         scope, after_id = {}, 0
-        while rows := await self.store.active_page(after_id=after_id, limit=500):
-            scope.update({row.id: row for row in rows if matches_filters(row, filters)})
-            after_id = rows[-1].id
+        try:
+            while rows := await self.store.active_page(after_id=after_id, limit=500):
+                scope.update({row.id: row for row in rows if matches_filters(row, filters)})
+                after_id = rows[-1].id
+        except BaseException as error:
+            if capture is not None:
+                # 尚未得到召回总数，分页局部数量不能充当零候选或完整候选数。
+                await capture.record(RetrievalAttempt(attempt_id=capture.attempt_id(query, scope=filters),
+                    query=query, top_k=capture.top_k, status="fault", fault=type(error).__name__))
+            raise
         return scope
 
     async def _retrieve_one(self, query: str, top_k: int,
                             scope: dict[int, ChunkSnapshot] | None = None, *,
-                            bm25_query: str | None = None, rerank_query: str | None = None) -> list[RankedChunk]:
-        """记录一次实际查询、召回候选及最终精排。参数：查询/上限/范围及阶段查询；返回：真实排名；异常：检索错误透传。"""
+                            bm25_query: str | None = None, rerank_query: str | None = None,
+                            capture: RetrievalCapture | None = None) -> list[RankedChunk]:
+        """记录实际查询、候选及精排。参数：查询/上限/范围、阶段查询、capture 请求收集器；返回：真实排名；异常：检索/快照保存错误透传。"""
         from app.observability.runtime import observe
         with observe("knowledge.retrieve", kind="retriever", input={"query": query, "top_k": top_k,
                 "scope_ids": sorted(scope) if scope is not None else None,
                 "bm25_query": bm25_query, "rerank_query": rerank_query}) as observation:
-            ranked = await self._retrieve_one_observed(query, top_k, scope, bm25_query=bm25_query,
-                                                       rerank_query=rerank_query, observation=observation)
+            facts = {"candidate_count": None, "chunks": [], "recall_scores": {}}
+            selected = max(top_k, capture.top_k) if capture else top_k
+            try:
+                ranked = await self._retrieve_one_observed(query, selected, scope, bm25_query=bm25_query,
+                    rerank_query=rerank_query, observation=observation, facts=facts)
+            except BaseException as error:
+                if capture is not None:
+                    await capture.record(RetrievalAttempt(attempt_id=capture.attempt_id(query,
+                        scope=sorted(scope) if scope is not None else None, bm25_query=bm25_query, rerank_query=rerank_query),
+                        query=query, top_k=capture.top_k, candidate_count=facts["candidate_count"], status="fault",
+                        chunks=facts["chunks"][:capture.top_k], fault=type(error).__name__))
+                raise
+            if capture is not None:
+                await capture.record(RetrievalAttempt(attempt_id=capture.attempt_id(query,
+                    scope=sorted(scope) if scope is not None else None, bm25_query=bm25_query, rerank_query=rerank_query),
+                    query=query, top_k=capture.top_k, candidate_count=facts["candidate_count"],
+                    status="ok" if ranked else "empty", chunks=[chunk_snapshot(item.chunk, i + 1,
+                        recall_score=facts["recall_scores"].get(item.chunk.id), rerank_score=item.score)
+                        for i, item in enumerate(sorted(ranked, key=lambda item: (-item.score, item.chunk.id))[:capture.top_k])]))
             observation.update(output={"ranked": [item.model_dump(mode="json") for item in ranked]})
-            return ranked
+            return ranked[:top_k]
 
     async def _retrieve_one_observed(self, query: str, top_k: int,
                                      scope: dict[int, ChunkSnapshot] | None = None, *,
-                                     bm25_query: str | None, rerank_query: str | None, observation) -> list[RankedChunk]:
+                                     bm25_query: str | None, rerank_query: str | None, observation, facts) -> list[RankedChunk]:
         """执行一次完整混合召回、权威回读、原 chunk 重排。
 
-        参数：query 标准子句；top_k 结果上限；scope 权威筛选快照；bm25_query/rerank_query 各阶段完整文本；observation 当前观测。
+        参数：query 标准子句；top_k 结果上限；scope 权威筛选快照；bm25_query/rerank_query 各阶段完整文本；
+            observation 当前观测；facts 本次检索局部候选数、原文与召回分，用于故障保留。
         返回：list[RankedChunk]，最多 top_k 权威块；候选默认最多 50。
         异常：KnowledgeSearchUnavailable，空索引或权威状态失配；编码/索引/重排依赖异常。
         """
         if scope is not None and not scope:
+            facts["candidate_count"] = 0
             return []
         vectors = await self.encoder.encode([query])
         if len(vectors) != 1 or not valid_dense_vector(vectors[0]):
@@ -165,6 +194,7 @@ class HybridKnowledgeSearch:
         options = {"filter_ids": sorted(scope)} if scope is not None else {}
         hits = await self.index.hybrid_search(vectors[0], bm25_query if bm25_query is not None else query, dense_limit=recall,
                                               sparse_limit=recall, limit=recall, **options)
+        facts.update(candidate_count=len(hits), recall_scores={hit.id: hit.score for hit in hits})
         observation.update(metadata={"recall_candidates": [hit.model_dump(mode="json") for hit in hits],
                                      "candidate_count": len(hits)})
         if not hits:
@@ -189,6 +219,7 @@ class HybridKnowledgeSearch:
                     raise KnowledgeSearchUnavailable("过滤范围内索引与权威状态失配")
                 continue
             chunks.append(row)
+            facts["chunks"].append(chunk_snapshot(row, len(chunks), recall_score=hit.score))
         if not chunks:
             raise KnowledgeSearchUnavailable("知识混合索引与 MySQL 权威状态不一致")
         observation.update(metadata={"verified_candidates": [chunk.model_dump(mode="json") for chunk in chunks]})
@@ -204,13 +235,14 @@ class HybridKnowledgeSearch:
     async def retrieve(self, query: str, *, top_k: int | None = None,
                        subquery_split: bool | None = None, filters: dict | None = None,
                        source_query: str | None = None, budget: BudgetLedger | None = None,
-                       history: str = "", prepared_queries: list[str] | None = None) -> list[RankedChunk]:
+                       history: str = "", prepared_queries: list[str] | None = None,
+                       capture: RetrievalCapture | None = None) -> list[RankedChunk]:
         """逐子句跑完整链路，轮转合并或按已准备查询最高分合并后截到 Top-K。
 
         参数：query 当前原话或已验证完整问；top_k None 使用 config.rerank_top_k=10，显式值 1–recall_top_k；
             subquery_split None 使用配置默认 True，False 只检索完整查询；filters 为权威元数据筛选；
             source_query 为可信原问；budget 请求独占账本；history 可信历史用户/工具文本（仅旧路径使用）；
-            prepared_queries 可选已准备的 1 条或 3 条查询，传入时跳过旧改写模型并按最高分合并。
+            prepared_queries 可选已准备的 1 条或 3 条查询，传入时跳过旧改写模型并按最高分合并；capture 请求局部闸前快照收集器。
         返回：list[RankedChunk]，旧路径最多 Top-K；已准备路径最多 min(Top-K, 10)，每条完整查询重排一次。
         异常：ValueError，参数非法；检索/模型/权威存储异常；取消直接传播。
         """
@@ -226,20 +258,20 @@ class HybridKnowledgeSearch:
         normalized = _validated_filters(filters)
         prepared = await self._prepare(query, subquery_split=split, source_query=source_query, budget=budget,
                                        history=history, prepared_queries=prepared_queries)
-        scope = await self._filter_scope(normalized) if normalized else None
+        scope = await self._filter_scope(normalized, query=query, capture=capture) if normalized else None
         if prepared_queries is not None:
             selected = min(selected, _PREPARED_QUERY_TOP_K)
-            groups = [await self._retrieve_one(group[0], selected, scope) for group in prepared.groups]
+            groups = [await self._retrieve_one(group[0], selected, scope, capture=capture) for group in prepared.groups]
             # 全部查询完成后再按最高分合并裁剪，普通结果最多十块，较小显式上限仍有效。
             return merge_ranked_chunks(groups)[:selected]
-        return await self._retrieve_group(prepared.groups[0], prepared, selected, scope)
+        return await self._retrieve_group(prepared.groups[0], prepared, selected, scope, capture=capture)
 
     async def _retrieve_group(self, queries: list[str], prepared: PreparedQuery, selected: int,
-                              scope: dict[int, ChunkSnapshot] | None) -> list[RankedChunk]:
-        """合并一组子句的排名。参数：queries 子句、prepared 共用文本、selected 上限、scope 权威范围；返回：排名；异常：检索依赖错误。"""
+                              scope: dict[int, ChunkSnapshot] | None, *, capture: RetrievalCapture | None = None) -> list[RankedChunk]:
+        """合并一组子句排名。参数：queries 子句、prepared 共用文本、selected 上限、scope 权威范围、capture 请求收集器；返回：排名；异常：检索依赖错误。"""
         results = [await self._retrieve_one(clause, selected, scope,
                     bm25_query=prepared.bm25_queries.get(clause, clause),
-                    rerank_query=prepared.rerank_queries.get(clause, clause)) for clause in queries]
+                    rerank_query=prepared.rerank_queries.get(clause, clause), capture=capture) for clause in queries]
         # 保持首次轮转位置，但同一证据跨子句相关度不同，门槛使用其最高有效分。
         strongest: dict[int, RankedChunk] = {}
         for group in results:
@@ -274,12 +306,12 @@ class HybridKnowledgeSearch:
 
     async def retrieve_policy(self, query: str, *, filters: dict | None = None,
                               budget: BudgetLedger | None = None, history: str = "",
-                              prepared_queries: list[str] | None = None) -> list[RankedChunk]:
+                              prepared_queries: list[str] | None = None, capture: RetrievalCapture | None = None) -> list[RankedChunk]:
         """退款与售后政策多查询检索并按 chunk id 去重，默认最多 30 条。
 
         参数：query 当前退款问题或含已核实状态的种子；filters 可选元数据筛选；
             budget 请求独占账本；history 可信历史用户/工具文本（仅旧路径使用）；
-            prepared_queries 可选已准备的 1 条或 3 条查询，传入时按 chunk ID 取最高分降序合并。
+            prepared_queries 可选已准备的 1 条或 3 条查询，传入时按 chunk ID 取最高分降序合并；capture 请求局部原文收集器。
         返回：list[RankedChunk]，旧路径默认最多 30 个原 chunk；已准备路径每条最多十块、合计最多三十块。
         异常：ValueError，参数/输入限制；检索、模型或存储异常。
         """
@@ -287,15 +319,15 @@ class HybridKnowledgeSearch:
         normalized = _validated_filters(filters)
         prepared = await self._prepare(query, policy=True, subquery_split=self.config.subquery_split,
                                        budget=budget, history=history, prepared_queries=prepared_queries)
-        scope = await self._filter_scope(normalized) if normalized else None
+        scope = await self._filter_scope(normalized, query=query, capture=capture) if normalized else None
         if prepared_queries is not None:
             selected = min(self.config.rerank_top_k, _PREPARED_QUERY_TOP_K)
-            groups = [await self._retrieve_one(group[0], selected, scope) for group in prepared.groups]
+            groups = [await self._retrieve_one(group[0], selected, scope, capture=capture) for group in prepared.groups]
             # 每条最多十块，最多三条查询；合并后不超过三十块，并保留更小的配置限制。
             return merge_ranked_chunks(groups)[:selected * 3]
         merged: dict[int, RankedChunk] = {}
         for group in prepared.groups:
-            for item in await self._retrieve_group(group, prepared, self.config.rerank_top_k, scope):
+            for item in await self._retrieve_group(group, prepared, self.config.rerank_top_k, scope, capture=capture):
                 merged.setdefault(item.chunk.id, item)
         return list(merged.values())
 

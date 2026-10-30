@@ -8,6 +8,8 @@ from app.models.rag_quality import LowConfidenceQuestion
 from app.repositories.chat import PersistenceUncertain
 from app.schemas.tools import ToolContext
 from app.schemas.workflow import RetrievalLowConfidence, SuggestedAction
+from app.schemas.flywheel import PoolSignal, RetrievalSnapshot
+from app.schemas.chat import public_rag_metadata
 from tests.workflow.service_fakes import collect, service_runtime
 
 
@@ -22,7 +24,8 @@ async def test_real_graph_persists_suggestions_before_metadata_and_done(tmp_path
         async with factory() as session:
             rows = (await session.scalars(select(Message).order_by(Message.id))).all()
         assert len(rows) == 2 and all(row.turn_status == "completed" for row in rows)
-        assert rows[-1].rag_metadata == metadata and metadata["workflow"]["intent"] == "投诉"
+        assert public_rag_metadata(rows[-1].rag_metadata) == metadata and metadata["workflow"]["intent"] == "投诉"
+        assert {"retrieval_snapshot", "knowledge_pool", "trace_identity", "completion_inputs"}.isdisjoint(metadata)
         assert deps.executor.calls == []
 
 
@@ -33,7 +36,8 @@ async def test_low_evidence_finish_retry_keeps_one_snapshot_and_one_raw_question
         assert events[-1].event == "done"
         snapshot = (await service.graph.aget_state({"configurable": {"thread_id": "mewhelp:ch05:1"}})).values
         context = ToolContext.model_validate(snapshot["context"])
-        kwargs = {"low_confidence": RetrievalLowConfidence.model_validate(snapshot["gate"]["low_confidence"]),
+        kwargs = {"pool_signals": [PoolSignal.model_validate(item) for item in snapshot["pool_signals"]],
+                  "retrieval_snapshot": RetrievalSnapshot.model_validate(snapshot["retrieval_snapshot"]),
                   "suggested_actions": [SuggestedAction.model_validate(item) for item in snapshot["suggested_actions"]],
                   "workflow_metadata": events[-2].data["workflow"]}
         assert await deps.chat.finish_turn(context, snapshot["answer"], **kwargs) == events[-2].data
@@ -51,7 +55,7 @@ async def test_low_evidence_finish_retry_keeps_one_snapshot_and_one_raw_question
         with pytest.raises(PersistenceUncertain):
             await deps.chat.finish_turn(context, snapshot["answer"], **{**kwargs, "workflow_metadata": {"intent": "订单"}})
         with pytest.raises(PersistenceUncertain):
-            await deps.chat.finish_turn(context, snapshot["answer"], **{**kwargs, "low_confidence": None})
+            await deps.chat.finish_turn(context, snapshot["answer"], **{**kwargs, "pool_signals": []})
 
 
 async def test_complete_snapshot_retry_compares_body_citations_and_suggestions(tmp_path):
@@ -69,7 +73,8 @@ async def test_complete_snapshot_retry_compares_body_citations_and_suggestions(t
         context = ToolContext.model_validate(state["context"])
         citations = [EvidenceCitation.model_validate(item) for item in state["evidence"]]
         actions = [SuggestedAction.model_validate(item) for item in state["suggested_actions"]]
-        kwargs = {"citations": citations, "suggested_actions": actions, "workflow_metadata": events[-2].data["workflow"]}
+        kwargs = {"citations": citations, "suggested_actions": actions, "workflow_metadata": events[-2].data["workflow"],
+                  "pool_signals": [], "retrieval_snapshot": RetrievalSnapshot.model_validate(state["retrieval_snapshot"])}
         assert await deps.chat.finish_turn(context, "答复[1]", **kwargs) == events[-2].data
         for content, override in [("另一个答复", {}), ("答复[1]", {"citations": []}),
                                   ("答复[1]", {"suggested_actions": []}),

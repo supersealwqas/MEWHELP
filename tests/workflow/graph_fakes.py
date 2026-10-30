@@ -27,6 +27,12 @@ class StrictChat:
         """参数：无；返回：None；异常：无。"""
         self.calls, self.results, self.finished, self.order = [], [], [], []
         self.history, self.next_id = {}, 1
+        self.snapshots = {}
+
+    async def save_retrieval_snapshot(self, context, snapshot):
+        """按原轮保存检索脚本实际证据。参数：可信上下文/快照；返回：None；异常：冲突事实。"""
+        from app.knowledge.snapshots import merge_snapshots
+        self.snapshots[context.turn_id] = merge_snapshots(self.snapshots.get(context.turn_id), snapshot)
 
     def _record(self, context, role, content, **fields):
         """记录本例等价原始流水。参数：上下文、角色、正文、工具字段；返回：None；异常：字段错误。"""
@@ -81,11 +87,18 @@ class StrictChat:
         self.order.append("result")
         self._record(context, "tool", result.model_dump_json(), tool_call_id=context.tool_call_id)
         return result
-    async def finish_turn(self, context, content, *, low_confidence, citations, suggested_actions, workflow_metadata, refund_action=None):
+    async def finish_turn(self, context, content, *, low_confidence=None, citations, suggested_actions,
+                          workflow_metadata, refund_action=None, retrieval_snapshot=None, pool_signals=None):
         """参数：最终仓储契约的全部字段；返回：完成元数据；异常：断言失败。"""
         assert isinstance(context, ToolContext) and content
         assert {"intent", "route", "stop_reason", "budget", "tool_count", "decision_count"} <= workflow_metadata.keys()
         assert all(item.model_dump(mode="json") for item in citations + suggested_actions)
+        assert low_confidence is None or pool_signals is None
+        if pool_signals:
+            low = next((signal for signal in pool_signals if signal.source == "retrieval_low_conf"), None)
+            low_confidence = RetrievalLowConfidence(reason=low.reason) if low else low_confidence
+        if retrieval_snapshot is not None:
+            assert retrieval_snapshot == self.snapshots.get(context.turn_id)
         # 复刻真实仓储的低证据契约：弱证据入池必须与固定拒答话术同时保存。
         # 替身不校验这一条时，图里传错 low_confidence 只会在真实服务上报错。
         if isinstance(low_confidence, RetrievalLowConfidence):
@@ -136,15 +149,25 @@ class StrictSearch:
     def __init__(self, ranked=(), error=None):
         """参数：ranked权威结果、error可选故障；返回：None；异常：无。"""
         self.ranked, self.error, self.calls = list(ranked), error, []
-    async def retrieve(self, query, *, budget, prepared_queries=None, history="", filters=None, source_query=None):
+    async def retrieve(self, query, *, budget, prepared_queries=None, history="", filters=None, source_query=None, capture=None):
         """参数：query原问、budget独占账本；返回：排名；异常：脚本故障。"""
-        return self._take("retrieve", query, budget)
-    async def retrieve_policy(self, query, *, budget, prepared_queries=None, history="", filters=None):
+        return await self._take("retrieve", query, budget, capture, prepared_queries)
+    async def retrieve_policy(self, query, *, budget, prepared_queries=None, history="", filters=None, capture=None):
         """参数：query原问、budget独占账本、filters来源范围；返回：排名；异常：脚本故障。"""
-        return self._take("retrieve_policy", query, budget)
-    def _take(self, kind, query, budget):
+        return await self._take("retrieve_policy", query, budget, capture, prepared_queries)
+    async def _take(self, kind, query, budget, capture, prepared_queries):
         """参数：kind入口、query原問、budget账本；返回：排名；异常：脚本故障。"""
         self.calls.append((kind, query))
+        if capture is not None:
+            from app.knowledge.snapshots import chunk_snapshot
+            from app.schemas.flywheel import RetrievalAttempt
+            for actual in prepared_queries or [query]:
+                await capture.record(RetrievalAttempt(attempt_id=capture.attempt_id(actual), query=actual,
+                    top_k=capture.top_k, candidate_count=None if self.error else len(self.ranked),
+                    status="fault" if self.error else "ok" if self.ranked else "empty",
+                    chunks=[] if self.error else [chunk_snapshot(item.chunk, i + 1, rerank_score=item.score)
+                        for i, item in enumerate(self.ranked[:capture.top_k])],
+                    fault=type(self.error).__name__ if self.error else None))
         if self.error:
             raise self.error
         return self.ranked

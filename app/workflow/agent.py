@@ -177,7 +177,7 @@ def build_agent_graph(deps: "WorkflowDependencies", *, decision=None):
                 seen_signatures.append(signature)
                 count += 1
             binding = binding_from_dict(bindings[call["id"]]) if call["id"] in bindings else None
-            runtime = KnowledgeCallContext(knowledge_state, ledger, deps.search, deps.settings, deps.query_expander)
+            runtime = KnowledgeCallContext(knowledge_state, ledger, deps.search, deps.settings, deps.query_expander, deps.chat)
             builtin_ticket = (binding is not None and binding.identity.source == "builtin"
                               and binding.identity.server is None and binding.identity.name == "create_ticket")
             authorize = None
@@ -236,7 +236,7 @@ def build_agent_graph(deps: "WorkflowDependencies", *, decision=None):
                   "ticket_intent": ticket_intent.model_dump(mode="json") if ticket_intent else None, "seen_call_ids": seen_ids,
                   "seen_call_signatures": seen_signatures, "tool_count": count, "budget": ledger.snapshot(),
                   **{key: knowledge_state[key] for key in ("knowledge_cache", "evidence", "gate", "evidence_scores",
-                     "expanded_queries", "retrieval_attempted", "order_id", "order_data")}}
+                     "expanded_queries", "retrieval_attempted", "order_id", "order_data", "retrieval_snapshot")}}
         if reason:
             update.update(stopped_state(reason))
         return update
@@ -331,13 +331,15 @@ def build_agent_graph(deps: "WorkflowDependencies", *, decision=None):
                 knowledge_state = deepcopy(state)
                 outcome = await retrieve_verified_knowledge(knowledge_state, ledger, search=deps.search,
                     settings=deps.settings, query_expander=deps.query_expander, query=state["resolved_query"],
-                    prepared_queries=[state["standard_query"]])
+                    prepared_queries=[state["standard_query"]], chat=deps.chat)
         except (WorkflowBudgetExceeded, ContextBudgetExceeded):
-            return {**update, **stopped_state("budget_exceeded", ledger)}
+            return {**update, **stopped_state("budget_exceeded", ledger),
+                    "retrieval_snapshot": knowledge_state.get("retrieval_snapshot")}
         except DEPENDENCY_ERRORS as error:
             publish_stage(state, "policy", "completed")
             return {**update, **stopped_state("retrieval_unavailable", ledger),
-                    **degradation(state, "recover_knowledge", error)}
+                    **degradation(state, "recover_knowledge", error),
+                    "retrieval_snapshot": knowledge_state.get("retrieval_snapshot")}
         publish_stage(state, "policy", "completed")
         update.update(outcome.model_dump(mode="json"), knowledge_cache=knowledge_state.get("knowledge_cache", {}))
         if outcome.gate["passed"]:

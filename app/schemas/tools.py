@@ -7,6 +7,7 @@ Schema，避免各处自行约定字段名导致协议漂移。
 from typing import Annotated, Literal
 from langchain_core.tools import InjectedToolArg
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from app.schemas.flywheel import RetrievalSnapshot
 
 # 业务拒绝的统一字段名。工具返回业务失败时必须携带这两个键，执行器据此识别并转为失败事实。
 # 集中定义避免工具层与执行器各写一份字符串字面量。
@@ -104,6 +105,7 @@ class VerifiedKnowledgeOutcome(BaseModel):
     evidence_scores: list[float] = Field(description="本次权威重排分数")
     expanded_queries: list[str] = Field(description="实际使用的完整检索问法")
     budget: dict = Field(description="原轮共享账本的单调消费快照")
+    retrieval_snapshot: RetrievalSnapshot | None = Field(default=None, description="同轮门禁和裁剪前的原始检索快照，旧结果可缺失")
 
 
 class ToolResult(BaseModel):

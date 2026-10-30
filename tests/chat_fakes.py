@@ -17,6 +17,13 @@ class MemoryRepository:
         self.low_confidence = []
         self.metadata = {}
         self.message_ids, self.last_message_id = {}, 0
+        self.retrieval_snapshots, self.completion_inputs = {}, {}
+
+    async def save_retrieval_snapshot(self, context, snapshot):
+        """合并原轮真实脚本快照。参数：上下文/证据；返回：None；异常：身份或冲突断言失败。"""
+        from app.knowledge.snapshots import merge_snapshots
+        assert context in self.contexts
+        self.retrieval_snapshots[context.turn_id] = merge_snapshots(self.retrieval_snapshots.get(context.turn_id), snapshot)
 
     def _message_added(self, turn_id):
         """分配单调审计主键。参数：turn_id新增消息的轮；返回：None；异常：无。"""
@@ -52,6 +59,7 @@ class MemoryRepository:
         ctx = contexts[-1]
         turn = self.turns[ctx.turn_id]
         return {"context": ctx, "turn_status": turn.turn_status, "order_selection": turn.order_selection,
+                "retrieval_snapshot": self.retrieval_snapshots[ctx.turn_id].model_dump(mode="json") if ctx.turn_id in self.retrieval_snapshots else None,
                 "answer": turn.messages[-1].content if turn.turn_status == "completed" else None,
                 "completion_metadata": self.metadata.get(ctx.turn_id)}
 
@@ -101,18 +109,26 @@ class MemoryRepository:
             self._message_added(context.turn_id)
         return self.results[key]
 
-    async def finish_turn(self, context, content, *, low_confidence=None, citations=None, suggested_actions=None, workflow_metadata=None, refund_action=None):
+    async def finish_turn(self, context, content, *, low_confidence=None, citations=None, suggested_actions=None,
+                          workflow_metadata=None, refund_action=None, retrieval_snapshot=None, pool_signals=None):
         """模拟原子完成/入池。参数：上下文、回答、失败、引用、建议、流程摘要；返回：元数据；异常：ConnectionError。"""
         from app.knowledge.sources import answer_metadata
         if self.fail_finish:
             raise ConnectionError("SECRET")
+        assert low_confidence is None or pool_signals is None
+        signals = [low_confidence] if low_confidence is not None else pool_signals or []
+        inputs = (content, retrieval_snapshot, signals)
         if self.turns[context.turn_id].turn_status == "completed":
+            assert self.completion_inputs[context.turn_id] == inputs
             return self.metadata[context.turn_id]
+        self.completion_inputs[context.turn_id] = inputs
+        if retrieval_snapshot is not None:
+            await self.save_retrieval_snapshot(context, retrieval_snapshot)
         self.turns[context.turn_id].messages.append(StoredMessage(role="assistant", content=content))
         self._message_added(context.turn_id)
-        if low_confidence is not None:
-            self.low_confidence.append({"raw_question": context.user_message, "source": low_confidence.source,
-                                        "reason": low_confidence.reason, "conversation_id": context.conversation_id})
+        for signal in signals:
+            self.low_confidence.append({"raw_question": context.user_message, "source": signal.source,
+                                        "reason": signal.reason, "conversation_id": context.conversation_id})
         self.turns[context.turn_id].turn_status = "completed"
         self.metadata[context.turn_id] = answer_metadata(context, citations or [])
         if suggested_actions is not None:

@@ -11,6 +11,8 @@ from app.models.customer_service import Conversation, Message
 from app.schemas.history import StoredMessage, StoredTurn
 from app.schemas.tools import ToolContext, ToolError, ToolResult
 from app.schemas.workflow import HistoryDelta, RetrievalLowConfidence, SuggestedAction, OrderSelectionAction, RefundAction
+from app.schemas.flywheel import FeedbackReceipt, PoolSignal, RetrievalSnapshot, TurnPoolState
+from app.knowledge.snapshots import merge_snapshots, recover_legacy_snapshot
 
 
 async def owned_source(session, session_id: str, user_id: str, turn_id: str | None = None, *, lock=False):
@@ -77,6 +79,75 @@ def result_query(context: ToolContext):
 
 class PersistenceUncertain(RuntimeError):
     """数据库提交结果无法确认；不能当作业务失败重新执行。"""
+
+
+class FeedbackNotFound(LookupError):
+    """原轮不存在或不属于指定身份，对外统一404。"""
+
+
+class FeedbackNotReady(ValueError):
+    """原轮用户和最终助手尚未全部完成，暂不接受反馈。"""
+
+
+async def _record_pool(session, source: Message, snapshot: RetrievalSnapshot | None,
+                       signals: list[PoolSignal]) -> TurnPoolState:
+    """在已锁原用户行的事务内统一落池，按用户→池→审核队列顺序加锁。
+
+    参数：session 原事务；source 已核验并锁定的原问；snapshot 原轮事实；signals 固定来源理由。
+    返回：本轮幂等状态；异常：ValueError，已保存落点损坏；数据库失败使外层事务一起回滚。
+    """
+    from app.models.flywheel import ReviewQueue
+    metadata = dict(source.rag_metadata or {})
+    state = TurnPoolState.model_validate(metadata.get("knowledge_pool") or {})
+    rows = {}
+    for identifier in sorted(set(state.pool_ids.values())):
+        row = await session.scalar(select(LowConfidenceQuestion).where(LowConfidenceQuestion.id == identifier).with_for_update())
+        if row is None or row.conversation_id != source.conversation_id or row.raw_question != source.content:
+            raise ValueError("原轮问题池落点不一致")
+        rows[identifier] = row
+    matched = {row.matched_review_id for row in rows.values() if row.matched_review_id is not None}
+    if state.matched_review_id is not None:
+        matched.add(state.matched_review_id)
+    if len(matched) > 1:
+        raise ValueError("同轮问题池不能归并到多个审核问题")
+    if matched:
+        identifier = next(iter(matched))
+        review = await session.scalar(select(ReviewQueue).where(ReviewQueue.id == identifier).with_for_update())
+        if review is not None:
+            state.matched_review_id = identifier
+            if state.counted_review_id != identifier:
+                review.occurrence_count += 1
+                state.counted_review_id = identifier
+    for signal in signals:
+        if signal.source in state.pool_ids:
+            continue
+        row = LowConfidenceQuestion(conversation_id=source.conversation_id, raw_question=source.content,
+            source=signal.source, reason=signal.reason,
+            retrieved_chunks=snapshot.model_dump(mode="json") if snapshot is not None else None,
+            matched_review_id=state.matched_review_id)
+        session.add(row)
+        await session.flush()
+        state.pool_ids[signal.source] = row.id
+    source.rag_metadata = {**metadata, "knowledge_pool": state.model_dump(mode="json")}
+    return state
+
+
+async def _original_snapshot(session, source: Message, *, current_citations: list[dict] | None = None) -> RetrievalSnapshot | None:
+    """读取单个原轮事实。参数：事务/原用户行、current_citations仅当前完成时传真实引用；返回：快照或明确无检索；异常：数据库或契约错误。"""
+    rows = (await session.scalars(select(Message).where(Message.conversation_id == source.conversation_id,
+        Message.turn_id == source.turn_id).order_by(Message.id))).all()
+    records = [{"turn_id": row.turn_id, "role": row.role, "content": row.content,
+        "tool_calls": row.tool_calls, "tool_call_id": row.tool_call_id, "rag_metadata": row.rag_metadata} for row in rows]
+    if current_citations is not None:
+        known = ("retrieval_snapshot" in (source.rag_metadata or {}) or current_citations
+            or any((row.rag_metadata or {}).get("citations") for row in rows)
+            or any(call.get("name") in {"query_faq", "query_refund_policy"}
+                for row in rows for call in row.tool_calls or [] if isinstance(call, dict)))
+        if not known:
+            return None
+        if current_citations:
+            records.append({"role": "assistant", "rag_metadata": {"citations": current_citations}})
+    return recover_legacy_snapshot(records)
 
 
 def stored_turns(rows: list[Message]) -> list[StoredTurn]:
@@ -211,12 +282,53 @@ class ChatRepository:
                 Message.turn_status == "completed").order_by(Message.id.desc()).limit(1))
             return {"context": source_context(conversation, source), "turn_status": source.turn_status,
                     "trace_identity": (source.rag_metadata or {}).get("trace_identity"),
+                    "retrieval_snapshot": (source.rag_metadata or {}).get("retrieval_snapshot"),
+                    "pool_signals": (source.rag_metadata or {}).get("completion_inputs", {}).get("pool_signals", []),
                     "order_selection": (source.rag_metadata or {}).get("order_selection"),
                     "pending_ticket": (source.rag_metadata or {}).get("pending_ticket"),
                     "ticket_intent": (source.rag_metadata or {}).get("ticket_intent"),
                     "ticket_write_state": (source.rag_metadata or {}).get("ticket_write_state"),
                     "answer": answer.content if answer is not None else None,
                     "completion_metadata": answer.rag_metadata if answer is not None else None}
+
+    async def save_retrieval_snapshot(self, context: ToolContext, snapshot: RetrievalSnapshot) -> None:
+        """及时合并原轮快照，整份替换JSON并保留追踪/工单字段。
+
+        参数：context 可信原轮原问；snapshot 检索核心收集的快照。
+        返回：None；异常：ValueError，身份或同尝试事实冲突；数据库错误。
+        """
+        async with self.factory.begin() as session:
+            conversation, source = await owned_source(session, context.session_id, context.user_id, context.turn_id, lock=True)
+            if source is None or source_context(conversation, source) != context.model_copy(update={"tool_call_id": ""}):
+                raise ValueError("检索快照缺少匹配的原始用户消息")
+            metadata = dict(source.rag_metadata or {})
+            saved = RetrievalSnapshot.model_validate(metadata["retrieval_snapshot"]) if metadata.get("retrieval_snapshot") else None
+            merged = merge_snapshots(saved, snapshot)
+            if source.turn_status == "completed" and merged != saved:
+                raise ValueError("已完成原轮不能补写新的检索事实")
+            source.rag_metadata = {**metadata, "retrieval_snapshot": merged.model_dump(mode="json")}
+
+    async def record_unresolved_feedback(self, session_id: str, user_id: str, turn_id: str) -> FeedbackReceipt:
+        """按服务端原轮原问和快照落池，重发复用已提交回执。
+
+        参数：session_id/user_id 演示归属、turn_id 明确原轮；返回：字符串主键回执。
+        异常：FeedbackNotFound 越权/未知；FeedbackNotReady 未完成；数据库错误。
+        """
+        async with self.factory.begin() as session:
+            conversation, source = await owned_source(session, session_id, user_id, turn_id, lock=True)
+            if source is None:
+                raise FeedbackNotFound()
+            answer = await session.scalar(select(Message).where(Message.conversation_id == conversation.id,
+                Message.turn_id == turn_id, Message.role == "assistant", Message.tool_calls.is_(None))
+                .order_by(Message.id.desc()).limit(1))
+            if source.turn_status != "completed" or answer is None or answer.turn_status != "completed":
+                raise FeedbackNotReady("原轮尚未完成")
+            snapshot = await _original_snapshot(session, source)
+            source.rag_metadata = {**(source.rag_metadata or {}),
+                "retrieval_snapshot": snapshot.model_dump(mode="json") if snapshot is not None else None}
+            state = await _record_pool(session, source, snapshot, [PoolSignal(source="user_feedback", reason="用户反馈未解决")])
+            return FeedbackReceipt(pool_id=str(state.pool_ids["user_feedback"]),
+                matched_review_id=str(state.matched_review_id) if state.matched_review_id is not None else None)
 
     async def save_trace_identity(self, context: ToolContext, identity: dict) -> dict:
         """在首次模型调用前锁原用户行保存追踪根，重试复用已有根。
@@ -468,15 +580,25 @@ class ChatRepository:
                           low_confidence: SelfCheckFailure | RetrievalLowConfidence | None = None,
                           citations: list[EvidenceCitation] | None = None,
                           suggested_actions: list[SuggestedAction] | None = None,
-                          workflow_metadata: dict | None = None, refund_action: RefundAction | None = None) -> dict:
+                          workflow_metadata: dict | None = None, refund_action: RefundAction | None = None,
+                          retrieval_snapshot: RetrievalSnapshot | None = None,
+                          pool_signals: list[PoolSignal] | None = None) -> dict:
         """原子保存最终回复、完成状态、完整原始引用及可选低证据问题池记录。
 
         参数：context可信身份/原话；content完整回复；low_confidence自评或检索弱证据；citations完整引用；
-            suggested_actions服务端工单建议；workflow_metadata本轮流程摘要；refund_action独立本地申请快照，均可省略。
+            suggested_actions服务端工单建议；workflow_metadata本轮流程摘要；refund_action独立本地申请快照；
+            retrieval_snapshot本轮闸前快照；pool_signals统一入池信号，不能与low_confidence同时传入，均可省略。
         返回：dict，提交成功后的完成元数据；同轮一致结果重试幂等，不重复原话入池。
         异常：ValueError，正文过长/身份或原话不符；PersistenceUncertain，已完成结果不同；数据库错误。
         """
-        if isinstance(low_confidence, SelfCheckFailure) and not content.endswith(FIXED_KNOWLEDGE_REFUSAL):
+        if low_confidence is not None and pool_signals is not None:
+            raise ValueError("旧低证据参数与统一入池信号不能同时使用")
+        signals = [PoolSignal.model_validate(item) for item in (pool_signals or [])]
+        if any(signal.source == "user_feedback" for signal in signals):
+            raise ValueError("用户反馈只能从已完成原轮反馈入口提交")
+        if len({signal.source for signal in signals}) != len(signals):
+            raise ValueError("同轮入池来源不能重复")
+        if (isinstance(low_confidence, SelfCheckFailure) or any(s.source == "self_check" for s in signals)) and not content.endswith(FIXED_KNOWLEDGE_REFUSAL):
             raise ValueError("自评不足入池必须与固定知识拒答一起保存")
         if low_confidence is not None and not isinstance(low_confidence, (SelfCheckFailure, RetrievalLowConfidence)):
             raise ValueError("未知的低证据入口")
@@ -486,6 +608,11 @@ class ChatRepository:
         originals = [item.model_dump(mode="json") for item in citations]
         actions = [action.model_dump(mode="json") for action in (suggested_actions or [])]
         low_snapshot = low_confidence.model_dump(mode="json") if low_confidence else None
+        if low_confidence is not None:
+            signals = [PoolSignal(source=low_confidence.source, reason=low_confidence.reason)]
+        snapshot_input = retrieval_snapshot.model_dump(mode="json") if retrieval_snapshot is not None else None
+        completion_inputs = {"retrieval_snapshot": snapshot_input,
+            "pool_signals": [signal.model_dump(mode="json") for signal in signals]}
         refund_snapshot = refund_action.model_dump(mode="json") if refund_action else None
         async with self.factory.begin() as session:
             # 锁定同一轮最早用户消息，使并发完成互斥，无须给用户DDL增加turn_id字段。
@@ -497,7 +624,7 @@ class ChatRepository:
             conversation = await session.get(Conversation, context.conversation_id)
             if conversation is None or conversation.user_id != context.user_id or conversation.session_id != context.session_id:
                 raise ValueError("完成轮次会话身份不匹配")
-            if isinstance(low_confidence, RetrievalLowConfidence):
+            if any(signal.source == "retrieval_low_conf" for signal in signals):
                 from app.repositories.actions import ActionRepository
                 from app.schemas.workflow import TicketResume
                 from app.workflow.routing import fixed_reply
@@ -532,6 +659,9 @@ class ChatRepository:
                 same_extra = isinstance(saved, dict) and saved.get("suggested_actions", []) == actions \
                     and saved.get("workflow") == workflow_metadata and saved.get("low_confidence") == low_snapshot \
                     and saved.get("refund_action") == refund_snapshot
+                stored_inputs = (user.rag_metadata or {}).get("completion_inputs")
+                same_extra = same_extra and (stored_inputs == completion_inputs if stored_inputs is not None
+                    else retrieval_snapshot is None and pool_signals is None)
                 if existing is None or existing.content != content or not same_extra or not same:
                     raise PersistenceUncertain("轮次已完成但结果不同，需核查")
                 return existing.rag_metadata
@@ -549,11 +679,17 @@ class ChatRepository:
                 metadata["refund_action"] = refund_snapshot
             if low_snapshot is not None:
                 metadata["low_confidence"] = low_snapshot
+            saved_snapshot = await _original_snapshot(session, user, current_citations=originals if not signals else None)
+            if retrieval_snapshot is not None:
+                # 原轮先前实时保存的事实优先；无历史数据的标记不参与本轮新检索合并。
+                prior = (user.rag_metadata or {}).get("retrieval_snapshot")
+                saved_snapshot = merge_snapshots(RetrievalSnapshot.model_validate(prior) if prior else None, retrieval_snapshot)
+            user.rag_metadata = {**(user.rag_metadata or {}), "completion_inputs": completion_inputs,
+                "retrieval_snapshot": saved_snapshot.model_dump(mode="json") if saved_snapshot is not None else None}
             session.add(Message(conversation_id=context.conversation_id, turn_id=context.turn_id,
                                 role="assistant", content=content, turn_status="completed", rag_metadata=metadata))
-            if low_confidence is not None:
-                session.add(LowConfidenceQuestion(conversation_id=context.conversation_id,
-                    raw_question=context.user_message, source=low_confidence.source, reason=low_confidence.reason))
+            if signals:
+                await _record_pool(session, user, saved_snapshot, signals)
             await session.execute(update(Message).where(Message.conversation_id == context.conversation_id,
                                                         Message.turn_id == context.turn_id).values(turn_status="completed"))
         return metadata

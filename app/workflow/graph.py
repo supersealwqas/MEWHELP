@@ -15,6 +15,7 @@ from app.observability.runtime import ObservabilityRuntime
 from app.core.memory import ContextBudgetExceeded
 from app.core.model_budget import BudgetLedger, WorkflowBudgetExceeded, budget_summary
 from app.knowledge.answering import EvidenceCitation
+from app.schemas.flywheel import PoolSignal, RetrievalSnapshot
 from app.knowledge.retrieval import HybridKnowledgeSearch
 from app.knowledge.query_rewrite import QueryExpander
 from app.repositories.chat import ChatRepository
@@ -202,6 +203,7 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
             """保留实际扩写与检索的原进度顺序。参数：阶段、状态、已核实详情；返回：None；异常：流写入错误。"""
             publish_stage(state, stage, status, **details)
 
+        knowledge_state = deepcopy(state)
         try:
             async with asyncio.timeout(deps.settings.knowledge_timeout_seconds):
                 if state["route"] == "order_policy":
@@ -216,9 +218,9 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
                 knowledge_state = deepcopy(state)
                 outcome = await retrieve_verified_knowledge(knowledge_state, ledger, search=deps.search,
                     settings=deps.settings, query_expander=deps.query_expander, query=query,
-                    prepared_queries=prepared_queries, stage_callback=knowledge_stage, **options)
+                    prepared_queries=prepared_queries, stage_callback=knowledge_stage, chat=deps.chat, **options)
         except (WorkflowBudgetExceeded, ContextBudgetExceeded):
-            return stopped_state("budget_exceeded", ledger)
+            return {**stopped_state("budget_exceeded", ledger), "retrieval_snapshot": knowledge_state.get("retrieval_snapshot")}
         except DEPENDENCY_ERRORS as error:
             # 依赖故障不能冒充低分证据，也不能把越界或失配原文交给模型。
             update = stopped_state("retrieval_unavailable", ledger)
@@ -226,7 +228,8 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
                 update["answer"] = verified_order_text(state) + update["answer"]
             publish_stage(state, "policy", "completed")
             return {**update, **degradation(state, "retrieve", error), "retrieval_attempted": True,
-                    "evidence": [], "evidence_scores": [], "gate": None}
+                    "evidence": [], "evidence_scores": [], "gate": None,
+                    "retrieval_snapshot": knowledge_state.get("retrieval_snapshot")}
         # 检索结果先交给证据闸；尚未通过的内容不能进入模型消息。
         return {**outcome.model_dump(mode="json"), "knowledge_cache": knowledge_state.get("knowledge_cache", {}),
                 "retrieval_attempted": True, "stop_reason": None}
@@ -296,6 +299,9 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
             source_turn_id=context.turn_id, question=state["raw_query"], ticket_type=ticket_type if kind == "create_ticket" else None)
             for kind in state["suggested_kinds"]]
         low_confidence = _pooled_low_confidence(state)
+        signals = [PoolSignal.model_validate(item) for item in state.get("pool_signals", [])]
+        if low_confidence is not None and not any(s.source == low_confidence.source for s in signals):
+            signals.append(PoolSignal(source=low_confidence.source, reason=low_confidence.reason))
         metadata = {key: state[key] for key in ("intent", "route", "stop_reason", "budget", "tool_count", "decision_count")}
         # 原始协议诊断只留在内部检查点，公开完成帧只带计量摘要。
         metadata["budget"] = budget_summary(state["budget"])
@@ -307,7 +313,8 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
             refund_action = RefundAction(action_id=str(uuid5(NAMESPACE_URL,
                 f"mewhelp:ch06:{context.conversation_id}:{context.turn_id}:submit_refund")),
                 source_turn_id=context.turn_id, question=state["raw_query"], order_id=state["order_id"])
-        saved = await deps.chat.finish_turn(context, state["answer"], low_confidence=low_confidence,
+        saved = await deps.chat.finish_turn(context, state["answer"], pool_signals=signals,
+            retrieval_snapshot=RetrievalSnapshot.model_validate(state["retrieval_snapshot"]) if state.get("retrieval_snapshot") else None,
             citations=[EvidenceCitation.model_validate(item) for item in state["evidence"]],
             suggested_actions=actions, workflow_metadata=metadata, refund_action=refund_action)
         # 完成事务后增量回读，使用同一稳定消息ID补主键，不能另追加第二份客服回答。
@@ -317,6 +324,7 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
         logger.info("workflow completed turn=%s reason=%s tools=%s decisions=%s", context.turn_id,
                     state["stop_reason"], state["tool_count"], state["decision_count"])
         return {"suggested_actions": [action.model_dump(mode="json") for action in actions], "completion_metadata": saved,
+                "pool_signals": [signal.model_dump(mode="json") for signal in signals],
                 "messages": full_history_messages([turn.model_dump(mode="json") for turn in delta.turns]),
                 "history_turns": list(history.values()), "audit_cursor": delta.last_message_id,
                 "refund_action": refund_action.model_dump(mode="json") if refund_action else None}
