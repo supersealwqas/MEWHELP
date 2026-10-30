@@ -54,3 +54,17 @@ docker compose --env-file .env.langfuse -f docker-compose.langfuse.yml -p mewhel
 ```
 
 不要运行带 `-v` 的删除命令；这会删除追踪数据。更新版本前先备份本项目全部卷并查官方升级说明。
+
+## CH09 表结构迁移
+
+迁移只补给定DDL的两张新表、问题池两列和对应索引/外键。先核实 `.env` 的目标应用库名；本机已确认目标是 `127.0.0.1:3307/mewhelp`。在项目根目录的 Git Bash 执行：
+
+```bash
+PYTHONIOENCODING=utf-8 uv run python -m app.db.migrate_ch09 --env-file .env --database mewhelp
+PYTHONIOENCODING=utf-8 uv run python -m app.db.migrate_ch09 --env-file .env --database mewhelp --apply
+PYTHONIOENCODING=utf-8 uv run python -m app.db.migrate_ch09 --env-file .env --database mewhelp
+```
+
+第一条预览，第二条应用，最后一条应返回空 `statements`。Windows显式指定stdout的UTF-8编码便于核对中文枚举；数据库连接仍由迁移实现按utf8mb4处理。命令会核对实际库名和既有结构，不用 `create_all` 代替增量迁移。
+
+2026-10-30本机应用库已按以上流程迁移，完整结构核验通过；迁移前后163个会话、1367条消息、17条问题池原件、52条知识块的数量一致。后续服务启动继续严格核验表结构，不重复执行已经完成的DDL。
