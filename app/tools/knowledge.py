@@ -16,6 +16,17 @@ ORDER_POLICY_SOURCES = ("doc:returns-policy.md", "doc:after-sales-manual.md",
                         "doc:billing-shipping.md", "doc:member-benefits.md")
 
 
+def unresolved_knowledge_faults(state: dict) -> dict[str, str]:
+    """读取责任键故障表，旧检查点没有范围信息时保守保留历史故障。
+
+    参数：state服务端原轮；返回：独立故障字典；异常：无。
+    """
+    if "knowledge_faults" in state:
+        return dict(state["knowledge_faults"])
+    return {"legacy:" + item["attempt_id"]: item.get("fault") or "unknown"
+            for item in (state.get("retrieval_snapshot") or {}).get("attempts", []) if item.get("status") == "fault"}
+
+
 async def restore_turn_knowledge(state: dict, chat, *, saved_turn: dict | None = None) -> dict:
     """为旧检查点补原轮检索状态，不把缺字段当作已确认没检索。
 
@@ -37,7 +48,9 @@ async def restore_turn_knowledge(state: dict, chat, *, saved_turn: dict | None =
         messages = [message.model_dump(mode="json") for turn in turns if turn.turn_id == context.turn_id
                     for message in turn.messages]
         current = recover_legacy_snapshot(messages)
-    return {"retrieval_snapshot": current.model_dump(mode="json") if current is not None else None,
+    snapshot = current.model_dump(mode="json") if current is not None else None
+    return {"retrieval_snapshot": snapshot,
+            "knowledge_faults": unresolved_knowledge_faults({**state, "retrieval_snapshot": snapshot}),
             "pool_signals": deepcopy(state.get("pool_signals", saved_turn.get("pool_signals", [])))}
 
 
@@ -81,10 +94,12 @@ async def retrieve_verified_knowledge(state: dict, ledger: BudgetLedger, *, sear
     key = json_hash({"turn_id": state["context"]["turn_id"], "query": query, "source_query": source_query,
                      "filters": filters or {}, "policy": policy,
                      "prepared_queries": prepared_queries, "evidence_policy_version": evidence_policy.version})
+    state["knowledge_faults"] = unresolved_knowledge_faults(state)
     cached = state.get("knowledge_cache", {}).get(key)
     saved = RetrievalSnapshot.model_validate(state["retrieval_snapshot"]) if state.get("retrieval_snapshot") else None
     if cached is not None:
         outcome = VerifiedKnowledgeOutcome.model_validate(cached)
+        state["knowledge_faults"].pop(key, None)
         merged = merge_snapshots(saved, outcome.retrieval_snapshot) if outcome.retrieval_snapshot else saved
         state["retrieval_snapshot"] = merged.model_dump(mode="json") if merged else None
         if stage_callback is not None:
@@ -100,6 +115,9 @@ async def retrieve_verified_knowledge(state: dict, ledger: BudgetLedger, *, sear
         current = RetrievalSnapshot.model_validate(state["retrieval_snapshot"]) if state.get("retrieval_snapshot") else None
         merged = merge_snapshots(current, incoming)
         state["retrieval_snapshot"] = merged.model_dump(mode="json")
+        faults = [item for item in incoming.attempts if item.status == "fault"]
+        if faults:
+            state["knowledge_faults"][key] = faults[-1].fault or "retrieval_fault"
         if chat is not None:
             await chat.save_retrieval_snapshot(ToolContext.model_validate(state["context"]), merged)
 
@@ -111,6 +129,8 @@ async def retrieve_verified_knowledge(state: dict, ledger: BudgetLedger, *, sear
         result = await pipeline.retrieve(prepared, capture=capture)
     ranked, selected, prepared_queries = result["ranked"], result["selected"], result["queries"]
     gate = assess_evidence(ranked, selected, evidence_policy)
+    # 整个同责任检索成功后才解除该键；其他范围/查询的故障与全部历史attempt继续保留。
+    state["knowledge_faults"].pop(key, None)
     evidence = [item.model_dump(mode="json") for item in selected] if gate.passed else []
     outcome = VerifiedKnowledgeOutcome(evidence=evidence, gate=gate.model_dump(mode="json"),
         evidence_scores=[item.score for item in ranked], expanded_queries=prepared_queries, budget=ledger.snapshot(),

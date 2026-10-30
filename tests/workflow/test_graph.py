@@ -91,17 +91,20 @@ async def test_other_dependency_boundaries_keep_safe_completion(stage):
 
 @pytest.mark.parametrize("error", [ConnectionError("断流"), WorkflowBudgetExceeded("额度")])
 async def test_policy_answer_interruption_keeps_verified_prefix(error):
-    """政策说明中断仍保存程序事实及已发出的说明，预算耗尽同样不能丢字。参数：error故障；返回：None；异常：断言失败。"""
+    """结构化政策候选中断不能发布私有首稿，仍保留业务事实和准确故障类别。参数：error故障；返回：None；异常：断言失败。"""
     deps = dependencies(intents=["售后"], results=[ToolResult.success({"order_id": "1001", "total_amount": 89})],
-                        answers=[["先说明已查到的部分。", error]])
+                        ranked=[ranked()], answers=[["先说明已查到的部分。", error]])
     initial = turn("订单1001能否维修")
     initial["context"]["user_id"] = "demo-user"
     pieces = []
     async for _, event in build_workflow(deps, checkpointer=None).astream(initial, stream_mode="custom", subgraphs=True):
         if event["event"] == "delta":
             pieces.append(event["data"]["delta"])
-    assert "商品总金额：89" in "".join(pieces) and "先说明已查到的部分。" in "".join(pieces)
+    assert "商品总金额：89" in "".join(pieces) and "先说明已查到的部分。" not in "".join(pieces)
     assert deps.chat.finished[0]["content"] == "".join(pieces)
+    assert deps.chat.finished[0]["low_confidence"] is None
+    assert deps.chat.finished[0]["workflow_metadata"]["stop_reason"] == (
+        "budget_exceeded" if isinstance(error, WorkflowBudgetExceeded) else "answer_unavailable")
 
 
 @pytest.mark.parametrize("query,previous,reply", [

@@ -119,3 +119,57 @@ class ProductionKnowledgePipeline:
                 "query": prepared["query"], "source_query": prepared["source_query"],
                 "standard_query": prepared["standard_query"], "queries": prepared["queries"],
                 "snapshot": capture.snapshot if capture is not None else None}
+
+    async def generate(self, prepared: dict, retrieved: dict) -> dict:
+        """共用实际selected生成、自评和一次引用修复，不保存聊天或问题池。
+
+        参数：prepared至少含原ledger；retrieved含selected及线上原gate或完整ranked。
+        返回：answer/refused/citations/pool_signals/usage；用量缺失仍为未知。
+        异常：预算、结构、引用、网络故障原样传播，不能冒充知识不足。
+        """
+        from pathlib import Path
+        from app.knowledge.answering import (FIXED_KNOWLEDGE_REFUSAL, KnowledgeAnswerError,
+            decide_answer, knowledge_answer_handoff, published_citations)
+        from app.knowledge.confidence import assess_evidence, load_evidence_policy
+        from app.schemas.flywheel import PoolSignal
+        from app.workflow.context import assemble_context, select_evidence
+        from app.workflow.model import knowledge_tool_schema
+        from app.workflow.prompts import KNOWLEDGE_PROMPT
+
+        ledger = prepared["ledger"]
+        selected = [EvidenceCitation.model_validate(item) for item in retrieved["selected"]]
+        gate = retrieved.get("gate")
+        if gate is None:
+            policy = load_evidence_policy(Path(self.settings.evidence_policy_path), protocols=production_protocols(self.settings))
+            gate = assess_evidence(retrieved["ranked"], selected, policy).model_dump(mode="json")
+        if not gate["passed"]:
+            signal = PoolSignal(source="retrieval_low_conf", reason=(gate.get("low_confidence") or {}).get("reason", "本轮检索证据不足"))
+            return {"answer": FIXED_KNOWLEDGE_REFUSAL, "refused": True, "citations": [],
+                    "pool_signals": [signal], "usage": ledger.snapshot(), "gate": gate}
+        rows = [item.model_dump(mode="json") for item in selected]
+        # assemble_context的历史接口还会选择证据；先证明其结果相同，否则明确预算失败。
+        # 不能把更小的集合带进模型却沿用原selected通过的检索判定。
+        if select_evidence(rows, self.settings) != rows:
+            raise ContextBudgetExceeded("生成阶段不能缩小已判闸的完整证据集合")
+        if self.state is None or self.model is None:
+            raise ValueError("知识生成缺少原轮状态或正式模型")
+        state = {**self.state, "evidence": rows}
+        messages = assemble_context(state, self.settings, KNOWLEDGE_PROMPT, [knowledge_tool_schema()])
+        messages.append({"role": "user", "content": json.dumps(knowledge_answer_handoff(state["raw_query"]), ensure_ascii=False)})
+        for attempt in range(2):
+            result = await self.model.answer_knowledge(messages, ledger)
+            try:
+                answer, failure = decide_answer(result, selected)
+            except KnowledgeAnswerError as error:
+                ledger.record_failure("answer", {"type": "knowledge_citation", "reason": str(error)})
+                if attempt:
+                    raise
+                # 同一answer阶段最多两次；完整修复说明也计入下一次请求预算。
+                messages.append({"role": "user", "content": "上次知识回答引用校验未通过：" + str(error) +
+                    "。请基于同一完整证据重新提交唯一结果；不要使用未出现的编号。"})
+                continue
+            signals = [PoolSignal(source=failure.source, reason=failure.reason)] if failure else []
+            return {"answer": answer, "refused": failure is not None,
+                    "citations": [] if failure else published_citations(answer, selected),
+                    "pool_signals": signals, "usage": ledger.snapshot(), "gate": gate}
+        raise KnowledgeAnswerError("知识回答无法通过校验")

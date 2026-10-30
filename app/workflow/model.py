@@ -20,6 +20,8 @@ from app.workflow.prompts import ANSWER_PROMPT, DECISION_NUDGE, DECISION_PROMPT,
 from app.workflow.routing import _understanding_outcome, original_understanding
 from app.workflow.context import ModelContext, log_model_context
 from app.tools.contracts import ToolDefinition
+from app.knowledge.answering import KnowledgeAnswer, KnowledgeAnswerError
+from app.workflow.prompts import KNOWLEDGE_PROMPT
 
 _CONTROL_NAME = "submit_decision"
 _CONTROL_SCHEMA = {"type": "function", "function": {
@@ -47,6 +49,11 @@ def understanding_tool_schema() -> dict:
 def intent_tool_schema() -> dict:
     """生成分类绑定与完整输入预算共用的结果工具。参数：无；返回：严格submit_intent定义；异常：schema转换错误。"""
     return output_tool(IntentResult, "submit_intent")
+
+
+def knowledge_tool_schema() -> dict:
+    """生成知识自评唯一工具并供完整预算使用。参数：无；返回：严格schema；异常：schema转换错误。"""
+    return output_tool(KnowledgeAnswer, "submit_knowledge_answer")
 
 
 def decision_tool_schemas(tools: list[ToolDefinition]) -> list[dict]:
@@ -317,6 +324,23 @@ class WorkflowModelAdapter:
             if produced:
                 return
         raise WorkflowOutputError("模型两次均未返回有效正文")
+
+    async def answer_knowledge(self, messages: list, ledger: BudgetLedger) -> KnowledgeAnswer:
+        """缓冲唯一知识工具结果，不向公共delta发布候选或useful字段。
+
+        参数：messages完整本轮资料、ledger原轮账本；返回：严格KnowledgeAnswer，尚需引用校验。
+        异常：KnowledgeAnswerError结构故障；预算、网络、取消原样传播，不伪造useful=false。
+        """
+        prepared = [SystemMessage(content=KNOWLEDGE_PROMPT), *convert_to_messages(messages)]
+        tool, limit = knowledge_tool_schema(), ledger.output_limit("answer")
+        ledger.reserve("answer", ledger.estimator.message_tokens(prepared) + ledger.estimator.value_tokens([tool]), limit)
+        gathered = await self._gather(prepared, bind_output_tool(self._model(limit), tool), ledger,
+                                      "answer", source=messages, tools=[tool])
+        try:
+            return parse_tool_output(gathered, KnowledgeAnswer, "submit_knowledge_answer")
+        except StructuredOutputError as error:
+            ledger.record_failure("answer", self._failure(gathered, "knowledge_structure", error))
+            raise KnowledgeAnswerError("知识回答结构不合法") from error
 
     async def _answer_once(self, messages: list, ledger: BudgetLedger) -> AsyncIterator[str]:
         """直接转发正文，过滤协议外工具/推理并及时关闭。参数：messages 完整输入、ledger 已占额账本；返回：正文增量流；异常：超长/截断/网络/取消。"""

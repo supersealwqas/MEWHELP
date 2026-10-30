@@ -19,7 +19,8 @@ def resume_request(action, order_id="1001"):
 
 async def test_waiting_lock_released_before_event_and_resume_keeps_original_turn(tmp_path):
     """选单帧可见前数据库已提交、图已关闭、会话锁已释放。参数：tmp_path目录；返回：None；异常：断言失败。"""
-    async with service_runtime(tmp_path, intents=["退款退货"], results=[order_result()], answers=[["签收时间未知，需核实政策。"]]) as (service, deps, _):
+    from tests.workflow.graph_fakes import ranked
+    async with service_runtime(tmp_path, intents=["退款退货"], ranked=[ranked()], results=[order_result()], answers=[["签收时间未知，需核实政策。[1]"]]) as (service, deps, _):
         stream = service.stream_turn(ChatRequest(session_id="s", message="我要退款"))
         async with aclosing(stream):
             events = []
@@ -178,7 +179,8 @@ async def test_resume_http_contract_and_current_identity(tmp_path):
     from httpx import ASGITransport, AsyncClient
     from app.api.chat import router as chat_router, get_chat_service
     from app.api.actions import router as actions_router
-    async with service_runtime(tmp_path, intents=["退款退货"], results=[order_result()], answers=[["待核实"]]) as (service, _, _):
+    from tests.workflow.graph_fakes import ranked
+    async with service_runtime(tmp_path, intents=["退款退货"], ranked=[ranked()], results=[order_result()], answers=[["待核实[1]"]]) as (service, _, _):
         application = FastAPI()
         application.include_router(chat_router)
         application.include_router(actions_router)

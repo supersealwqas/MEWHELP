@@ -41,14 +41,12 @@ class ProductionEvaluationRuntime:
         self.last_attempt = {}
 
     async def execute(self, query: str, filters: dict, *, retrieval_only: bool) -> dict:
-        """执行真实理解、分类、共享准备和检索；本任务仅支持检索采样。
+        """执行真实理解、分类、共享检索及可选知识生成。
 
-        参数：query完整原问、filters真实筛选、retrieval_only当前必须True。
-        返回：实际ranked/selected/预算/查询/快照/路由；不返回标注。
-        异常：NotImplementedError生成接缝尚待Task5；预算/依赖/参数错误原样传播。
+        参数：query完整原问、filters真实筛选、retrieval_only是否只采样检索。
+        返回：实际检索结果；完整模式追加answer/refused/citations/usage，不写聊天。
+        异常：预算/依赖/参数错误原样传播。
         """
-        if retrieval_only is not True:
-            raise NotImplementedError("生产知识生成须接入Task5；本入口当前仅支持真实检索采样")
         from app.schemas.tools import ToolContext
         from app.workflow.state import new_turn_state
         from app.workflow.agent import model_messages
@@ -70,6 +68,7 @@ class ProductionEvaluationRuntime:
             self.last_attempt["stage"] = "classify"
             intent = await self.model.classify(model_messages(state, self.settings, INTENT_PROMPT, [intent_tool_schema()]), ledger)
             route = route_by_intent({**state, "intent": intent.intent})
+            state.update(intent=intent.intent, route=route)
             policy = route == "order_policy"
             actual_filters = dict(filters)
             if policy:
@@ -77,11 +76,15 @@ class ProductionEvaluationRuntime:
                 wanted = wanted if isinstance(wanted, list) else [wanted]
                 actual_filters["source_key"] = [key for key in wanted if key in ORDER_POLICY_SOURCES] or ["evaluation:no-policy-source"]
             pipeline = ProductionKnowledgePipeline(self.search, self.settings, query_expander=self.query_expander,
-                state=state, policy=policy)
+                state=state, policy=policy, model=self.model)
             self.last_attempt["stage"] = "prepare"
             prepared = await pipeline.prepare(understood.resolved_query, actual_filters, messages=[], budget=ledger)
             self.last_attempt.update(stage="retrieve", prepared=prepared)
             result = await pipeline.retrieve(prepared, capture=capture)
+            if not retrieval_only:
+                self.last_attempt["stage"] = "generate"
+                result.update(await pipeline.generate(prepared, result))
+                result["budget"] = ledger.snapshot()
             return {**result, "route": route, "filters": actual_filters,
                     "intent": intent.intent, "intent_confidence": intent.confidence}
 

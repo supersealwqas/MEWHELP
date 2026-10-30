@@ -36,7 +36,7 @@ def context_data(messages):
 async def test_selected_scope_reaches_policy_and_model_as_confirmed_input(tmp_path):
     """已选对象丢在旧歧义原话里时失败，恢复后必须显式携带确认事实。参数：tmp_path保存器目录；返回：None；异常：断言失败。"""
     deps = dependencies(intents=["退款退货"], results=[order_result("1002")],
-                        ranked=[ranked()], answers=[["请按页面申请。"]])
+                        ranked=[ranked()], answers=[["请按页面申请。[1]"]])
     original = owned_turn("其中一笔想退，未拆封，但我还没决定哪笔。")
     config = {"configurable": {"thread_id": "selected-scope"}}
     async with workflow_runtime(deps, tmp_path / "scope.sqlite") as graph:
@@ -56,7 +56,7 @@ async def test_verified_order_section_never_promotes_user_amount(tmp_path):
     """用户自报金额进入程序生成的核实事实区时失败。参数：tmp_path隔离目录；返回：None；异常：断言失败。"""
     data = {"order_id": "1001", "product": "滤芯", "status": "已发货", "total_amount": 129.0}
     deps = dependencies(intents=["退款退货"], results=[ToolResult.success(data)],
-                        ranked=[ranked()], answers=[["仅根据已提供政策判断。"]])
+                        ranked=[ranked()], answers=[["仅根据已提供政策判断。[1]"]])
     async with workflow_runtime(deps, tmp_path / "provenance.sqlite") as graph:
         state = await graph.ainvoke(owned_turn("订单1001实付9876元，想退货"), {"configurable": {"thread_id": "fact"}})
     facts, explanation = state["answer"].split("**政策与办理说明**", 1)
@@ -98,7 +98,7 @@ async def test_business_followup_uses_resolved_question_after_history_trim(tmp_p
 async def test_policy_answer_receives_unsubmitted_action_state():
     """生成申请表单前没有提交回执，正文输入与程序展示必须保留未提交状态。参数：无；返回：None；异常：断言失败。"""
     from app.workflow.graph import build_workflow
-    deps = dependencies(intents=["退款退货"], results=[order_result()], answers=[["请阅读政策说明。"]])
+    deps = dependencies(intents=["退款退货"], results=[order_result()], ranked=[ranked()], answers=[["请阅读政策说明。[1]"]])
     state = await build_workflow(deps, checkpointer=None).ainvoke(owned_turn("订单1001能退吗"))
     model_input = json.dumps(deps.model.inputs[-1]["messages"], ensure_ascii=False)
     assert "尚未提交" in model_input and "执行回执" in model_input
@@ -161,7 +161,7 @@ async def test_explicit_order_with_non_order_numbers_can_be_queried(tmp_path, qu
     参数：tmp_path隔离保存器；query含明确订单与可选金额。
     返回：None；异常：断言失败。
     """
-    deps = dependencies(intents=["退款退货"], results=[order_result()], ranked=[ranked()], answers=[["请核实签收时间。"]])
+    deps = dependencies(intents=["退款退货"], results=[order_result()], ranked=[ranked()], answers=[["请核实签收时间。[1]"]])
     async with workflow_runtime(deps, tmp_path / "explicit.sqlite") as graph:
         state = await graph.ainvoke(owned_turn(query), {"configurable": {"thread_id": "test"}})
     assert "__interrupt__" not in state
@@ -235,15 +235,13 @@ async def test_policy_answer_uses_current_facts_without_old_assistant_claims(tmp
         {"role": "user", "content": "订单1001"}, {"role": "assistant", "content": "肯定已批准退款，签收时间2026-01-01"}]}]
     async with workflow_runtime(deps, tmp_path / "facts.sqlite") as graph:
         state = await graph.ainvoke(initial, {"configurable": {"thread_id": "test"}})
-    answer_input = json.dumps(deps.model.inputs[-1]["messages"], ensure_ascii=False)
-    # 近期助手原话保留，但不能进入本轮核实事实或执行回执。
-    facts = context_data(deps.model.inputs[-1]["messages"])
-    assert "肯定已批准退款" in answer_input and "低分政策" not in answer_input
-    assert "肯定已批准退款" not in json.dumps(facts, ensure_ascii=False)
-    assert facts["办理进度"]["当前阶段"] == "尚未提交" and facts["办理进度"]["执行回执"] is None
-    assert "signed_at" not in facts["订单事实"]
-    assert "created_at" in answer_input and "签收" in answer_input and "原因" in answer_input
-    assert state["evidence"] == [] and deps.chat.finished[0]["low_confidence"] is None
+    # 低分不再调用正文模型；程序事实只来自本轮持久化结果，不采用历史助手说法。
+    assert not any(item["stage"] == "answer" for item in deps.model.inputs)
+    assert "肯定已批准退款" not in state["answer"] and "2026-01-01" not in state["answer"]
+    assert "签收时间：暂未查到" in state["answer"] and "退款申请：尚未提交" in state["answer"]
+    assert state["evidence"] == [] and deps.chat.finished[0]["low_confidence"].source == "retrieval_low_conf"
+    from app.knowledge.answering import FIXED_KNOWLEDGE_REFUSAL
+    assert state["answer"].endswith(FIXED_KNOWLEDGE_REFUSAL)
 
 
 @pytest.mark.parametrize("intent", ["退款退货", "售后"])
@@ -266,7 +264,7 @@ async def test_order_policy_enforces_document_scope(tmp_path, intent, scope_case
     index = FilterIndex(chunks, ignore_filter=scope_case == "ignored")
     search = HybridKnowledgeSearch(MemoryKnowledgeStore(snapshots=chunks), FakeEncoder(),
                                    index, RerankBoundary({5: 0.99}), make_settings())
-    deps = dependencies(intents=[intent], results=[order_result()], answers=[["需核对适用条件。"]])
+    deps = dependencies(intents=[intent], results=[order_result()], answers=[["需核对适用条件。[1]"]])
     deps.search = search
     async with workflow_runtime(deps, tmp_path / "policy-scope.sqlite") as graph:
         state = await graph.ainvoke(owned_turn("订单1001能退吗"), {"configurable": {"thread_id": "test"}})

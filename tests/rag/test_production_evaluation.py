@@ -102,10 +102,17 @@ def test_finite_calibration_compares_same_selected_labels_with_baseline():
 
 
 @pytest.mark.asyncio
-async def test_generation_is_rejected_before_paid_work():
-    """未接Task5时拒绝伪装完整生成。参数：无；返回：None；异常：断言失败。"""
-    with pytest.raises(NotImplementedError):
-        await production().ProductionEvaluationRuntime(None, Settings()).execute("问题", {}, retrieval_only=False)
+async def test_generation_reuses_shared_pipeline_without_chat_side_effects():
+    """完整模式必须生成真实结果且无聊天写入，保留实际selected。参数：无；返回：None；异常：断言失败。"""
+    from tests.workflow.graph_fakes import dependencies, ranked
+    deps = dependencies(intents=["商品咨询"], ranked=[ranked()], answers=[["依据当前政策。[1]"]])
+    runtime = production().ProductionEvaluationRuntime(deps.search, deps.settings,
+        model=deps.model, query_expander=deps.query_expander)
+    result = await runtime.execute("有什么条件？", {}, retrieval_only=False)
+    assert result["answer"] == "依据当前政策。[1]" and result["refused"] is False
+    assert result["citations"] == result["selected"] and len(result["selected"]) == 1
+    assert result["usage"]["model_calls"] == 3 and result["budget"] == result["usage"]
+    assert not deps.chat.finished and not deps.chat.calls and not deps.chat.results
 
 
 def test_threshold_selection_counts_mandatory_empty_refusal():

@@ -28,7 +28,8 @@ def test_new_turn_replaces_every_runtime_field_and_retains_history():
                     retrieval_snapshot={"status": "fault", "attempts": []}, pool_signals=[{"source": "self_check", "reason": "旧理由"}],
                     intent="物流", standard_query="旧检索问题", intent_confidence=0.9, order_id="1001",
                     order_data={"order_id": "1001"}, expanded_queries=["旧扩写"], selection_action={"action_id": "old"}, route="business", evidence=[{"chunk_id": 9}], evidence_scores=[0.9],
-                    gate={"passed": True}, retrieval_attempted=True, degradations=[{"stage": "answer", "error_type": "ConnectionError"}],
+                    gate={"passed": True}, retrieval_attempted=True, optional_knowledge_probe=True,
+                    knowledge_faults={"old": "OSError"}, degradations=[{"stage": "answer", "error_type": "ConnectionError"}],
                     pending_calls=[{"id": "old-call"}], seen_call_ids=["old-call"],
                     pending_bindings={"old-call": {"identity": "old"}}, pending_tool_bindings={"old-call": {}},
                     pending_ticket={"action": "old"}, ticket_intent={"status": "confirmed"},
@@ -55,7 +56,7 @@ def test_new_turn_replaces_every_runtime_field_and_retains_history():
         "context_version": 7, "current_message_id": "turn:new-turn:user", "history_context": None, "context_notes": [],
         "intent": None, "standard_query": "", "intent_confidence": None,
         "order_id": None, "order_data": None, "expanded_queries": [], "selection_action": None, "route": None, "evidence": [], "evidence_scores": [],
-        "gate": None, "retrieval_attempted": False, "degradations": [], "pending_calls": [], "seen_call_ids": [], "seen_call_signatures": [],
+        "gate": None, "retrieval_attempted": False, "optional_knowledge_probe": False, "knowledge_faults": {}, "degradations": [], "pending_calls": [], "seen_call_ids": [], "seen_call_signatures": [],
         "pending_bindings": {}, "pending_tool_bindings": {}, "tool_call_facts": {}, "pending_ticket": None, "ticket_intent": None,
         "ticket_write_state": None, "knowledge_cache": {}, "route_ready": False,
         "tool_count": 0, "decision_count": 0, "suggested_kinds": [], "suggested_actions": [],
@@ -125,3 +126,12 @@ def test_new_turn_clears_selection_and_order():
     assert merged["order_id"] is merged["order_data"] is merged["selection_action"] is None
     assert merged["intent_confidence"] is None and merged["standard_query"] == ""
     assert merged["expanded_queries"] == []
+def test_optional_probe_is_reset_and_missing_marker_is_conservative():
+    """新轮不能沿用旧探测资格，旧checkpoint缺字段不能猜成探测。参数：无；返回：None；异常：断言失败。"""
+    from tests.workflow.graph_fakes import turn
+    from app.workflow.policy_context import optional_probe_miss
+    current = turn("查订单")
+    assert current["optional_knowledge_probe"] is False
+    current.update(route="business", gate={"passed": False})
+    current.pop("optional_knowledge_probe")
+    assert optional_probe_miss(current) is False

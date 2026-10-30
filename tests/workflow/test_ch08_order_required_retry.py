@@ -27,7 +27,7 @@ async def test_order_required_then_order_then_same_policy_query_can_execute(tmp_
         AgentDecision(kind="tools", tool_calls=[call("early", "query_refund_policy", query=query)]),
         AgentDecision(kind="tools", tool_calls=[call("order", "query_order", order_id="1001")]),
         AgentDecision(kind="tools", tool_calls=[call("ready", "query_refund_policy", query=query)]),
-        AgentDecision(kind="answer")], answers=[["按已核实的政策申请。"]])
+        AgentDecision(kind="answer")], answers=[["按已核实的政策申请。[1]"]])
     initial = turn(query)
     initial["context"]["user_id"] = "demo-user"
     final = await build_workflow(deps, checkpointer=None).ainvoke(initial)

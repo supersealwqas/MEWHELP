@@ -5,6 +5,39 @@ import json
 from app.workflow.state import ConversationState
 
 
+async def verified_business_prefix(state: ConversationState, repository) -> str:
+    """仅由仓储核实本轮冻结调用和真实结果生成订单/工单前缀。
+
+    参数：state服务端原轮及tool_call_facts，repository聊天仓储。
+    返回：可信前缀，无可核实业务结果为空；异常：身份、数据库或结果一致性错误。
+    """
+    return await repository.verified_business_prefix(state)
+
+
+def optional_probe_miss(state: ConversationState) -> bool:
+    """识别确实进入无业务对象补检索后的未命中，保留纯业务澄清而不认定政策缺口。
+
+    参数：state服务端原轮；返回：严格窄场景布尔，旧checkpoint缺标记为False；异常：无。
+    """
+    from app.workflow.routing import _active_order_tokens, _trusted_history
+    return bool(state.get("optional_knowledge_probe") is True and state.get("route") == "business"
+        and not state.get("route_ready") and not state.get("tool_count") and not state.get("order_id")
+        and not state.get("pending_ticket") and not _active_order_tokens(state["raw_query"])
+        and not _trusted_history(state["history_turns"])[1]
+        and not any(message.get("tool_calls") or message.get("role") == "tool"
+                    for turn in state["history_turns"] for message in turn.get("messages", []))
+        and state.get("gate") is not None and state["gate"].get("passed") is False)
+
+
+def knowledge_retrieval_fault(state: ConversationState) -> bool:
+    """识别未恢复的真实检索责任，不让历史故障永久阻断同请求成功重试。
+
+    参数：state服务端责任字典及快照；返回：仍有未恢复故障时为True；异常：无。
+    """
+    from app.tools.knowledge import unresolved_knowledge_faults
+    return bool(unresolved_knowledge_faults(state))
+
+
 def policy_query(state: ConversationState) -> str:
     """为检索绑定已核实对象，保留用户原始条件。
 

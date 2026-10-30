@@ -576,6 +576,109 @@ class ChatRepository:
             return existing_result
         return result
 
+    async def verified_business_prefix(self, state: dict) -> str:
+        """回读原轮业务结果，校验图的冻结来源，不采纳state.order_data正文。
+
+        参数：state含可信context及本轮tool_call_facts；返回：订单和工单前缀。
+        异常：ValueError身份不符，数据库错误；非内置或不匹配来源不生成事实。
+        """
+        context = ToolContext.model_validate(state["context"])
+        async with self.factory() as session:
+            conversation, user = await owned_source(session, context.session_id, context.user_id, context.turn_id)
+            if user is None or source_context(conversation, user) != context.model_copy(update={"tool_call_id": ""}):
+                raise ValueError("业务前缀缺少可信原轮")
+            return await self._business_prefix(session, user, context, state=state)
+
+    async def _business_prefix(self, session, user, context: ToolContext, *, state: dict) -> str:
+        """在调用方事务内重新配对原轮调用与结果，完成事务复用同一边界。
+
+        参数：session现有事务、user已核实用户行、context原身份、state显示意图及可选冻结事实。
+        返回：确定性订单/工单前缀；异常：数据库及已保存回执结构错误。
+        """
+        from app.tools.contracts import binding_from_dict
+        from app.workflow.policy_context import verified_order_text
+        from app.repositories.actions import ActionRepository
+        from app.schemas.workflow import TicketResume
+        rows = (await session.scalars(select(Message).where(Message.conversation_id == context.conversation_id,
+            Message.turn_id == context.turn_id).order_by(Message.id))).all()
+        calls, orders = {}, []
+        facts = state.get("tool_call_facts")
+        for row in rows:
+            if row.id <= user.id:
+                continue
+            if row.role == "assistant" and row.tool_calls:
+                for call in row.tool_calls:
+                    try:
+                        binding = binding_from_dict(call["binding"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if (binding.identity.source != "builtin" or binding.identity.server is not None
+                            or binding.identity.name != call.get("name") or call["name"] != "query_order"):
+                        continue
+                    if facts is not None and facts.get(call["id"]) != {
+                            "turn_id": context.turn_id, "binding": call["binding"], "access": "read"}:
+                        continue
+                    calls[call["id"]] = call
+            elif row.role == "tool" and row.tool_call_id in calls:
+                call = calls.pop(row.tool_call_id)
+                result = ToolResult.model_validate_json(row.content, strict=True)
+                if (result.ok and result.error is None and result.data
+                        and result.data.get("order_id") == call["args"].get("order_id")):
+                    orders.append(result.data)
+        prefix = ""
+        pending = (user.rag_metadata or {}).get("pending_ticket")
+        if (isinstance(pending, dict) and pending.get("decision") == "confirm"
+                and isinstance(pending.get("action"), dict)):
+            request = TicketResume(type="confirm_ticket", session_id=context.session_id, user_id=context.user_id,
+                source_turn_id=context.turn_id, action_id=pending["action"].get("action_id"), decision="confirm")
+            receipt = await ActionRepository(self.factory)._chat_ticket_receipt(session, request, lock=True)
+            if receipt is not None:
+                prefix = receipt.answer_prefix()
+        # 只展示本轮实际查询过的订单；相同对象多次成功查询保留最后的持久化结果。
+        by_order = {order["order_id"]: order for order in orders}
+        for order in by_order.values():
+            prefix += verified_order_text({"order_data": order, "intent": state.get("intent")})
+        return prefix
+
+    async def _legacy_business_prefix(self, session, user, context: ToolContext) -> str:
+        """复核Legacy的原轮业务摘要，旧入口也不能仅凭拒答后缀接纳任意前缀。
+
+        参数：session现有事务、user原用户行、context可信身份；返回：旧格式真实业务前缀。
+        异常：数据库或业务结果格式错误；绑定存在时同样拒绝非内置来源。
+        """
+        from langchain_core.messages import AIMessage, ToolMessage
+        from app.knowledge.answering import business_facts_summary
+        from app.models.customer_service import Ticket
+        from app.tools.contracts import binding_from_dict
+        rows = (await session.scalars(select(Message).where(Message.conversation_id == context.conversation_id,
+            Message.turn_id == context.turn_id).order_by(Message.id))).all()
+        calls, current, receipt = {}, [], ""
+        for row in rows:
+            if row.id <= user.id:
+                continue
+            if row.role == "assistant" and row.tool_calls:
+                for call in row.tool_calls:
+                    if call.get("name") not in {"query_order", "query_logistics", "query_product", "create_ticket"}:
+                        continue
+                    if call.get("binding"):
+                        binding = binding_from_dict(call["binding"])
+                        if binding.identity.source != "builtin" or binding.identity.name != call["name"]:
+                            continue
+                    calls[call["id"]] = call
+                    current.append(AIMessage(content="", tool_calls=[{key: call[key] for key in ("id", "name", "args")}]))
+            elif row.role == "tool" and row.tool_call_id in calls:
+                call = calls.pop(row.tool_call_id)
+                current.append(ToolMessage(content=row.content, tool_call_id=row.tool_call_id))
+                result = ToolResult.model_validate_json(row.content, strict=True)
+                if call["name"] == "create_ticket" and result.ok and result.data:
+                    ticket = await session.get(Ticket, result.data.get("ticket_no"))
+                    if (ticket is not None and ticket.conversation_id == context.conversation_id
+                            and ticket.description == call["args"].get("description")
+                            and ticket.ticket_type == result.data.get("ticket_type") and ticket.status == "待处理"):
+                        receipt = f"工单已创建，工单号：{ticket.ticket_no}，状态：待处理。\n\n"
+        business = business_facts_summary(current)
+        return receipt + (business + "\n\n" if business else "")
+
     async def finish_turn(self, context: ToolContext, content: str, *,
                           low_confidence: SelfCheckFailure | RetrievalLowConfidence | None = None,
                           citations: list[EvidenceCitation] | None = None,
@@ -624,7 +727,22 @@ class ChatRepository:
             conversation = await session.get(Conversation, context.conversation_id)
             if conversation is None or conversation.user_id != context.user_id or conversation.session_id != context.session_id:
                 raise ValueError("完成轮次会话身份不匹配")
-            if any(signal.source == "retrieval_low_conf" for signal in signals):
+            if signals and pool_signals is not None:
+                from app.workflow.routing import fixed_reply
+                prefix = await self._business_prefix(session, user, context, state=workflow_metadata or {})
+                # 精确匹配可信业务区和固定兜底，endswith不足以拒绝模型伪造的成功事实。
+                allowed = {prefix + FIXED_KNOWLEDGE_REFUSAL}
+                if all(signal.source == "retrieval_low_conf" for signal in signals):
+                    allowed.add(prefix + fixed_reply("fallback")["answer"])
+                if content not in allowed:
+                    raise ValueError("知识不足入池必须与本轮核实业务前缀和固定兜底一起保存")
+                if citations:
+                    raise ValueError("固定知识兜底没有实际发布的知识引用")
+            elif isinstance(low_confidence, SelfCheckFailure):
+                prefix = await self._legacy_business_prefix(session, user, context)
+                if content != prefix + FIXED_KNOWLEDGE_REFUSAL:
+                    raise ValueError("Legacy自评拒答前缀与原轮真实业务结果不符")
+            elif any(signal.source == "retrieval_low_conf" for signal in signals):
                 from app.repositories.actions import ActionRepository
                 from app.schemas.workflow import TicketResume
                 from app.workflow.routing import fixed_reply

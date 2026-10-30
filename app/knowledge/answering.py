@@ -289,6 +289,16 @@ def decide_answer(result: KnowledgeAnswer, citations: list[EvidenceCitation]) ->
     return result.answer, None
 
 
+def published_citations(answer: str, citations: list[EvidenceCitation]) -> list[EvidenceCitation]:
+    """仅保留实际公开正文中的有效角标，不把模型参考过的资料全标作引用。
+
+    参数：answer已通过decide_answer的正文、citations实际送入的证据全集。
+    返回：按原编号排列的引用子集；异常：Markdown解析错误。
+    """
+    used = _inline_citation_numbers(answer)
+    return [item for item in citations if item.n in used]
+
+
 KNOWLEDGE_ANSWER_HANDOFF = "本轮业务查询阶段已经结束，不能再次申请或模拟业务查询、写入操作。现在只对query字段中的原始问题进行知识有用性自评，依据前面本轮完整工具事实，仅调用一次submit_knowledge_answer提交规定字段；不要输出自由文本。"
 
 

@@ -44,6 +44,8 @@ class ConversationState(TypedDict, total=False):
     evidence_scores: list[float]  # 本轮全部归一化重排分，与权威证据同源。
     gate: dict | None  # GateDecision的JSON快照，未执行证据闸时为空。
     retrieval_attempted: bool  # 本轮是否已经尝试知识检索，防止分类补救重复检索。
+    optional_knowledge_probe: bool  # 仅无业务对象的可选补检索入口置真；新轮清空，旧checkpoint缺失保守为假。
+    knowledge_faults: dict[str, str]  # 按真实查询/过滤/策略责任键记录未恢复检索故障；成功只解除相同键。
     degradations: list[dict]  # 本轮外部故障的阶段和类型，不含错误原文。
     pending_calls: list[dict]  # 本轮下一批工具申请；写入仍须经过服务端确认。
     pending_bindings: dict[str, dict]  # 决定时按调用ID冻结的工具来源与schema。
@@ -143,7 +145,7 @@ def new_turn_state(context: ToolContext, history_turns: list[dict], audit_cursor
         "context_version": 7, "current_message_id": f"turn:{context.turn_id}:user",
         "history_context": None, "context_notes": [],
         "intent": None, "intent_confidence": None, "route": None, "evidence": [], "evidence_scores": [], "gate": None,
-        "retrieval_attempted": False, "degradations": [],
+        "retrieval_attempted": False, "optional_knowledge_probe": False, "knowledge_faults": {}, "degradations": [],
         "pending_calls": [], "pending_bindings": {}, "pending_tool_bindings": {},
         "tool_call_facts": {},
         "pending_ticket": None, "ticket_intent": previous, "ticket_write_state": None,

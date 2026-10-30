@@ -201,7 +201,9 @@ async def test_followup_recovers_decision_format_without_losing_order_or_policy(
     sdk_runtime.responses.extend([
         understanding_response(query), intent_response("商品咨询"),
         *([text_response(invalid_raw)] if needs_recovery else []),
-        call_response("submit_decision", '{"kind":"answer","suggested_actions":[]}'), text_response(answer),
+        call_response("submit_decision", '{"kind":"answer","suggested_actions":[]}'),
+        call_response("submit_knowledge_answer", json.dumps({"useful": True, "reason": "", "answer": answer,
+                                                            "citation_numbers": [1]}, ensure_ascii=False)),
     ])
     deps = dependencies(ranked=[ranked(answer=policy)])
     deps.model = WorkflowModelAdapter(model_factory=sdk_runtime.factory)

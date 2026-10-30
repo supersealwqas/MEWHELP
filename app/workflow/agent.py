@@ -16,14 +16,14 @@ from app.schemas.tools import ToolContext, ToolResult
 from app.repositories.chat import PersistenceUncertain
 from app.tools.confirmation import TicketIntentState, request_ticket_authorization, ticket_context_notes, ticket_write_rejection
 from app.tools.contracts import KnowledgeCallContext, ToolExecutionScope, binding_dict, binding_from_dict
-from app.tools.knowledge import merge_knowledge_budget, retrieve_verified_knowledge, restore_turn_knowledge
+from app.tools.knowledge import merge_knowledge_budget, retrieve_verified_knowledge, restore_turn_knowledge, unresolved_knowledge_faults
 from app.workflow.citations import CitationStreamFilter
 from app.workflow.answer_policy import query_fault_answer
 from app.workflow.model import decision_tool_schemas
 from app.workflow.prompts import ANSWER_PROMPT, DECISION_PROMPT
 from app.workflow.state import ConversationState, message_row
 from app.workflow.stages import publish_stage
-from app.workflow.policy_context import verified_order_text
+from app.workflow.policy_context import verified_business_prefix, optional_probe_miss, knowledge_retrieval_fault
 from app.workflow.routing import _active_order_tokens, knowledge_input_stop_reason, _trusted_history
 from app.workflow.resilience import DEPENDENCY_ERRORS, degradation
 from app.workflow.model import WorkflowOutputError
@@ -157,6 +157,7 @@ def build_agent_graph(deps: "WorkflowDependencies", *, decision=None):
         if "retrieval_snapshot" not in knowledge_state or "pool_signals" not in knowledge_state:
             # 根Command.update不能改写已暂停子图的旧输入，消费边界也要恢复新增字段。
             knowledge_state.update(await restore_turn_knowledge(knowledge_state, deps.chat))
+        knowledge_state["knowledge_faults"] = unresolved_knowledge_faults(knowledge_state)
         seen_ids, seen_signatures = list(state["seen_call_ids"]), list(state["seen_call_signatures"])
         count, reason, batch_failed = state["tool_count"], None, False
         writer = get_stream_writer()
@@ -245,7 +246,7 @@ def build_agent_graph(deps: "WorkflowDependencies", *, decision=None):
                   "ticket_intent": ticket_intent.model_dump(mode="json") if ticket_intent else None, "seen_call_ids": seen_ids,
                   "seen_call_signatures": seen_signatures, "tool_count": count, "budget": ledger.snapshot(),
                   **{key: knowledge_state[key] for key in ("knowledge_cache", "evidence", "gate", "evidence_scores",
-                     "expanded_queries", "retrieval_attempted", "order_id", "order_data", "retrieval_snapshot", "pool_signals")}}
+                     "expanded_queries", "retrieval_attempted", "order_id", "order_data", "retrieval_snapshot", "pool_signals", "knowledge_faults")}}
         if reason:
             update.update(stopped_state(reason))
         return update
@@ -255,6 +256,48 @@ def build_agent_graph(deps: "WorkflowDependencies", *, decision=None):
         writer = get_stream_writer()
         publish_stage(state, "answer", "running")
         receipt_prefix = await confirmed_ticket_prefix(state, deps.chat)
+        instructions = {"create_ticket": "请点击本条回复后的“创建工单”按钮，在弹窗中确认后提交。",
+                        "handoff": "如需人工协助，可点击本条回复后的“转人工”按钮。"}
+        action_text = ("本轮回复后可用按钮的操作说明如下：\n" +
+            "\n".join(instructions[kind] for kind in state["suggested_kinds"])) if state["suggested_kinds"] else "本轮回复后没有可操作的按钮，请按已有事实回答或追问。"
+        answer_state = {**state, "context_notes": [*state.get("context_notes", []), action_text]}
+        if knowledge_retrieval_fault(state):
+            update = stopped_state("retrieval_unavailable")
+            update.update(answer=await verified_business_prefix(state, deps.chat) + update["answer"],
+                          evidence=[], pool_signals=[])
+            writer({"event": "delta", "data": {"delta": update["answer"]}})
+            publish_stage(state, "answer", "completed")
+            return update
+        # 已有本轮真实知识结果才进入自评；不以意图名称决定，也不把业务字段当政策证据。
+        if (state.get("gate") is not None and not optional_probe_miss(state)
+                and (not state["answer"] or state["gate"].get("passed") is False)):
+            from app.knowledge.answering import EvidenceCitation
+            from app.knowledge.pipeline import ProductionKnowledgePipeline
+            ledger = BudgetLedger.from_snapshot(state["budget"])
+            prefix = await verified_business_prefix(state, deps.chat)
+            try:
+                pipeline = ProductionKnowledgePipeline(deps.search, deps.settings, query_expander=deps.query_expander,
+                    model=deps.model, state=answer_state)
+                generated = await pipeline.generate({"ledger": ledger}, {
+                    "selected": [EvidenceCitation.model_validate(item) for item in state["evidence"]], "gate": state["gate"]})
+                answer = prefix + generated["answer"]
+                signals = {item["source"]: item for item in state.get("pool_signals", [])}
+                signals.update({item.source: item.model_dump(mode="json") for item in generated["pool_signals"]})
+                update = {"answer": answer, "budget": ledger.snapshot(),
+                    "evidence": [] if generated["refused"] else state["evidence"],
+                    "pool_signals": list(signals.values())}
+                if any(item.source == "self_check" for item in generated["pool_signals"]):
+                    update["stop_reason"] = "self_check"
+            except (WorkflowBudgetExceeded, ContextBudgetExceeded) as error:
+                update = {**stopped_state("budget_exceeded", ledger), **degradation(state, "answer", error), "evidence": []}
+                update["answer"] = prefix + update["answer"]
+            except DEPENDENCY_ERRORS as error:
+                update = {**stopped_state("answer_unavailable", ledger), **degradation(state, "answer", error), "evidence": []}
+                update["answer"] = prefix + update["answer"]
+            # 只有已经通过结构/自评/引用校验的最终正文能进入custom公共流。
+            writer({"event": "delta", "data": {"delta": update["answer"]}})
+            publish_stage(state, "answer", "completed")
+            return update
         if state["answer"]:
             answer = receipt_prefix + state["answer"]
             writer({"event": "delta", "data": {"delta": answer}})
@@ -271,10 +314,6 @@ def build_agent_graph(deps: "WorkflowDependencies", *, decision=None):
         if receipt_prefix:
             parts.append(receipt_prefix)
             writer({"event": "delta", "data": {"delta": receipt_prefix}})
-        if state.get("route") == "order_policy":
-            prefix = verified_order_text(state)
-            parts.append(prefix)
-            writer({"event": "delta", "data": {"delta": prefix}})
         prefix_count = len(parts)
         citation_tool_names = {tool.name for tool in deps.registry.snapshot()} | {"submit_intent", "submit_decision"}
         citations = CitationStreamFilter({item["n"] for item in state["evidence"]}, citation_tool_names)
@@ -290,14 +329,7 @@ def build_agent_graph(deps: "WorkflowDependencies", *, decision=None):
             return {**update, **degradation(state, "answer", error), "answer": "".join(parts)}
 
         try:
-            instructions = {
-                "create_ticket": "请点击本条回复后的“创建工单”按钮，在弹窗中确认后提交。",
-                "handoff": "如需人工协助，可点击本条回复后的“转人工”按钮。",
-            }
-            action_text = ("本轮回复后可用按钮的操作说明如下：\n" +
-                           "\n".join(instructions[kind] for kind in state["suggested_kinds"])) if state["suggested_kinds"] else "本轮回复后没有可操作的按钮，请按已有事实回答或追问。"
             # 正文模型只需要中文按钮语义；不传内部字段、枚举、身份或动作ID。完整说明仍先过原预算。
-            answer_state = {**state, "context_notes": [*state.get("context_notes", []), action_text]}
             messages = model_messages(answer_state, deps.settings, ANSWER_PROMPT, registry=deps.registry)
             async with aclosing(deps.model.stream_answer(messages, ledger)) as stream:
                 async for delta in stream:
@@ -331,7 +363,7 @@ def build_agent_graph(deps: "WorkflowDependencies", *, decision=None):
         参数：state本轮未执行工具且未检索的终止决定；返回：知识证据或原回答/澄清出口；异常：取消及程序错误。
         """
         ledger = BudgetLedger.from_snapshot(state["budget"])
-        update = {"retrieval_attempted": True}
+        update = {"retrieval_attempted": True, "optional_knowledge_probe": True}
         if any(knowledge_input_stop_reason(state[key]) for key in ("raw_query", "resolved_query", "standard_query")):
             return update
         publish_stage(state, "policy", "running")
@@ -343,14 +375,17 @@ def build_agent_graph(deps: "WorkflowDependencies", *, decision=None):
                     prepared_queries=[state["standard_query"]], chat=deps.chat)
         except (WorkflowBudgetExceeded, ContextBudgetExceeded):
             return {**update, **stopped_state("budget_exceeded", ledger),
-                    "retrieval_snapshot": knowledge_state.get("retrieval_snapshot")}
+                    "retrieval_snapshot": knowledge_state.get("retrieval_snapshot"),
+                    "knowledge_faults": unresolved_knowledge_faults(knowledge_state)}
         except DEPENDENCY_ERRORS as error:
             publish_stage(state, "policy", "completed")
             return {**update, **stopped_state("retrieval_unavailable", ledger),
                     **degradation(state, "recover_knowledge", error),
-                    "retrieval_snapshot": knowledge_state.get("retrieval_snapshot")}
+                    "retrieval_snapshot": knowledge_state.get("retrieval_snapshot"),
+                    "knowledge_faults": unresolved_knowledge_faults(knowledge_state)}
         publish_stage(state, "policy", "completed")
-        update.update(outcome.model_dump(mode="json"), knowledge_cache=knowledge_state.get("knowledge_cache", {}))
+        update.update(outcome.model_dump(mode="json"), knowledge_cache=knowledge_state.get("knowledge_cache", {}),
+                      knowledge_faults=unresolved_knowledge_faults(knowledge_state))
         if outcome.gate["passed"]:
             update.update(stop_reason="answer", context_notes=[])
         # 低分不把原业务问题封死，也不冒充一次有效回答；保留已有澄清流程。

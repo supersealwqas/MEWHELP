@@ -14,7 +14,7 @@ from app.config import Settings
 from app.observability.runtime import ObservabilityRuntime
 from app.core.memory import ContextBudgetExceeded
 from app.core.model_budget import BudgetLedger, WorkflowBudgetExceeded, budget_summary
-from app.knowledge.answering import EvidenceCitation
+from app.knowledge.answering import EvidenceCitation, published_citations
 from app.schemas.flywheel import PoolSignal, RetrievalSnapshot
 from app.knowledge.retrieval import HybridKnowledgeSearch
 from app.knowledge.query_rewrite import QueryExpander
@@ -26,7 +26,7 @@ from app.tools.registry import ToolRegistry, build_agent_registry
 from app.tools.permissions import ToolPermissions
 from app.tools.mcp import MCPToolManager
 from app.tools.contracts import ToolExecutionScope, binding_dict
-from app.tools.knowledge import ORDER_POLICY_SOURCES, retrieve_verified_knowledge
+from app.tools.knowledge import ORDER_POLICY_SOURCES, retrieve_verified_knowledge, unresolved_knowledge_faults
 from app.workflow.agent import build_agent_decision, build_agent_graph, confirmed_ticket_prefix, model_messages, stopped_state
 from app.workflow.model import WorkflowModelAdapter, intent_tool_schema, understanding_tool_schema
 from app.workflow.prompts import INTENT_PROMPT, UNDERSTANDING_PROMPT
@@ -35,7 +35,7 @@ from app.knowledge.pipeline import understand_query
 from app.tools.business import list_user_orders, owns_order
 from app.workflow.state import ConversationState, full_history_messages, message_row
 from app.workflow.stages import publish_stage
-from app.workflow.policy_context import policy_query, verified_order_text
+from app.workflow.policy_context import policy_query, verified_business_prefix, optional_probe_miss, knowledge_retrieval_fault
 from app.workflow.resilience import DEPENDENCY_ERRORS, degradation
 from app.workflow.routing import original_understanding
 from app.workflow.context import history_snapshot, log_history
@@ -45,16 +45,12 @@ logger = logging.getLogger(__name__)
 
 
 def _pooled_low_confidence(state: ConversationState):
-    """判定本轮是否真的以弱证据拒答入池。
+    """从实际知识责任和检索结果派生信号，独立于最终stop_reason。
 
-    参数：state含gate与stop_reason的工作流状态。
-    返回：RetrievalLowConfidence表示应入池；None表示本轮正常作答或走了业务分支。
-    异常：无；gate缺失或非弱证据原因时返回None。
-
-    只有真正以retrieval_low_conf结束后，正文才会是固定拒答话术；
-    业务意图在低分后继续查事实并正常作答，不属于弱证据入池，不能传给仓储。
+    参数：state原轮检索、窄范围可选探测标记和业务事实。
+    返回：RetrievalLowConfidence或None；异常：坏gate校验错误。
     """
-    if not state.get("gate") or state.get("stop_reason") != "retrieval_low_conf":
+    if not state.get("gate") or state["gate"].get("passed") or optional_probe_miss(state) or knowledge_retrieval_fault(state):
         return None
     return GateDecision.model_validate(state["gate"]).low_confidence
 
@@ -186,7 +182,10 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
             scope=ToolExecutionScope(binding=definition.binding, rejection=rejection))
         messages = [message_row(context.turn_id, "assistant", "", calls=[call], bindings=bindings),
                     message_row(context.turn_id, "tool", result.model_dump_json(), call_id=call["id"])]
-        update = {"messages": messages, "order_id": identifier, "tool_count": state["tool_count"] + (0 if rejection else 1)}
+        facts = {**state.get("tool_call_facts", {}), call["id"]: {
+            "turn_id": context.turn_id, "binding": bindings[call["id"]], "access": definition.access}}
+        update = {"messages": messages, "order_id": identifier, "tool_count": state["tool_count"] + (0 if rejection else 1),
+                  "tool_call_facts": facts}
         if not result.ok or result.data.get("order_id") != identifier:
             return {**update, **stopped_state("tool_failed")}
         publish_stage(state, "order", "completed", order_id=identifier)
@@ -221,18 +220,19 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
                     settings=deps.settings, query_expander=deps.query_expander, query=query,
                     prepared_queries=prepared_queries, stage_callback=knowledge_stage, chat=deps.chat, **options)
         except (WorkflowBudgetExceeded, ContextBudgetExceeded):
-            return {**stopped_state("budget_exceeded", ledger), "retrieval_snapshot": knowledge_state.get("retrieval_snapshot")}
+            return {**stopped_state("budget_exceeded", ledger), "retrieval_snapshot": knowledge_state.get("retrieval_snapshot"),
+                    "knowledge_faults": unresolved_knowledge_faults(knowledge_state)}
         except DEPENDENCY_ERRORS as error:
             # 依赖故障不能冒充低分证据，也不能把越界或失配原文交给模型。
             update = stopped_state("retrieval_unavailable", ledger)
-            if state.get("order_data"):
-                update["answer"] = verified_order_text(state) + update["answer"]
             publish_stage(state, "policy", "completed")
             return {**update, **degradation(state, "retrieve", error), "retrieval_attempted": True,
                     "evidence": [], "evidence_scores": [], "gate": None,
-                    "retrieval_snapshot": knowledge_state.get("retrieval_snapshot")}
+                    "retrieval_snapshot": knowledge_state.get("retrieval_snapshot"),
+                    "knowledge_faults": unresolved_knowledge_faults(knowledge_state)}
         # 检索结果先交给证据闸；尚未通过的内容不能进入模型消息。
         return {**outcome.model_dump(mode="json"), "knowledge_cache": knowledge_state.get("knowledge_cache", {}),
+                "knowledge_faults": unresolved_knowledge_faults(knowledge_state),
                 "retrieval_attempted": True, "stop_reason": None}
 
     def confidence_node(state: ConversationState) -> ConversationState:
@@ -271,7 +271,12 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
             update = fixed_reply(reply_kind)
             update["stop_reason"] = kind if state["stop_reason"] in {None, "answer", "clarify"} else state["stop_reason"]
         # 建单可以先于政策检索完成，故障或弱证据出口也必须保留原调用的成功事实。
-        update["answer"] = await confirmed_ticket_prefix(state, deps.chat) + update["answer"]
+        if state.get("gate") is not None and not state["gate"]["passed"]:
+            from app.knowledge.answering import FIXED_KNOWLEDGE_REFUSAL
+            update["answer"] = await verified_business_prefix(state, deps.chat) + FIXED_KNOWLEDGE_REFUSAL
+            update["evidence"] = []
+        else:
+            update["answer"] = await verified_business_prefix(state, deps.chat) + update["answer"]
         get_stream_writer()({"event": "delta", "data": {"delta": update["answer"]}})
         return update
 
@@ -316,7 +321,7 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
                 source_turn_id=context.turn_id, question=state["raw_query"], order_id=state["order_id"])
         saved = await deps.chat.finish_turn(context, state["answer"], pool_signals=signals,
             retrieval_snapshot=RetrievalSnapshot.model_validate(state["retrieval_snapshot"]) if state.get("retrieval_snapshot") else None,
-            citations=[EvidenceCitation.model_validate(item) for item in state["evidence"]],
+            citations=published_citations(state["answer"], [EvidenceCitation.model_validate(item) for item in state["evidence"]]),
             suggested_actions=actions, workflow_metadata=metadata, refund_action=refund_action)
         # 完成事务后增量回读，使用同一稳定消息ID补主键，不能另追加第二份客服回答。
         delta = await deps.chat.load_history_delta(context.conversation_id, state["audit_cursor"], refresh_turn_id=context.turn_id)

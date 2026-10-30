@@ -37,6 +37,9 @@ async def test_answer_filters_only_unavailable_citations_before_stream_and_stora
     deps = dependencies(intents=["商品咨询" if has_evidence else "订单"],
         decisions=[AgentDecision(kind="answer")], ranked=[ranked()] if has_evidence else [],
         answers=[[raw[index:index + chunk_size] for index in range(0, len(raw), chunk_size)]])
+    if has_evidence and raw != expected:
+        # 知识候选不能先发再删错引；第二个有限候选才是修复后的可发布正文。
+        deps.model.answers.append([expected])
     state = turn("这笔订单呢")
     state["history_turns"] = [{"turn_id": "previous-policy", "turn_status": "completed", "messages": [
         {"role": "user", "content": "可以退货吗"},

@@ -53,3 +53,21 @@ class ScriptedWorkflowModel:
             if isinstance(delta, BaseException):
                 raise delta
             yield delta
+
+    async def answer_knowledge(self, messages: list, ledger: BudgetLedger):
+        """消费有限知识候选，不替脚本补造引用或自评结果。
+
+        参数：messages完整资料、ledger原账本；返回：KnowledgeAnswer；异常：脚本耗尽/候选错误。
+        """
+        from app.knowledge.answering import KnowledgeAnswer, _inline_citation_numbers
+        result = self._take(self.answers, "answer", messages, ledger, 4096)
+        if isinstance(result, KnowledgeAnswer):
+            return result
+        parts = []
+        for part in result:
+            if isinstance(part, BaseException):
+                raise part
+            parts.append(part)
+        answer = "".join(parts)
+        return KnowledgeAnswer(useful=True, reason="", answer=answer,
+                               citation_numbers=sorted(_inline_citation_numbers(answer)))

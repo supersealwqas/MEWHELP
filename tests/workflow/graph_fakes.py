@@ -104,7 +104,10 @@ class StrictChat:
         # 替身不校验这一条时，图里传错 low_confidence 只会在真实服务上报错。
         if isinstance(low_confidence, RetrievalLowConfidence):
             from app.workflow.routing import fixed_reply
-            assert content == fixed_reply("fallback")["answer"], (
+            from app.knowledge.answering import FIXED_KNOWLEDGE_REFUSAL
+            prefix = await self.verified_business_prefix({"context": context.model_dump(mode="json"),
+                                                        "intent": workflow_metadata.get("intent")})
+            assert content in {prefix + fixed_reply("fallback")["answer"], prefix + FIXED_KNOWLEDGE_REFUSAL}, (
                 "检索弱证据入池必须与固定兜底一起保存")
         record = {"context": context, "content": content, "low_confidence": low_confidence,
                   "citations": citations, "suggested_actions": suggested_actions, "workflow_metadata": workflow_metadata}
@@ -115,6 +118,27 @@ class StrictChat:
         return {"turn_id": context.turn_id, "citations": [x.model_dump(mode="json") for x in citations],
                 "suggested_actions": [x.model_dump(mode="json") for x in suggested_actions], "workflow": workflow_metadata,
                 "refund_action": refund_action.model_dump(mode="json") if refund_action else None}
+
+    async def verified_business_prefix(self, state):
+        """按本轮已保存申请/结果模拟前缀读取，事务防伪另由真实SQLite覆盖。
+
+        参数：state原轮及意图；返回：有限脚本真实订单前缀；异常：绑定格式错误。
+        """
+        from app.workflow.policy_context import verified_order_text
+        from app.tools.contracts import binding_from_dict
+        prefix, orders = "", {}
+        saved_turn = self.history.get(state["context"]["turn_id"])
+        for row in saved_turn.messages if saved_turn else []:
+            if row.tool_calls:
+                for call in row.tool_calls:
+                    binding = binding_from_dict(call["binding"]) if call.get("binding") else None
+                    if binding and binding.identity.source == "builtin" and call["name"] == "query_order":
+                        orders[call["id"]] = call
+            if row.role == "tool" and row.tool_call_id in orders:
+                result = ToolResult.model_validate_json(row.content)
+                if result.ok and result.data and result.data.get("order_id") == orders[row.tool_call_id]["args"].get("order_id"):
+                    prefix += verified_order_text({"order_data": result.data, "intent": state.get("intent")})
+        return prefix
 
 class StrictExecutor:
     """只记录被图批准的执行；模拟已有执行器的结果落库和状态回调。"""

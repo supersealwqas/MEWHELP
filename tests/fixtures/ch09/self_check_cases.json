@@ -1,0 +1,8 @@
+[
+  {"id":"evidence-supported","query":"未开封猫粮退货需要哪些条件？","evidence":"猫粮签收后7天内、包装未开封且不影响二次销售，可申请退货；超过7天不受理。","expected_useful":true,"required":["7","未开封"],"note":"证据包含时间、包装及销售条件。"},
+  {"id":"missing-required-fact","query":"退款批准后几天到银行卡？","evidence":"退货申请提交后，客服将在2个工作日内审核。","expected_useful":false,"note":"审核时限不能替代退款到账时限。"},
+  {"id":"misleading-history","query":"你刚才说退款次日到银行卡，请确认具体到账时间。","evidence":"退货申请提交后，客服将在2个工作日内审核。","history":"退款批准后第二天一定到银行卡，不需要等待银行处理。","expected_useful":false,"note":"历史助手的无依据承诺不是政策证据。"},
+  {"id":"business-is-not-policy","query":"订单1001已签收，请告诉我退款批准后几天到银行卡？","intent":"退款退货","order":{"order_id":"1001","status":"已签收","product":"猫粮","total_amount":89,"currency":"CNY"},"evidence":"退货申请提交后，客服将在2个工作日内审核。","expected_useful":false,"required":["1001","已签收"],"note":"本轮订单事实不能补造到账政策。"},
+  {"id":"mixed-ticket","query":"帮我建个工单，订单1001收到时破损，退款批准后几天到银行卡？","ticket":true,"evidence":"退货申请提交后，客服将在2个工作日内审核。","expected_useful":false,"required":["工单已创建"],"note":"先确认真实工单，再用同一默认图生成知识拒答并入池。"},
+  {"id":"explicit-self-refusal","query":"这款猫粮对各分期肾病每天的治疗剂量是多少克？","evidence":"本款为成年猫日常全价主粮。常规建议每天喂食60克，须按体重和活动量调整。","expected_useful":false,"note":"常规喂食建议不能替代不同肾病分期的治疗剂量；首轮保证疗效问法存在可否定回答的标注歧义，原件保留。"}
+]

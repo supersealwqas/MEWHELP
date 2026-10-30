@@ -21,7 +21,7 @@ async def test_refund_policy_before_order_preserves_required_expansion(tmp_path,
     query = "订单1001能退吗"
     deps = dynamic_dependencies(tmp_path, intents=["退款退货"], ranked=[ranked(score)], decisions=[
         AgentDecision(kind="tools", tool_calls=[call("early-policy", "query_refund_policy", query=query)]),
-        AgentDecision(kind="answer")], answers=[["退货条件以已核实证据为准。"]])
+        AgentDecision(kind="answer")], answers=[["退货条件以已核实证据为准。[1]"]])
     original_search = deps.search.retrieve_policy
 
     async def checked_search(search_query, **options):
@@ -93,7 +93,10 @@ async def test_order_fact_does_not_bypass_policy_gate(tmp_path):
     assert [identifier for identifier, _ in deps.chat.results] == ["order"]
     assert len(deps.search.calls) == 1 and deps.search.calls[0][0] == "retrieve_policy"
     assert state["route_ready"] and not state["gate"]["passed"] and state["evidence"] == []
-    assert "没有可用知识政策证据" in json.dumps(deps.model.inputs[-1]["messages"], ensure_ascii=False)
+    from app.knowledge.answering import FIXED_KNOWLEDGE_REFUSAL
+    assert not any(row["stage"] == "answer" for row in deps.model.inputs)
+    assert "订单：1001" in state["answer"] and state["answer"].endswith(FIXED_KNOWLEDGE_REFUSAL)
+    assert deps.chat.finished[0]["low_confidence"].source == "retrieval_low_conf"
 
 
 async def test_internal_knowledge_and_bindings_never_reach_later_model(tmp_path):
@@ -125,13 +128,15 @@ async def test_evidence_keeps_numbers_and_uses_existing_edge_order(tmp_path):
     参数：tmp_path 权限文件；返回：None；异常：图或断言失败。
     """
     deps = dynamic_dependencies(tmp_path, intents=["其他"], ranked=[ranked(number=n) for n in range(1, 5)], decisions=[
-        AgentDecision(kind="tools", tool_calls=[call("faq", "query_faq", keyword="会员规则")]), AgentDecision(kind="answer")])
+        AgentDecision(kind="tools", tool_calls=[call("faq", "query_faq", keyword="会员规则")]), AgentDecision(kind="answer")],
+        answers=[["会员政策说明。[1]"]])
     state = await build_workflow(deps, checkpointer=None).ainvoke(turn("会员规则"))
     context = next(row["content"] for row in deps.model.inputs[-1]["messages"] if row["content"].startswith("上下文资料"))
     evidence = json.loads(context.split("\n", 1)[1])["本轮知识证据"]
     assert [row["n"] for row in evidence] == [1, 3, 4, 2]
     assert [row["n"] for row in state["evidence"]] == [1, 2, 3, 4]
     assert all("source_key" not in row for row in evidence)
+    assert [row.n for row in deps.chat.finished[0]["citations"]] == [1]
 
 
 async def test_weak_knowledge_tool_cannot_answer_policy(tmp_path):
