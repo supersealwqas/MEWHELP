@@ -278,7 +278,9 @@ async def test_database_runtime_starts_and_closes_production_worker(tmp_path, mo
         @asynccontextmanager
         async def search(*args):
             """参数：搜索装配；返回：外部模型占位；异常：无。"""
-            yield object()
+            from types import SimpleNamespace
+            from tests.knowledge.fakes import FakeEncoder, MemoryVectorIndex
+            yield SimpleNamespace(encoder=FakeEncoder(), index=MemoryVectorIndex())
         async def schema(config):
             """参数：配置；返回：None；异常：无，实库结构另验。"""
         monkeypatch.setattr(main, "check_ch09_tables", schema)

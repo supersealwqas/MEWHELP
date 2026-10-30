@@ -46,6 +46,14 @@ async def offline_recovery_database(path: Path):
 class ForbiddenRecoverySearch:
     """恢复业务场景不允许意外读取知识模型、编码器或向量库。"""
 
+    def __init__(self):
+        """仅暴露装配引用，不允许实际使用外部依赖。参数：无；返回：None；异常：无。"""
+        self.encoder = self.index = self
+
+    def __getattr__(self, name):
+        """任何编码/索引接口访问均显式拒绝。参数：接口名；返回：不返回；异常：AssertionError走错恢复路径。"""
+        raise AssertionError(f"恢复业务验收不得访问知识依赖接口：{name}")
+
     async def retrieve(self, *args, **kwargs):
         """阻断知识读取。参数：原检索契约；返回：不返回；异常：AssertionError，走错路由。"""
         raise AssertionError("恢复业务验收不得访问知识资源")

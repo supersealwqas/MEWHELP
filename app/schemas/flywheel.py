@@ -2,7 +2,7 @@
 
 from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 RetrievalStatus = Literal["ok", "empty", "fault", "legacy_incomplete", "legacy_unavailable"]
@@ -107,3 +107,17 @@ class MatchDecision(FlywheelContract):
     """当前候选页的语义等价判定，不包含审核或发布权限。"""
 
     matched_review_id: PositiveId | None = Field(description="本页语义相同的真实主键；没有重复为null")
+
+
+class ApprovalRequest(FlywheelContract):
+    """人工明确提交的核准答案；不从模型示例自动取值。"""
+
+    answer: str = Field(min_length=1, description="人工核准正文；保留空白和标点，三格字符/token硬限由实际编码器校验")
+
+    @field_validator("answer")
+    @classmethod
+    def require_human_answer(cls, value: str) -> str:
+        """拒绝纯空白但不改写人工输入。参数：答案；返回：原字符串；异常：ValueError空答案。"""
+        if not value.strip():
+            raise ValueError("人工答案不能为空")
+        return value

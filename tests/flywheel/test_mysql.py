@@ -1,6 +1,6 @@
 """仅在显式开启的空 mewhelp_ch09_test 验证真实 MySQL 迁移断点与 JSON。
 
-不操作应用库。若专库存在任何表则拒绝运行；只清理本轮成功登记创建的五张表。
+不操作应用库。若专库存在任何表则拒绝运行；只清理本轮成功登记创建的白名单表。
 运行：MEWHELP_RUN_CH09_MYSQL=1 uv run pytest tests/flywheel/test_mysql.py -m mysql -q。
 """
 
@@ -17,7 +17,7 @@ from app.models.customer_service import Conversation
 pytestmark = [pytest.mark.mysql, pytest.mark.skipif(
     os.getenv("MEWHELP_RUN_CH09_MYSQL") != "1", reason="需要显式 MEWHELP_RUN_CH09_MYSQL=1")]
 TEST_DATABASE = "mewhelp_ch09_test"
-OWNED_TABLES = ("messages", "low_confidence_questions", "faith_cases", "eval_runs", "review_queue", "conversations")
+OWNED_TABLES = ("qa_extraction_staging", "qa_extraction_batches", "knowledge_chunks", "messages", "low_confidence_questions", "faith_cases", "eval_runs", "review_queue", "conversations")
 
 
 @pytest.fixture
@@ -592,3 +592,174 @@ async def test_mysql_worker_cancel_releases_owned_lock_and_connection(merge_mysq
             await blocker.release()
         await worker.close()
         await asyncio.gather(operation, return_exceptions=True)
+
+
+@pytest.fixture
+async def publication_mysql(isolated_mysql):
+    """在显式空专库组装真实审核与CH03存储，向量仍是可断点替身。参数：安全夹具；返回：发布依赖；异常：建表/连接错误。"""
+    from types import SimpleNamespace
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import NullPool
+    from app.models.knowledge import KnowledgeBase
+    from app.models.flywheel import ReviewQueue
+    from app.repositories.flywheel import FlywheelRepository
+    from app.knowledge.store import KnowledgeStore
+    from app.services.review_publish import ReviewPublisher
+    from tests.knowledge.fakes import FakeEncoder, MemoryVectorIndex
+    config, engine, factory, _ = isolated_mysql
+    await prepare_feedback(engine)
+    async with engine.begin() as connection:
+        assert await connection.scalar(text("SELECT DATABASE()")) == TEST_DATABASE
+        for table in KnowledgeBase.metadata.sorted_tables:
+            await connection.run_sync(table.create)
+            warnings = (await connection.execute(text("SHOW WARNINGS"))).all()
+            if warnings:
+                print(f"既有CH03建表警告 {table.name}: {warnings}")
+    lease_engine = create_async_engine(engine.url, poolclass=NullPool, connect_args={"connect_timeout": 5})
+    repo, store = FlywheelRepository(factory, lease_engine), KnowledgeStore(factory, lease_engine)
+    encoder, index = FakeEncoder(), MemoryVectorIndex()
+    publisher = ReviewPublisher(repo, store, encoder, index, close_seconds=0.01)
+    async with factory.begin() as session:
+        row = ReviewQueue(normalized_question="实际审核的问题", ai_suggested_answer="模型建议不能自动通过")
+        session.add(row)
+        await session.flush()
+    try:
+        yield SimpleNamespace(config=config, engine=engine, factory=factory, repo=repo, store=store,
+            encoder=encoder, index=index, publisher=publisher, review_id=row.id, lease_engine=lease_engine)
+    finally:
+        try:
+            await publisher.close()
+        finally:
+            await lease_engine.dispose()
+
+
+@pytest.mark.parametrize("point", ["mysql", "vector", "review"])
+async def test_mysql_review_publication_breakpoints_recover_same_identity(publication_mysql, point):
+    """真实MySQL持久写后断点恢复不得重复块或丢失人工正文。参数：专库依赖/断点；返回：None；异常：断言失败。"""
+    from sqlalchemy import select
+    from app.models.knowledge import KnowledgeChunk
+    from app.services.review_publish import PublicationPending, ReviewPublisher
+    env = publication_mysql
+    original_encode = env.encoder.encode
+    async def crash(texts):
+        """数据库发布已提交后拒绝编码。参数：文本；返回：不返回；异常：RuntimeError。"""
+        raise RuntimeError("after mysql publication")
+    def reject_status(connection, cursor, statement, parameters, context, executemany):
+        """在真实审核完成UPDATE前断开业务路径。参数：SQL事件；返回：None；异常：RuntimeError。"""
+        if statement.startswith("UPDATE review_queue SET review_status="):
+            raise RuntimeError("before review complete")
+    if point == "mysql":
+        env.encoder.encode = crash
+    elif point == "vector":
+        env.index.fail_after_upsert = True
+    else:
+        event.listen(env.engine.sync_engine, "before_cursor_execute", reject_status)
+    try:
+        with pytest.raises(PublicationPending):
+            await env.publisher.approve(env.review_id, "  人工原样答复：保留199元、否定和空白。  ")
+    finally:
+        if point == "review":
+            event.remove(env.engine.sync_engine, "before_cursor_execute", reject_status)
+    first = await env.repo.review_detail(env.review_id)
+    assert first["review_status"] == "待审" and first["publication_status"] == "pending"
+    async with env.factory() as session:
+        chunks = (await session.scalars(select(KnowledgeChunk))).all()
+        assert len(chunks) == 1
+        chunk_id = chunks[0].id
+        assert chunks[0].vectorize_status == ("done" if point == "review" else "pending")
+        assert chunks[0].answer == first["approved_answer"]
+    env.encoder.encode, env.index.fail_after_upsert = original_encode, False
+    restarted = ReviewPublisher(env.repo, env.store, env.encoder, env.index)
+    try:
+        assert await restarted.recover_pending() == {"published": 1, "failed": 0}
+    finally:
+        await restarted.close()
+    async with env.factory() as session:
+        chunks = (await session.scalars(select(KnowledgeChunk))).all()
+        assert len(chunks) == 1 and chunks[0].id == chunk_id and chunks[0].is_active
+        assert chunks[0].source_key == f"ch09/review/{env.review_id}" and chunks[0].ordinal == 0
+        assert chunks[0].vectorize_status == "done" and chunks[0].vector_id == str(chunk_id)
+        assert await env.index.get_fingerprints([chunk_id]) == {chunk_id: (chunks[0].content_hash, chunks[0].embedding_revision)}
+    assert (await env.repo.review_detail(env.review_id))["review_status"] == "通过"
+    print(f"真实MySQL断点 {point}：审核冻结待审→新发布器恢复；知识主键{chunk_id}不变且仅1 active块；索引替身指纹一致")
+
+
+async def test_mysql_review_concurrent_freeze_and_reject_are_atomic(publication_mysql):
+    """多个真实事务只能冻结同一正文，审核和驳回只有一方成功。参数：专库；返回：None；异常：断言失败。"""
+    import asyncio
+    from app.repositories.flywheel import ReviewConflict
+    from app.models.flywheel import ReviewQueue
+    env = publication_mysql
+    saved = await asyncio.gather(*(env.repo.freeze_approval(env.review_id, "人工唯一原答") for _ in range(8)))
+    assert all(row["approved_answer"] == "人工唯一原答" and row["publication_status"] == "pending" for row in saved)
+    with pytest.raises(ReviewConflict):
+        await env.repo.freeze_approval(env.review_id, "另一个答案")
+    with pytest.raises(ReviewConflict):
+        await env.repo.reject(env.review_id)
+    async with env.factory.begin() as session:
+        other = ReviewQueue(normalized_question="竞争审核")
+        session.add(other)
+        await session.flush()
+    outcomes = await asyncio.gather(env.repo.freeze_approval(other.id, "人审答"), env.repo.reject(other.id), return_exceptions=True)
+    assert sum(isinstance(outcome, ReviewConflict) for outcome in outcomes) == 1
+    detail = await env.repo.review_detail(other.id)
+    assert (detail["review_status"], detail["approved_answer"]) in [("待审", "人审答"), ("驳回", None)]
+    print("真实MySQL：8会话同答案冻结稳定；不同正文/冻结后驳回409；冻结与驳回并发只允许一方")
+
+
+async def test_mysql_review_real_tokenizer_overflow_precedes_freeze(publication_mysql):
+    """使用正式BGE tokenizer验证字符未超但token超限时仍未冻结。参数：专库配置；返回：None；异常：断言/分词器错误。"""
+    from app.knowledge.embedding import BgeM3Encoder
+    from app.knowledge.schemas import KnowledgeText
+    from app.knowledge.text import format_knowledge
+    from app.services.review_publish import ReviewPublisher
+    env = publication_mysql
+    encoder = BgeM3Encoder(env.config)
+    publisher = ReviewPublisher(env.repo, env.store, encoder, env.index)
+    # NFKC会把此兼容字符展开成多个日文片段；真实计数高于原字符串字符数。
+    answer = "㌖" * 1200
+    knowledge = KnowledgeText(category="商品与购物 FAQ", questions="实际审核的问题", answer=answer)
+    try:
+        count = encoder.count_tokens(format_knowledge(knowledge))
+        assert len(knowledge.category) + len(knowledge.questions) + len(answer) <= 1600 and count > 2048
+        with pytest.raises(ValueError, match="超过"):
+            await publisher.approve(env.review_id, answer)
+        assert (await env.repo.review_detail(env.review_id))["approved_answer"] is None
+        assert encoder._model is None
+        print(f"真实BGE tokenizer：三格字符{len(knowledge.category) + len(knowledge.questions) + len(answer)}，含特殊token共{count}；拒绝前未冻结且未加载推理模型")
+    finally:
+        await publisher.close()
+        await encoder.aclose()
+
+
+async def test_mysql_review_close_releases_real_writer_before_dependency_close(publication_mysql, monkeypatch):
+    """关闭正式发布器后真实CH03命名锁连接已回收，冻结答案可恢复。参数：专库/补丁；返回：None；异常：断言失败。"""
+    import asyncio
+    from app.knowledge.lease import MySqlWriteLease, KNOWLEDGE_WRITE_LOCK
+    env = publication_mysql
+    entered, captured = asyncio.Event(), []
+    original_acquire = MySqlWriteLease.acquire
+    async def acquire(cls, engine, **kwargs):
+        """登记本轮专库真实租约连接。参数：正式参数；返回：原租约；异常：原样传播。"""
+        lease = await original_acquire(engine, **kwargs)
+        assert await lease.connection.scalar(text("SELECT DATABASE()")) == TEST_DATABASE
+        captured.append((lease, await lease.connection.scalar(text("SELECT CONNECTION_ID()"))))
+        await lease.connection.commit()
+        return lease
+    monkeypatch.setattr(MySqlWriteLease, "acquire", classmethod(acquire))
+    async def encode(texts):
+        """保持编码等待以验证取消。参数：文本；返回：不返回；异常：取消。"""
+        entered.set()
+        await asyncio.Event().wait()
+    env.encoder.encode = encode
+    task = asyncio.create_task(env.publisher.approve(env.review_id, "关闭后保留答案"))
+    await asyncio.wait_for(entered.wait(), 5)
+    await asyncio.wait_for(env.publisher.close(), 5)
+    assert task.done() and task.cancelled() and not env.publisher._active
+    assert captured[0][0].connection.closed
+    async with env.engine.connect() as connection:
+        assert await connection.scalar(text("SELECT DATABASE()")) == TEST_DATABASE
+        assert await connection.scalar(text("SELECT IS_USED_LOCK(:name)"), {"name": KNOWLEDGE_WRITE_LOCK}) is None
+        assert await connection.scalar(text("SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE ID=:id"), {"id": captured[0][1]}) == 0
+    assert (await env.repo.review_detail(env.review_id))["publication_status"] == "pending"
+    print("真实MySQL：发布器关闭已取消并收回编码等待，专用物理连接closed且PROCESSLIST无登记ID，CH03命名锁无owner；人工答案保留")

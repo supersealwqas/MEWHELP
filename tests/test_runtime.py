@@ -45,7 +45,9 @@ def test_lifespan_recovery_failure_blocks_startup(monkeypatch, tmp_path, offline
     async def search(config, store):
         """替换模型/索引外部资源，保留真实启动与检查点。参数：配置/仓储；返回：占位资源；异常：原启动错误。"""
         try:
-            yield object()
+            from types import SimpleNamespace
+            from tests.knowledge.fakes import FakeEncoder, MemoryVectorIndex
+            yield SimpleNamespace(encoder=FakeEncoder(), index=MemoryVectorIndex())
         finally:
             disposed.append("search")
 

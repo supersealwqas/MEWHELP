@@ -91,7 +91,7 @@ def answer_metadata(context, citations: list) -> dict:
     for item in citations:
         snapshot = item.model_dump()
         key = item.source_key or ""
-        snapshot["source_type"] = "document" if key.startswith("doc:") else "published_qa" if key.startswith("qa:") else "unknown"
+        snapshot["source_type"] = "document" if key.startswith("doc:") else "published_qa" if key.startswith(("qa:", "ch09/review/")) else "unknown"
         snapshot["content_hash"] = hashlib.sha256(item.answer.encode("utf-8")).hexdigest()
         snapshots.append(snapshot)
     return {"session_id": context.session_id, "turn_id": context.turn_id, "status": "completed", "citations": snapshots}

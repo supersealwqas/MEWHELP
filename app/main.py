@@ -22,6 +22,7 @@ from app.api.citations import router as citations_router
 from app.api.conversations import router as conversations_router
 from app.api.extract import router as extract_router
 from app.api.feedback import router as feedback_router
+from app.api.flywheel import router as flywheel_router
 from app.api.rageval import router as rageval_router
 from app.api.rageval import create_job_manager
 from app.core.logging import setup_logging
@@ -157,35 +158,47 @@ async def database_runtime():
             timeout_seconds=settings.flywheel_timeout_seconds, close_seconds=settings.flywheel_close_seconds,
             observability=observability)
         async with online_search_runtime(settings, store) as search:
-            support = SupportRepository(factory, search)
-            registry = build_agent_registry()
-            permissions = ToolPermissions(settings.mcp_permissions_path)
-            permissions.reload()
-            mcp = MCPToolManager(registry, permissions, {
-                "logistics": {"transport": "streamable_http", "url": settings.mcp_logistics_url},
-                "after_sales": {"transport": "streamable_http", "url": settings.mcp_after_sales_url}},
-                timeout_seconds=settings.mcp_discovery_timeout_seconds)
-            executor = ToolExecutor(registry, repository, support, settings.tool_timeout_seconds,
-                settings.tool_max_retries, settings.tool_retry_delay_seconds,
-                knowledge_timeout_seconds=settings.knowledge_timeout_seconds, permissions=permissions,
-                audit_repository=ToolAuditRepository(factory), audit_timeout_seconds=settings.tool_audit_timeout_seconds)
-            from app.knowledge.query_rewrite import QueryExpander
-            deps = WorkflowDependencies(WorkflowModelAdapter(), search, executor, repository, settings,
-                QueryExpander(request_budget=settings.request_token_budget), registry=registry, permissions=permissions, mcp=mcp,
-                observability=observability)
-            async with workflow_runtime(deps, Path(settings.workflow_checkpoint_path)) as graph:
-                summaries = SummaryManager(ContextRepository(factory), SummaryGenerator(settings), settings, observability=observability)
-                try:
-                    service = ChatService(repository, graph, executor, settings, summaries=summaries, observability=observability)
-                    await service.reconcile_waiting_turns()
-                    await summaries.recover()
-                    service.flywheel = flywheel
-                    flywheel.start()
-                    yield service
-                finally:
-                    # 摘要先收回，数据库与模型依赖随后关闭；外部取消不能跳过收尾。
-                    with anyio.CancelScope(shield=True):
-                        await summaries.close()
+            from app.services.review_publish import ReviewPublisher
+            publisher = ReviewPublisher(flywheel.repository, store, search.encoder, search.index,
+                page_size=settings.flywheel_page_size, interval_seconds=settings.flywheel_interval_seconds,
+                timeout_seconds=settings.flywheel_timeout_seconds, close_seconds=settings.flywheel_close_seconds)
+            try:
+                support = SupportRepository(factory, search)
+                registry = build_agent_registry()
+                permissions = ToolPermissions(settings.mcp_permissions_path)
+                permissions.reload()
+                mcp = MCPToolManager(registry, permissions, {
+                    "logistics": {"transport": "streamable_http", "url": settings.mcp_logistics_url},
+                    "after_sales": {"transport": "streamable_http", "url": settings.mcp_after_sales_url}},
+                    timeout_seconds=settings.mcp_discovery_timeout_seconds)
+                executor = ToolExecutor(registry, repository, support, settings.tool_timeout_seconds,
+                    settings.tool_max_retries, settings.tool_retry_delay_seconds,
+                    knowledge_timeout_seconds=settings.knowledge_timeout_seconds, permissions=permissions,
+                    audit_repository=ToolAuditRepository(factory), audit_timeout_seconds=settings.tool_audit_timeout_seconds)
+                from app.knowledge.query_rewrite import QueryExpander
+                deps = WorkflowDependencies(WorkflowModelAdapter(), search, executor, repository, settings,
+                    QueryExpander(request_budget=settings.request_token_budget), registry=registry, permissions=permissions, mcp=mcp,
+                    observability=observability)
+                async with workflow_runtime(deps, Path(settings.workflow_checkpoint_path)) as graph:
+                    summaries = SummaryManager(ContextRepository(factory), SummaryGenerator(settings), settings, observability=observability)
+                    try:
+                        service = ChatService(repository, graph, executor, settings, summaries=summaries, observability=observability)
+                        await service.reconcile_waiting_turns()
+                        await summaries.recover()
+                        service.flywheel = flywheel
+                        service.review_publisher = publisher
+                        publisher.start()
+                        flywheel.start()
+                        yield service
+                    finally:
+                        # 摘要先收回，数据库与模型依赖随后关闭；外部取消不能跳过收尾。
+                        with anyio.CancelScope(shield=True):
+                            await summaries.close()
+            finally:
+                # 发布器依赖当前搜索编码器/索引，必须在退出搜索上下文前收回。
+                with anyio.CancelScope(shield=True):
+                    await publisher.close()
+
     finally:
         with anyio.CancelScope(shield=True):
             try:
@@ -238,6 +251,7 @@ def create_app(runtime_factory=None) -> FastAPI:
     application.include_router(extract_router)
     application.include_router(chat_router)
     application.include_router(feedback_router)
+    application.include_router(flywheel_router)
     application.include_router(actions_router)
     application.include_router(citations_router)
     application.include_router(conversations_router)
