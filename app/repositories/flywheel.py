@@ -9,7 +9,7 @@ from app.knowledge.lease import MySqlWriteLease
 from app.models.customer_service import Message
 from app.models.flywheel import ReviewQueue
 from app.models.rag_quality import LowConfidenceQuestion
-from app.schemas.flywheel import NormalizedGap, ReviewCandidate, TurnPoolState
+from app.schemas.flywheel import NormalizedGap, ReviewCandidate, RetrievalSnapshot, TurnPoolState
 
 
 class CandidateChanged(RuntimeError):
@@ -77,22 +77,24 @@ class FlywheelRepository:
                 .order_by(ReviewQueue.id).limit(limit))).all()
             return [ReviewCandidate(id=row.id, normalized_question=row.normalized_question) for row in rows]
 
-    async def _source_id(self, pool_id):
-        """只按原消息pool_ids定位精确轮次，不按同文本猜测。参数：池主键；返回：用户消息ID或None；异常：落点损坏/数据库错误。"""
-        async with self.factory() as session:
-            pool = await session.get(LowConfidenceQuestion, pool_id)
-            if pool is None:
-                raise ValueError("问题池原件不存在")
-            if pool.conversation_id is None:
-                return None
-            # 老数据没有轮次列；只遍历同会话用户行中的精确主键映射。
-            sources = (await session.scalars(select(Message).where(Message.conversation_id == pool.conversation_id,
-                Message.role == "user"))).all()
-            identifiers = [row.id for row in sources
-                if (row.rag_metadata or {}).get("knowledge_pool", {}).get("pool_ids", {}).get(pool.source) == pool_id]
-            if len(identifiers) > 1:
-                raise ValueError("池主键指向多个原轮")
-            return identifiers[0] if identifiers else None
+    async def _source_id(self, pool_id, *, session=None):
+        """只按pool_ids定位精确轮次。参数：池主键、可复用读会话；返回：用户消息ID或None；异常：落点损坏/数据库错误。"""
+        if session is None:
+            async with self.factory() as owned_session:
+                return await self._source_id(pool_id, session=owned_session)
+        pool = await session.get(LowConfidenceQuestion, pool_id)
+        if pool is None:
+            raise ValueError("问题池原件不存在")
+        if pool.conversation_id is None:
+            return None
+        # 老数据没有轮次列；只遍历同会话用户行中的精确主键映射。
+        sources = (await session.scalars(select(Message).where(Message.conversation_id == pool.conversation_id,
+            Message.role == "user"))).all()
+        identifiers = [row.id for row in sources
+            if (row.rag_metadata or {}).get("knowledge_pool", {}).get("pool_ids", {}).get(pool.source) == pool_id]
+        if len(identifiers) > 1:
+            raise ValueError("池主键指向多个原轮")
+        return identifiers[0] if identifiers else None
 
     async def commit_match(self, pool_id: int, normalized: NormalizedGap, matched_review_id: int | None) -> dict:
         """同连接原子锁定用户→池→队列，历史计数落点优先。
@@ -154,8 +156,42 @@ class FlywheelRepository:
             return {"items": [_review_payload(row) for row in rows[:limit]],
                 "next_after_id": str(rows[limit - 1].id) if len(rows) > limit else None}
 
+    async def _review_snapshot(self, session, pool) -> dict:
+        """只读派生审核展示证据，原始NULL不自动等于未检索。
+
+        参数：当前读取会话、原始池实体；仅pool_ids可定位可信原轮。
+        返回：retrieval_status和规范retrieval_snapshot，not_retrieved仅表示原轮明确无检索。
+        异常：数据库错误透传；缺失/损坏身份或历史证据保守转为legacy状态。
+        """
+        from app.repositories.chat import _original_snapshot
+        try:
+            if pool.retrieved_chunks is not None:
+                snapshot = RetrievalSnapshot.model_validate(pool.retrieved_chunks)
+            else:
+                source_id = await self._source_id(pool.id, session=session)
+                if source_id is None:
+                    snapshot = RetrievalSnapshot(status="legacy_unavailable")
+                else:
+                    source = await session.get(Message, source_id)
+                    if (source is None or source.role != "user" or source.conversation_id != pool.conversation_id
+                            or source.content != pool.raw_question or not source.turn_id):
+                        raise ValueError("问题池与精确原轮身份冲突")
+                    state = TurnPoolState.model_validate((source.rag_metadata or {}).get("knowledge_pool") or {})
+                    if state.pool_ids.get(pool.source) != pool.id:
+                        raise ValueError("原轮问题池主键映射不一致")
+                    users = (await session.scalars(select(Message.id).where(Message.conversation_id == source.conversation_id,
+                        Message.turn_id == source.turn_id, Message.role == "user"))).all()
+                    if users != [source.id]:
+                        raise ValueError("原轮用户来源不唯一")
+                    # 只恢复该轮已有消息/工具/引用，不重新检索、不保存推断结果。
+                    snapshot = await _original_snapshot(session, source)
+        except (ValueError, TypeError, AttributeError):
+            snapshot = RetrievalSnapshot(status="legacy_incomplete")
+        return {"retrieval_status": snapshot.status if snapshot is not None else "not_retrieved",
+            "retrieval_snapshot": snapshot.model_dump(mode="json") if snapshot is not None else None}
+
     async def review_detail(self, review_id: int) -> dict:
-        """读取审核和所有历史原件，绝不重新检索补快照。参数：正审核主键；返回：字段及originals；异常：ReviewNotFound或数据库错误。"""
+        """读取审核及原件和保守展示证据，绝不重新检索。参数：正审核主键；返回：字段及originals，原始retrieved_chunks保持不变；异常：ReviewNotFound或数据库错误。"""
         async with self.factory() as session:
             row = await session.get(ReviewQueue, review_id)
             if row is None:
@@ -164,7 +200,7 @@ class FlywheelRepository:
                 LowConfidenceQuestion.matched_review_id == review_id).order_by(LowConfidenceQuestion.id))).all()
             return {**_review_payload(row), "originals": [{"id": str(item.id), "raw_question": item.raw_question,
                 "source": item.source, "reason": item.reason, "created_at": item.created_at,
-                "retrieved_chunks": item.retrieved_chunks} for item in originals]}
+                "retrieved_chunks": item.retrieved_chunks, **(await self._review_snapshot(session, item))} for item in originals]}
 
     async def freeze_approval(self, review_id: int, answer: str) -> dict:
         """短行锁冻结人工答案；相同正文幂等，不同正文拒绝。参数：审核主键、非空原样答案；返回：审核字段；异常：不存在/冲突/输入或数据库错误。"""
@@ -209,9 +245,9 @@ class FlywheelRepository:
                 .order_by(ReviewQueue.id).limit(limit))).all()
             return [_review_payload(row) for row in rows]
 
-    async def complete_publication(self, review_id: int, expected_answer: str) -> dict:
-        """可见性已确认后短行锁完成审核，并再次比较冻结正文。参数：主键、预期正文；返回：审核字段；异常：不存在/冲突或数据库错误。"""
-        async with self.factory.begin() as session:
+    async def complete_publication(self, review_id: int, expected_answer: str, *, writer) -> dict:
+        """可见性已确认后短行锁完成审核，并再次比较冻结正文。参数：主键、预期正文、当前持锁writer；返回：审核字段；异常：不存在/冲突或数据库错误。"""
+        async with writer.transaction() as session:
             row = await session.scalar(select(ReviewQueue).where(ReviewQueue.id == review_id).with_for_update())
             if row is None:
                 raise ReviewNotFound("审核缺口不存在")

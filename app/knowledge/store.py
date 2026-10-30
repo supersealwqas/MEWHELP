@@ -270,6 +270,16 @@ class KnowledgeWriter:
             await session.close()
 
     @asynccontextmanager
+    async def transaction(self):
+        """为同租约关联写入提供短事务，不能用于等待模型或索引。
+
+        参数：无，调用方必须仍位于当前writer生命周期内。
+        返回：绑定当前持锁物理连接的AsyncSession；异常：失锁、断线或事务错误。
+        """
+        async with self._transaction() as session:
+            yield session
+
+    @asynccontextmanager
     async def _read_session(self):
         """在持锁连接上只读。参数：无；返回：会话；异常：LeaseLost、数据库异常。"""
         await self._lease.assert_held()

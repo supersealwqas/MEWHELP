@@ -100,7 +100,7 @@ class ReviewPublisher:
                     if current.id != target.id or fingerprints.get(current.id) != (current.content_hash, current.embedding_revision):
                         raise PublicationPending("当前知识版本尚未在索引中确认可读")
                     await writer.assert_held()
-                    return await self.repository.complete_publication(review_id, answer)
+                    return await self.repository.complete_publication(review_id, answer, writer=writer)
             except Exception as error:
                 logger.warning("review publication unconfirmed review_id=%s error_type=%s", review_id, type(error).__name__)
                 raise PublicationPending("人工答案已保存，请回读审核状态后重试未完成发布") from error

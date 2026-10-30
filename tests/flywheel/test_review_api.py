@@ -108,3 +108,28 @@ async def test_release_failure_reports_persisted_publication_status(tmp_path, mo
             assert result.status_code == 503
             assert (await env.repo.review_detail(env.review_id))["publication_status"] == "published"
             assert result.json()["detail"]["publication_status"] == "published"
+
+
+async def test_review_api_exposes_raw_and_proven_retrieval_state(tmp_path, monkeypatch):
+    """HTTP同时保留原始NULL与可解释展示状态，不把旧缺失当未检索。参数：资源；返回：None；异常：断言失败。"""
+    from app.models.rag_quality import LowConfidenceQuestion
+    from app.repositories.chat import ChatRepository
+    from tests.flywheel.test_pool import start
+    async with review_runtime(tmp_path, monkeypatch) as env:
+        chat = ChatRepository(env.factory)
+        await chat.finish_turn(await start(chat), "无需检索的回答")
+        receipt = await chat.record_unresolved_feedback("s", "u", "first")
+        async with env.factory.begin() as session:
+            current = await session.get(LowConfidenceQuestion, int(receipt.pool_id))
+            current.matched_review_id = env.review_id
+            session.add(LowConfidenceQuestion(raw_question="旧原件", source="retrieval_low_conf", matched_review_id=env.review_id))
+        app = FastAPI()
+        app.include_router(importlib.import_module("app.api.flywheel").router)
+        app.dependency_overrides[get_chat_service] = lambda: SimpleNamespace(review_publisher=env.publisher)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            result = await client.get("/api/flywheel/reviews/1")
+            assert result.status_code == 200
+            current, legacy = result.json()["originals"]
+            assert current["retrieved_chunks"] is legacy["retrieved_chunks"] is None
+            assert current["retrieval_status"] == "not_retrieved" and current["retrieval_snapshot"] is None
+            assert legacy["retrieval_status"] == legacy["retrieval_snapshot"]["status"] == "legacy_unavailable"

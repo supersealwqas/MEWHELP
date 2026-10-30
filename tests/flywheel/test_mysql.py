@@ -653,13 +653,13 @@ async def test_mysql_review_publication_breakpoints_recover_same_identity(public
     elif point == "vector":
         env.index.fail_after_upsert = True
     else:
-        event.listen(env.engine.sync_engine, "before_cursor_execute", reject_status)
+        event.listen(env.lease_engine.sync_engine, "before_cursor_execute", reject_status)
     try:
         with pytest.raises(PublicationPending):
             await env.publisher.approve(env.review_id, "  人工原样答复：保留199元、否定和空白。  ")
     finally:
         if point == "review":
-            event.remove(env.engine.sync_engine, "before_cursor_execute", reject_status)
+            event.remove(env.lease_engine.sync_engine, "before_cursor_execute", reject_status)
     first = await env.repo.review_detail(env.review_id)
     assert first["review_status"] == "待审" and first["publication_status"] == "pending"
     async with env.factory() as session:
@@ -763,3 +763,110 @@ async def test_mysql_review_close_releases_real_writer_before_dependency_close(p
         assert await connection.scalar(text("SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE ID=:id"), {"id": captured[0][1]}) == 0
     assert (await env.repo.review_detail(env.review_id))["publication_status"] == "pending"
     print("真实MySQL：发布器关闭已取消并收回编码等待，专用物理连接closed且PROCESSLIST无登记ID，CH03命名锁无owner；人工答案保留")
+
+
+async def test_mysql_review_completion_wait_loses_owned_writer_connection(publication_mysql, monkeypatch):
+    """最终核锁后在审核行锁等待中KILL本轮专用连接，旧完成事务不得提交。参数：空专库/补丁；返回：None；异常：断言失败。"""
+    import asyncio
+    from sqlalchemy import select
+    from app.knowledge.lease import MySqlWriteLease, KNOWLEDGE_WRITE_LOCK
+    from app.models.flywheel import ReviewQueue
+    from app.services.review_publish import PublicationPending
+    env = publication_mysql
+    acquired, completing = [], []
+    entered = asyncio.Event()
+    blocker = env.factory()
+    armed = False
+    original_acquire, original_fingerprints = MySqlWriteLease.acquire, env.index.get_fingerprints
+    async def acquire(cls, engine, **kwargs):
+        """仅登记本轮自行取得的专库CH03租约。参数：租约参数；返回：真实租约；异常：身份错误。"""
+        lease = await original_acquire(engine, **kwargs)
+        assert await lease.connection.scalar(text("SELECT DATABASE()")) == TEST_DATABASE
+        acquired.append(await lease.connection.scalar(text("SELECT CONNECTION_ID()")))
+        await lease.connection.commit()
+        return lease
+    async def fingerprints(ids):
+        """最终Strong替身回读后由另一真实事务锁住审核行。参数：知识ID；返回：原指纹；异常：数据库错误。"""
+        nonlocal armed
+        result = await original_fingerprints(ids)
+        await blocker.begin()
+        await blocker.scalar(select(ReviewQueue).where(ReviewQueue.id == env.review_id).with_for_update())
+        armed = True
+        return result
+    def waiting(connection, cursor, statement, parameters, context, executemany):
+        """记录已进入最终完成SELECT的真实连接，后续核对服务器活动SQL。参数：SQL事件；返回：None；异常：数据库错误。"""
+        if armed and statement.startswith("SELECT review_queue.") and "FOR UPDATE" in statement:
+            completing.append(connection.scalar(text("SELECT CONNECTION_ID()")))
+            entered.set()
+    monkeypatch.setattr(MySqlWriteLease, "acquire", classmethod(acquire))
+    env.index.get_fingerprints = fingerprints
+    event.listen(env.engine.sync_engine, "before_cursor_execute", waiting)
+    event.listen(env.lease_engine.sync_engine, "before_cursor_execute", waiting)
+    operation = asyncio.create_task(env.publisher.approve(env.review_id, "最终事务必须仍受原租约保护"))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        assert len(acquired) == len(completing) == 1
+        async with env.factory() as control:
+            assert await control.scalar(text("SELECT DATABASE()")) == TEST_DATABASE
+            # 确认完成SELECT已经送达服务器且被另一事务持有的审核行阻塞。
+            async with asyncio.timeout(5):
+                while True:
+                    info = await control.scalar(text("SELECT INFO FROM information_schema.PROCESSLIST WHERE ID=:id"), {"id": completing[0]})
+                    if info and "review_queue" in info and "FOR UPDATE" in info:
+                        break
+                    await asyncio.sleep(0.01)
+            identifier = await control.scalar(text("SELECT IS_USED_LOCK(:name)"), {"name": KNOWLEDGE_WRITE_LOCK})
+            assert type(identifier) is int and identifier > 0 and identifier == acquired[0]
+            assert await control.scalar(text("SELECT DB FROM information_schema.PROCESSLIST WHERE ID=:id"), {"id": identifier}) == TEST_DATABASE
+            # 只KILL本轮登记、库名/CH03命名锁owner均再次核对过的精确ID。
+            await control.execute(text(f"KILL CONNECTION {identifier}"))
+            await control.commit()
+        async with env.store.writer() as fresh:
+            current = (await fresh.chunks_by_sources([f"ch09/review/{env.review_id}"]))[0]
+            assert await fresh.mark_pending(current)
+            await env.index.delete([current.id])
+        await blocker.rollback()
+        with pytest.raises(PublicationPending):
+            await asyncio.wait_for(operation, 5)
+        assert completing[0] == acquired[0], "完成事务必须绑定原writer连接"
+        assert (await env.repo.review_detail(env.review_id))["review_status"] == "待审"
+        print(f"真实MySQL：完成SELECT在连接{completing[0]}等待审核行锁；仅KILL本轮CH03 owner {acquired[0]}；新writer可改知识，旧完成仍待审")
+    finally:
+        event.remove(env.engine.sync_engine, "before_cursor_execute", waiting)
+        event.remove(env.lease_engine.sync_engine, "before_cursor_execute", waiting)
+        await blocker.rollback()
+        await blocker.close()
+        if not operation.done():
+            operation.cancel()
+        await asyncio.gather(operation, return_exceptions=True)
+
+
+async def test_mysql_review_detail_preserves_raw_null_and_distinguishes_history(merge_mysql):
+    """真实SQLNULL原样保留，只有精确现代原轮才能展示明确未检索。参数：专库；返回：None；异常：断言失败。"""
+    from sqlalchemy import select
+    from app.models.flywheel import ReviewQueue
+    from app.models.customer_service import Message
+    from app.models.rag_quality import LowConfidenceQuestion
+    from tests.flywheel.test_pool import start
+    chat, repo, factory, _ = merge_mysql
+    ctx = await start(chat, question="相同问题")
+    await chat.finish_turn(ctx, "不需要检索的回答")
+    receipt = await chat.record_unresolved_feedback("s", "u", "first")
+    async with factory.begin() as session:
+        review = ReviewQueue(normalized_question="待审问题")
+        session.add(review)
+        await session.flush()
+        current = await session.get(LowConfidenceQuestion, int(receipt.pool_id))
+        current.matched_review_id = review.id
+        session.add(LowConfidenceQuestion(conversation_id=ctx.conversation_id, raw_question="相同问题", source="retrieval_low_conf", matched_review_id=review.id))
+    async with factory() as session:
+        before = [(row.id, row.rag_metadata) for row in (await session.scalars(select(Message))).all()]
+        assert (await session.execute(text("SELECT retrieved_chunks IS NULL FROM low_confidence_questions ORDER BY id"))).scalars().all() == [1, 1]
+    current, legacy = (await repo.review_detail(review.id))["originals"]
+    assert current["retrieved_chunks"] is legacy["retrieved_chunks"] is None
+    assert current["retrieval_status"] == "not_retrieved" and current["retrieval_snapshot"] is None
+    assert legacy["retrieval_status"] == "legacy_unavailable" and legacy["retrieval_snapshot"]["status"] == "legacy_unavailable"
+    async with factory() as session:
+        assert (await session.execute(text("SELECT retrieved_chunks IS NULL FROM low_confidence_questions ORDER BY id"))).scalars().all() == [1, 1]
+        assert before == [(row.id, row.rag_metadata) for row in (await session.scalars(select(Message))).all()]
+    print("真实MySQL：两条SQLNULL未改写；按pool_ids精确原轮展示not_retrieved，旧同文retrieval_low_conf原件展示legacy_unavailable；用户JSON未写入")

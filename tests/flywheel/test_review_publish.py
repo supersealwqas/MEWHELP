@@ -22,6 +22,13 @@ async def review_runtime(tmp_path, monkeypatch, **options):
             session.add(row)
             await session.flush()
         store, encoder, index = MemoryKnowledgeStore(), FakeEncoder(), MemoryVectorIndex()
+        from tests.knowledge.fakes import MemoryKnowledgeWriter
+        @asynccontextmanager
+        async def transaction(writer):
+            """为内存知识替身提供真实审核事务。参数：写入器；返回：审核会话；异常：数据库错误。"""
+            async with factory.begin() as session:
+                yield session
+        monkeypatch.setattr(MemoryKnowledgeWriter, "transaction", transaction, raising=False)
         publisher = ReviewPublisher(repo, store, encoder, index, **options)
         try:
             yield SimpleNamespace(repo=repo, factory=factory, store=store, encoder=encoder,
@@ -64,7 +71,7 @@ async def test_crash_recovers_same_chunk(tmp_path, monkeypatch, point):
     from app.services.review_publish import PublicationPending
     async with review_runtime(tmp_path, monkeypatch) as env:
         original_encode, original_complete = env.encoder.encode, env.repo.complete_publication
-        async def crash(*args):
+        async def crash(*args, **kwargs):
             """模拟进程在明确阶段中断。参数：被替代接口参数；返回：不返回；异常：RuntimeError。"""
             raise RuntimeError("断点")
         if point == "mysql":
@@ -154,6 +161,9 @@ async def test_detail_preserves_every_original_and_snapshot(tmp_path, monkeypatc
         assert [(r["raw_question"], r["source"], r["reason"], r["retrieved_chunks"]) for r in detail["originals"]] == [
             ("原话一", "self_check", "理由一", None), ("原话二", "user_feedback", "理由二", snapshot)]
         assert all(r["created_at"] for r in detail["originals"])
+        assert [r["retrieval_status"] for r in detail["originals"]] == ["legacy_unavailable", "empty"]
+        assert detail["originals"][0]["retrieval_snapshot"]["status"] == "legacy_unavailable"
+        assert detail["originals"][1]["retrieval_snapshot"] == snapshot
 
 
 async def test_recovery_start_and_close_collects_inflight_publish(tmp_path, monkeypatch):
@@ -266,8 +276,9 @@ async def test_complete_publication_rechecks_frozen_answer(tmp_path, monkeypatch
     from app.repositories.flywheel import ReviewConflict
     async with review_runtime(tmp_path, monkeypatch) as env:
         await env.repo.freeze_approval(env.review_id, "人工原答")
-        with pytest.raises(ReviewConflict):
-            await env.repo.complete_publication(env.review_id, "另一个答案")
+        async with env.store.writer() as writer:
+            with pytest.raises(ReviewConflict):
+                await env.repo.complete_publication(env.review_id, "另一个答案", writer=writer)
         assert (await env.repo.review_detail(env.review_id))["review_status"] == "待审"
 
 
@@ -312,3 +323,165 @@ async def test_lease_loss_after_fingerprint_prevents_completion(tmp_path, monkey
         with pytest.raises(PublicationPending):
             await env.publisher.approve(env.review_id, "人工答案")
         assert read and (await env.repo.review_detail(env.review_id))["review_status"] == "待审"
+
+
+async def test_completion_loses_writer_connection_after_successful_check(tmp_path, monkeypatch):
+    """最终核锁成功后完成SELECT期间断线，不得借普通工厂提交通过。参数：资源；返回：None；异常：断言失败。"""
+    from sqlalchemy.ext.asyncio import AsyncSession
+    from app.knowledge.errors import LeaseLost
+    from app.knowledge.store import KnowledgeWriter
+    from app.services.review_publish import PublicationPending
+    from tests.knowledge.fakes import MemoryKnowledgeWriter
+    async with review_runtime(tmp_path, monkeypatch) as env:
+        connection = await env.factory.kw["bind"].connect()
+        class Lease:
+            """仅模拟失锁通知，SQLite连接关闭是实际动作。"""
+            async def assert_held(self):
+                """核验专用连接。参数：无；返回：None；异常：LeaseLost已关闭。"""
+                if connection.closed:
+                    raise LeaseLost("持锁连接已关闭")
+        lease = Lease()
+        lease.connection = connection
+        actual_writer = KnowledgeWriter(env.factory, lease)
+        completed_select = []
+        armed = False
+        original_scalar, original_fingerprints = AsyncSession.scalar, env.index.get_fingerprints
+        async def scalar(session, statement, *args, **kwargs):
+            """在最终审核SELECT之前真实关闭专用连接。参数：原会话查询；返回：原查询结果；异常：连接错误。"""
+            nonlocal armed
+            if armed and getattr(statement, "_for_update_arg", None) is not None:
+                armed = False
+                completed_select.append(session.bind is connection)
+                await connection.close()
+            return await original_scalar(session, statement, *args, **kwargs)
+        async def fingerprints(ids):
+            """最后指纹成功回读之后打开断点。参数：ID；返回：实际内存指纹；异常：无。"""
+            nonlocal armed
+            result = await original_fingerprints(ids)
+            armed = True
+            return result
+        @asynccontextmanager
+        async def writer():
+            """内存知识读写配正式持锁事务底座。参数：无；返回：知识写入器；异常：原事务错误。"""
+            memory = MemoryKnowledgeWriter(env.store)
+            @asynccontextmanager
+            async def transaction():
+                """只把完成审核事务交给正式CH03底座。参数：无；返回：专用会话；异常：连接错误。"""
+                async with actual_writer.transaction() as session:
+                    yield session
+            memory.transaction = transaction
+            memory.assert_held = actual_writer.assert_held
+            yield memory
+        env.store.writer = writer
+        env.index.get_fingerprints = fingerprints
+        monkeypatch.setattr(AsyncSession, "scalar", scalar)
+        try:
+            with pytest.raises(PublicationPending):
+                await env.publisher.approve(env.review_id, "仍需持锁完成的人工答案")
+            assert completed_select == [True]
+            assert (await env.repo.review_detail(env.review_id))["review_status"] == "待审"
+        finally:
+            await connection.close()
+
+
+@pytest.mark.parametrize("source", ["retrieval_low_conf", "self_check"])
+async def test_legacy_null_without_pool_identity_is_unknown_even_with_same_latest_question(tmp_path, monkeypatch, source):
+    """旧NULL不能按同文新轮的明确未检索标记推断。参数：资源/池来源；返回：None；异常：断言失败。"""
+    from app.models.customer_service import Conversation, Message
+    async with review_runtime(tmp_path, monkeypatch) as env:
+        async with env.factory.begin() as session:
+            conversation = Conversation(session_id="same", user_id="u")
+            session.add(conversation)
+            await session.flush()
+            pool = LowConfidenceQuestion(conversation_id=conversation.id, raw_question="相同问题", source=source, matched_review_id=env.review_id)
+            session.add_all([pool, Message(conversation_id=conversation.id, turn_id="latest", role="user", content="相同问题",
+                turn_status="completed", rag_metadata={"retrieval_snapshot": None})])
+        original = (await env.repo.review_detail(env.review_id))["originals"][0]
+        assert original["retrieved_chunks"] is None
+        assert original["retrieval_status"] == "legacy_unavailable"
+        assert original["retrieval_snapshot"] == {"schema_version": 1, "status": "legacy_unavailable", "attempts": []}
+        async with env.factory() as session:
+            assert (await session.get(LowConfidenceQuestion, pool.id)).retrieved_chunks is None
+
+
+async def test_review_original_explicit_no_retrieval_is_proven_by_exact_pool_identity(tmp_path, monkeypatch):
+    """真实完成轮显式None且pool_ids精确匹配时才能展示未检索。参数：资源；返回：None；异常：断言失败。"""
+    from app.repositories.chat import ChatRepository
+    from tests.flywheel.test_pool import start
+    async with review_runtime(tmp_path, monkeypatch) as env:
+        chat = ChatRepository(env.factory)
+        await chat.finish_turn(await start(chat), "不需要知识检索的原答")
+        receipt = await chat.record_unresolved_feedback("s", "u", "first")
+        async with env.factory.begin() as session:
+            pool = await session.get(LowConfidenceQuestion, int(receipt.pool_id))
+            pool.matched_review_id = env.review_id
+        original = (await env.repo.review_detail(env.review_id))["originals"][0]
+        assert original["retrieved_chunks"] is None
+        assert original["retrieval_status"] == "not_retrieved" and original["retrieval_snapshot"] is None
+
+
+@pytest.mark.parametrize("mode", ["modern", "legacy", "missing", "corrupt", "wrong_identity"])
+async def test_review_snapshot_recovers_only_exact_original_turn_without_writes(tmp_path, monkeypatch, mode):
+    """精确旧轮可只读恢复，不能取同文新轮；损坏身份和证据保持legacy。参数：资源/历史形式；返回：None；异常：断言失败。"""
+    from app.models.customer_service import Conversation, Message
+    from sqlalchemy import select
+    async with review_runtime(tmp_path, monkeypatch) as env:
+        old_snapshot = {"schema_version": 1, "status": "empty", "attempts": [{"attempt_id": "old", "query": "真正旧查询",
+            "status": "empty", "candidate_count": 0, "top_k": 5, "chunks": [], "fault": None}]}
+        async with env.factory.begin() as session:
+            conversation = Conversation(session_id="history", user_id="u")
+            session.add(conversation)
+            await session.flush()
+            pool = LowConfidenceQuestion(conversation_id=conversation.id, raw_question="相同原话", source="self_check", matched_review_id=env.review_id)
+            session.add(pool)
+            await session.flush()
+            metadata = {"knowledge_pool": {"pool_ids": {"self_check": pool.id}}}
+            if mode == "modern":
+                metadata["retrieval_snapshot"] = old_snapshot
+            elif mode == "corrupt":
+                metadata["retrieval_snapshot"] = {"破损": True}
+            elif mode == "wrong_identity":
+                metadata["retrieval_snapshot"] = None
+            session.add_all([Message(conversation_id=conversation.id, turn_id="old", role="user",
+                content="不属于池的原文" if mode == "wrong_identity" else "相同原话", turn_status="completed", rag_metadata=metadata),
+                Message(conversation_id=conversation.id, turn_id="new", role="user", content="相同原话",
+                    turn_status="completed", rag_metadata={"retrieval_snapshot": None})])
+            if mode == "legacy":
+                session.add(Message(conversation_id=conversation.id, turn_id="old", role="assistant", content="历史回答",
+                    turn_status="completed", rag_metadata={"citations": [{"question": "旧问法", "answer": "当时原文", "content_hash": "不能当块指纹"}]}))
+        async with env.factory() as session:
+            before = [(row.id, row.rag_metadata) for row in (await session.scalars(select(Message))).all()]
+        original = (await env.repo.review_detail(env.review_id))["originals"][0]
+        assert original["retrieved_chunks"] is None
+        if mode == "modern":
+            assert original["retrieval_status"] == "empty" and original["retrieval_snapshot"] == old_snapshot
+        elif mode == "legacy":
+            assert original["retrieval_status"] == "legacy_incomplete"
+            chunk = original["retrieval_snapshot"]["attempts"][0]["chunks"][0]
+            assert chunk["answer"] == "当时原文" and chunk["content_hash"] is None
+        else:
+            assert original["retrieval_status"] == ("legacy_unavailable" if mode == "missing" else "legacy_incomplete")
+        async with env.factory() as session:
+            assert before == [(row.id, row.rag_metadata) for row in (await session.scalars(select(Message))).all()]
+            assert (await session.get(LowConfidenceQuestion, pool.id)).retrieved_chunks is None
+
+
+async def test_review_detail_reuses_read_session_for_original_identity(tmp_path, monkeypatch):
+    """详情不能持有一个连接再等待第二个连接查原轮，以免并发耗尽连接池。参数：资源；返回：None；异常：断言失败。"""
+    async with review_runtime(tmp_path, monkeypatch) as env:
+        async with env.factory.begin() as session:
+            session.add(LowConfidenceQuestion(raw_question="旧原件", source="self_check", matched_review_id=env.review_id))
+        active = False
+        @asynccontextmanager
+        async def factory():
+            """限制单请求只占一个读连接。参数：无；返回：原会话；异常：嵌套连接断言失败。"""
+            nonlocal active
+            assert not active, "详情读取不应嵌套申请第二个连接"
+            active = True
+            try:
+                async with env.factory() as session:
+                    yield session
+            finally:
+                active = False
+        env.repo.factory = factory
+        assert (await env.repo.review_detail(env.review_id))["originals"][0]["retrieval_status"] == "legacy_unavailable"
