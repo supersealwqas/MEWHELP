@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import re
 
 import anyio
 from sqlalchemy import Column, Enum, ForeignKey, Index, MetaData, Table, Text, UniqueConstraint, inspect, text
@@ -39,11 +40,31 @@ class QualitySchemaError(RuntimeError):
     """质量表已有结构不兼容或依赖缺失，需要操作人核查，不能自动破坏性修复。"""
 
 
-def _default(value: object) -> str | None:
-    """统一 MySQL 反射默认值写法。参数：value 默认表达式；返回：规范字符串或 None；异常：无。"""
+def _default(value: object, *, string_literal: bool = False, integer_column: bool = False) -> tuple[str, str] | None:
+    """比较固定 DDL 的默认值，只规范化已知时间表达式。
+
+    参数：value 为反射 SQL 或 ORM 默认值；string_literal 表示 ORM 未加引号的字符串；integer_column 标记整数列。
+    返回：带字面值/整数/表达式类别的精确内容；无默认值返回 None。
+    异常：无；未知 SQL 写法保持原样，不尝试通用解析。
+    """
     if value is None:
         return None
-    return " ".join(str(value).strip().strip("'").lower().replace("()", "").split())
+    if string_literal and not integer_column:
+        return ("literal", str(value))
+    source = str(value).strip()
+    if len(source) >= 2 and source[0] == source[-1] == "'":
+        # 只移除反射结果的成对外引号，内部大小写、空白和括号均属于真实默认内容。
+        return ("integer" if integer_column else "literal", source[1:-1])
+    if integer_column:
+        # MySQL 将整数 DEFAULT 1 反射为 '1'；只对已核实的整数列消除包装差别。
+        return ("integer", source)
+    timestamp = re.fullmatch(
+        r"CURRENT_TIMESTAMP(?:\(\))?(?P<update>\s+ON\s+UPDATE\s+CURRENT_TIMESTAMP(?:\(\))?)?",
+        source, flags=re.IGNORECASE,
+    )
+    if timestamp:
+        return ("expression", "CURRENT_TIMESTAMP" + (" ON UPDATE CURRENT_TIMESTAMP" if timestamp["update"] else ""))
+    return ("expression", source)
 
 
 def _validate_table(inspector, table, *, optional_columns=(), optional_indexes=(), optional_foreign_keys=()) -> None:
@@ -69,7 +90,9 @@ def _validate_table(inspector, table, *, optional_columns=(), optional_indexes=(
         if hasattr(wanted, "enums") and actual_type.enums != wanted.enums:
             raise QualitySchemaError(f"{name}.{expected.name} 中文枚举不兼容")
         default = None if expected.server_default is None else expected.server_default.arg
-        if _default(actual.get("default")) != _default(default):
+        integer_column = isinstance(wanted, mysql.INTEGER)
+        if _default(actual.get("default"), integer_column=integer_column) != _default(
+                default, string_literal=isinstance(default, str), integer_column=integer_column):
             raise QualitySchemaError(f"{name}.{expected.name} 默认值不兼容")
         if expected.primary_key and not actual.get("autoincrement"):
             raise QualitySchemaError(f"{name} 主键不是自增")

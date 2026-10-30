@@ -185,3 +185,39 @@ async def test_ch09_rejects_changed_enum_index_or_foreign_key(isolated_mysql, ch
             await connection.execute(text(statement))
         with pytest.raises(QualitySchemaError):
             await connection.run_sync(lambda sync: migrate_connection(sync, apply=True))
+
+
+@pytest.mark.parametrize("default", ["hybrid_()rerank", "HYBRID_RERANK", " hybrid_rerank "])
+async def test_changed_varchar_default_refuses_upgrade_without_writes(isolated_mysql, default):
+    """真实 VARCHAR 默认漂移必须在任何新章写入前被拒绝。参数：专库/错误默认值；返回：None；异常：断言失败。"""
+    from app.db.migrate_ch09 import migrate_connection
+    from app.db.migrate_rag_quality import QualitySchemaError
+
+    _, engine, _, _ = isolated_mysql
+    await prepare_ch04(engine)
+    async with engine.begin() as connection:
+        await connection.execute(text("ALTER TABLE faith_cases ALTER COLUMN strategy SET DEFAULT :value"), {"value": default})
+        await connection.execute(text("INSERT INTO faith_cases (eval_id,bucket,query,answer,reason) VALUES ('default-drift','A_policy','测试问','测试答','测试理由')"))
+        reflected = await connection.run_sync(lambda sync: next(
+            column["default"] for column in inspect(sync).get_columns("faith_cases") if column["name"] == "strategy"))
+        assert reflected == "'" + default + "'"
+        before_tables = await connection.run_sync(lambda sync: inspect(sync).get_table_names())
+        before_rows = (await connection.execute(text("SELECT * FROM faith_cases"))).all()
+        assert (await connection.execute(text("SELECT strategy FROM faith_cases"))).scalar_one() == default
+        writes = []
+
+        def remember_write(connection, cursor, statement, parameters, context, executemany):
+            """记录迁移阶段实际发往驱动的写操作。参数：游标执行事件；返回：None；异常：无。"""
+            if statement.lstrip().upper().startswith(("CREATE ", "ALTER ", "DROP ", "INSERT ", "UPDATE ", "DELETE ", "SET ")):
+                writes.append(statement)
+
+        event.listen(engine.sync_engine, "before_cursor_execute", remember_write)
+        try:
+            with pytest.raises(QualitySchemaError, match="strategy.*默认值"):
+                await connection.run_sync(lambda sync: migrate_connection(sync, apply=True))
+        finally:
+            event.remove(engine.sync_engine, "before_cursor_execute", remember_write)
+        assert writes == []
+        assert await connection.run_sync(lambda sync: inspect(sync).get_table_names()) == before_tables
+        assert (await connection.execute(text("SELECT * FROM faith_cases"))).all() == before_rows
+    print(f"VARCHAR default {reflected!r}：真实反射及默认写入保留原值；预检拒绝，迁移写操作 0")

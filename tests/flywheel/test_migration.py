@@ -187,3 +187,54 @@ async def test_migration_rejects_actual_database_mismatch_and_disposes(monkeypat
     assert disposed == [True]
     with pytest.raises(ValueError):
         await migrate_ch09.migrate(make_settings(), "unapproved_database", apply=True)
+
+
+@pytest.mark.parametrize("default", ["'hybrid_()rerank'", "'HYBRID_RERANK'", "' hybrid_rerank '"])
+def test_changed_string_default_is_rejected_before_migration(monkeypatch, default):
+    """去括号、大小写折叠或去空白不能掩盖默认策略漂移。参数：替换器/默认值；返回：None；异常：断言失败。"""
+    from app.db import migrate_ch09
+    from app.db.migrate_rag_quality import QualitySchemaError, validate_quality_schema
+
+    inspector = FlywheelInspector()
+    inspector.columns["faith_cases"][4]["default"] = default
+    monkeypatch.setattr(migrate_ch09, "inspect", lambda connection: inspector)
+    with pytest.raises(QualitySchemaError, match="strategy.*默认值"):
+        validate_quality_schema(inspector)
+    with pytest.raises(QualitySchemaError, match="strategy.*默认值"):
+        migrate_ch09.validate_ch09_schema(inspector)
+    with pytest.raises(QualitySchemaError, match="strategy.*默认值"):
+        migrate_ch09.migrate_connection(PreviewConnection(), apply=True)
+
+
+@pytest.mark.parametrize("created, updated", [
+    ("CURRENT_TIMESTAMP", "CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
+    ("current_timestamp()", "current_timestamp() on update current_timestamp()"),
+    (" CURRENT_TIMESTAMP() ", "current_timestamp()  ON\n UPDATE   CURRENT_TIMESTAMP"),
+])
+def test_equivalent_known_timestamp_defaults_remain_compatible(created, updated):
+    """修正字面值不能误拒绝 MySQL 等价时间表达式。参数：创建/更新时间表达式；返回：None；异常：核验失败。"""
+    from app.db.migrate_ch09 import validate_ch09_schema
+
+    inspector = FlywheelInspector()
+    inspector.columns["review_queue"][6]["default"] = created
+    inspector.columns["review_queue"][7]["default"] = updated
+    validate_ch09_schema(inspector)
+
+
+@pytest.mark.parametrize("left, right", [("'a  b'", "'a b'"), ("'CURRENT_TIMESTAMP'", "CURRENT_TIMESTAMP")])
+def test_default_comparison_preserves_literal_spaces_and_expression_kind(left, right):
+    """引号内空白或字面值与表达式不得被规范化成同值。参数：不同语义默认值；返回：None；异常：断言失败。"""
+    from app.db.migrate_rag_quality import _default
+
+    assert _default(left) != _default(right)
+
+
+@pytest.mark.parametrize("default", ["1", "'1'"])
+def test_integer_defaults_accept_mysql_reflection_quotes(default):
+    """整数默认值的 MySQL 反射引号不能被误作字符串类型漂移。参数：默认值；返回：None；异常：核验失败。"""
+    from app.db.migrate_ch09 import validate_ch09_schema
+
+    inspector = FlywheelInspector()
+    inspector.columns["faith_cases"][10]["default"] = default
+    inspector.columns["review_queue"][3]["default"] = default
+    validate_ch09_schema(inspector)
