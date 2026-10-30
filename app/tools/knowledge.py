@@ -7,12 +7,37 @@ from app.core.memory import ContextBudgetExceeded
 from app.core.model_budget import BudgetLedger
 from app.schemas.tools import ToolContext, ToolResult, VerifiedKnowledgeOutcome
 from app.tools.contracts import ToolExecutionScope, json_hash
-from app.knowledge.snapshots import RetrievalCapture, merge_snapshots
+from app.knowledge.snapshots import RetrievalCapture, merge_snapshots, recover_legacy_snapshot
 from app.schemas.flywheel import RetrievalSnapshot
 
 # 与原订单政策流程保持同一来源范围；商品规格与外部工具文字不能进入此范围。
 ORDER_POLICY_SOURCES = ("doc:returns-policy.md", "doc:after-sales-manual.md",
                         "doc:billing-shipping.md", "doc:member-benefits.md")
+
+
+async def restore_turn_knowledge(state: dict, chat, *, saved_turn: dict | None = None) -> dict:
+    """为旧检查点补原轮检索状态，不把缺字段当作已确认没检索。
+
+    参数：state原轮检查点、chat可信仓储、saved_turn可复用的原轮回读结果。
+    返回：仅含快照与入池信号的独立更新；异常：ValueError原轮缺失或事实冲突、数据库错误。
+    """
+    context = ToolContext.model_validate(state["context"])
+    saved_turn = saved_turn if saved_turn is not None else await chat.get_workflow_turn(
+        context.session_id, context.user_id, context.turn_id)
+    if saved_turn is None:
+        raise ValueError("旧检查点缺少可核对的原轮")
+    saved = saved_turn.get("retrieval_snapshot")
+    current = RetrievalSnapshot.model_validate(state["retrieval_snapshot"]) if state.get("retrieval_snapshot") else None
+    if saved is not None:
+        current = merge_snapshots(current, RetrievalSnapshot.model_validate(saved))
+    elif "retrieval_snapshot" not in state:
+        turns = await chat.load_turns(context.conversation_id)
+        # 只看明确原轮，不能借当前会话最后一问或重新检索补造历史。
+        messages = [message.model_dump(mode="json") for turn in turns if turn.turn_id == context.turn_id
+                    for message in turn.messages]
+        current = recover_legacy_snapshot(messages)
+    return {"retrieval_snapshot": current.model_dump(mode="json") if current is not None else None,
+            "pool_signals": deepcopy(state.get("pool_signals", saved_turn.get("pool_signals", [])))}
 
 
 def merge_knowledge_budget(current: dict, saved: dict) -> dict:

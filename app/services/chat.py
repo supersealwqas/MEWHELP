@@ -789,15 +789,12 @@ class ChatService:
         config = {"configurable": {"thread_id": checkpoint_thread_id(context.conversation_id)}}
         identity, trace_state = None, None
         row = await self.chat.get_workflow_turn(context.session_id, context.user_id, context.turn_id)
-        if row and row.get("retrieval_snapshot") is not None:
-            from app.knowledge.snapshots import merge_snapshots
-            from app.schemas.flywheel import RetrievalSnapshot
-            prior = initial if isinstance(initial, dict) else (await self.graph.aget_state(config)).values
-            incoming = RetrievalSnapshot.model_validate(row["retrieval_snapshot"])
-            merged = merge_snapshots(RetrievalSnapshot.model_validate(prior["retrieval_snapshot"])
-                if prior.get("retrieval_snapshot") else None, incoming).model_dump(mode="json")
-            initial = {**initial, "retrieval_snapshot": merged} if isinstance(initial, dict) else replace(
-                initial, update={**(initial.update or {}), "retrieval_snapshot": merged})
+        prior = initial if isinstance(initial, dict) else (await self.graph.aget_state(config)).values
+        if row and (row.get("retrieval_snapshot") is not None or "retrieval_snapshot" not in prior or "pool_signals" not in prior):
+            from app.tools.knowledge import restore_turn_knowledge
+            restored = await restore_turn_knowledge(prior, self.chat, saved_turn=row)
+            initial = {**initial, **restored} if isinstance(initial, dict) else replace(
+                initial, update={**(initial.update or {}), **restored})
         if self.observability is not None and self.observability.enabled:
             saved = row.get("trace_identity") if row else None
             identity = TraceIdentity(**saved) if saved else self.observability.identity_for(context)

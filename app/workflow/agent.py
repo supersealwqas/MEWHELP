@@ -16,7 +16,7 @@ from app.schemas.tools import ToolContext, ToolResult
 from app.repositories.chat import PersistenceUncertain
 from app.tools.confirmation import TicketIntentState, request_ticket_authorization, ticket_context_notes, ticket_write_rejection
 from app.tools.contracts import KnowledgeCallContext, ToolExecutionScope, binding_dict, binding_from_dict
-from app.tools.knowledge import merge_knowledge_budget, retrieve_verified_knowledge
+from app.tools.knowledge import merge_knowledge_budget, retrieve_verified_knowledge, restore_turn_knowledge
 from app.workflow.citations import CitationStreamFilter
 from app.workflow.answer_policy import query_fault_answer
 from app.workflow.model import decision_tool_schemas
@@ -154,6 +154,9 @@ def build_agent_graph(deps: "WorkflowDependencies", *, decision=None):
         ledger = BudgetLedger.from_snapshot(state["budget"])
         knowledge_state = deepcopy(state)
         knowledge_state.setdefault("knowledge_cache", {})
+        if "retrieval_snapshot" not in knowledge_state or "pool_signals" not in knowledge_state:
+            # 根Command.update不能改写已暂停子图的旧输入，消费边界也要恢复新增字段。
+            knowledge_state.update(await restore_turn_knowledge(knowledge_state, deps.chat))
         seen_ids, seen_signatures = list(state["seen_call_ids"]), list(state["seen_call_signatures"])
         count, reason, batch_failed = state["tool_count"], None, False
         writer = get_stream_writer()
@@ -213,7 +216,13 @@ def build_agent_graph(deps: "WorkflowDependencies", *, decision=None):
                     and binding.identity.source == "builtin" and call["name"] in {"query_faq", "query_refund_policy"}):
                 outcome = result.verified_knowledge
                 ledger = BudgetLedger.from_snapshot(merge_knowledge_budget(ledger.snapshot(), outcome.budget))
+                from app.knowledge.snapshots import merge_snapshots
+                from app.schemas.flywheel import RetrievalSnapshot
+                saved = RetrievalSnapshot.model_validate(knowledge_state["retrieval_snapshot"]) if knowledge_state.get("retrieval_snapshot") else None
+                merged = merge_snapshots(saved, outcome.retrieval_snapshot) if outcome.retrieval_snapshot is not None else saved
                 knowledge_state.update(outcome.model_dump(mode="json"), retrieval_attempted=True)
+                # 旧回执缺快照时保留已恢复的未知/原件，新回执也只能累加而不能覆盖前次尝试。
+                knowledge_state["retrieval_snapshot"] = merged.model_dump(mode="json") if merged is not None else None
             if result.ok and call["name"] == "query_order" and result.data and result.data.get("order_id"):
                 knowledge_state.update(order_id=result.data["order_id"], order_data=deepcopy(result.data))
             if not result.ok and result.error is not None:
@@ -236,7 +245,7 @@ def build_agent_graph(deps: "WorkflowDependencies", *, decision=None):
                   "ticket_intent": ticket_intent.model_dump(mode="json") if ticket_intent else None, "seen_call_ids": seen_ids,
                   "seen_call_signatures": seen_signatures, "tool_count": count, "budget": ledger.snapshot(),
                   **{key: knowledge_state[key] for key in ("knowledge_cache", "evidence", "gate", "evidence_scores",
-                     "expanded_queries", "retrieval_attempted", "order_id", "order_data", "retrieval_snapshot")}}
+                     "expanded_queries", "retrieval_attempted", "order_id", "order_data", "retrieval_snapshot", "pool_signals")}}
         if reason:
             update.update(stopped_state(reason))
         return update

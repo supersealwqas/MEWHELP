@@ -167,3 +167,58 @@ async def test_rerank_failure_keeps_only_verified_originals_without_invented_sco
     attempt = capture.snapshot.attempts[0]
     assert attempt.status == "fault" and attempt.candidate_count == 8
     assert len(attempt.chunks) == 5 and all(item.recall_score == .01 and item.rerank_score is None for item in attempt.chunks)
+
+
+@pytest.mark.parametrize("entry", ["graph", "service"])
+@pytest.mark.parametrize("has_saved_snapshot", [False, True])
+async def test_legacy_ticket_checkpoint_resumes_without_duplicate_write(tmp_path, entry, has_saved_snapshot):
+    """旧检查点缺CH09字段时仍须确认完成，保留原证据或明确未知，重发不重复建单。
+
+    参数：tmp_path独占目录、entry恢复入口、has_saved_snapshot用户行是否已有快照。
+    返回：None；异常：图恢复/快照或单次写入断言失败。
+    """
+    from langgraph.types import Command
+    from app.schemas.flywheel import RetrievalAttempt, RetrievalSnapshot
+    from app.schemas.workflow import AgentDecision, TicketResume
+    from app.workflow.state import checkpoint_thread_id
+    from tests.workflow.ch08_ticket_fakes import saved_decision, ticket_runtime
+    from tests.workflow.test_ch08_ticket_interrupt import rows, ticket_call
+
+    query = "帮我建个工单，订单1001收到时破损"
+    async with ticket_runtime(tmp_path, decisions=[AgentDecision(kind="tools", tool_calls=[ticket_call()]),
+            AgentDecision(kind="answer")], answers=[["工单已创建。"]]) as (service, deps, factory, _):
+        context = await deps.chat.start_turn(ToolContext(session_id="legacy-ticket", user_id="demo-user",
+            turn_id="legacy-turn", user_message=query), query)
+        initial = new_turn_state(context, [], 0)
+        initial.pop("retrieval_snapshot")
+        initial.pop("pool_signals")
+        config = {"configurable": {"thread_id": checkpoint_thread_id(context.conversation_id)}}
+        async for _ in service.graph.astream(initial, config, stream_mode="custom", durability="sync"):
+            pass
+        paused = await service.graph.aget_state(config)
+        assert paused.interrupts and "retrieval_snapshot" not in paused.values and "pool_signals" not in paused.values
+        assert await rows(factory, "SELECT ticket_no FROM tickets") == []
+        expected = RetrievalSnapshot(status="empty", attempts=[RetrievalAttempt(attempt_id="original-retrieval",
+            query="破损处理政策", status="empty", candidate_count=0, top_k=5)]) if has_saved_snapshot else RetrievalSnapshot(status="legacy_unavailable")
+        if has_saved_snapshot:
+            await deps.chat.save_retrieval_snapshot(context, expected)
+        preview = paused.interrupts[0].value
+        request = TicketResume(type="confirm_ticket", session_id=context.session_id, user_id=context.user_id,
+            source_turn_id=context.turn_id, action_id=preview["action_id"], decision="confirm")
+        if entry == "graph":
+            final = await service.graph.ainvoke(Command(resume=await saved_decision(factory, context)), config)
+        else:
+            events = [event async for event in service.stream_resume(request)]
+            assert events[-1].event == "done", [(event.event, event.data) for event in events]
+            final = (await service.graph.aget_state(config)).values
+        ticket_no = (await rows(factory, "SELECT ticket_no FROM tickets"))[0][0]
+        assert final["retrieval_snapshot"] == expected.model_dump(mode="json") and final["pool_signals"] == []
+        assert ticket_no in final["answer"] and final["completion_metadata"]["status"] == "completed"
+        saved = await deps.chat.get_workflow_turn(context.session_id, context.user_id, context.turn_id)
+        assert saved["retrieval_snapshot"] == expected.model_dump(mode="json") and saved["turn_status"] == "completed"
+        repeated = [event async for event in service.stream_resume(request)]
+        assert repeated[-1].event == "done"
+        assert ticket_no in "".join(event.data.get("delta", "") for event in repeated)
+        assert await rows(factory, "SELECT ticket_no FROM tickets") == [(ticket_no,)]
+        assert await rows(factory, "SELECT tool_name FROM tool_audit_logs WHERE tool_name='create_ticket'") == [("create_ticket",)]
+        assert deps.search.calls == []
