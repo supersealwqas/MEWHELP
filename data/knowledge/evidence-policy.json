@@ -1,0 +1,35 @@
+{
+  "schema_version": 2,
+  "version": "f4bad0eb60dfc487210e9ffd4a9a2a469fee4331eef14e6e30012afaa58d6038",
+  "feature_protocol": "evidence-v2",
+  "minimum_score": 0.9996993541717529,
+  "count_cap": 1,
+  "weights": {
+    "top1": 1.0,
+    "count": 0.0,
+    "gap": 0.0
+  },
+  "threshold": 0.9244152307510376,
+  "protocols": {
+    "query": "5dcd79849ab47deb2505c77833c5c013d739a81ce090c8b4e63c6cd06b4d1de6",
+    "rerank": "bge-reranker-large:flagembedding-1.4.2:sigmoid:pair512:window64:v1:recall50:top10",
+    "budget": "84e52828a90e918759804023e9873efa9c998e7012c54a2545b7cc647a76a12c"
+  },
+  "training_source": {
+    "target": "application-readonly",
+    "split": "calibration",
+    "case_count": 24,
+    "feature_protocol": "evidence-v2",
+    "metrics_version": "selected-sufficiency-v1",
+    "dataset_sha256": "84e66401ef54bd1ad78fc645a0237e396a7587434eb0adc818916cc869b6ecf3",
+    "corpus_version": "5440437906bbe5c54394e9e30ee5271d68f27f618b1224a7d227792d1fafead7",
+    "database": "mewhelp",
+    "milvus_database": "mewhelp_ch03",
+    "collection": "knowledge_ch04",
+    "chat_model": "gemini-3.5-flash-lite",
+    "intent_model": "gemini-3.5-flash-lite",
+    "policy_version": null,
+    "scope": "single-turn-production-knowledge; no business execution or final-answer generation",
+    "corpus_version_after": "5440437906bbe5c54394e9e30ee5271d68f27f618b1224a7d227792d1fafead7"
+  }
+}

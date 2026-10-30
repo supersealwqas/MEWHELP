@@ -18,6 +18,7 @@ from app.knowledge.contracts import KnowledgeEncoder
 from app.knowledge.limits import valid_dense_vector
 from app.knowledge.query_rewrite import QueryRewrite, QueryRewriter, validate_prepared_queries, validate_rewrite
 from app.knowledge.rerank import RankedChunk, RerankUnavailable
+from app.knowledge.confidence import unique_ranked
 from app.knowledge.schemas import ChunkSnapshot
 from app.knowledge.search import KnowledgeSearchUnavailable
 from app.knowledge.store import KnowledgeStore
@@ -69,17 +70,11 @@ def merge_ranked_chunks(groups: list[list[RankedChunk]]) -> list[RankedChunk]:
 
     参数：groups 多条查询各自返回的 RankedChunk 列表。
     返回：list[RankedChunk]，去重后按 (-score, chunk.id) 排序的权威结果列表。
-    异常：无。
+    异常：ValueError，同一稳定身份对应不同原文。
     """
-    strongest: dict[int, RankedChunk] = {}
-    for group in groups:
-        for item in group:
-            existing = strongest.get(item.chunk.id)
-            # 同一原文可能多次命中，保留最高相关度，避免先遇到的低分覆盖后续证据。
-            if existing is None or item.score > existing.score:
-                strongest[item.chunk.id] = item
+    strongest = unique_ranked([item for group in groups for item in group])
     # 分数相同按原文主键固定次序，保证后续引用编号稳定。
-    return sorted(strongest.values(), key=lambda item: (-item.score, item.chunk.id))
+    return sorted(strongest, key=lambda item: (-item.score, item.chunk.id))
 
 
 def faq_rows(ranked: list[RankedChunk]) -> list[dict]:
@@ -236,13 +231,15 @@ class HybridKnowledgeSearch:
                        subquery_split: bool | None = None, filters: dict | None = None,
                        source_query: str | None = None, budget: BudgetLedger | None = None,
                        history: str = "", prepared_queries: list[str] | None = None,
-                       capture: RetrievalCapture | None = None) -> list[RankedChunk]:
+                       capture: RetrievalCapture | None = None,
+                       ranked_capture: list[RankedChunk] | None = None) -> list[RankedChunk]:
         """逐子句跑完整链路，轮转合并或按已准备查询最高分合并后截到 Top-K。
 
         参数：query 当前原话或已验证完整问；top_k None 使用 config.rerank_top_k=10，显式值 1–recall_top_k；
             subquery_split None 使用配置默认 True，False 只检索完整查询；filters 为权威元数据筛选；
             source_query 为可信原问；budget 请求独占账本；history 可信历史用户/工具文本（仅旧路径使用）；
             prepared_queries 可选已准备的 1 条或 3 条查询，传入时跳过旧改写模型并按最高分合并；capture 请求局部闸前快照收集器。
+            ranked_capture 可选请求局部列表，收集业务精排返回而非Top5审计额外候选，跨查询裁剪前保留。
         返回：list[RankedChunk]，旧路径最多 Top-K；已准备路径最多 min(Top-K, 10)，每条完整查询重排一次。
         异常：ValueError，参数非法；检索/模型/权威存储异常；取消直接传播。
         """
@@ -262,23 +259,23 @@ class HybridKnowledgeSearch:
         if prepared_queries is not None:
             selected = min(selected, _PREPARED_QUERY_TOP_K)
             groups = [await self._retrieve_one(group[0], selected, scope, capture=capture) for group in prepared.groups]
+            if ranked_capture is not None:
+                ranked_capture.extend(item for group in groups for item in group)
             # 全部查询完成后再按最高分合并裁剪，普通结果最多十块，较小显式上限仍有效。
             return merge_ranked_chunks(groups)[:selected]
-        return await self._retrieve_group(prepared.groups[0], prepared, selected, scope, capture=capture)
+        return await self._retrieve_group(prepared.groups[0], prepared, selected, scope, capture=capture, ranked_capture=ranked_capture)
 
     async def _retrieve_group(self, queries: list[str], prepared: PreparedQuery, selected: int,
-                              scope: dict[int, ChunkSnapshot] | None, *, capture: RetrievalCapture | None = None) -> list[RankedChunk]:
+                              scope: dict[int, ChunkSnapshot] | None, *, capture: RetrievalCapture | None = None,
+                              ranked_capture: list[RankedChunk] | None = None) -> list[RankedChunk]:
         """合并一组子句排名。参数：queries 子句、prepared 共用文本、selected 上限、scope 权威范围、capture 请求收集器；返回：排名；异常：检索依赖错误。"""
         results = [await self._retrieve_one(clause, selected, scope,
                     bm25_query=prepared.bm25_queries.get(clause, clause),
                     rerank_query=prepared.rerank_queries.get(clause, clause), capture=capture) for clause in queries]
+        if ranked_capture is not None:
+            ranked_capture.extend(item for group in results for item in group)
         # 保持首次轮转位置，但同一证据跨子句相关度不同，门槛使用其最高有效分。
-        strongest: dict[int, RankedChunk] = {}
-        for group in results:
-            for item in group:
-                existing = strongest.get(item.chunk.id)
-                if existing is None or item.score > existing.score:
-                    strongest[item.chunk.id] = item
+        strongest = {item.chunk.id: item for item in unique_ranked([item for group in results for item in group])}
         merged: list[RankedChunk] = []
         seen: set[int] = set()
         # 按轮次取每条子句的下一条，避免首句占满截断上限而完全丢掉后句证据。
@@ -306,12 +303,14 @@ class HybridKnowledgeSearch:
 
     async def retrieve_policy(self, query: str, *, filters: dict | None = None,
                               budget: BudgetLedger | None = None, history: str = "",
-                              prepared_queries: list[str] | None = None, capture: RetrievalCapture | None = None) -> list[RankedChunk]:
+                              prepared_queries: list[str] | None = None, capture: RetrievalCapture | None = None,
+                              ranked_capture: list[RankedChunk] | None = None) -> list[RankedChunk]:
         """退款与售后政策多查询检索并按 chunk id 去重，默认最多 30 条。
 
         参数：query 当前退款问题或含已核实状态的种子；filters 可选元数据筛选；
             budget 请求独占账本；history 可信历史用户/工具文本（仅旧路径使用）；
             prepared_queries 可选已准备的 1 条或 3 条查询，传入时按 chunk ID 取最高分降序合并；capture 请求局部原文收集器。
+            ranked_capture 收集各子查询既定业务上限的精排输出，最终候选裁剪前写入，不包含额外审计块。
         返回：list[RankedChunk]，旧路径默认最多 30 个原 chunk；已准备路径每条最多十块、合计最多三十块。
         异常：ValueError，参数/输入限制；检索、模型或存储异常。
         """
@@ -323,13 +322,13 @@ class HybridKnowledgeSearch:
         if prepared_queries is not None:
             selected = min(self.config.rerank_top_k, _PREPARED_QUERY_TOP_K)
             groups = [await self._retrieve_one(group[0], selected, scope, capture=capture) for group in prepared.groups]
+            if ranked_capture is not None:
+                ranked_capture.extend(item for group in groups for item in group)
             # 每条最多十块，最多三条查询；合并后不超过三十块，并保留更小的配置限制。
             return merge_ranked_chunks(groups)[:selected * 3]
-        merged: dict[int, RankedChunk] = {}
-        for group in prepared.groups:
-            for item in await self._retrieve_group(group, prepared, self.config.rerank_top_k, scope, capture=capture):
-                merged.setdefault(item.chunk.id, item)
-        return list(merged.values())
+        groups = [await self._retrieve_group(group, prepared, self.config.rerank_top_k, scope,
+                    capture=capture, ranked_capture=ranked_capture) for group in prepared.groups]
+        return unique_ranked([item for group in groups for item in group])
 
 
 class RetrievalCandidate(BaseModel):

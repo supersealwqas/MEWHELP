@@ -18,10 +18,12 @@ def snapshots():
     return importlib.import_module("app.knowledge.snapshots")
 
 
-async def test_low_score_snapshot_preserves_top_five_before_gate():
+async def test_low_score_snapshot_preserves_top_five_before_gate(tmp_path):
     """先按低分清空证据会丢失审核原文。参数：无；返回：None；异常：断言失败。"""
     snapshots()
     search, _, _, _ = _search([_chunk(i) for i in range(1, 9)], scores={i: .1 for i in range(1, 9)})
+    from tests.workflow.graph_fakes import write_test_evidence_policy
+    search.config = write_test_evidence_policy(search.config, tmp_path / "policy.json")
     state = new_turn_state(ToolContext(conversation_id=1, session_id="s", user_id="u", turn_id="first", user_message="退货政策"), [], 0)
     outcome = await retrieve_verified_knowledge(state, BudgetLedger(), search=search, settings=search.config,
         query_expander=None, query="退货政策", prepared_queries=["退货政策"])
@@ -63,10 +65,12 @@ async def test_no_retrieval_empty_and_fault_are_distinct():
     assert module.recover_legacy_snapshot([{"role": "user", "rag_metadata": {"retrieval_snapshot": None}}]) is None
 
 
-async def test_multiple_retrieval_attempts_survive_confirmation_resume():
+async def test_multiple_retrieval_attempts_survive_confirmation_resume(tmp_path):
     """恢复或同轮缓存不能覆盖暂停前检索。参数：无；返回：None；异常：断言失败。"""
     module = snapshots()
     search, _, index, _ = _search([_chunk(1)])
+    from tests.workflow.graph_fakes import write_test_evidence_policy
+    search.config = write_test_evidence_policy(search.config, tmp_path / "policy.json")
     state = new_turn_state(ToolContext(conversation_id=1, session_id="s", user_id="u", turn_id="first", user_message="退货政策"), [], 0)
     options = dict(search=search, settings=search.config, query_expander=None)
     await retrieve_verified_knowledge(state, BudgetLedger(), query="退货政策", prepared_queries=["退货政策"], **options)
@@ -84,6 +88,8 @@ async def test_partial_failure_is_persisted_before_retry_without_replacing_histo
     from tests.flywheel.test_pool import start
     from tests.workflow.service_fakes import service_runtime
     search, encoder, _, _ = _search([_chunk(1)])
+    from tests.workflow.graph_fakes import write_test_evidence_policy
+    search.config = write_test_evidence_policy(search.config, tmp_path / "policy.json")
     original = encoder.encode
     async def fail_second(texts):
         """第二个真实编码失败。参数：查询文本；返回：向量；异常：ConnectionError。"""

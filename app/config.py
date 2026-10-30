@@ -148,6 +148,8 @@ class Settings(BaseSettings):
         min_length=1,
         description="在线 Dense 检索的校准策略文件路径",
     )
+    evidence_policy_path: str = Field(default="data/knowledge/evidence-policy.json", min_length=1,
+        description="真实生产校准生成的v2证据策略；缺失或不兼容时新搜索失败关闭，没有拍定默认阈值")
     knowledge_relation_policy_path: str = Field(
         default="data/knowledge/relation-policy.json",
         min_length=1,

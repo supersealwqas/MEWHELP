@@ -218,22 +218,47 @@ class RetrievalLowConfidence(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
     source: Literal["retrieval_low_conf"] = Field(default="retrieval_low_conf", description="固定的前置检索弱证据入口")
-    reason: str = Field(min_length=1, max_length=1000, description="成功检索后无证据或最高重排分不足的原因")
+    reason: str = Field(min_length=1, max_length=1000, description="成功检索后无证据或未达到正式证据策略门槛的原因")
 
 
 class GateDecision(BaseModel):
-    """成功检索的最高归一化分判定；坏数据和依赖失败必须作为异常处理。"""
+    """唯一证据闸快照；v2使用正式综合分，无版本历史按v1最高分解释。"""
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
-    passed: bool = Field(description="证据非空且最高归一化重排分达到门槛时为真")
+    schema_version: Literal[1, 2] = Field(default=2, description="判定协议版本，旧无版本检查点解释为1")
+    policy_version: str | None = Field(default=None, description="v2冻结证据策略版本，旧检查点为空")
+    evidence_confidence: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False, description="v2综合证据分，不是回答正确概率")
+    features: dict | None = Field(default=None, description="v2全候选及预算后证据特征，旧检查点为空")
+    passed: bool = Field(description="v2证据非空且综合分达到策略门槛；v1按历史最高分解释")
     max_score: float | None = Field(ge=0, le=1, allow_inf_nan=False, description="本轮全部重排分中的最高值，成功零命中时为空")
-    threshold: float = Field(ge=0, le=1, allow_inf_nan=False, description="已有rerank_min_score门槛，不代表回答正确概率")
+    threshold: float = Field(ge=0, le=1, allow_inf_nan=False, description="当前版本通过门槛；v2来自校准制品，不代表回答正确概率")
     low_confidence: RetrievalLowConfidence | None = Field(default=None, description="仅未通过时携带的弱证据入池草案，不直接写库")
+
+    @model_validator(mode="before")
+    @classmethod
+    def read_legacy(cls, value):
+        """无版本历史明确按v1读取。参数：原始字段；返回：带版本字段；异常：无。"""
+        if isinstance(value, dict):
+            value = dict(value)
+            if "schema_version" not in value:
+                value["schema_version"] = 1
+            if hasattr(value.get("features"), "model_dump"):
+                value["features"] = value["features"].model_dump()
+        return value
 
     @model_validator(mode="after")
     def validate_outcome(self) -> "GateDecision":
         """拒绝相互矛盾的闸快照。参数：无；返回：自身；异常：ValueError，通过标记或弱证据草案与分数不符。"""
-        expected = self.max_score is not None and self.max_score >= self.threshold
+        if self.schema_version == 2:
+            from app.knowledge.confidence import EvidenceFeatures
+            if not self.policy_version or self.features is None or self.evidence_confidence is None:
+                raise ValueError("v2证据闸必须携带策略、特征和综合分")
+            features = EvidenceFeatures.model_validate(self.features)
+            if features.top1_score != self.max_score:
+                raise ValueError("最高分与证据特征不一致")
+            expected = features.candidate_count > 0 and self.evidence_confidence >= self.threshold
+        else:
+            expected = self.max_score is not None and self.max_score >= self.threshold
         if self.passed != expected or (self.low_confidence is None) != self.passed:
             raise ValueError("证据闸通过标记、分数和弱证据草案不一致")
         return self

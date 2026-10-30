@@ -1,5 +1,6 @@
 """真实图测试的严格外部依赖替身；无网络、模型网关和业务数据库。"""
 from copy import deepcopy
+from pathlib import Path
 from uuid import uuid4
 from langchain_core.callbacks import BaseCallbackHandler
 from app import config
@@ -149,13 +150,13 @@ class StrictSearch:
     def __init__(self, ranked=(), error=None):
         """参数：ranked权威结果、error可选故障；返回：None；异常：无。"""
         self.ranked, self.error, self.calls = list(ranked), error, []
-    async def retrieve(self, query, *, budget, prepared_queries=None, history="", filters=None, source_query=None, capture=None):
+    async def retrieve(self, query, *, budget, prepared_queries=None, history="", filters=None, source_query=None, capture=None, ranked_capture=None):
         """参数：query原问、budget独占账本；返回：排名；异常：脚本故障。"""
-        return await self._take("retrieve", query, budget, capture, prepared_queries)
-    async def retrieve_policy(self, query, *, budget, prepared_queries=None, history="", filters=None, capture=None):
+        return await self._take("retrieve", query, budget, capture, prepared_queries, ranked_capture)
+    async def retrieve_policy(self, query, *, budget, prepared_queries=None, history="", filters=None, capture=None, ranked_capture=None):
         """参数：query原问、budget独占账本、filters来源范围；返回：排名；异常：脚本故障。"""
-        return await self._take("retrieve_policy", query, budget, capture, prepared_queries)
-    async def _take(self, kind, query, budget, capture, prepared_queries):
+        return await self._take("retrieve_policy", query, budget, capture, prepared_queries, ranked_capture)
+    async def _take(self, kind, query, budget, capture, prepared_queries, ranked_capture):
         """参数：kind入口、query原問、budget账本；返回：排名；异常：脚本故障。"""
         self.calls.append((kind, query))
         if capture is not None:
@@ -170,6 +171,8 @@ class StrictSearch:
                     fault=type(self.error).__name__ if self.error else None))
         if self.error:
             raise self.error
+        if ranked_capture is not None:
+            ranked_capture.extend(self.ranked)
         return self.ranked
 
 class StrictExpander:
@@ -199,9 +202,30 @@ def dependencies(*, intents=("订单",), decisions=(), answers=(), ranked=(), re
         # CH08原固定出口也先真实决定一次，旧场景明确选择继续其原出口。
         from app.schemas.workflow import AgentDecision
         decisions = [AgentDecision(kind="answer") for _ in intents]
-    return WorkflowDependencies(ScriptedWorkflowModel(intents=intents, decisions=decisions, answers=answers, understandings=understandings),
+    from tempfile import TemporaryDirectory
+    import weakref
+    temporary = TemporaryDirectory(prefix="mewhelp-test-evidence-")
+    options["evidence_policy_path"] = str(Path(temporary.name) / "policy.json")
+    configured = Settings(_env_file=None, **options)
+    write_test_evidence_policy(configured, Path(options["evidence_policy_path"]))
+    deps = WorkflowDependencies(ScriptedWorkflowModel(intents=intents, decisions=decisions, answers=answers, understandings=understandings),
         StrictSearch(ranked), StrictExecutor(chat, results), chat,
-        Settings(_env_file=None, **options), query_expander=StrictExpander(), registry=build_registry())
+        configured, query_expander=StrictExpander(), registry=build_registry())
+    # 由测试依赖生命周期持有目录，依赖释放时明确清理；绝不覆盖正式制品。
+    deps._test_evidence_policy_directory = temporary
+    weakref.finalize(deps, temporary.cleanup)
+    return deps
+
+
+def write_test_evidence_policy(settings, path):
+    """仅测试显式配置旧场景的最高分语义。参数：设置/临时路径；返回：设置；异常：文件或校验错误。"""
+    from app.knowledge.confidence import EvidencePolicy
+    from app.knowledge.pipeline import production_protocols
+    value = EvidencePolicy(version="explicit-test-policy-v2", feature_protocol="evidence-v2",
+        minimum_score=settings.rerank_min_score, count_cap=1, weights={"top1": 1.0, "count": 0.0, "gap": 0.0},
+        threshold=settings.rerank_min_score, protocols=production_protocols(settings), training_source={"source": "test-only"})
+    path.write_text(value.model_dump_json(), encoding="utf-8")
+    return settings.model_copy(update={"evidence_policy_path": str(path)})
 
 def turn(query="查订单1001", *, session="session", turn_id=None):
     """参数：query原问、session会话、turn_id可选轮ID；返回：新轮State；异常：原问错误。"""

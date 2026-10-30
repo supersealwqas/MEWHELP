@@ -41,6 +41,14 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--evidence-budget", type=int, default=8000)
         if name == "compare":
             command.add_argument("--policy", type=Path, required=True, help="真实校准运行产生的policy.json（校准题数须与当前数据集一致）")
+    for name in ("calibrate-production", "validate-production-policy"):
+        command = commands.add_parser(name, help="共享生产知识流程的只读校准或一次冻结策略验收")
+        command.add_argument("--env-file", type=Path)
+        command.add_argument("--dataset", type=Path, default=Path("data/evaluation/ch04.json"))
+        command.add_argument("--output-dir", type=Path, required=True, help="必须不存在，禁止覆盖已采样的报告")
+        command.add_argument("--target", choices=["application-readonly"], required=True)
+        if name == "validate-production-policy":
+            command.add_argument("--policy", type=Path, required=True)
     return parser
 
 
@@ -69,6 +77,10 @@ async def run(args: argparse.Namespace) -> int:
     异常：取消直接传播，保留已写记录；文件系统报告错误可能传播。
     """
     _load_environment(args.env_file)
+    if args.command in {"calibrate-production", "validate-production-policy"}:
+        from app.config import Settings
+        from app.evaluation.production import run_production
+        return await run_production(args, Settings())
     from app.evaluation.dataset import load_dataset, resolve_evidence
     from app.evaluation.policy import POLICY_VERSION, build_corpus, calibrate_threshold, digest_json, validate_policy
 

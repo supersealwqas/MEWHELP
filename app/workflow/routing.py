@@ -232,7 +232,7 @@ def _validate_score(value: float) -> None:
 
 
 def assess_evidence(scores: list[float], threshold: float) -> GateDecision:
-    """仅对成功检索的全部分数执行最高分证据闸。
+    """兼容旧版最高分协议；新生产请求使用knowledge.confidence的v2策略。
 
     参数：scores为完整归一化重排分列表，可为空；threshold为已有rerank_min_score的0–1有限门槛。
     返回：GateDecision，空结果/低分携带retrieval_low_conf草案，通过则不创建草案。
@@ -249,7 +249,7 @@ def assess_evidence(scores: list[float], threshold: float) -> GateDecision:
         reason = ("检索成功但未找到可用证据" if max_score is None
                   else f"最高重排相关度{max_score:g}低于门槛{threshold:g}")
         low_confidence = RetrievalLowConfidence(reason=reason)
-    return GateDecision(passed=passed, max_score=max_score, threshold=threshold, low_confidence=low_confidence)
+    return GateDecision(schema_version=1, passed=passed, max_score=max_score, threshold=threshold, low_confidence=low_confidence)
 
 
 def citations_from_ranked(ranked: list[RankedChunk]) -> list[EvidenceCitation]:

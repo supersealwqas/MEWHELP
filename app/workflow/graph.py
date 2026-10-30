@@ -30,14 +30,15 @@ from app.tools.knowledge import ORDER_POLICY_SOURCES, retrieve_verified_knowledg
 from app.workflow.agent import build_agent_decision, build_agent_graph, confirmed_ticket_prefix, model_messages, stopped_state
 from app.workflow.model import WorkflowModelAdapter, intent_tool_schema, understanding_tool_schema
 from app.workflow.prompts import INTENT_PROMPT, UNDERSTANDING_PROMPT
-from app.workflow.routing import assess_evidence, fixed_reply, knowledge_input_stop_reason, route_by_intent, order_candidate
+from app.workflow.routing import fixed_reply, knowledge_input_stop_reason, route_by_intent, order_candidate
+from app.knowledge.pipeline import understand_query
 from app.tools.business import list_user_orders, owns_order
 from app.workflow.state import ConversationState, full_history_messages, message_row
 from app.workflow.stages import publish_stage
 from app.workflow.policy_context import policy_query, verified_order_text
 from app.workflow.resilience import DEPENDENCY_ERRORS, degradation
 from app.workflow.routing import original_understanding
-from app.workflow.context import history_snapshot, log_history, select_evidence
+from app.workflow.context import history_snapshot, log_history
 from app.repositories.context import ContextRepository
 
 logger = logging.getLogger(__name__)
@@ -105,7 +106,7 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
                     snapshot["previous_layer1_from_msg_id"], snapshot["layer1_from_msg_id"], state["context"]["conversation_id"],
                     snapshot["demoted_turns"], snapshot["layer1_before_tokens"], snapshot["layer1_tokens"], advanced)
             current = {**state, "history_context": snapshot}
-            understood = await deps.model.understand(model_messages(current, deps.settings, UNDERSTANDING_PROMPT,
+            understood = await understand_query(deps.model, model_messages(current, deps.settings, UNDERSTANDING_PROMPT,
                 [understanding_tool_schema()], registry=deps.registry), ledger)
         except (WorkflowBudgetExceeded, ContextBudgetExceeded) as error:
             if snapshot is None:
@@ -235,13 +236,13 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
                 "retrieval_attempted": True, "stop_reason": None}
 
     def confidence_node(state: ConversationState) -> ConversationState:
-        """控制政策证据是否可用，业务仍可查事实。参数：state完整分数；返回：闸、可用证据与消息；异常：分数非法。"""
-        gate = assess_evidence(state["evidence_scores"], deps.settings.rerank_min_score)
+        """消费工具唯一判定，业务仍可查事实。参数：state含可信gate；返回：同一闸与路由；异常：快照非法。"""
+        gate = GateDecision.model_validate(state["gate"])
         logger.info("workflow gate passed=%s max_score=%s", gate.passed, gate.max_score)
         update = {"gate": gate.model_dump(mode="json"), "stop_reason": "answer", "route_ready": True}
         if gate.passed:
             # 只发送可完整容纳的块，引用仍使用原编号，不能引用未发给模型的资料。
-            update["evidence"] = select_evidence(state["evidence"], deps.settings)
+            update["evidence"] = deepcopy(state["evidence"])
             update["context_notes"] = []
         else:
             # 门闸约束政策证据，不代表订单/物流工具不可用；分数和失败原因仍保留供审计。

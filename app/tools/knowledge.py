@@ -2,6 +2,7 @@
 
 import asyncio
 from copy import deepcopy
+from pathlib import Path
 
 from app.core.memory import ContextBudgetExceeded
 from app.core.model_budget import BudgetLedger
@@ -69,15 +70,17 @@ async def retrieve_verified_knowledge(state: dict, ledger: BudgetLedger, *, sear
     返回：VerifiedKnowledgeOutcome，弱证据保留分数/计量而不注入原文。
     异常：预算超限、输入非法、知识依赖故障及取消原样传播。
     """
-    from app.workflow.context import select_evidence
-    from app.workflow.routing import assess_evidence, citations_from_ranked, knowledge_input_stop_reason
+    from app.workflow.routing import knowledge_input_stop_reason
+    from app.knowledge.confidence import assess_evidence, load_evidence_policy
+    from app.knowledge.pipeline import ProductionKnowledgePipeline, production_protocols
 
     source_query = state.get("resolved_query") or state["raw_query"]
     if any(knowledge_input_stop_reason(value) for value in (state["raw_query"], source_query, query)):
         raise ContextBudgetExceeded("本轮知识输入超出可处理范围")
+    evidence_policy = load_evidence_policy(Path(settings.evidence_policy_path), protocols=production_protocols(settings))
     key = json_hash({"turn_id": state["context"]["turn_id"], "query": query, "source_query": source_query,
                      "filters": filters or {}, "policy": policy,
-                     "prepared_queries": prepared_queries})
+                     "prepared_queries": prepared_queries, "evidence_policy_version": evidence_policy.version})
     cached = state.get("knowledge_cache", {}).get(key)
     saved = RetrievalSnapshot.model_validate(state["retrieval_snapshot"]) if state.get("retrieval_snapshot") else None
     if cached is not None:
@@ -102,26 +105,13 @@ async def retrieve_verified_knowledge(state: dict, ledger: BudgetLedger, *, sear
 
     capture.on_update = save_snapshot
     async with asyncio.timeout(settings.knowledge_timeout_seconds):
-        if prepared_queries is None:
-            if policy:
-                if stage_callback is not None:
-                    stage_callback("expand", "running")
-                expanded = await query_expander.expand(query, simple_query=state.get("standard_query") or source_query,
-                                                       required_count=3, budget=ledger)
-                prepared_queries = expanded.queries
-                if stage_callback is not None:
-                    stage_callback("expand", "completed", queries=prepared_queries)
-            else:
-                prepared_queries = [query]
-        options = {"filters": filters} if filters else {}
-        retrieve = search.retrieve_policy if policy else search.retrieve
-        if not policy:
-            options["source_query"] = source_query
-        if stage_callback is not None:
-            stage_callback("policy", "running")
-        ranked = await retrieve(query, prepared_queries=prepared_queries, budget=ledger, history="", capture=capture, **options)
-    gate = assess_evidence([item.score for item in ranked], settings.rerank_min_score)
-    evidence = select_evidence([item.model_dump(mode="json") for item in citations_from_ranked(ranked)], settings) if gate.passed else []
+        pipeline = ProductionKnowledgePipeline(search, settings, query_expander=query_expander,
+            state=state, policy=policy, prepared_queries=prepared_queries, stage_callback=stage_callback)
+        prepared = await pipeline.prepare(query, filters or {}, messages=[], budget=ledger)
+        result = await pipeline.retrieve(prepared, capture=capture)
+    ranked, selected, prepared_queries = result["ranked"], result["selected"], result["queries"]
+    gate = assess_evidence(ranked, selected, evidence_policy)
+    evidence = [item.model_dump(mode="json") for item in selected] if gate.passed else []
     outcome = VerifiedKnowledgeOutcome(evidence=evidence, gate=gate.model_dump(mode="json"),
         evidence_scores=[item.score for item in ranked], expanded_queries=prepared_queries, budget=ledger.snapshot(),
         retrieval_snapshot=RetrievalSnapshot.model_validate(state["retrieval_snapshot"]) if state.get("retrieval_snapshot") else None)
