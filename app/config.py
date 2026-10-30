@@ -29,6 +29,14 @@ class Settings(BaseSettings):
     langfuse_secret_key: SecretStr = Field(default=SecretStr(""), description="本机 Langfuse 项目密钥，不写入日志或前端")
     observability_shutdown_timeout_seconds: float = Field(default=5, gt=0, le=30,
         description="应用等待观测导出关闭的总秒数，超时明确记录未完成导出")
+    observability_cost_max_days: int = Field(default=31, ge=1, le=366,
+        description="意图用量查询允许的最大时间跨度天数，窗口按观测开始时间左闭右开")
+    observability_cost_page_size: int = Field(default=100, ge=1, le=1000,
+        description="Langfuse v2每页记录数，必须持续读取cursor直至结束")
+    observability_cost_request_timeout_seconds: float = Field(default=10, gt=0, le=60,
+        description="单次本机观测HTTP请求等待上限秒数")
+    observability_cost_timeout_seconds: float = Field(default=60, gt=0, le=300,
+        description="用量分页及同轮归属补查总期限，超时返回不完整状态")
     flywheel_interval_seconds: float = Field(default=30, gt=0, le=3600, description="知识飞轮持久问题池扫描间隔秒数")
     flywheel_page_size: int = Field(default=50, gt=0, le=100, description="单次语义判重完整候选页上限，所有页均需完成才能新建")
     flywheel_timeout_seconds: float = Field(default=180, gt=0, le=600, description="单条归并含标准化及全部分页的总秒数上限，失败保留原件")

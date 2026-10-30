@@ -23,6 +23,7 @@ from app.api.conversations import router as conversations_router
 from app.api.extract import router as extract_router
 from app.api.feedback import router as feedback_router
 from app.api.flywheel import router as flywheel_router
+from app.api.observability import router as observability_router
 from app.api.rageval import router as rageval_router
 from app.api.rageval import create_job_manager
 from app.core.logging import setup_logging
@@ -252,6 +253,7 @@ def create_app(runtime_factory=None) -> FastAPI:
     application.include_router(chat_router)
     application.include_router(feedback_router)
     application.include_router(flywheel_router)
+    application.include_router(observability_router)
     application.include_router(actions_router)
     application.include_router(citations_router)
     application.include_router(conversations_router)
