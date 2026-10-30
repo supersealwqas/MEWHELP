@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+import asyncio
 
 import pytest
 
@@ -128,3 +129,41 @@ async def test_release_closes_physical_connection() -> None:
     await lease.release()
     assert connection.closed is True
     assert connection.commits >= 1
+
+
+@pytest.mark.parametrize("phase", ["acquire", "release"])
+async def test_cancel_and_repeat_cancel_still_closes_connection(phase):
+    """取消与重复取消不得跳过物理关闭。参数：等待阶段；返回：None；异常：断言失败。"""
+    entered, closing, finish = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    class SlowConnection(_FakeConnection):
+        """只在指定锁查询和关闭边界等待的连接替身。"""
+        async def scalar(self, statement, parameters=None):
+            """参数：SQL与参数；返回：查询结果；异常：取消。"""
+            if (phase == "acquire" and "GET_LOCK" in str(statement)) or (phase == "release" and "RELEASE_LOCK" in str(statement)):
+                entered.set()
+                await asyncio.Event().wait()
+            return await super().scalar(statement, parameters)
+
+        async def close(self):
+            """参数：无；返回：None；异常：取消会使测试失败。"""
+            closing.set()
+            await finish.wait()
+            await super().close()
+
+    connection = SlowConnection()
+    operation = MySqlWriteLease.acquire(_FakeEngine(connection)) if phase == "acquire" else MySqlWriteLease(connection, lock_name="test").release()
+    task = asyncio.create_task(operation)
+    await entered.wait()
+    task.cancel()
+    try:
+        await asyncio.wait_for(closing.wait(), 0.2)
+        task.cancel()
+        finish.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert connection.closed
+    finally:
+        finish.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

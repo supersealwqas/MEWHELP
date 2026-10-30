@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     langfuse_secret_key: SecretStr = Field(default=SecretStr(""), description="本机 Langfuse 项目密钥，不写入日志或前端")
     observability_shutdown_timeout_seconds: float = Field(default=5, gt=0, le=30,
         description="应用等待观测导出关闭的总秒数，超时明确记录未完成导出")
+    flywheel_interval_seconds: float = Field(default=30, gt=0, le=3600, description="知识飞轮持久问题池扫描间隔秒数")
+    flywheel_page_size: int = Field(default=50, gt=0, le=100, description="单次语义判重完整候选页上限，所有页均需完成才能新建")
+    flywheel_timeout_seconds: float = Field(default=180, gt=0, le=600, description="单条归并含标准化及全部分页的总秒数上限，失败保留原件")
+    flywheel_close_seconds: float = Field(default=5, ge=0, le=30, description="停机等待当前任务的宽限秒数，随后取消并有界清理租约")
 
     chat_base_url: str = Field(
         min_length=1,

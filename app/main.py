@@ -137,6 +137,7 @@ async def database_runtime():
     lease_engine = None
     mcp = None
     observability = None
+    flywheel = None
     try:
         # 新章启动只核验完整结构；DDL 必须通过显式具名迁移完成。
         await check_ch09_tables(settings)
@@ -148,6 +149,13 @@ async def database_runtime():
             connect_args={"connect_timeout": 5},
         )
         store = KnowledgeStore(factory, lease_engine)
+        from app.knowledge.flywheel import FlywheelModel
+        from app.repositories.flywheel import FlywheelRepository
+        from app.services.flywheel import FlywheelService
+        flywheel = FlywheelService(FlywheelRepository(factory, lease_engine), FlywheelModel(),
+            page_size=settings.flywheel_page_size, interval_seconds=settings.flywheel_interval_seconds,
+            timeout_seconds=settings.flywheel_timeout_seconds, close_seconds=settings.flywheel_close_seconds,
+            observability=observability)
         async with online_search_runtime(settings, store) as search:
             support = SupportRepository(factory, search)
             registry = build_agent_registry()
@@ -171,6 +179,8 @@ async def database_runtime():
                     service = ChatService(repository, graph, executor, settings, summaries=summaries, observability=observability)
                     await service.reconcile_waiting_turns()
                     await summaries.recover()
+                    service.flywheel = flywheel
+                    flywheel.start()
                     yield service
                 finally:
                     # 摘要先收回，数据库与模型依赖随后关闭；外部取消不能跳过收尾。
@@ -179,10 +189,17 @@ async def database_runtime():
     finally:
         with anyio.CancelScope(shield=True):
             try:
-                if mcp is not None:
-                    await mcp.aclose()
-                if lease_engine is not None:
-                    await lease_engine.dispose()
+                try:
+                    if flywheel is not None:
+                        await flywheel.close()
+                finally:
+                    # 飞轮清理报错也继续释放其余依赖，原异常仍向外传播。
+                    try:
+                        if mcp is not None:
+                            await mcp.aclose()
+                    finally:
+                        if lease_engine is not None:
+                            await lease_engine.dispose()
             finally:
                 try:
                     await engine.dispose()

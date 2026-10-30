@@ -1,4 +1,4 @@
-"""CH09受控真实知识模型样例：默认图、原策略、独立SQLite及逐条原始流报告。"""
+"""CH09真实模型样例：自评走默认图与独立SQLite，飞轮走标准化/分页适配器，均保存原始流。"""
 
 import argparse
 import asyncio
@@ -119,6 +119,8 @@ async def evaluate(case: dict, directory: Path, config) -> dict:
 async def run(args) -> int:
     """执行冻结样例并保存模型/策略/样例指纹和每条原件。参数：CLI；返回：退出码；异常：路径/配置错误。"""
     from app.config import settings
+    if args.suite == "flywheel":
+        return await run_flywheel(args, settings)
     from app.knowledge.confidence import load_evidence_policy, evidence_policy_digest
     from app.knowledge.pipeline import production_protocols
     from app.workflow.prompts import KNOWLEDGE_PROMPT
@@ -147,10 +149,77 @@ async def run(args) -> int:
     return 0 if summary["passed"] == len(results) else 1
 
 
+async def run_flywheel(args, config) -> int:
+    """运行标注的真实标准化/逐页判重，不改写模型返回或连接应用库。
+
+    参数：CLI和正式模型配置；返回：全部通过为0，否则1。
+    异常：网络/结构问题保留逐条失败；报告写入错误传播。
+    """
+    from importlib.metadata import version
+    from app.core.llm import get_chat_model
+    from app.knowledge.flywheel import FlywheelModel, NORMALIZE_PROMPT, MATCH_PROMPT
+    from app.schemas.flywheel import ReviewCandidate
+    from tests.ch05_live_runtime import RecordingChat
+    paths = [ROOT / "tests/fixtures/ch09" / name for name in ("normalization_cases.json", "dedup_cases.json")]
+    groups = [json.loads(path.read_text(encoding="utf-8")) for path in paths]
+    cases = [{**case, "kind": kind} for kind, group in zip(("normalize", "match"), groups) for case in group]
+    if args.case:
+        cases = [case for case in cases if case["id"] == args.case]
+        if not cases:
+            raise ValueError("样例ID不存在")
+    output = args.output_dir.resolve() / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    output.mkdir(parents=True)
+    metadata = {"suite": "flywheel", "model": config.chat_model,
+        "versions": {name: version(name) for name in ("langchain-core", "langchain-openai", "pydantic", "SQLAlchemy")},
+        "datasets": {path.name: sha256(path.read_bytes()).hexdigest() for path in paths},
+        "prompt_sha256": sha256((NORMALIZE_PROMPT + MATCH_PROMPT).encode()).hexdigest(),
+        "limitation": "真实模型与正式适配器；受控手工标注样例与候选页，无生产数据库写入。字面检查辅以逐条语义复核，不能证明所有隐私或语义正确。示例答案永不自动批准。"}
+    save(output / "manifest.json", metadata)
+    results = []
+    for case in cases:
+        records, parsed, error = [], [], None
+        def factory(**options):
+            """参数：正式模型选项；返回：保留原流的透明包装；异常：模型配置错误。"""
+            return RecordingChat(get_chat_model(**options), records, case["kind"])
+        model = FlywheelModel(factory)
+        try:
+            async with asyncio.timeout(90):
+                if case["kind"] == "normalize":
+                    result = await model.normalize(case["raw_question"])
+                    parsed.append(result.model_dump(mode="json"))
+                    question = result.normalized_question
+                    checks = {"required": all(any(word in question for word in group) for group in case["required_groups"]),
+                        "privacy_and_conditions": not any(word in question + (result.ai_suggested_answer or "") for word in case["forbidden"]),
+                        "length": 1 <= len(question) <= 512,
+                        "no_unverified_answer": not case.get("expected_null_answer") or result.ai_suggested_answer is None,
+                        "reference_only": set(parsed[0]) == {"normalized_question", "ai_suggested_answer"}}
+                else:
+                    matched = None
+                    for page in case["pages"]:
+                        result = await model.match(case["question"], [ReviewCandidate.model_validate(row) for row in page])
+                        parsed.append(result.model_dump(mode="json"))
+                        if result.matched_review_id is not None:
+                            matched = result.matched_review_id
+                            break
+                    checks = {"matched_label": matched == case["expected"]}
+        except Exception as failure:
+            error = type(failure).__name__
+            checks = {"no_error": False}
+        row = {"id": case["id"], "case": case, "parsed": parsed, "records": records,
+            "checks": checks, "passed": all(checks.values()), "error_type": error}
+        save(output / (case["id"] + ".json"), row)
+        results.append(row)
+        print(json.dumps({key: row[key] for key in ("id", "passed", "checks", "error_type")}, ensure_ascii=False), flush=True)
+    summary = {**metadata, "passed": sum(row["passed"] for row in results), "total": len(results), "output": str(output)}
+    save(output / "summary.json", summary)
+    print(json.dumps(summary, ensure_ascii=False), flush=True)
+    return 0 if summary["passed"] == len(results) else 1
+
+
 def main() -> int:
-    """解析唯一自评套件参数。参数：命令行；返回：退出码；异常：参数或执行错误。"""
+    """解析自评或飞轮套件参数。参数：命令行；返回：退出码；异常：参数或执行错误。"""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--suite", choices=["self-check"], required=True)
+    parser.add_argument("--suite", choices=["self-check", "flywheel"], required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--case", help="仅重试指定失败样例ID，保留此前全部原件")
     return asyncio.run(run(parser.parse_args()))

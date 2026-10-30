@@ -87,3 +87,23 @@ class FeedbackReceipt(FlywheelContract):
 
     pool_id: DecimalId = Field(description="十进制正整数形式的问题池主键")
     matched_review_id: DecimalId | None = Field(default=None, description="已归并审核主键的十进制字符串，未处理时为空")
+
+
+class NormalizedGap(FlywheelContract):
+    """经隐私泛化的FAQ问题和仅供人工参考的示例答案。"""
+
+    normalized_question: str = Field(min_length=1, max_length=512, description="保留关键条件、去除私人身份的FAQ问题，不截断事实")
+    ai_suggested_answer: str | None = Field(description="仅供人工审核参考的示例答案；无法可靠建议时为null")
+
+
+class ReviewCandidate(FlywheelContract):
+    """单页中真实、尚未冻结的待审缺口。"""
+
+    id: PositiveId = Field(description="本页真实审核主键，只能原样选择")
+    normalized_question: str = Field(min_length=1, max_length=512, description="该待审缺口的标准问题")
+
+
+class MatchDecision(FlywheelContract):
+    """当前候选页的语义等价判定，不包含审核或发布权限。"""
+
+    matched_review_id: PositiveId | None = Field(description="本页语义相同的真实主键；没有重复为null")
