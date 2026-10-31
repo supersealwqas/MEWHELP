@@ -27,7 +27,7 @@ def _is_field_business_phrase(text: str) -> bool:
     """
     relation = r"(?:(?:不是|不为|并非|是|为)\s*[:：]?\s*)?"
     particles = r"[的了吗呢呀吧么过]*"
-    negative = r"(?:不用|无需|不必|没有|不|没|别)?"
+    negative = r"(?:不用|无需|无法|不必|没有|不|没|别)?"
     action = re.fullmatch(relation + negative + r"(?:" + _FIELD_MODAL + r"\s*)?" + negative +
                          r"(?:再|重新|再次|直接|继续|正常)?(?:修改|更改|变更|更换|填写|提供|确认|保留|删除|使用|配送|改|换|填|写|选|加|删)"
                          r"(?:一下|个人|本人|姓名|名字|地址|电话|错|漏|好|掉|过|"

@@ -157,3 +157,18 @@ async def test_personal_values_in_confirmation_questions_are_redacted(tmp_path, 
     assert all(fragment in outbound for fragment in structure)
     assert len(cleaned) <= len(original)
     assert clean_question(cleaned) == cleaned
+
+
+async def test_unavailable_field_action_keeps_business_meaning_in_payload(tmp_path):
+    """字段无法修改的否定动作不得被当成个人值遮盖。
+
+    参数：tmp_path为隔离预标记录目录。返回：None，检查实际外发载荷和最终预标原文。
+    异常：断言失败或预标校验错误。
+    """
+    import json
+    original = "地址是否无法修改？"
+    model = Model([dict(index=0, text=original, labels=["订单修改"], family="business", needs_review=False, review_reason="")])
+    result = await TopicLabeller(model, report_dir=tmp_path).label([original])
+    outbound = json.loads(model.messages[1].content)["items"][0]["text"]
+    assert outbound == original
+    assert result[0]["original_text"] == original
