@@ -191,19 +191,28 @@ def test_cli_trains_and_predicts_only_explicit_local_directories(trained_tiny, m
 
 
 def test_validation_early_stopping_patience_two_and_single_test_evaluation(tmp_path, cpu_offline, monkeypatch):
-    """捕获验证早停失效或多次消费测试集的错误。参数：目录、隔离、替换器；返回：无；异常：断言失败。"""
+    """捕获按损失误选模型、宏F1耐心失效或重复测试的错误。参数：目录、隔离、替换器；返回：无；异常：断言失败。"""
+    import torch
+    from transformers import AutoModelForSequenceClassification
     from app.topics import training
     base = tiny_base(tmp_path / "base")
     dataset = tiny_dataset(tmp_path / "dataset")
     evaluate = training._evaluate
     test_evaluations = []
+    validation_calls, first_state = [], {}
 
     def stable_validation(*args, **kwargs):
-        """保留真实前向，仅控制验证损失为固定值。参数：真实评估参数；返回：真实概率/固定验证分；异常：模型错误。"""
+        """保留真实训练/前向，让损失改善但后续验证宏F1变差。参数：评估参数；返回：受控验证概率/真实测试；异常：模型错误。"""
         result = evaluate(*args, **kwargs)
         rows = args[2]
         if rows[0]["id"].startswith("validation:"):
-            result["loss"] = 1.0
+            validation_calls.append(1)
+            state = args[0].state_dict()
+            if not first_state:
+                first_state.update({name: value.detach().clone() for name, value in state.items()})
+            first_checkpoint = all(torch.equal(value, first_state[name]) for name, value in state.items())
+            result["probabilities"] = [[.9] + [.02] * 16 if first_checkpoint else [.01] * 17 for _ in rows]
+            result["loss"] = max(.1, 1.0 - .1 * len(validation_calls))
         else:
             test_evaluations.append(1)
         return result
@@ -211,6 +220,12 @@ def test_validation_early_stopping_patience_two_and_single_test_evaluation(tmp_p
     monkeypatch.setattr(training, "_evaluate", stable_validation)
     report = training.train_model(dataset, base, tmp_path / "early", epochs=8, max_length=16)
     assert len(report["epochs"]) == 3 and report["best_epoch"] == 1
+    assert [row["validation_macro_f1"] for row in report["epochs"]] == [1.0, 0.0, 0.0]
+    assert [row["validation_threshold"] for row in report["epochs"]] == [.5, .5, .5]
+    assert report["validation_macro_f1"] == 1.0
+    exported = AutoModelForSequenceClassification.from_pretrained(tmp_path / "early/model", local_files_only=True, use_safetensors=True)
+    for name, value in exported.state_dict().items():
+        torch.testing.assert_close(value, first_state[name], atol=0, rtol=0)
     assert report["test_evaluations"] == 1 and test_evaluations == [1]
 
 
@@ -240,3 +255,40 @@ def test_untracked_base_file_cannot_override_verified_tokenizer(tmp_path, cpu_of
     (base / "untracked.json").write_text("{}", encoding="utf-8")
     with pytest.raises(ValueError):
         train_model(dataset, base, tmp_path / "invalid-extra", epochs=1, max_length=16)
+
+
+def test_training_policy_is_archived_before_epoch_and_export_is_standalone(tmp_path, cpu_offline, monkeypatch):
+    """捕获训练后才选择规则、独立模型缺少完整参数的错误。参数：目录、隔离、替换器；返回：无；异常：断言失败。"""
+    import shutil
+    from app.topics import training
+    from app.topics.inference import TopicPredictor
+    base = tiny_base(tmp_path / "base")
+    dataset = tiny_dataset(tmp_path / "dataset")
+    output = tmp_path / "policy-training"
+    archived = []
+    real_train_epoch = training._train_epoch
+
+    def observe_first_epoch(*args, **kwargs):
+        """读取首轮实际更新前的归档，不替代训练。参数：训练参数；返回：真实结果；异常：训练错误。"""
+        archived.append(json.loads((output / "training.json").read_text(encoding="utf-8")))
+        return real_train_epoch(*args, **kwargs)
+
+    monkeypatch.setattr(training, "_train_epoch", observe_first_epoch)
+    training.train_model(dataset, base, output, epochs=1, max_length=16, seed=19)
+    assert archived[0]["status"] == "running" and archived[0]["epochs"] == []
+    plan = archived[0]["evaluation_plan"]
+    assert plan["threshold_candidates"] == [.1, .15, .2, .25, .3, .35, .4, .45, .5, .55, .6, .65, .7, .75, .8, .85, .9]
+    assert plan["threshold_selection"] == ["supported_macro_f1_desc", "exact_match_desc", "distance_to_0.5_asc"]
+    assert plan["checkpoint_metric"] == "supported_macro_f1" and plan["early_stopping_patience"] == 2
+    assert plan["threshold_source"] == "validation" and plan["test_evaluations"] == 1
+    standalone = tmp_path / "standalone"
+    shutil.copytree(output / "model", standalone)
+    (output / "training.json").unlink()
+    predictor = TopicPredictor(standalone)
+    settings = predictor.metadata["training"]
+    assert settings["seed"] == 19 and settings["evaluation_plan"] == plan
+    config = settings["configuration"]
+    assert config["epochs"] == 1 and config["micro_batch"] == 2 and config["accumulate"] == 8
+    assert config["max_length"] == 16 and config["learning_rate"] == 2e-5 and config["weight_decay"] == .01
+    assert config["optimizer"] == "AdamW" and config["gradient_clip_norm"] == 1.0
+    assert len(predictor.predict(["我要退货"])[0]["probabilities"]) == 17

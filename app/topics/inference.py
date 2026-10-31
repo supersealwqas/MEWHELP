@@ -7,7 +7,7 @@ import os
 from copy import deepcopy
 from pathlib import Path
 
-from app.topics.metrics import decode_labels
+from app.topics.metrics import decode_labels, evaluation_plan
 from app.topics.taxonomy import label_names, load_taxonomy, taxonomy_digest
 
 
@@ -34,7 +34,7 @@ def validate_model_package(model_dir: Path) -> dict:
         directory = Path(model_dir)
         manifest = json.loads((directory / "topic_manifest.json").read_text(encoding="utf-8"))
         required = {"version", "taxonomy", "taxonomy_digest", "threshold", "base", "training_sha256", "data_sha256",
-                    "annotation_status", "max_length", "model_files"}
+                    "annotation_status", "max_length", "model_files", "training"}
         if not required <= manifest.keys() or not isinstance(manifest["version"], str) or not manifest["version"]:
             raise ValueError("模型清单缺少字段")
         taxonomy = load_taxonomy()
@@ -45,6 +45,25 @@ def validate_model_package(model_dir: Path) -> dict:
             raise ValueError("模型阈值非法")
         if type(manifest["max_length"]) is not int or manifest["max_length"] < 2:
             raise ValueError("模型截断长度非法")
+        training = manifest["training"]
+        if not isinstance(training, dict) or type(training.get("seed")) is not int:
+            raise ValueError("模型包缺少合法训练种子")
+        if training.get("evaluation_plan") != evaluation_plan():
+            raise ValueError("模型训练评价方案缺失或与固定规则不一致")
+        configuration = training.get("configuration")
+        if not isinstance(configuration, dict):
+            raise ValueError("模型包训练配置缺失")
+        for key in ("epochs", "micro_batch", "accumulate", "max_length"):
+            if type(configuration.get(key)) is not int or configuration[key] < 1:
+                raise ValueError("模型包训练批次或轮数非法")
+        if configuration["max_length"] != manifest["max_length"]:
+            raise ValueError("模型包训练长度与推理长度不一致")
+        fixed = dict(learning_rate=2e-5, weight_decay=.01, early_stopping_patience=2, optimizer="AdamW",
+                     problem_type="multi_label_classification", gradient_clip_norm=1.0,
+                     gradient_checkpointing=dict(enabled=True, use_reentrant=False),
+                     amp=dict(enabled_on="cuda", dtype="float16", init_scale=1024), shuffle="seed_plus_epoch")
+        if any(configuration.get(key) != value for key, value in fixed.items()):
+            raise ValueError("模型包训练优化与精度配置缺失或不符合本章规则")
         for key in ("training_sha256", "data_sha256"):
             digest = manifest[key]
             if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):

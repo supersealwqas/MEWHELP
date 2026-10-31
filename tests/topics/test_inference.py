@@ -27,7 +27,8 @@ def test_predictor_validates_text_and_reports_truncation_and_readonly_metadata(t
             predictor.predict(texts)
 
 
-@pytest.mark.parametrize("mutation", ["missing", "weights", "taxonomy", "dimension", "extra", "head"])
+@pytest.mark.parametrize("mutation", ["missing", "weights", "taxonomy", "dimension", "extra", "head",
+                                      "training_missing", "training_seed", "training_policy", "training_parameters"])
 def test_predictor_rejects_incomplete_or_mismatched_model_package(trained_tiny, mutation):
     """捕获模型缺失、SHA破坏与主题映射错配的错误。参数：制品、破坏方式；返回：无；异常：断言失败。"""
     from app.topics.inference import TopicPredictor
@@ -51,6 +52,16 @@ def test_predictor_rejects_incomplete_or_mismatched_model_package(trained_tiny, 
         state.pop("classifier.weight")
         save_file(state, path, metadata={"format": "pt"})
         manifest["model_files"]["model.safetensors"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+    elif mutation.startswith("training_"):
+        if mutation == "training_missing":
+            manifest.pop("training", None)
+        elif mutation == "training_seed":
+            manifest.setdefault("training", {})["seed"] = True
+        elif mutation == "training_policy":
+            manifest.setdefault("training", {})["evaluation_plan"] = {"threshold_source": "test"}
+        else:
+            manifest.setdefault("training", {})["configuration"] = {"epochs": 0}
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
     else:
         path = model_dir / "config.json"
@@ -151,3 +162,90 @@ def test_service_import_and_health_need_no_torch_or_chat_configuration(tmp_path,
     with TestClient(create_app(lambda: None)) as client:
         assert client.get("/health").status_code == 503
         assert client.post("/classify", json={"texts": ["退货"]}).status_code == 503
+
+
+async def test_cancelled_request_keeps_slot_until_real_worker_finishes(trained_tiny, monkeypatch):
+    """捕获取消请求后旧线程仍运行却放行新推理的错误。参数：制品、替换器；返回：无；异常：断言失败。"""
+    import asyncio
+    from fastapi import HTTPException
+    from starlette.requests import Request
+    from app.topics.inference import TopicPredictor
+    from app.topic_service import ClassifyRequest, create_app
+    predictor = TopicPredictor(trained_tiny[2] / "model")
+    real_predict = predictor.predict
+    entered, release, finished = Event(), Event(), Event()
+
+    def blocking_predict(texts):
+        """仅阻塞首次真实计算，保留分词和解码。参数：文本；返回：真实预测；异常：阻塞失败AssertionError。"""
+        if texts[0] == "阻塞首次":
+            entered.set()
+            try:
+                assert release.wait(10)
+                return real_predict(texts)
+            finally:
+                finished.set()
+        return real_predict(texts)
+
+    monkeypatch.setattr(predictor, "predict", blocking_predict)
+    application = create_app(lambda: predictor)
+    endpoint = next(route.endpoint for route in application.routes if getattr(route, "path", None) == "/classify")
+    request = Request({"type": "http", "app": application})
+    async with application.router.lifespan_context(application):
+        task = asyncio.create_task(endpoint(ClassifyRequest(texts=["阻塞首次"]), request))
+        try:
+            assert await asyncio.to_thread(entered.wait, 10)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            with pytest.raises(HTTPException) as busy:
+                await endpoint(ClassifyRequest(texts=["我要退货"]), request)
+            assert busy.value.status_code == 503 and not finished.is_set()
+        finally:
+            release.set()
+            assert await asyncio.to_thread(finished.wait, 10)
+        recovered = await endpoint(ClassifyRequest(texts=["我要退货"]), request)
+        assert len(recovered["results"]) == 1
+
+
+async def test_timeout_returns_504_and_holds_slot_until_worker_finishes(trained_tiny, monkeypatch):
+    """捕获服务无限等待或超时提前释放真实计算槽的错误。参数：制品、替换器；返回：无；异常：断言失败。"""
+    import asyncio
+    import time
+    from fastapi import HTTPException
+    from starlette.requests import Request
+    from app.topics.inference import TopicPredictor
+    from app.topic_service import ClassifyRequest, create_app
+    predictor = TopicPredictor(trained_tiny[2] / "model")
+    real_predict = predictor.predict
+    entered, release, finished = Event(), Event(), Event()
+
+    def blocking_predict(texts):
+        """只阻塞指定实际预测。参数：文本；返回：真实预测；异常：阻塞失败AssertionError。"""
+        entered.set()
+        try:
+            assert release.wait(10)
+            return real_predict(texts)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(predictor, "predict", blocking_predict)
+    application = create_app(lambda: predictor, inference_timeout=.03)
+    endpoint = next(route.endpoint for route in application.routes if getattr(route, "path", None) == "/classify")
+    request = Request({"type": "http", "app": application})
+    async with application.router.lifespan_context(application):
+        started = time.monotonic()
+        try:
+            with pytest.raises(HTTPException) as timeout:
+                await endpoint(ClassifyRequest(texts=["私密输入"]), request)
+            assert timeout.value.status_code == 504 and time.monotonic() - started < 2
+            assert "私密输入" not in str(timeout.value.detail)
+            assert entered.is_set() and not finished.is_set()
+            with pytest.raises(HTTPException) as busy:
+                await endpoint(ClassifyRequest(texts=["我要退货"]), request)
+            assert busy.value.status_code == 503
+        finally:
+            release.set()
+            assert await asyncio.to_thread(finished.wait, 10)
+        monkeypatch.setattr(predictor, "predict", real_predict)
+        recovered = await endpoint(ClassifyRequest(texts=["我要退货"]), request)
+        assert len(recovered["results"]) == 1

@@ -5,6 +5,17 @@ import math
 from app.topics.taxonomy import label_names, validate_labels
 
 
+def evaluation_plan() -> dict:
+    """返回训练前固定且可归档的评价规则。参数：无；返回：阈值候选、选模和测试方案副本；异常：无。"""
+    return dict(threshold_candidates=[candidate / 100 for candidate in range(10, 91, 5)],
+                threshold_source="validation", epoch_threshold="select_global_threshold_each_epoch",
+                threshold_selection=["supported_macro_f1_desc", "exact_match_desc", "distance_to_0.5_asc"],
+                checkpoint_metric="supported_macro_f1", checkpoint_improvement="strictly_greater",
+                checkpoint_tie="keep_earlier", early_stopping_patience=2,
+                unsupported_policy="exclude_from_macro_f1_and_report", test_evaluations=1,
+                test_timing="after_checkpoint_and_threshold_selection")
+
+
 def _probabilities(values, taxonomy: dict) -> list[float]:
     """校验一行模型概率。参数：values17维概率、taxonomy主题表；返回：浮点列表；异常：ValueError。"""
     try:
@@ -75,11 +86,10 @@ def select_threshold(probabilities, targets, taxonomy: dict) -> float:
     expected = [[name for name, value in zip(names, row) if value] for row in targets]
     best_threshold, best_score = .5, None
     # 用整数生成候选，避免浮点累加改变边界概率与稳定平局规则。
-    for candidate in range(10, 91, 5):
-        threshold = candidate / 100
+    for threshold in evaluation_plan()["threshold_candidates"]:
         report = compute_metrics(expected, [decode_labels(row, threshold, taxonomy) for row in probabilities], taxonomy)
         score = (report["macro_f1"] if report["macro_f1"] is not None else -1,
-                 report["exact_match"], -abs(threshold - .5))
+                 report["exact_match"], -abs(round(threshold * 100) - 50))
         if best_score is None or score > best_score:
             best_threshold, best_score = threshold, score
     return best_threshold

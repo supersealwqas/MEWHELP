@@ -9,7 +9,7 @@ from pathlib import Path
 
 from app.topics.data import validate_dataset
 from app.topics.inference import file_sha256, validate_model_package
-from app.topics.metrics import compute_metrics, decode_labels, select_threshold
+from app.topics.metrics import compute_metrics, decode_labels, evaluation_plan, select_threshold
 from app.topics.taxonomy import label_names, load_taxonomy, taxonomy_digest
 
 OFFICIAL_REPO = "hfl/chinese-roberta-wwm-ext"
@@ -165,7 +165,11 @@ def train_model(dataset_dir: Path, base_dir: Path, output_dir: Path, *, epochs=8
     output_dir.mkdir(parents=True, exist_ok=False)
     report = dict(status="running", epochs=[], optimizer_steps=0, seed=seed,
                   configuration=dict(epochs=epochs, micro_batch=micro_batch, accumulate=accumulate, max_length=max_length,
-                                     learning_rate=2e-5, weight_decay=.01, early_stopping_patience=2),
+                                     learning_rate=2e-5, weight_decay=.01, early_stopping_patience=2, optimizer="AdamW",
+                                     problem_type="multi_label_classification", gradient_clip_norm=1.0,
+                                     gradient_checkpointing=dict(enabled=True, use_reentrant=False),
+                                     amp=dict(enabled_on="cuda", dtype="float16", init_scale=1024),
+                                     shuffle="seed_plus_epoch"), evaluation_plan=evaluation_plan(),
                   taxonomy_digest=taxonomy_digest(taxonomy), data_sha256=file_sha256(dataset_dir / "manifest.json"),
                   base=source, annotation_status=dataset_manifest["human_review_status"],
                   annotation_counts=dict(Counter(row["annotation_status"] for rows in parts.values() for row in rows)))
@@ -202,7 +206,7 @@ def train_model(dataset_dir: Path, base_dir: Path, output_dir: Path, *, epochs=8
                       total_parameters=sum(p.numel() for p in model.parameters()), label_dtype="float32",
                       loading=json.loads(json.dumps(loading, default=list)))
         _write_json(state_path, report)
-        best_loss, stale, best_epoch = math.inf, 0, None
+        best_macro_f1, stale, best_epoch = -math.inf, 0, None
         for epoch in range(1, epochs + 1):
             shuffled = list(parts["train"])
             random.Random(seed + epoch).shuffle(shuffled)
@@ -210,19 +214,30 @@ def train_model(dataset_dir: Path, base_dir: Path, output_dir: Path, *, epochs=8
                                     micro_batch=micro_batch, accumulate=accumulate, max_length=max_length)
             validation = _evaluate(model, tokenizer, parts["validation"], taxonomy, device=device,
                                    micro_batch=micro_batch, max_length=max_length)
+            validation_threshold = select_threshold(validation["probabilities"], validation["targets"], taxonomy)
+            validation_metrics = compute_metrics([row["labels"] for row in parts["validation"]],
+                                                 [decode_labels(row, validation_threshold, taxonomy)
+                                                  for row in validation["probabilities"]], taxonomy)
+            macro_f1 = validation_metrics["macro_f1"]
+            if macro_f1 is None:
+                raise ValueError("验证集没有有支持类别，无法按宏F1选择模型")
             report["optimizer_steps"] += training["optimizer_steps"]
-            if validation["loss"] < best_loss:
-                best_loss, stale, best_epoch = validation["loss"], 0, epoch
+            # 训练前已归档每轮验证阈值和宏F1口径；损失仅记录，不参与选模或早停。
+            if macro_f1 > best_macro_f1:
+                best_macro_f1, stale, best_epoch = macro_f1, 0, epoch
                 model.save_pretrained(staging)
             else:
                 stale += 1
             report["epochs"].append(dict(epoch=epoch, **training, validation_loss=validation["loss"],
+                                          validation_macro_f1=macro_f1, validation_threshold=validation_threshold,
+                                          validation_exact_match=validation_metrics["exact_match"],
+                                          validation_unsupported=validation_metrics["unsupported"],
                                           best_epoch=best_epoch, stale_epochs=stale))
             _write_json(state_path, report)
             print(json.dumps(report["epochs"][-1], ensure_ascii=False), flush=True)
-            if stale >= 2:
+            if stale >= report["evaluation_plan"]["early_stopping_patience"]:
                 break
-        # 只从最佳验证损失模型选择阈值；测试集合不参与早停或阈值选择。
+        # 只从最佳验证宏F1模型确定导出阈值；测试集合不参与早停或阈值选择。
         del optimizer, scaler, model
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -231,6 +246,8 @@ def train_model(dataset_dir: Path, base_dir: Path, output_dir: Path, *, epochs=8
         validation = _evaluate(model, tokenizer, parts["validation"], taxonomy, device=device,
                                micro_batch=micro_batch, max_length=max_length)
         threshold = select_threshold(validation["probabilities"], validation["targets"], taxonomy)
+        validation_metrics = compute_metrics([row["labels"] for row in parts["validation"]],
+                                             [decode_labels(row, threshold, taxonomy) for row in validation["probabilities"]], taxonomy)
         tokenizer.save_pretrained(staging)
         test = _evaluate(model, tokenizer, parts["test"], taxonomy, device=device,
                          micro_batch=micro_batch, max_length=max_length)
@@ -241,12 +258,14 @@ def train_model(dataset_dir: Path, base_dir: Path, output_dir: Path, *, epochs=8
             predictions.append(dict(labels=labels, probabilities=values, uncertain=not labels, truncated=len(ids) > max_length))
         _test_reports(output_dir, parts["test"], predictions, taxonomy)
         report.update(status="completed", best_epoch=best_epoch, threshold=threshold,
-                      validation_loss=validation["loss"], test_loss=test["loss"], test_evaluations=1)
+                      validation_loss=validation["loss"], validation_macro_f1=validation_metrics["macro_f1"],
+                      test_loss=test["loss"], test_evaluations=1)
         _write_json(state_path, report)
         training_sha = file_sha256(state_path)
         manifest = dict(version="ch10-topic-" + training_sha[:16], taxonomy=taxonomy, taxonomy_digest=taxonomy_digest(taxonomy),
                         threshold=threshold, base=source, training_sha256=training_sha, data_sha256=report["data_sha256"],
                         annotation_status=report["annotation_status"], max_length=max_length,
+                        training=dict(seed=seed, configuration=report["configuration"], evaluation_plan=report["evaluation_plan"]),
                         model_files={path.relative_to(staging).as_posix(): file_sha256(path) for path in staging.rglob("*") if path.is_file()})
         _write_json(staging / "topic_manifest.json", manifest)
         validate_model_package(staging)
