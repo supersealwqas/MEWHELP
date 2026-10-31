@@ -33,6 +33,7 @@ svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width:
 
 /* 桌面保留呼吸空间；实际聊天区域保持稳定高度，增量消息不会推走输入框。 */
 .page-shell { width: min(1280px, calc(100% - 64px)); margin: 0 auto; }
+.workspace-nav { display:flex; flex-wrap:wrap; align-items:center; justify-content:flex-end; gap:16px; }
 .chat-layout { display: grid; grid-template-columns: 228px minmax(0, 1fr); gap: 18px; align-items: start; }
 .history-panel { max-height: min(780px, calc(100dvh - 154px)); overflow: auto; background: var(--surface); border: 1px solid var(--border); border-radius: 20px; }
 .history-panel summary { padding: 19px 16px; cursor: pointer; font-weight: 650; }
@@ -136,7 +137,8 @@ kbd { font: inherit; }
 /* 小屏不挤压消息与操作按钮；低高度横屏允许整页滚动，避免键盘遮住输入区。 */
 @media (max-width: 640px) {
   .page-shell { width: calc(100% - 24px); }
-  .site-header { height: 78px; }
+  .site-header { min-height:78px; height:auto; flex-wrap:wrap; gap:12px; padding:16px 0; }
+  .workspace-nav { gap:12px; }
   .brand-name { font-size: 20px; }
   .brand-caption { font-size: 11px; }
   .chat-card { border-radius: 20px; height: calc(100dvh - 146px); min-height: 520px; }

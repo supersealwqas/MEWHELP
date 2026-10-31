@@ -1,4 +1,4 @@
-/** 完成回答的引用阅读面板与本地一次性反馈，不发送评价网络请求。 */
+/** 完成回答的引用阅读面板与原轮反馈；负面反馈以服务端成功回执为准。 */
 import { renderMarkdown } from "./markdown.mjs";
 
 /** 创建纯文本节点；参数为标签、文字与可选类名；返回元素，不解释HTML。 */
@@ -85,7 +85,7 @@ async function openCitation(url, number) {
   }
 }
 
-/** 仅在收到完成帧后启用引用与本地反馈；参数为气泡、完整回答和已验证元数据。 */
+/** 仅在收到完成帧后启用引用与原轮反馈；参数为气泡、完整回答和已验证元数据。 */
 export function attachAnswerTools(reply, answer, metadata) {
   reply.bubble.innerHTML = renderMarkdown(answer, metadata.citations);
   const prefix = `/api/chat/${encodeURIComponent(metadata.session_id)}/turns/${encodeURIComponent(metadata.turn_id)}/citations/`;
@@ -99,32 +99,59 @@ export function attachAnswerTools(reply, answer, metadata) {
   feedback.setAttribute("aria-label", "评价这条回答");
   const useful = element("button", "👍 有帮助", "feedback-choice");
   const unhelpful = element("button", "👎 没帮助", "feedback-choice");
-  const status = element("span", "仅保存在本浏览器", "feedback-note");
+  const status = element("span", "没解决的问题可提交给客服改进", "feedback-note");
   status.setAttribute("aria-live", "polite");
-  const key = `mewhelp:answer-feedback:${metadata.session_id}:${metadata.turn_id}`;
+  // 新键绑定用户且只接受服务端回执；旧版的本地 down 不能冒充已入池。
+  const key = `mewhelp:answer-feedback:v2:${metadata.user_id}:${metadata.session_id}:${metadata.turn_id}`;
   let choice = null;
+  let pending = false;
   try {
     const stored = JSON.parse(localStorage.getItem(key));
-    if (["up", "down"].includes(stored?.choice)) choice = stored.choice;
-  } catch { /* 禁止本地存储时，本页仍可选择一次。 */ }
+    if (stored?.choice === "up" || (stored?.choice === "down" && typeof stored.pool_id === "string" && /^[1-9][0-9]*$/.test(stored.pool_id))) choice = stored.choice;
+  } catch { /* 禁止本地存储时，后端仍提供原轮幂等保证。 */ }
   function paintChoice() {
-    useful.disabled = unhelpful.disabled = Boolean(choice);
+    useful.disabled = pending || Boolean(choice);
+    unhelpful.disabled = pending || choice === "down";
     useful.setAttribute("aria-pressed", String(choice === "up"));
     unhelpful.setAttribute("aria-pressed", String(choice === "down"));
-    if (choice) status.textContent = "已反馈 · 仅保存在本浏览器";
+    if (choice === "down") status.textContent = "已提交 · 我们会用这条反馈改进回答";
+    else if (choice === "up") status.textContent = "谢谢反馈 · 已记在本浏览器";
   }
-  for (const [button, value] of [[useful, "up"], [unhelpful, "down"]]) {
-    button.type = "button";
-    button.addEventListener("click", function chooseFeedback() {
-      if (choice) return;
-      choice = value;
+  useful.type = unhelpful.type = "button";
+  useful.addEventListener("click", () => {
+    if (pending || choice) return;
+    choice = "up";
+    try { localStorage.setItem(key, JSON.stringify({ choice })); } catch { /* 仍保留当前页面选择。 */ }
+    paintChoice();
+  });
+  unhelpful.addEventListener("click", async () => {
+    if (pending || choice === "down") return;
+    pending = true;
+    paintChoice();
+    status.textContent = "正在提交…";
+    try {
+      const response = await fetch(`/api/chat/${encodeURIComponent(metadata.session_id)}/turns/${encodeURIComponent(metadata.turn_id)}/feedback`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user_id: metadata.user_id, resolved: false }),
+      });
+      let receipt;
+      try { receipt = await response.json(); }
+      catch { throw new Error("提交暂未确认，请再试一次。"); }
+      if (!response.ok || typeof receipt?.pool_id !== "string" || !/^[1-9][0-9]*$/.test(receipt.pool_id)) {
+        throw new Error(response.status === 409 ? "这轮还未完整结束，请稍后重试。" : "提交暂未成功，请再试一次。");
+      }
+      choice = "down";
+      try { localStorage.setItem(key, JSON.stringify({ choice, pool_id: receipt.pool_id })); }
+      catch { /* 回执已成功；刷新后的重复请求由服务器去重。 */ }
+    } catch (error) {
+      status.textContent = error instanceof TypeError ? "网络暂时不可用，请重试。" : error.message;
+    } finally {
+      pending = false;
+      const message = status.textContent;
       paintChoice();
-      try {
-        localStorage.setItem(key, JSON.stringify({ session_id: metadata.session_id, turn_id: metadata.turn_id,
-          choice, at: new Date().toISOString() }));
-      } catch { status.textContent = "已反馈 · 仅在本页保留"; }
-    });
-  }
+      if (choice !== "down") status.textContent = message;
+    }
+  });
   feedback.append(useful, unhelpful, status);
   reply.bubble.parentElement.after(feedback);
   paintChoice();

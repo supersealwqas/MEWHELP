@@ -1,0 +1,36 @@
+<!doctype html>
+<!-- CH09 人工审核与用量后台：只展示服务端原件，人工正文明确提交后才发布。 -->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#285b49">
+<title>知识改进 · MewHelp</title>
+<link rel="icon" href="/static/mew.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/flywheel.css">
+<script type="module" src="/static/flywheel.mjs"></script>
+</head>
+<body class="fw-page">
+<a class="fw-skip" href="#review-list">跳到待审问题</a>
+<div class="fw-shell">
+<header class="fw-header">
+<a class="fw-brand" href="/"><img src="/static/mew.svg" width="40" height="40" alt="">MewHelp <span>客服工作台</span></a>
+<nav class="fw-nav" aria-label="工作台导航"><a href="/">对话</a><a href="/flywheel" aria-current="page">知识改进</a><a href="/rag-eval">质量评估</a></nav>
+</header>
+<main>
+<div class="fw-intro"><div><p class="fw-eyebrow">从一次没答好，到下一次有答案</p><h1>知识改进</h1><p>核对用户原话和当时的检索证据，再把确认好的答案补进知识库。</p></div><a class="fw-button fw-secondary" href="/rag-eval">查看回答质量 →</a></div>
+<section class="fw-section" aria-labelledby="queue-title">
+<div class="fw-section-heading"><div><h2 id="queue-title">审核队列</h2><p class="fw-muted">相似问题归在一起；示例答案仅供参考。</p></div>
+<div class="fw-actions"><button id="process-gaps" class="fw-button fw-secondary" type="button">整理新问题</button><button id="refresh-reviews" class="fw-button fw-secondary" type="button">刷新队列</button></div></div>
+<div class="fw-toolbar"><label for="review-status">审核状态</label><select id="review-status"><option value="待审">待审</option><option value="通过">通过</option><option value="驳回">驳回</option><option value="">全部状态</option></select><span id="queue-status" class="fw-muted" role="status"></span></div>
+<div class="fw-review-layout"><div><div id="review-list" class="fw-review-list" aria-label="问题列表"></div><button id="more-reviews" class="fw-button fw-secondary" type="button" hidden>加载更多问题</button></div>
+<section id="review-detail" class="fw-detail" aria-label="审核详情" aria-live="polite"><div class="fw-empty"><h3>选择一个问题</h3><p>这里会展示原话、检索证据和审核操作。</p></div></section></div>
+</section>
+<section class="fw-section" aria-labelledby="usage-title">
+<div class="fw-section-heading"><div><p class="fw-eyebrow">真实模型用量</p><h2 id="usage-title">哪些问题消耗了多少 token</h2><p class="fw-muted">Token 是模型处理文字的计量单位。只统计模型实际报告的已知部分。</p></div></div>
+<form id="usage-form" class="fw-toolbar"><label>开始时间<input id="usage-from" type="datetime-local" required></label><label>结束时间<input id="usage-to" type="datetime-local" required></label><button id="refresh-usage" class="fw-button fw-secondary" type="submit">查询用量</button></form>
+<p id="usage-status" class="fw-muted" role="status">正在读取用量…</p><div id="usage-summary" class="fw-stats"></div><div id="usage-groups" class="fw-table-wrap"></div>
+<p class="fw-footnote">时间按当前设备时区输入；结束时间不计入窗口。占比以所有分组的已知 token 为分母。刚完成的调用可能延迟出现，金额暂无可靠来源。</p>
+</section>
+</main><footer class="fw-footer">MewHelp · 每一次改进，都保留来处</footer>
+</div></body></html>

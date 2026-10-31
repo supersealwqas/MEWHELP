@@ -1,12 +1,11 @@
-/** 评估页行为回归：执行生产HTML的原脚本，仅替换DOM、网络与定时器边界。 */
+/** 评估页行为回归：执行页面同源模块，仅替换DOM、网络与定时器边界。 */
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
 import { setImmediate } from "node:timers/promises";
 
-const html = readFileSync(new URL("../../app/static/rag-eval.html", import.meta.url), "utf8");
-const script = html.match(/<script type="module">([\s\S]*?)<\/script>/)[1];
+const script = readFileSync(new URL("../../app/static/rag-eval.mjs", import.meta.url), "utf8");
 const OVERVIEW = "/api/rag-eval/overview";
 const JOB = "/api/rag-eval/job";
 const RERUN = "/api/rag-eval/rerun";
@@ -62,7 +61,7 @@ function setup() {
     setTimeout(callback, delay) { const id = ++timerId; timers.set(id, { callback, delay }); return id; },
     clearTimeout(id) { timers.delete(id); },
   });
-  vm.runInContext(script, context, { filename: "app/static/rag-eval.html:inline" });
+  vm.runInContext(script, context, { filename: "app/static/rag-eval.mjs" });
   return { requests, timers, node: document.getElementById,
     async respond(index, body, status = 200) {
       assert.ok(requests[index], `缺少第${index + 1}个网络请求`);
