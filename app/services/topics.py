@@ -62,6 +62,27 @@ class TopicBatchService:
             occurred_at=datetime.now(timezone.utc).isoformat(timespec="microseconds"))
         self._state.update(status="failed", error=self._local_attempt_error)
 
+    async def _record_terminal_state(self, lease, scan, *, status, error):
+        """记录本轮终止事实，仅确认持锁后发布共享结果。
+
+        参数：lease为本轮共同租约；scan为扫描字典或None；status为failed/cancelled；error为已脱敏错误字典。
+        返回：None。异常：写盘OSError或取消CancelledError；核锁失败转为独立中断证据。
+        """
+        if scan:
+            scan.update(status=status, error=error)
+        self._state.update(status=status, last_batch=scan, error=error,
+            updated_at=datetime.now(timezone.utc).isoformat(timespec="microseconds"))
+        try:
+            await lease.assert_held()
+        except Exception:
+            # 接手者可能已恢复同一scan_id，独立随机文件不能覆盖其扫描原件或当前指针。
+            atomic_json(self.root / f"interrupted-{uuid4().hex}.json",
+                {**self._state, "database": self.config.mysql_database})
+        else:
+            if scan:
+                self._write_scan(scan)
+            self._set_state(status=status, last_batch=scan, error=error)
+
     def _new_scan(self, high_watermark, reclassify):
         """创建独立扫描轮次。参数：冻结上界/重跑开关；返回：扫描字典；异常：无。"""
         return dict(database=self.config.mysql_database, batch_id=uuid4().hex, status="running",
@@ -150,12 +171,15 @@ class TopicBatchService:
         """持共同锁执行完整扫描，高水位后新行留下一轮。参数：lease/重跑/自动最小批限制；返回：扫描报告；异常：取消传播，其余写真实失败状态。"""
         scan = None
         current_ids = []
-        self._set_state(status="running", error=None)
         try:
+            # 后台任务可能在首次调度前已失锁，取得过租约不足以授权当前写盘。
+            await lease.assert_held()
+            self._set_state(status="running", error=None)
             if self._closing:
                 raise RuntimeError("主题服务已关闭")
             # 即使零候选也先确认依赖，不能把服务不可用解释成空数据。
             health = await self._identity(await self.client.get(self.config.topic_service_url + "/health", timeout=35))
+            await lease.assert_held()
             if health.get("status") != "ready":
                 raise ValueError("主题服务未就绪")
             scan = self._read(self.root / "scan.json")
@@ -165,6 +189,7 @@ class TopicBatchService:
                 await self._recover(scan, lease)
             else:
                 high = await self.repository.high_watermark()
+                await lease.assert_held()
                 if automatic:
                     pending = await self.repository.pending(self.config.topic_batch_min_size)
                     await lease.assert_held()
@@ -208,6 +233,8 @@ class TopicBatchService:
                 scan["pending_batch"] = batch["batch_id"]
                 self._write_scan(scan)
                 await self.repository.save(saved, lease=lease)
+                # 提交等待返回时也可能失锁，不能据旧连接的返回覆盖接手者已确认的批次。
+                await lease.assert_held()
                 self._complete_batch(scan, batch)
                 current_ids = []
             # 零高水位不进入循环；最终完成和高水位游标更新仍必须受原租约保护。
@@ -217,20 +244,15 @@ class TopicBatchService:
             self._set_state(status="complete", last_batch=scan, error=None)
             return scan
         except asyncio.CancelledError:
-            if scan:
-                scan.update(status="cancelled", error=dict(type="CancelledError", message="主题批次已取消，未确认游标不推进"))
-                self._write_scan(scan)
-            self._set_state(status="cancelled", last_batch=scan, error=dict(type="CancelledError"))
+            await self._record_terminal_state(lease, scan, status="cancelled",
+                error=dict(type="CancelledError", message="主题批次已取消，未确认游标不推进"))
             raise
         except Exception as error:
             # 错误只公开类型和稳定摘要，不暴露问题文本、凭据或驱动内部地址。
             summary = dict(type=type(error).__name__, message="主题依赖或批次核验失败，保留原件与游标供重试",
                            question_ids=current_ids)
-            if scan:
-                scan.update(status="failed", error=summary)
-                self._write_scan(scan)
-            self._set_state(status="failed", last_batch=scan, error=summary)
-            return scan or dict(batch_id=None, status="failed", counts=dict(checked=0, saved=0, uncertain=0),
+            await self._record_terminal_state(lease, scan, status="failed", error=summary)
+            return scan or dict(batch_id=None, status="failed", cursor="0", counts=dict(checked=0, saved=0, uncertain=0),
                                 model_version="unknown", error=summary)
 
     async def process(self, *, reclassify=False):
@@ -278,6 +300,7 @@ class TopicBatchService:
                     self._leases.pop(asyncio.current_task(), None)
                     self._active.discard(asyncio.current_task())
         try:
+            await lease.assert_held()
             self._set_state(status="running", error=None)
             task = asyncio.create_task(run(), context=Context())
             self._active.add(task)

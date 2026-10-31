@@ -103,7 +103,7 @@ def _train_epoch(model, tokenizer, rows: list[dict], taxonomy: dict, optimizer, 
 
 
 def _evaluate(model, tokenizer, rows: list[dict], taxonomy: dict, *, device, micro_batch: int, max_length: int) -> dict:
-    """前向评估一个显式数据集合。参数：模型/分词/样本/主题表/设备/批长；返回：损失、概率和金标；异常：非有限输出ValueError。"""
+    """前向评估一个显式数据集合。参数：模型/分词/样本/主题表/设备/批长；返回：损失、概率和参考标签；异常：非有限输出ValueError。"""
     import torch
     model.eval()
     total_loss, probabilities, targets = 0.0, [], []
@@ -131,7 +131,7 @@ def _test_reports(output_dir: Path, rows: list[dict], predictions: list[dict], t
             reports[target][value] = compute_metrics([expected[i] for i in indices], [predicted[i] for i in indices], taxonomy)
     _write_json(output_dir / "test_metrics.json", reports)
     errors = ["# 测试错误列表", "", "以下按模型预标或真实审核状态评估；不能当作真实客户泛化证明。", "",
-              "|ID|来源|审核状态|文本|金标|预测|", "|---|---|---|---|---|---|"]
+              "|ID|来源|审核状态|文本|参考标签|预测|", "|---|---|---|---|---|---|"]
     with (output_dir / "test_predictions.jsonl").open("x", encoding="utf-8") as stream:
         for row, guess in zip(rows, predictions):
             record = {**row, "expected_labels": row["labels"], **guess}

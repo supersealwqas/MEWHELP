@@ -63,6 +63,39 @@ class MemoryRepository:
         return self.busy
 
 
+class HandoffRepository(MemoryRepository):
+    """用独立连接令牌模拟旧租约失效与新执行者接手，产品服务和文件操作仍用真实实现。"""
+
+    def __init__(self, count=1):
+        """初始化共享池与当前所有者。参数：count为非负池行数；返回：None；异常：无。"""
+        super().__init__(count)
+        self.owner = None
+
+    @asynccontextmanager
+    async def execution(self):
+        """取得本轮独立租约。参数：无；返回：带核锁方法的令牌租约；异常：共同锁忙或失锁。"""
+        if self.owner is not None:
+            raise ConcurrentKnowledgeWrite("共同锁忙")
+        token = object()
+        self.owner = token
+
+        async def assert_held():
+            """核对本轮连接身份。参数：无；返回：None；异常：LeaseLost表示连接失效或所有者改变。"""
+            if self.owner is not token:
+                raise LeaseLost("本轮连接已失锁")
+
+        try:
+            yield NS(assert_held=assert_held)
+        finally:
+            # 旧连接收尾不能释放接手者的新令牌。
+            if self.owner is token:
+                self.owner = None
+
+    async def execution_busy(self):
+        """读取共同锁占用。参数：无；返回：bool，是否有当前所有者；异常：无。"""
+        return self.owner is not None
+
+
 def make_service(tmp_path, repository, handler):
     """构建真实服务+受控HTTP。参数：目录/仓储/HTTP处理器；返回：服务；异常：缺实现断言。"""
     assert importlib.util.find_spec("app.services.topics"), "缺少主题批次服务"
@@ -389,7 +422,21 @@ async def test_lease_lost_during_empty_read_never_completes_or_advances(tmp_path
         result = await service.process()
         assert result["status"] == "failed" and result["cursor"] == "0"
         assert result["error"]["type"] == "LeaseLost"
-        assert json.loads((tmp_path / "scan.json").read_text(encoding="utf-8"))["status"] == "failed"
+        if zero_watermark:
+            # 上界读取时已失锁，首轮共享扫描尚未获准创建。
+            assert not (tmp_path / "scan.json").exists()
+        else:
+            shared = json.loads((tmp_path / "scan.json").read_text(encoding="utf-8"))
+            assert shared["status"] == "running" and shared["cursor"] == "0" and shared["error"] is None
+        evidence = list(tmp_path.glob("interrupted-*.json"))
+        assert len(evidence) == 1
+        local = json.loads(evidence[0].read_text(encoding="utf-8"))
+        assert local["status"] == "failed"
+        if zero_watermark:
+            assert local["last_batch"] is None
+        else:
+            assert local["last_batch"]["cursor"] == "0"
+        assert local["error"]["type"] == "LeaseLost"
     finally:
         await service.close()
 
@@ -447,3 +494,145 @@ async def test_manual_prelease_failure_is_visible_without_shared_write(tmp_path,
         assert json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))["status"] == "complete"
     finally:
         await service.close()
+
+
+@pytest.mark.parametrize("outcome", ["response", "disconnect", "cancelled"])
+async def test_lost_owner_cannot_overwrite_successor_scan_or_status(tmp_path, outcome):
+    """旧HTTP返回、失败或取消不得覆盖接手者已完成的新轮。参数：隔离目录/结束方式；返回：None；异常：断言失败。"""
+    repo, entered, release = HandoffRepository(), asyncio.Event(), asyncio.Event()
+
+    async def delayed(request):
+        """暂停旧分类请求。参数：HTTP请求；返回：合同响应；异常：模拟断线或外部取消。"""
+        if request.url.path == "/classify":
+            entered.set()
+            await release.wait()
+            if outcome == "disconnect":
+                raise httpx.ConnectError("旧请求断线", request=request)
+        return response(request)
+
+    old, successor = make_service(tmp_path, repo, delayed), make_service(tmp_path, repo, response)
+    task = asyncio.create_task(old.process())
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        old_scan = json.loads((tmp_path / "scan.json").read_text(encoding="utf-8"))
+        repo.owner = None  # 外部MySQL连接失效会释放该会话的命名锁。
+        resumed = await successor.process()
+        current = await successor.process(reclassify=True)
+        assert resumed["batch_id"] == old_scan["batch_id"] and resumed["status"] == "complete"
+        assert current["batch_id"] != old_scan["batch_id"]
+        assert current["status"] == "complete" and current["cursor"] == "1"
+        before = {path: path.read_bytes() for path in tmp_path.glob("*.json")}
+        if outcome == "cancelled":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 3)
+            expected_status, expected_error = "cancelled", "CancelledError"
+        else:
+            release.set()
+            failure = await asyncio.wait_for(task, 3)
+            expected_status = "failed"
+            expected_error = "ConnectError" if outcome == "disconnect" else "LeaseLost"
+            assert failure["status"] == expected_status and failure["error"]["type"] == expected_error
+        # 两个扫描原件、当前指针、完成批次和共享状态均保持接手者的字节原件。
+        for path, contents in before.items():
+            assert path.read_bytes() == contents, path.name
+        evidence = list(tmp_path.glob("interrupted-*.json"))
+        assert len(evidence) == 1
+        local = json.loads(evidence[0].read_text(encoding="utf-8"))
+        assert local["status"] == expected_status and local["error"]["type"] == expected_error
+        assert local["last_batch"]["batch_id"] == old_scan["batch_id"]
+        assert local["last_batch"]["cursor"] == "0"
+        assert set(tmp_path.glob("*.json")) == set(before) | set(evidence)
+        latest = await old.status()
+        assert latest["status"] == "complete" and latest["last_batch"]["batch_id"] == current["batch_id"]
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await old.close()
+        await successor.close()
+
+
+@pytest.mark.parametrize("boundary", ["health", "watermark", "save"])
+async def test_lease_handoff_during_await_preserves_successor_artifacts(tmp_path, boundary):
+    """外部等待返回后须重新核锁，旧执行者不能续写共享原件。参数：隔离目录/等待边界；返回：None；异常：断言失败。"""
+    entered, release, paused = asyncio.Event(), asyncio.Event(), False
+
+    async def wait_once(point):
+        """仅暂停旧执行者一次。参数：point为健康、上界或提交边界；返回：None；异常：外部取消。"""
+        nonlocal paused
+        if point == boundary and not paused:
+            paused = True
+            entered.set()
+            await release.wait()
+
+    class PausedRepository(HandoffRepository):
+        """在真实服务依赖边界暂停旧连接，让接手者完成恢复和新重跑。"""
+
+        async def high_watermark(self):
+            """读取上界时允许失锁。参数：无；返回：最大问题ID；异常：取消。"""
+            await wait_once("watermark")
+            return await super().high_watermark()
+
+        async def save(self, rows, *, lease):
+            """模拟提交完成但调用尚未返回。参数：结果行/本轮租约；返回：保存计数；异常：失锁或取消。"""
+            result = await super().save(rows, lease=lease)
+            await wait_once("save")
+            return result
+
+    async def handler(request):
+        """暂停健康依赖响应。参数：HTTP请求；返回：合同响应；异常：外部取消。"""
+        if request.url.path == "/health":
+            await wait_once("health")
+        return response(request)
+
+    repo = PausedRepository()
+    old, successor = make_service(tmp_path, repo, handler), make_service(tmp_path, repo, response)
+    task = asyncio.create_task(old.process())
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        repo.owner = None
+        assert (await successor.process())["status"] == "complete"
+        current = await successor.process(reclassify=True)
+        before = {path: path.read_bytes() for path in tmp_path.glob("*.json")}
+        release.set()
+        failure = await asyncio.wait_for(task, 3)
+        assert failure["status"] == "failed" and failure["error"]["type"] == "LeaseLost"
+        for path, contents in before.items():
+            assert path.read_bytes() == contents, path.name
+        evidence = list(tmp_path.glob("interrupted-*.json"))
+        assert len(evidence) == 1 and set(tmp_path.glob("*.json")) == set(before) | set(evidence)
+        latest = await old.status()
+        assert latest["status"] == "complete" and latest["last_batch"]["batch_id"] == current["batch_id"]
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await old.close()
+        await successor.close()
+
+
+async def test_trigger_lost_before_worker_start_preserves_successor_state(tmp_path):
+    """后台任务首次调度前失锁不能覆盖新执行者状态。参数：隔离目录；返回：None；异常：断言失败。"""
+    repo = HandoffRepository()
+    old, successor = make_service(tmp_path, repo, response), make_service(tmp_path, repo, response)
+    try:
+        await old.trigger()
+        repo.owner = None
+        assert (await successor.process())["status"] == "complete"
+        current = await successor.process(reclassify=True)
+        before = {path: path.read_bytes() for path in tmp_path.glob("*.json")}
+        await asyncio.wait_for(asyncio.gather(*old._active), 3)
+        for path, contents in before.items():
+            assert path.read_bytes() == contents, path.name
+        evidence = list(tmp_path.glob("interrupted-*.json"))
+        assert len(evidence) == 1
+        local = json.loads(evidence[0].read_text(encoding="utf-8"))
+        assert local["last_batch"] is None and local["error"]["type"] == "LeaseLost"
+        latest = await old.status()
+        assert latest["status"] == "complete" and latest["last_batch"]["batch_id"] == current["batch_id"]
+    finally:
+        await old.close()
+        await successor.close()
