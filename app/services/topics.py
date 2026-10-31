@@ -273,44 +273,49 @@ class TopicBatchService:
             self._active.discard(task)
 
     async def trigger(self, *, reclassify=False):
-        """先真实取得共同锁再后台登记，消除先查busy后启动竞态。参数：重跑开关；返回：202接受状态；异常：占用/依赖/关闭。"""
+        """登记请求直到取锁、核锁和后台移交或失败清理完成。参数：重跑开关；返回：202接受状态；异常：占用/依赖/关闭/取消。"""
         if self._closing:
             raise RuntimeError("主题服务已关闭")
         manager = self.repository.execution()
         request_task = asyncio.current_task()
         self._active.add(request_task)
         try:
-            lease = await manager.__aenter__()
-        except ConcurrentKnowledgeWrite:
-            self._local_attempt_error = None
-            raise
-        except Exception as error:
-            self._record_local_attempt_error(error)
-            raise
-        finally:
-            self._active.discard(request_task)
-        async def run():
-            """参数：闭包持锁资源；返回：None；异常：取消传播，租约清理保证完成。"""
             try:
-                await self._process_locked(lease, reclassify=reclassify)
-            finally:
-                try:
-                    await finish_cleanup(manager.__aexit__(None, None, None))
-                finally:
-                    self._leases.pop(asyncio.current_task(), None)
-                    self._active.discard(asyncio.current_task())
-        try:
-            await lease.assert_held()
-            self._set_state(status="running", error=None)
-            task = asyncio.create_task(run(), context=Context())
-            self._active.add(task)
-            self._leases[task] = manager
-        except BaseException as error:
-            if isinstance(error, Exception):
+                lease = await manager.__aenter__()
+            except ConcurrentKnowledgeWrite:
+                self._local_attempt_error = None
+                raise
+            except Exception as error:
                 self._record_local_attempt_error(error)
-            await finish_cleanup(manager.__aexit__(None, None, None))
-            raise
-        return dict(status="running", message="主题批次已在后台启动")
+                raise
+            async def run():
+                """参数：闭包持锁资源；返回：None；异常：取消传播，租约清理保证完成。"""
+                try:
+                    await self._process_locked(lease, reclassify=reclassify)
+                finally:
+                    try:
+                        await finish_cleanup(manager.__aexit__(None, None, None))
+                    finally:
+                        self._leases.pop(asyncio.current_task(), None)
+                        self._active.discard(asyncio.current_task())
+            try:
+                await lease.assert_held()
+                # 核锁依赖即使吞掉关闭取消，也不能在关闭后继续发布或生成后台任务。
+                if self._closing:
+                    raise RuntimeError("主题服务已关闭")
+                self._set_state(status="running", error=None)
+                task = asyncio.create_task(run(), context=Context())
+                self._active.add(task)
+                self._leases[task] = manager
+            except BaseException as error:
+                if isinstance(error, Exception):
+                    self._record_local_attempt_error(error)
+                await finish_cleanup(manager.__aexit__(None, None, None))
+                raise
+            return dict(status="running", message="主题批次已在后台启动")
+        finally:
+            # 请求交出租约或完成失败清理前，close必须始终能够取消并等待它。
+            self._active.discard(request_task)
 
     async def _model_version(self):
         """从当前行与完整批次原件证明全表版本。参数：无；返回：版本/unknown/mixed；异常：数据库或原件错误。"""

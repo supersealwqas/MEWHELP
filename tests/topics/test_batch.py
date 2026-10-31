@@ -252,6 +252,78 @@ async def test_close_cancels_task_still_acquiring_execution_lease(tmp_path):
         await asyncio.gather(task, return_exceptions=True)
 
 
+@pytest.mark.parametrize("stage", ["verify", "publish_failure", "verify_ignores_cancel"])
+async def test_close_waits_for_trigger_verification_and_failed_handoff_cleanup(tmp_path, monkeypatch, stage):
+    """关闭须收回核锁或失败移交中的请求，不能在关闭后启动后台任务。参数：隔离目录/替换器/等待阶段；返回：None；异常：断言失败。"""
+    verifying, verification_release = asyncio.Event(), asyncio.Event()
+    cleaning, cleanup_release = asyncio.Event(), asyncio.Event()
+
+    class PausedTriggerRepository(HandoffRepository):
+        """只暂停外部核锁与释放，使用真实trigger和close验证完整移交生命周期。"""
+
+        @asynccontextmanager
+        async def execution(self):
+            """取得独立令牌并在释放时等待确认。参数：无；返回：受控核锁租约；异常：失锁或取消。"""
+            async with super().execution() as lease:
+                async def assert_held():
+                    """暂停首次核锁。参数：无；返回：None；异常：取消，指定场景模拟依赖吞掉取消。"""
+                    if stage != "publish_failure":
+                        verifying.set()
+                        try:
+                            await verification_release.wait()
+                        except asyncio.CancelledError:
+                            if stage != "verify_ignores_cancel":
+                                raise
+                    await lease.assert_held()
+
+                try:
+                    yield NS(assert_held=assert_held)
+                finally:
+                    cleaning.set()
+                    await cleanup_release.wait()
+
+    repo = PausedTriggerRepository()
+    service = make_service(tmp_path, repo, response)
+    if stage == "publish_failure":
+        def fail_publish(**values):
+            """在真实移交边界模拟写盘失败。参数：状态更新字段；返回：无；异常：OSError。"""
+            raise OSError("后台移交前写盘失败")
+        monkeypatch.setattr(service, "_set_state", fail_publish)
+    trigger_task = asyncio.create_task(service.trigger())
+    close_task, cleanup_wait = None, None
+    try:
+        await asyncio.wait_for((cleaning if stage == "publish_failure" else verifying).wait(), 3)
+        close_task = asyncio.create_task(service.close())
+        cleanup_wait = asyncio.create_task(cleaning.wait())
+        await asyncio.wait({close_task, cleanup_wait}, timeout=3, return_when=asyncio.FIRST_COMPLETED)
+        assert cleaning.is_set() and not close_task.done(), "关闭在请求租约清理前返回"
+        # 释放还被明确阻塞时，关闭必须持续等待，HTTP客户端也不能提前关闭。
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(close_task), 0.1)
+        assert await repo.execution_busy() and not service.client.is_closed
+        cleanup_release.set()
+        await asyncio.wait_for(close_task, 3)
+        if stage == "verify_ignores_cancel":
+            assert isinstance(trigger_task.exception(), RuntimeError)
+        else:
+            assert trigger_task.cancelled()
+        assert not await repo.execution_busy()
+        assert not service._active and not service._leases and service.client.is_closed
+        assert not list(tmp_path.glob("*.json")), "关闭请求不得发布运行状态或生成后台产物"
+    finally:
+        verification_release.set()
+        cleanup_release.set()
+        if not trigger_task.done():
+            trigger_task.cancel()
+        await asyncio.gather(trigger_task, return_exceptions=True)
+        if cleanup_wait is not None:
+            cleanup_wait.cancel()
+            await asyncio.gather(cleanup_wait, return_exceptions=True)
+        if close_task is not None:
+            await asyncio.gather(close_task, return_exceptions=True)
+        await service.close()
+
+
 async def test_new_ids_after_frozen_high_watermark_wait_next_round(tmp_path):
     """扫描时追加新问题不能扩展当前轮上界。参数：目录；返回：None；异常：断言失败。"""
     repo = MemoryRepository(1)
