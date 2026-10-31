@@ -42,6 +42,31 @@ class Settings(BaseSettings):
     flywheel_timeout_seconds: float = Field(default=180, gt=0, le=600, description="单条归并含标准化及全部分页的总秒数上限，失败保留原件")
     flywheel_close_seconds: float = Field(default=5, ge=0, le=30, description="停机等待当前任务的宽限秒数，随后取消并有界清理租约")
 
+    topic_enabled: bool = Field(default=False, description="显式启用CH10旁路主题扫描，关闭时不依赖主题表或模型")
+    topic_service_url: str = Field(default="http://127.0.0.1:18010", description="只允许回环HTTP主题服务地址")
+    topic_batch_min_size: int = Field(default=20, ge=1, le=200, description="定时扫描启动分类的最小候选条数")
+    topic_poll_seconds: float = Field(default=60, gt=0, le=86400, allow_inf_nan=False, description="旁路扫描和依赖失败重试间隔秒数")
+    topic_max_wait_seconds: float = Field(default=86400, gt=0, allow_inf_nan=False, description="已知入池时间的尾批最长等待秒数")
+    topic_batch_size: int = Field(default=200, ge=1, le=200, description="单个数据库批次最多200条，HTTP分块最多64条")
+    topic_reports_dir: str = Field(default="reports/ch10/batches", min_length=1, description="主题扫描和批次原件目录，需持久保存供恢复和版本对账")
+
+    @field_validator("topic_service_url")
+    @classmethod
+    def validate_topic_service_url(cls, value):
+        """只允许无凭据回环HTTP地址。参数：value配置URL；返回：规范URL；异常：ValueError。"""
+        from ipaddress import ip_address
+        from urllib.parse import urlsplit
+        parsed = urlsplit(value)
+        try:
+            loopback = parsed.hostname == "localhost" or ip_address(parsed.hostname or "").is_loopback
+            parsed.port
+        except ValueError:
+            loopback = False
+        if (parsed.scheme != "http" or not loopback or parsed.username or parsed.password
+                or parsed.query or parsed.fragment or parsed.path not in {"", "/"}):
+            raise ValueError("TOPIC_SERVICE_URL必须为无凭据回环HTTP地址")
+        return value.rstrip("/")
+
     chat_base_url: str = Field(
         min_length=1,
         description="对话模型上游兼容端点地址（支持 OpenAI 协议）",

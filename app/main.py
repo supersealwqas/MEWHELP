@@ -23,6 +23,7 @@ from app.api.conversations import router as conversations_router
 from app.api.extract import router as extract_router
 from app.api.feedback import router as feedback_router
 from app.api.flywheel import router as flywheel_router
+from app.api.topics import router as topics_router
 from app.api.observability import router as observability_router
 from app.api.rageval import router as rageval_router
 from app.api.rageval import create_job_manager
@@ -77,7 +78,7 @@ class SecurityHeadersMiddleware:
             if message["type"] == "http.response.start":
                 headers = MutableHeaders(scope=message)
                 headers["X-Content-Type-Options"] = "nosniff"
-                is_page_path = scope["path"] in {"/", "/flywheel", "/rag-eval"} or scope["path"].startswith("/static/")
+                is_page_path = scope["path"] in {"/", "/flywheel", "/rag-eval", "/topics"} or scope["path"].startswith("/static/")
                 if is_page_path and headers.get("content-type", "").startswith("text/html"):
                     # 聊天、审核和评估页共用策略，直接访问静态 HTML 也不能绕过防护。
                     headers["Content-Security-Policy"] = (
@@ -136,6 +137,11 @@ async def flywheel_page() -> FileResponse:
     )
 
 
+async def topics_page() -> FileResponse:
+    """返回旁路主题看板。参数：无；返回：同源HTML；异常：RuntimeError，部署缺失topics.html。"""
+    return FileResponse(STATIC_DIR / "topics.html", media_type="text/html", headers={"Cache-Control": "no-cache"})
+
+
 @asynccontextmanager
 async def database_runtime():
     """建立单 worker 运行时、恢复中断轮并加载知识检索。
@@ -154,6 +160,7 @@ async def database_runtime():
     mcp = None
     observability = None
     flywheel = None
+    topics = None
     try:
         # 新章启动只核验完整结构；DDL 必须通过显式具名迁移完成。
         await check_ch09_tables(settings)
@@ -164,6 +171,13 @@ async def database_runtime():
             poolclass=NullPool,
             connect_args={"connect_timeout": 5, "init_command": "SET time_zone = '+00:00'"},
         )
+        if settings.topic_enabled:
+            # 分类器仅走回环HTTP；关闭模式不检查新表，不导入torch或分类模型。
+            from app.db.migrate_ch10 import check_ch10_tables
+            from app.repositories.topics import TopicRepository
+            from app.services.topics import TopicBatchService
+            await check_ch10_tables(settings)
+            topics = TopicBatchService(TopicRepository(factory, lease_engine), settings)
         store = KnowledgeStore(factory, lease_engine)
         from app.knowledge.flywheel import FlywheelModel
         from app.repositories.flywheel import FlywheelRepository
@@ -204,6 +218,9 @@ async def database_runtime():
                         service.review_publisher = publisher
                         from app.repositories.evaluations import EvaluationRepository
                         service.evaluations = EvaluationRepository(factory, lease_engine)
+                        service.topics = topics
+                        if topics is not None:
+                            topics.start()
                         publisher.start()
                         flywheel.start()
                         yield service
@@ -225,8 +242,12 @@ async def database_runtime():
                 finally:
                     # 飞轮清理报错也继续释放其余依赖，原异常仍向外传播。
                     try:
-                        if mcp is not None:
-                            await mcp.aclose()
+                        try:
+                            if topics is not None:
+                                await topics.close()
+                        finally:
+                            if mcp is not None:
+                                await mcp.aclose()
                     finally:
                         if lease_engine is not None:
                             await lease_engine.dispose()
@@ -288,6 +309,7 @@ def create_app(runtime_factory=None) -> FastAPI:
     application.include_router(chat_router)
     application.include_router(feedback_router)
     application.include_router(flywheel_router)
+    application.include_router(topics_router)
     application.include_router(observability_router)
     application.include_router(actions_router)
     application.include_router(citations_router)
@@ -298,6 +320,7 @@ def create_app(runtime_factory=None) -> FastAPI:
     application.add_api_route("/", chat_page, response_class=FileResponse, include_in_schema=False)
     application.add_api_route("/rag-eval", rag_eval_page, response_class=FileResponse, include_in_schema=False)
     application.add_api_route("/flywheel", flywheel_page, response_class=FileResponse, include_in_schema=False)
+    application.add_api_route("/topics", topics_page, response_class=FileResponse, include_in_schema=False)
     return application
 
 
