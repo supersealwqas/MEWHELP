@@ -351,6 +351,8 @@ def _production_signature(settings) -> dict:
     from app.core.structured import output_tool
     from app.workflow.prompts import KNOWLEDGE_PROMPT
     from app.workflow.model import knowledge_tool_schema
+    from app.knowledge.answering import KNOWLEDGE_ANSWER_HANDOFF
+    from app.knowledge.pipeline import KNOWLEDGE_CITATION_REPAIR_TEMPLATE
     from app.knowledge.embedding import EMBEDDING_REVISION
     from app.knowledge.rerank import RERANKER_REVISION
     from app.evaluation.runtime import model_digest
@@ -363,7 +365,8 @@ def _production_signature(settings) -> dict:
             "embedding_artifacts_digest": model_digest(Path(settings.knowledge_model_path)),
             "reranker_artifacts_digest": model_digest(Path(settings.rerank_model_path))},
         "generation_protocol": digest_json({"protocol": "structured-selfcheck:full-evidence:one-citation-repair:v1",
-            "prompt": KNOWLEDGE_PROMPT, "tool": knowledge_tool_schema()}),
+            "prompt": KNOWLEDGE_PROMPT, "handoff": KNOWLEDGE_ANSWER_HANDOFF,
+            "citation_repair": KNOWLEDGE_CITATION_REPAIR_TEMPLATE, "tool": knowledge_tool_schema()}),
         "judge_protocol": digest_json({"prompt": _JUDGE_SYSTEM,
             "tool": output_tool(FaithfulnessDecision, "submit_faithfulness"), "max_input_chars": 65000,
             "max_output_chars": 20000, "max_tokens": 4096, "temperature": 0.0}),
@@ -554,7 +557,25 @@ async def run_complete_production(args, settings) -> int:
                         raise LeaseLost("评估执行锁丢失") from error
 
                 summary = await evaluate_production(args, settings, checkpoint=checkpoint)
-                await checkpoint()
+                try:
+                    await checkpoint()
+                except LeaseLost:
+                    from app.evaluation.runner import atomic_json
+                    from app.evaluation.policy import digest_json
+                    output = Path(args.output_dir)
+                    manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+                    if manifest["artifact_id"] != summary["artifact_id"]:
+                        raise ValueError("执行失锁后的产物身份不符，不能覆盖其他运行")
+                    invalidated = {**summary, "status": "invalidated"}
+                    # 完成后已确认失锁也必须先撤销可补存标记；仅保存连接故障仍走下方persist_failed。
+                    atomic_json(output / "manifest.json", {**manifest, "status": "invalidated",
+                        "error_type": "LeaseLost", "error_stage": "before_persist", "summary_digest": digest_json(invalidated)})
+                    atomic_json(output / "summary.json", invalidated)
+                    markdown = output / "summary.md"
+                    if markdown.exists():
+                        markdown.write_text("本轮已失效：保存前确认执行锁丢失，不能补存。\n\n" +
+                            markdown.read_text(encoding="utf-8"), encoding="utf-8")
+                    raise
                 try:
                     saved = await repository.save_completed_run(Path(args.output_dir), args.triggered_by)
                 except Exception as error:

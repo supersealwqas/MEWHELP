@@ -67,6 +67,94 @@ def test_model_identity_binds_endpoint_and_actual_local_weights(monkeypatch, cha
     assert module._production_signature(settings)["models"] != before["models"]
 
 
+@pytest.mark.parametrize("instruction", ["handoff", "citation_repair"])
+def test_generation_handoff_changes_comparison_without_recalibrating_retrieval(tmp_path, monkeypatch, instruction):
+    """实际交接指令变化必须隔离趋势，冻结检索协议不应随之失效。参数：目录/常量替身；返回：None；异常：断言失败。"""
+    import json
+    from tests.flywheel.test_eval_runs import completed_artifact
+    from app.evaluation.runner import production_comparison_key
+    from app.knowledge import answering
+    from app.knowledge.confidence import load_evidence_policy
+    module, settings = production(), Settings()
+    monkeypatch.setattr("app.evaluation.runtime.model_digest", lambda path: "a" * 64)
+    metadata = json.loads((completed_artifact(tmp_path / "run") / "summary.json").read_text(encoding="utf-8"))["metadata"]
+    before = module._production_signature(settings)
+    if instruction == "handoff":
+        monkeypatch.setattr(answering, "KNOWLEDGE_ANSWER_HANDOFF", answering.KNOWLEDGE_ANSWER_HANDOFF + " 新的生成控制规则。")
+    else:
+        monkeypatch.setattr("app.knowledge.pipeline.KNOWLEDGE_CITATION_REPAIR_TEMPLATE", "新修复规则：{reason}", raising=False)
+    after = module._production_signature(settings)
+    assert production_comparison_key({**metadata, **before}) != production_comparison_key({**metadata, **after})
+    assert before["protocols"] == after["protocols"]
+    assert load_evidence_policy(settings.evidence_policy_path, protocols=after["protocols"]).version
+
+
+@pytest.mark.parametrize("failure", ["execution_lease", "save_only"])
+async def test_post_completion_lease_loss_invalidates_but_save_failure_allows_retry(tmp_path, monkeypatch, failure):
+    """保存前已确认执行失锁不得留下可补存成绩，单纯保存故障则保留完整原件。参数：目录/外部边界/故障类型；返回：None；异常：断言失败。"""
+    import json
+    from contextlib import asynccontextmanager
+    from tests.flywheel.test_eval_runs import completed_artifact
+    from app.evaluation.runner import validate_completed_artifact
+    from app.knowledge.errors import LeaseLost
+    module = production()
+    output = completed_artifact(tmp_path / "completed")
+    original_rows = (output / "results.jsonl").read_bytes()
+    save_calls = []
+
+    class Lease:
+        """替换已经执行完成后才失去的外部锁连接。"""
+        @property
+        def connection(self):
+            """提供同一连接的提交边界。参数：无；返回：自身；异常：无。"""
+            return self
+
+        async def assert_held(self):
+            """只在执行阶段返回后的检查失败。参数：无；返回：None；异常：LeaseLost。"""
+            if failure == "execution_lease":
+                raise LeaseLost("模拟已观察到的执行锁丢失")
+
+        async def commit(self):
+            """结束检查隐式事务。参数：无；返回：None；异常：无。"""
+
+    class Repository:
+        """隔离数据库，验证真正CLI编排是否允许保存。"""
+        @asynccontextmanager
+        async def execution(self):
+            """模拟进入过执行锁作用域。参数：无；返回：锁；异常：无。"""
+            yield Lease()
+
+        async def save_completed_run(self, path, triggered_by):
+            """仅保存故障允许到达此边界。参数：产物/来源；返回：无；异常：ConnectionError。"""
+            save_calls.append(path)
+            assert failure == "save_only", "已失执行锁不能进入保存"
+            raise ConnectionError("仅保存连接故障")
+
+    @asynccontextmanager
+    async def repository_runtime(settings):
+        """替换外部数据库资源。参数：配置；返回：仓储；异常：无。"""
+        yield Repository()
+
+    async def evaluated(args, settings, *, checkpoint):
+        """替代已经完成的模型执行，保留真实落盘产物。参数：运行参数；返回：完整汇总；异常：文件错误。"""
+        return json.loads((output / "summary.json").read_text(encoding="utf-8"))
+
+    monkeypatch.setattr("app.repositories.evaluations.evaluation_repository_runtime", repository_runtime)
+    monkeypatch.setattr(module, "evaluate_production", evaluated)
+    code = await module.run_complete_production(SimpleNamespace(output_dir=output, triggered_by="手动"), Settings())
+    assert code == (1 if failure == "execution_lease" else 4)
+    assert (output / "results.jsonl").read_bytes() == original_rows
+    if failure == "execution_lease":
+        assert save_calls == []
+        assert json.loads((output / "manifest.json").read_text(encoding="utf-8"))["status"] == "invalidated"
+        assert json.loads((output / "summary.json").read_text(encoding="utf-8"))["status"] == "invalidated"
+        with pytest.raises(ValueError):
+            validate_completed_artifact(output)
+    else:
+        assert save_calls == [output]
+        assert validate_completed_artifact(output)["status"] == "completed_with_errors"
+
+
 @pytest.mark.asyncio
 async def test_explicit_frozen_policy_controls_generation_and_keeps_partial_retrieval():
     """CLI指定策略不能被settings覆盖，生成故障不能抹掉已成功检索。参数：无；返回：None；异常：断言失败。"""

@@ -69,6 +69,7 @@ def validate_completed_artifact(artifact_dir: Path) -> dict:
     from app.knowledge.confidence import EvidencePolicy
     from app.knowledge.answering import EvidenceCitation
     from app.knowledge.rerank import RankedChunk
+    from app.evaluation.faithfulness import FaithfulnessDecision
     from hashlib import sha256
     try:
         manifest = json.loads((artifact_dir / "manifest.json").read_text(encoding="utf-8"))
@@ -81,6 +82,7 @@ def validate_completed_artifact(artifact_dir: Path) -> dict:
         policy = json.loads((artifact_dir / "policy.json").read_text(encoding="utf-8"))
         EvidencePolicy.model_validate(policy)
         chunks = [ChunkSnapshot.model_validate(row) for row in corpus]
+        frozen_chunks = {chunk.id: chunk for chunk in chunks}
         cases = load_dataset(artifact_dir / "dataset.json", chunks=chunks)
         dataset = [case.model_dump(mode="json") for case in cases]
         metadata = manifest["metadata"]
@@ -114,6 +116,9 @@ def validate_completed_artifact(artifact_dir: Path) -> dict:
             if row["error"] is None and row["refused"] is False and row["faithfulness"] is None:
                 raise ValueError("成功非拒答样本必须包含裁判结果，否则应记录真实错误")
             ranked = [RankedChunk.model_validate(item) for item in row["ranked"]]
+            # 同一主键不足以证明同一知识版本；逐项比较冻结快照的原文及全部身份字段。
+            if any(item.chunk != frozen_chunks.get(item.chunk.id) for item in ranked):
+                raise ValueError("ranked原文或身份与冻结corpus不符")
             selected = [EvidenceCitation.model_validate(item) for item in row["selected"]]
             citations = [EvidenceCitation.model_validate(item) for item in row["citations"]]
             known = {item.chunk.id: item.chunk for item in ranked}
@@ -122,7 +127,7 @@ def validate_completed_artifact(artifact_dir: Path) -> dict:
             for item in selected:
                 chunk = known.get(item.chunk_id)
                 if (chunk is None or item.answer != chunk.text.answer or item.question != chunk.text.questions
-                        or item.section_path != chunk.section_path):
+                        or item.section_path != chunk.section_path or item.source_key != chunk.source_key):
                     raise ValueError("selected与本轮ranked原文身份不符")
             if any(item not in selected for item in citations):
                 raise ValueError("公开引用不是本轮完整selected的子集")
@@ -132,13 +137,20 @@ def validate_completed_artifact(artifact_dir: Path) -> dict:
                     raise ValueError("逐题召回指标与实际排名不符")
                 if row["ranked_ids"] != [item["chunk"]["id"] for item in row["ranked"]]:
                     raise ValueError("排名身份与原始检索不符")
+            # persist-run独立读取文件，必须重新执行在线裁判的严格类型/字段校验。
+            judgment = FaithfulnessDecision.model_validate(row["judgment"], strict=True) if row.get("judgment") is not None else None
+            if (type(row["supported_count"]) is not int or type(row["total_count"]) is not int
+                    or not 0 <= row["supported_count"] <= row["total_count"]):
+                raise ValueError("裁判事实计数必须为非负整数且支持数不超过总数")
             if row["faithfulness"] is not None:
-                facts = row["judgment"]["facts"]
+                if type(row["faithfulness"]) not in (int, float) or not math.isfinite(row["faithfulness"]) or not 0 <= row["faithfulness"] <= 1:
+                    raise ValueError("忠实度必须是0到1的有限数值，不能用布尔值代替")
+                facts = judgment.facts if judgment is not None else []
                 numbers = {item["n"] for item in row["selected"]}
                 if (not facts or row["refused"] is not False
-                        or any(not set(fact["evidence_numbers"]).issubset(numbers)
-                            or (fact["supported"] and not fact["evidence_numbers"]) for fact in facts)
-                        or row["total_count"] != len(facts) or row["supported_count"] != sum(fact["supported"] for fact in facts)
+                        or any(not set(fact.evidence_numbers).issubset(numbers)
+                            or (fact.supported and not fact.evidence_numbers) for fact in facts)
+                        or row["total_count"] != len(facts) or row["supported_count"] != sum(fact.supported for fact in facts)
                         or row["faithfulness"] != row["supported_count"] / len(facts)):
                     raise ValueError("逐题忠实度与完整裁判不符")
             elif row["total_count"] != 0 or row["supported_count"] != 0:

@@ -73,6 +73,69 @@ def rewrite_artifact(path, *, rows=None, metadata=None):
     atomic_json(path / "summary.json", summary)
 
 
+def judged_artifact(path):
+    """建立一题有真实冻结证据和合法裁判的完整离线产物。参数：目录；返回：目录及可修改逐题；异常：文件/校验错误。"""
+    from app.evaluation.dataset import load_dataset, resolve_evidence
+    from app.evaluation.metrics import retrieval_metrics
+    from app.knowledge.schemas import ChunkSnapshot
+    from app.knowledge.rerank import RankedChunk
+    from app.workflow.routing import citations_from_ranked
+    completed_artifact(path)
+    chunks = [ChunkSnapshot.model_validate(row) for row in json.loads((path / "corpus.json").read_text(encoding="utf-8"))]
+    case = next(case for case in load_dataset(path / "dataset.json", chunks=chunks) if case.split == "evaluation")
+    groups = resolve_evidence(case, chunks)
+    chunk = next(chunk for chunk in chunks if chunk.id == min(groups[0]))
+    ranked = [RankedChunk(chunk=chunk, score=0.9)]
+    selected = [item.model_dump(mode="json") for item in citations_from_ranked(ranked)]
+    rows = [json.loads(line) for line in (path / "results.jsonl").read_text(encoding="utf-8").splitlines()]
+    rows[0].update(error=None, answer="事实[1]", refused=False, citation_valid=True,
+        ranked=[item.model_dump(mode="json") for item in ranked], ranked_ids=[chunk.id],
+        retrieval=retrieval_metrics([chunk.id], groups), selected=copy.deepcopy(selected), citations=copy.deepcopy(selected),
+        faithfulness=1.0, total_count=1, supported_count=1,
+        judgment={"facts": [{"claim": "事实", "supported": True, "reason": "冻结原文支持", "evidence_numbers": [1]}]})
+    rewrite_artifact(path, rows=rows)
+    return path, rows
+
+
+@pytest.mark.parametrize("damage", ["ranked_text", "selected_source"])
+def test_ranked_and_selected_must_match_frozen_corpus(tmp_path, damage):
+    """原主键不能掩盖另一版本正文，selected来源也必须与冻结原文一致。参数：目录/损坏方式；返回：None；异常：断言失败。"""
+    path, rows = judged_artifact(tmp_path / "run")
+    assert runner_module().validate_completed_artifact(path)["faithfulness"] == 1.0
+    if damage == "ranked_text":
+        rows[0]["ranked"][0]["chunk"]["text"]["answer"] = "另一知识版本的原文"
+        rows[0]["selected"][0]["answer"] = rows[0]["citations"][0]["answer"] = "另一知识版本的原文"
+    else:
+        rows[0]["selected"][0]["source_key"] = rows[0]["citations"][0]["source_key"] = "other/source"
+    rewrite_artifact(path, rows=rows)
+    with pytest.raises(ValueError):
+        runner_module().validate_completed_artifact(path)
+
+
+@pytest.mark.parametrize("damage", ["supported_int", "missing_claim", "extra_fact", "count_bool", "count_float", "faith_bool"])
+def test_persist_rejects_non_strict_judge_and_invalid_metric_types(tmp_path, damage):
+    """补存必须重验裁判原始结构，不能让整数冒充布尔或宽松数值成为指标。参数：目录/损坏方式；返回：None；异常：断言失败。"""
+    path, rows = judged_artifact(tmp_path / "run")
+    assert runner_module().validate_completed_artifact(path)["faithfulness"] == 1.0
+    row = rows[0]
+    if damage == "supported_int":
+        row["judgment"]["facts"][0]["supported"] = 2
+        row.update(supported_count=2, total_count=1, faithfulness=2.0)
+    elif damage == "missing_claim":
+        del row["judgment"]["facts"][0]["claim"]
+    elif damage == "extra_fact":
+        row["judgment"]["facts"][0]["unknown_field"] = "不允许的字段"
+    elif damage == "count_bool":
+        row.update(supported_count=True, total_count=True)
+    elif damage == "count_float":
+        row.update(supported_count=1.0, total_count=1.0)
+    else:
+        row["faithfulness"] = True
+    rewrite_artifact(path, rows=rows)
+    with pytest.raises(ValueError):
+        runner_module().validate_completed_artifact(path)
+
+
 def test_original_dataset_bytes_must_match_recorded_identity(tmp_path):
     """只改原文件身份且重算外层摘要不能通过本地完整验证。参数：目录；返回：None；异常：断言失败。"""
     path = completed_artifact(tmp_path / "run")

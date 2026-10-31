@@ -13,6 +13,8 @@ from app.knowledge.snapshots import RetrievalCapture
 
 QUERY_PROTOCOL = "production-understanding:prepared-query:policy-expansion3:v1"
 BUDGET_PROTOCOL = "complete-block-skip:context-evidence:window-div16:v1"
+# 线上引用修复与离线生成协议身份共用同一文案，避免实际提示漂移仍沿用旧比较键。
+KNOWLEDGE_CITATION_REPAIR_TEMPLATE = "上次知识回答引用校验未通过：{reason}。请基于同一完整证据重新提交唯一结果；不要使用未出现的编号。"
 
 
 def production_protocols(settings) -> dict[str, str]:
@@ -165,8 +167,7 @@ class ProductionKnowledgePipeline:
                 if attempt:
                     raise
                 # 同一answer阶段最多两次；完整修复说明也计入下一次请求预算。
-                messages.append({"role": "user", "content": "上次知识回答引用校验未通过：" + str(error) +
-                    "。请基于同一完整证据重新提交唯一结果；不要使用未出现的编号。"})
+                messages.append({"role": "user", "content": KNOWLEDGE_CITATION_REPAIR_TEMPLATE.format(reason=str(error))})
                 continue
             signals = [PoolSignal(source=failure.source, reason=failure.reason)] if failure else []
             return {"answer": answer, "refused": failure is not None,
