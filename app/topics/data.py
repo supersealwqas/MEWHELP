@@ -24,14 +24,19 @@ def _mask_personal_field(match: re.Match) -> str:
     """
     prefix = match.group(1)
     value = match.group(0)[len(prefix):]
-    # 先规范字段值再判断业务语法；不能把保护条件放进可回溯的空白匹配后面。
+    # 使用完整字段关系词与正文判句，避免字段提取把“是否”切成“是”+“否正确”。
     content = value.lstrip()
-    question = re.match(r"(?:[是为]\s*)?(?:谁|哪里|在哪|哪个|哪些|什么|怎么|如何|是否|能否|可否|"
-                        r"否(?:可|能|要|需)|(?:能|可以|需要|应该|必须|要)(?:改|换|填|写|选|加|删|提供|确认|保留|不))", content)
-    description = re.fullmatch(r"(?:[是为]\s*)?(?:不变|没变|未变|未定|一样|不同|有误|错误|填错|写错|选错|"
-                               r"必填(?:项)?|姓名|名字|电话|信息|方式|名单)(?:了|的|吗|呢|呀|吧|么|过|一下)?", content)
-    # 保护完整问句结构/状态短语，不能按“无/应/查”等单字放行无锡地址或合法姓氏。
-    if question or description:
+    syntax = re.sub(r"^(?:姓名|收件人|联系人|收货地址|联系地址|地址)", "", match.group(0)).lstrip().lstrip(":：").lstrip()
+    relation = r"(?:[是为]\s*[:：]?\s*)?"
+    particles = r"[的了吗呢呀吧么过]*"
+    question = re.match(relation + r"(?:是否|能否|可否|谁|哪里|在哪|哪个|哪些|什么|怎么|如何)", syntax)
+    action = re.fullmatch(relation + r"(?:(?:可以|需要|应该|必须|能|可|该|应|得|须|要|想|需|会)\s*)?"
+                         r"(?:再|重新|再次|直接|继续)?(?:修改|更改|变更|更换|填写|提供|确认|保留|删除|改|换|填|写|选|加|删)"
+                         r"(?:一下|个人|本人|姓名|名字|地址|电话|错|漏|好|掉|过)?" + particles, syntax)
+    description = re.fullmatch(relation + r"(?:不变|没变|未变|未定|一样|不同|有误|错误|"
+                               r"必填(?:项)?|姓名|名字|电话|信息|方式|名单)" + particles, syntax)
+    # 动作/状态要求整段匹配，疑问助词可组合；不能按“无/应/查”等单字放行真实字段。
+    if question or action or description:
         return match.group(0)
     if prefix.rstrip().endswith("联系人") and re.fullmatch(r"工(?:客服|服务|处理|办理|审核|咨询)", content):
         # “联系人工客服”中的“联系人”只是动词和角色名重叠，不是姓名字段。
