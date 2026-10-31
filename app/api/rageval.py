@@ -386,3 +386,62 @@ async def rerun(
         return manager.start(dataset_path, chosen)
     except RuntimeError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+def _production_dependencies(request: Request):
+    """取得生命周期提供的共同所有者和应用仓储。参数：请求；返回：manager/repository；异常：HTTP503未启动。"""
+    manager = getattr(request.app.state, "evaluation_jobs", None)
+    service = getattr(request.app.state, "chat_service", None)
+    repository = getattr(service, "evaluations", None)
+    if manager is None or repository is None:
+        raise HTTPException(status_code=503, detail="生产评估运行时尚未启动")
+    return manager, repository
+
+
+@router.post("/production/rerun")
+async def production_rerun(request: Request) -> dict:
+    """接受一次配置题集和冻结策略评估，数据库准入由子进程明确报告。
+
+    参数：请求；返回：本实例started/admission=pending，不能表示全库已取得执行锁。
+    异常：HTTP503资源缺失、409本实例忙或关闭；不接受浏览器任意文件路径。
+    """
+    from app.config import settings
+    manager, _ = _production_dependencies(request)
+    dataset, policy = Path(settings.evaluation_dataset_path).resolve(), Path(settings.evidence_policy_path).resolve()
+    if not dataset.is_file() or not policy.is_file():
+        raise HTTPException(status_code=503, detail="生产题集或冻结策略文件不可用")
+    try:
+        return manager.start(dataset, [], profile="production", policy_path=policy, triggered_by="手动")
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@router.get("/production/job")
+async def production_job(request: Request) -> dict:
+    """同时报告本实例任务与数据库实际执行锁，不以本机idle代替全库空闲。
+
+    参数：请求；返回：共同job状态、database_busy与下次时间；异常：HTTP503资源或数据库不可用。
+    """
+    manager, repository = _production_dependencies(request)
+    try:
+        busy = await repository.execution_busy()
+    except Exception as error:
+        raise HTTPException(status_code=503, detail="无法核验数据库评估占用状态") from error
+    scheduler = getattr(request.app.state, "evaluation_scheduler", None)
+    return {**manager.status(), "database_busy": busy,
+        "next_run_at": scheduler.next_at.isoformat() if scheduler is not None else None}
+
+
+@router.get("/production/runs")
+async def production_runs(request: Request,
+        after_id: int = Query(default=0, ge=0, description="上一页最后主键，首次为0"),
+        limit: int = Query(default=50, ge=1, le=200, description="每页条数")) -> dict:
+    """分页读取已联合核验并保存的生产评估，缺失指标保持null。
+
+    参数：请求、非负游标、1–200页长；返回：items/next_after_id；异常：HTTP503数据库或生命周期不可用。
+    """
+    _, repository = _production_dependencies(request)
+    try:
+        return await repository.list_runs(after_id, limit)
+    except Exception as error:
+        raise HTTPException(status_code=503, detail="生产评估历史暂不可用") from error

@@ -3,6 +3,49 @@
 import pytest
 
 
+def test_production_cli_requires_explicit_readonly_target_and_policy():
+    """生产路径不得回落旧评估准备或省略冻结策略。参数：无；返回：None；异常：断言失败。"""
+    from app.evaluation.cli import build_parser
+    parser = build_parser()
+    args = parser.parse_args(["evaluate-production", "--target", "application-readonly", "--policy", "p.json",
+        "--output-dir", "out", "--triggered-by", "定时"])
+    assert args.triggered_by == "定时"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["evaluate-production", "--policy", "p.json", "--output-dir", "out"])
+    assert parser.parse_args(["persist-run", "--artifact-dir", "out"]).artifact_dir.name == "out"
+
+
+@pytest.mark.parametrize("triggered_by", ["手动", "定时"])
+async def test_persist_run_never_repeats_production_evaluation(tmp_path, monkeypatch, triggered_by):
+    """补存只核验现成产物和写仓储，不能重新构建生产运行时。参数：目录/外部数据库替身；返回：None；异常：断言失败。"""
+    from contextlib import asynccontextmanager
+    from app.evaluation.cli import build_parser, run
+    from tests.flywheel.test_eval_runs import completed_artifact
+    artifact = completed_artifact(tmp_path / "run", triggered_by)
+    stored = []
+
+    class Repository:
+        """隔离数据库写入，保留CLI本地完整验证。"""
+        async def save_completed_run(self, path, triggered_by):
+            """记录实际补存请求。参数：路径/来源；返回：保存结果；异常：无。"""
+            stored.append((path, triggered_by))
+            return {"id": "11", "saved": True}
+
+    @asynccontextmanager
+    async def repository(config):
+        """隔离真实数据库连接。参数：配置；返回：仓储；异常：无。"""
+        yield Repository()
+
+    def forbidden(*args, **kwargs):
+        """任何生产资源构造均违反无付费补存合同。参数：任意；返回：无；异常：AssertionError。"""
+        raise AssertionError("补存不得重新评估")
+
+    monkeypatch.setattr("app.repositories.evaluations.evaluation_repository_runtime", repository)
+    monkeypatch.setattr("app.evaluation.production.production_runtime", forbidden)
+    assert await run(build_parser().parse_args(["persist-run", "--artifact-dir", str(artifact)])) == 0
+    assert stored == [(artifact, triggered_by)]
+
+
 def test_cli_requires_explicit_prepare_target_and_fixed_split() -> None:
     """prepare不默认指向任意库，固定验收不能误当校准。参数：无；返回：None；异常：断言失败。"""
     from app.evaluation.cli import build_parser

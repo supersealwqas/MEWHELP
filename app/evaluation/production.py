@@ -39,6 +39,22 @@ class ProductionEvaluationRuntime:
         self.model = model or WorkflowModelAdapter(stream_usage=True)
         self.query_expander = query_expander or QueryExpander(request_budget=settings.request_token_budget)
         self.last_attempt = {}
+        self.frozen_policy, self.checkpoint = None, None
+        self.faithfulness_judge, self.last_judge_usage = None, None
+
+    async def check_execution(self) -> None:
+        """在下一阶段前核验执行锁。参数：无；返回：None；异常：失锁失败关闭。"""
+        if self.checkpoint is not None:
+            await self.checkpoint()
+
+    def observe_judge_usage(self, record: dict) -> None:
+        """保存本题裁判已取得真实用量。参数：record用量记录；返回：None；异常：无。"""
+        self.last_judge_usage = record
+
+    async def judge(self, query: str, answer: str, selected: list):
+        """独立裁判完整selected，不写长期台账。参数：原问/答案/模型证据全集；返回：裁判模型；异常：模型或失锁错误。"""
+        await self.check_execution()
+        return await self.faithfulness_judge.judge(query, answer, selected)
 
     async def execute(self, query: str, filters: dict, *, retrieval_only: bool) -> dict:
         """执行真实理解、分类、共享检索及可选知识生成。
@@ -62,10 +78,12 @@ class ProductionEvaluationRuntime:
         self.last_attempt = {"stage": "understand", "ledger": ledger, "capture": capture}
         observed = self.observability.execution(self.observability.identity_for(context), kind="evaluation") if self.observability else nullcontext()
         with observed:
+            await self.check_execution()
             understood = await understand_query(self.model, model_messages(state, self.settings, UNDERSTANDING_PROMPT,
                 [understanding_tool_schema()]), ledger)
             state.update(understood.model_dump())
             self.last_attempt["stage"] = "classify"
+            await self.check_execution()
             intent = await self.model.classify(model_messages(state, self.settings, INTENT_PROMPT, [intent_tool_schema()]), ledger)
             route = route_by_intent({**state, "intent": intent.intent})
             state.update(intent=intent.intent, route=route)
@@ -78,11 +96,18 @@ class ProductionEvaluationRuntime:
             pipeline = ProductionKnowledgePipeline(self.search, self.settings, query_expander=self.query_expander,
                 state=state, policy=policy, model=self.model)
             self.last_attempt["stage"] = "prepare"
+            await self.check_execution()
             prepared = await pipeline.prepare(understood.resolved_query, actual_filters, messages=[], budget=ledger)
             self.last_attempt.update(stage="retrieve", prepared=prepared)
+            await self.check_execution()
             result = await pipeline.retrieve(prepared, capture=capture)
+            result.update(route=route, filters=actual_filters, intent=intent.intent, intent_confidence=intent.confidence)
+            self.last_attempt["result"] = result
             if not retrieval_only:
                 self.last_attempt["stage"] = "generate"
+                await self.check_execution()
+                if self.frozen_policy is not None:
+                    result["gate"] = assess_evidence(result["ranked"], result["selected"], self.frozen_policy).model_dump(mode="json")
                 result.update(await pipeline.generate(prepared, result))
                 result["budget"] = ledger.snapshot()
             return {**result, "route": route, "filters": actual_filters,
@@ -183,6 +208,7 @@ async def production_runtime(settings, *, target: str):
     def model_factory(**kwargs):
         """给本次真实模型装一次后台观测回调并请求真实usage。参数：模型选项；返回：模型；异常：配置错误。"""
         kwargs.setdefault("stream_usage", True)
+        kwargs.setdefault("model", settings.chat_model)
         if observation.enabled:
             kwargs["callbacks"] = [observation.callback_handler]
         return get_chat_model(**kwargs)
@@ -193,9 +219,12 @@ async def production_runtime(settings, *, target: str):
             chunks = await read_corpus(store)
             await _verify_vectors(index, chunks)
             runtime = ProductionEvaluationRuntime(HybridKnowledgeSearch(store, encoder, index, reranker, settings), settings,
-                model=WorkflowModelAdapter(model_factory=model_factory, stream_usage=True),
+                model=WorkflowModelAdapter(model_factory=model_factory, stream_usage=True, intent_model=settings.intent_model),
                 query_expander=QueryExpander(model_factory=model_factory, request_budget=settings.request_token_budget),
                 observability=observation)
+            from app.evaluation.faithfulness import FaithfulnessJudge
+            runtime.faithfulness_judge = FaithfulnessJudge(model_factory,
+                model_name=settings.judge_model or settings.chat_model, usage_observer=runtime.observe_judge_usage)
             yield runtime, store, chunks, index
     finally:
         with anyio.CancelScope(shield=True):
@@ -309,4 +338,234 @@ async def run_production(args, settings) -> int:
         failure = {"status": "failed", "error_type": type(error).__name__, "completed_rows": len(rows)}
         atomic_json(output / "startup-error.json", failure)
         print(json.dumps(failure, ensure_ascii=False))
+        return 1
+
+
+def _production_signature(settings) -> dict:
+    """保存实际生产与测量模型协议，只绑定相关控制规则，不哈希整个应用。
+
+    参数：本轮Settings；返回：可比较口径；异常：配置或序列化错误。
+    """
+    from app.evaluation.policy import digest_json
+    from app.evaluation.faithfulness import _JUDGE_SYSTEM, FaithfulnessDecision
+    from app.core.structured import output_tool
+    from app.workflow.prompts import KNOWLEDGE_PROMPT
+    from app.workflow.model import knowledge_tool_schema
+    from app.knowledge.embedding import EMBEDDING_REVISION
+    from app.knowledge.rerank import RERANKER_REVISION
+    from app.evaluation.runtime import model_digest
+    budget = BudgetLedger.from_settings(settings).snapshot()
+    budget.pop("records", None)
+    return {"protocols": production_protocols(settings),
+        "models": {"generation": settings.chat_model, "intent": settings.intent_model,
+            "judge": settings.judge_model or settings.chat_model, "embedding": EMBEDDING_REVISION, "reranker": RERANKER_REVISION,
+            "endpoint_digest": sha256(settings.chat_base_url.encode()).hexdigest(),
+            "embedding_artifacts_digest": model_digest(Path(settings.knowledge_model_path)),
+            "reranker_artifacts_digest": model_digest(Path(settings.rerank_model_path))},
+        "generation_protocol": digest_json({"protocol": "structured-selfcheck:full-evidence:one-citation-repair:v1",
+            "prompt": KNOWLEDGE_PROMPT, "tool": knowledge_tool_schema()}),
+        "judge_protocol": digest_json({"prompt": _JUDGE_SYSTEM,
+            "tool": output_tool(FaithfulnessDecision, "submit_faithfulness"), "max_input_chars": 65000,
+            "max_output_chars": 20000, "max_tokens": 4096, "temperature": 0.0}),
+        "budget_config": budget,
+        "retrieval_config": {key: getattr(settings, key) for key in ("knowledge_retrieval_mode", "recall_top_k",
+            "rerank_top_k", "rerank_min_score", "subquery_split", "context_evidence_max_tokens",
+            "knowledge_model_path", "rerank_model_path")}}
+
+
+def _json_value(value):
+    """将真实诊断模型集中转成标准JSON值，禁止隐藏非有限数字。
+
+    参数：模型/字典/列表/基础值；返回：JSON兼容值；异常：写盘时遇非法值显式失败。
+    """
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    if isinstance(value, dict):
+        return {key: _json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_value(item) for item in value]
+    return value
+
+
+def _capture_result(row: dict, result: dict, groups: list[set[int]]) -> None:
+    """保留同次已完成检索/生成，原题身份不被理解后的查询或路由筛选覆盖。
+
+    参数：当前记录、共享执行部分结果、真实标注组；返回：None；异常：结果结构错误。
+    """
+    from app.evaluation.metrics import retrieval_metrics
+    result = dict(result)
+    if "query" in result:
+        result["prepared_query"] = result.pop("query")
+    if "filters" in result:
+        result["actual_filters"] = result.pop("filters")
+    row.update(_json_value(result))
+    if "ranked" in result:
+        row["ranked_ids"] = [item.chunk.id for item in result["ranked"]]
+        row["retrieval"] = retrieval_metrics(row["ranked_ids"], groups)
+        row["sufficient"] = selected_evidence_sufficient(groups, result["selected"])
+    if row["refused"] is False:
+        row["citation_valid"] = True
+
+
+async def evaluate_production(args, settings, *, checkpoint) -> dict:
+    """只读执行48题生产知识子流程，逐题写盘，末次版本核验后才发布完成标记。
+
+    参数：完整CLI参数、冻结设置、各阶段执行lease核验协程。
+    返回：完整汇总；异常：目录冲突、启动/版本/失锁/取消；逐题模型故障保留原分母。
+    """
+    from app.evaluation.dataset import load_dataset, resolve_evidence
+    from app.evaluation.runner import atomic_json, production_summary, PRODUCTION_SCOPE
+    from app.evaluation.policy import digest_json
+    from app.evaluation.runtime import _verify_vectors
+    from app.evaluation.faithfulness import FaithfulnessError
+    from app.knowledge.errors import LeaseLost
+    output = Path(args.output_dir)
+    output.mkdir(parents=True, exist_ok=False)
+    identity, rows, metadata = str(uuid4()), [], None
+    manifest = {"schema_version": 1, "artifact_id": identity, "scope": PRODUCTION_SCOPE,
+        "status": "running", "expected_sample_count": 48, "completed_sample_count": 0}
+    atomic_json(output / "manifest.json", manifest)
+    invalidated = False
+    try:
+        await checkpoint()
+        signature = await anyio.to_thread.run_sync(_production_signature, settings)
+        policy = load_evidence_policy(args.policy, protocols=signature["protocols"])
+        dataset_bytes = Path(args.dataset).read_bytes()
+        with (output / "dataset.json").open("xb") as frozen_dataset:
+            frozen_dataset.write(dataset_bytes)
+            frozen_dataset.flush()
+            os.fsync(frozen_dataset.fileno())
+        await checkpoint()
+        async with production_runtime(settings, target=args.target) as (runtime, store, chunks, index):
+            runtime.frozen_policy, runtime.checkpoint = policy, checkpoint
+            cases = load_dataset(output / "dataset.json", chunks=chunks)
+            dataset = [case.model_dump(mode="json") for case in cases]
+            cases = [case for case in cases if case.split == "evaluation"]
+            corpus = [chunk.model_dump(mode="json") for chunk in chunks]
+            before = {"knowledge": digest_json(corpus), "policy": digest_json(policy.model_dump(mode="json")),
+                "protocols": signature["protocols"], "configuration": digest_json(signature)}
+            metadata = {**signature, "dataset_digest": digest_json(dataset), "dataset_sha256": sha256(dataset_bytes).hexdigest(),
+                "triggered_by": args.triggered_by,
+                "split": "evaluation", "case_ids": [case.id for case in cases], "corpus_version": before["knowledge"],
+                "policy_sha256": before["policy"], "policy_version": policy.version,
+                "database": settings.mysql_database, "milvus_database": settings.milvus_database,
+                "collection": settings.milvus_hybrid_collection, "versions_before": before, "versions_after": None}
+            manifest["metadata"] = metadata
+            atomic_json(output / "manifest.json", manifest)
+            atomic_json(output / "corpus.json", corpus)
+            atomic_json(output / "policy.json", policy.model_dump(mode="json"))
+            with (output / "results.jsonl").open("x", encoding="utf-8", newline="\n") as stream:
+                for case in cases:
+                    await checkpoint()
+                    tick = monotonic()
+                    groups = resolve_evidence(case, chunks)
+                    row = {"artifact_id": identity, "id": case.id, "split": case.split, "query": case.query,
+                        "filters": case.filters, "bucket": case.bucket, "difficulty": case.difficulty, "answerable": case.answerable,
+                        "refused": None, "answer": None, "error": None, "faithfulness": None,
+                        "supported_count": 0, "total_count": 0, "retrieval": None, "ranked_ids": [], "ranked": [],
+                        "selected": [], "citations": [], "citation_valid": None, "budget": None, "judge_usage": None,
+                        "resolved_evidence_groups": [sorted(group) for group in groups]}
+                    runtime.last_attempt, runtime.last_judge_usage = {}, None
+                    stage = "execute"
+                    try:
+                        result = await runtime.execute(case.query, case.filters, retrieval_only=False)
+                        _capture_result(row, result, groups)
+                        if row["refused"] is False:
+                            stage = "judge"
+                            await checkpoint()
+                            judged = await runtime.judge(case.query, row["answer"], result["selected"])
+                            numbers = {item.n for item in result["selected"]}
+                            if not judged.facts or any(not set(fact.evidence_numbers).issubset(numbers)
+                                    or (fact.supported and not fact.evidence_numbers) for fact in judged.facts):
+                                raise FaithfulnessError("裁判事实为空或引用不合法")
+                            row.update(judgment=judged.model_dump(mode="json"), total_count=len(judged.facts),
+                                supported_count=sum(fact.supported for fact in judged.facts))
+                            row["faithfulness"] = row["supported_count"] / row["total_count"]
+                    except LeaseLost:
+                        raise
+                    except Exception as error:
+                        attempt = runtime.last_attempt
+                        if stage != "judge":
+                            _capture_result(row, attempt.get("result", {}), groups)
+                        ledger, capture = attempt.get("ledger"), attempt.get("capture")
+                        if ledger is not None:
+                            row["budget"] = ledger.snapshot()
+                        if capture is not None and capture.snapshot is not None:
+                            row["snapshot"] = capture.snapshot.model_dump(mode="json")
+                        row["error"] = {"stage": "judge" if stage == "judge" else attempt.get("stage", stage),
+                            "type": type(error).__name__, "kind": "budget" if isinstance(error,
+                                (WorkflowBudgetExceeded, ContextBudgetExceeded)) else "fault"}
+                    row["judge_usage"] = runtime.last_judge_usage
+                    row["elapsed_seconds"] = monotonic() - tick
+                    stream.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                    rows.append(row)
+                    print(json.dumps({"id": row["id"], "error": row["error"], "completed": len(rows)}, ensure_ascii=False), flush=True)
+            await checkpoint()
+            # 末次版本无法确认时也不得发布完整成绩。
+            invalidated = True
+            after_chunks = await read_corpus(store)
+            await _verify_vectors(index, after_chunks)
+            after_signature = await anyio.to_thread.run_sync(_production_signature, settings)
+            after_policy = load_evidence_policy(args.policy, protocols=after_signature["protocols"])
+            metadata["versions_after"] = {"knowledge": digest_json([chunk.model_dump(mode="json") for chunk in after_chunks]),
+                "policy": digest_json(after_policy.model_dump(mode="json")), "protocols": after_signature["protocols"],
+                "configuration": digest_json(after_signature)}
+            if metadata["versions_after"] != before or Path(args.dataset).read_bytes() != dataset_bytes:
+                invalidated = True
+                raise ValueError("运行期间知识、检索、策略或数据发生变化，本轮成绩失效")
+            invalidated = False
+            await checkpoint()
+            summary = production_summary(rows, metadata, identity)
+            atomic_json(output / "summary.json", summary)
+            (output / "summary.md").write_text("# 生产知识评估\n\n" + summary["limitation"] +
+                f"\n\n状态：{summary['status']}；题量：48；错误：{summary['error_count']}；拒答：{summary['refusal_count']}。\n" +
+                "\n完整指标与分母见summary.json，逐题证据与真实用量见results.jsonl。\n", encoding="utf-8")
+            atomic_json(output / "manifest.json", {**manifest, "status": summary["status"], "completed_sample_count": 48,
+                "summary_digest": digest_json(summary), "results_digest": digest_json(rows)})
+            return summary
+    except BaseException as error:
+        status = "invalidated" if invalidated else "failed" if isinstance(error, Exception) else "interrupted"
+        atomic_json(output / "manifest.json", {**manifest, "status": status, "completed_sample_count": len(rows),
+            "error_type": type(error).__name__})
+        if metadata is not None:
+            atomic_json(output / "summary.json", production_summary(rows, metadata, identity, status=status))
+        raise
+
+
+async def run_complete_production(args, settings) -> int:
+    """CLI唯一付费执行者；先取得独立执行锁，完成文件后另用短保存锁。
+
+    参数：CLI参数与明确应用设置；返回：0完成、2含逐题错误、3跨进程忙、4仅保存失败、1执行失败。
+    异常：取消传播；不覆盖旧目录、不重新校准、不初始化应用知识资源。
+    """
+    from app.repositories.evaluations import evaluation_repository_runtime
+    from app.knowledge.errors import ConcurrentKnowledgeWrite, LeaseLost
+    try:
+        async with evaluation_repository_runtime(settings) as repository:
+            async with repository.execution() as lease:
+                async def checkpoint():
+                    """每阶段核验原物理执行连接，结束查询隐式事务。参数：无；返回：None；异常：LeaseLost。"""
+                    try:
+                        await lease.assert_held()
+                        await lease.connection.commit()
+                    except Exception as error:
+                        raise LeaseLost("评估执行锁丢失") from error
+
+                summary = await evaluate_production(args, settings, checkpoint=checkpoint)
+                await checkpoint()
+                try:
+                    saved = await repository.save_completed_run(Path(args.output_dir), args.triggered_by)
+                except Exception as error:
+                    print(json.dumps({"status": "persist_failed", "error_type": type(error).__name__,
+                        "artifact_dir": str(Path(args.output_dir).resolve())}, ensure_ascii=False), flush=True)
+                    return 4
+                print(json.dumps({"status": summary["status"], "id": saved["id"], "artifact_id": summary["artifact_id"]}, ensure_ascii=False))
+                return 0 if summary["status"] == "completed" else 2
+    except ConcurrentKnowledgeWrite:
+        print(json.dumps({"status": "busy", "message": "应用数据库已有生产评估执行者"}, ensure_ascii=False))
+        return 3
+    except Exception as error:
+        print(json.dumps({"status": "failed", "error_type": type(error).__name__}, ensure_ascii=False))
         return 1

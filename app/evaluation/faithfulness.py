@@ -64,10 +64,12 @@ _JUDGE_SYSTEM = """你是独立的答案忠实度裁判。只使用下面实际�
 class FaithfulnessJudge:
     """通过强制控制工具提交逐事实结论的有界裁判，保留全集证据，失败明确上抛。"""
 
-    def __init__(self, client_factory: Callable[..., Any] = get_chat_model, *, model_name: str | None = None) -> None:
-        """保存裁判工厂。参数：client_factory 项目模型工厂、model_name 可选真实模型名；返回：None；异常：无。"""
+    def __init__(self, client_factory: Callable[..., Any] = get_chat_model, *, model_name: str | None = None,
+                 usage_observer: Callable[[dict], None] | None = None) -> None:
+        """保存裁判工厂。参数：工厂、可选模型名、独立实际用量出口；返回：None；异常：无。"""
         self.factory = client_factory
         self.model_name = model_name or settings.chat_model
+        self.usage_observer = usage_observer
 
     async def judge(self, query: str, answer: str, citations: list[EvidenceCitation]) -> FaithfulnessDecision:
         """把本轮问答及全部证据传给独立模型并严格回收逐事实结论。
@@ -85,11 +87,26 @@ class FaithfulnessJudge:
         model = self.factory(streaming=True, temperature=0.0, model=self.model_name, max_tokens=4096)
         messages = [SystemMessage(content=_JUDGE_SYSTEM), HumanMessage(content=payload)]
         try:
-            gathered = await collect_tool_output(bind_output_tool(model, tool), messages, max_chars=20000)
+            # 仅适配已有收集器的记录出口；裁判不占用生产BudgetLedger，也不增加生产阶段。
+            observation = _JudgeUsage(self.usage_observer) if self.usage_observer else None
+            gathered = await collect_tool_output(bind_output_tool(model, tool), messages, max_chars=20000,
+                budget=observation, stage="judge" if observation else None)
             return parse_tool_output(gathered, FaithfulnessDecision, name)
         except StructuredOutputError as error:
             # 协议失败不能成为空事实或满分，业务层只接收合法的逐事实结论。
             raise FaithfulnessError("裁判未提交合法结构化结果") from error
+
+
+class _JudgeUsage:
+    """连接流收集器的可选用量出口，不负责生产预算或长期台账。"""
+
+    def __init__(self, observer):
+        """保存观察函数。参数：observer接收真实记录；返回：None；异常：无。"""
+        self.observer = observer
+
+    def record_usage(self, stage, usage, finish_reason):
+        """在流结束或故障时记录已取得的用量。参数：阶段/用量/结束原因；返回：None；异常：观察函数错误。"""
+        self.observer({"usage": dict(usage) if usage is not None else None, "finish_reason": finish_reason})
 
 
 class FaithfulnessService:

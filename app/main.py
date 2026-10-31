@@ -188,6 +188,8 @@ async def database_runtime():
                         await summaries.recover()
                         service.flywheel = flywheel
                         service.review_publisher = publisher
+                        from app.repositories.evaluations import EvaluationRepository
+                        service.evaluations = EvaluationRepository(factory, lease_engine)
                         publisher.start()
                         flywheel.start()
                         yield service
@@ -236,10 +238,29 @@ def create_app(runtime_factory=None) -> FastAPI:
         try:
             async with (runtime_factory or create_runtime)() as service:
                 application.state.chat_service = service
+                scheduler = None
                 try:
+                    if getattr(service, "evaluations", None) is not None and settings.evaluation_schedule_enabled:
+                        from app.evaluation.scheduler import EvaluationScheduler
+                        scheduler = EvaluationScheduler(manager, Path(settings.evaluation_dataset_path).resolve(),
+                            Path(settings.evidence_policy_path).resolve(), hour=settings.evaluation_hour,
+                            minute=settings.evaluation_minute, timezone=settings.evaluation_timezone)
+                        application.state.evaluation_scheduler = scheduler
+                        scheduler.start()
                     yield
                 finally:
-                    del application.state.chat_service
+                    # 先停定时触发，再回收本实例子进程；此时数据库/搜索/观测依赖仍存活。
+                    with anyio.CancelScope(shield=True):
+                        try:
+                            if scheduler is not None:
+                                await scheduler.close()
+                        finally:
+                            try:
+                                await manager.close()
+                            finally:
+                                if hasattr(application.state, "evaluation_scheduler"):
+                                    del application.state.evaluation_scheduler
+                                del application.state.chat_service
         finally:
             # 应用关闭或启动失败都收回本实例评估资源，外层取消不能跳过清理。
             with anyio.CancelScope(shield=True):

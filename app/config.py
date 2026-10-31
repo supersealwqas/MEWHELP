@@ -162,6 +162,12 @@ class Settings(BaseSettings):
     )
     evidence_policy_path: str = Field(default="data/knowledge/evidence-policy.json", min_length=1,
         description="真实生产校准生成的v2证据策略；缺失或不兼容时新搜索失败关闭，没有拍定默认阈值")
+    evaluation_dataset_path: str = Field(default="data/evaluation/ch04.json", min_length=1,
+        description="生产评估原72题文件；只执行其中48道evaluation，不重新校准")
+    evaluation_schedule_enabled: bool = Field(default=True, description="是否启用应用每日生产知识评估；手动入口仍可使用")
+    evaluation_hour: int = Field(default=3, ge=0, le=23, description="每日评估本地小时，默认03点")
+    evaluation_minute: int = Field(default=0, ge=0, le=59, description="每日评估本地分钟，默认整点")
+    evaluation_timezone: str = Field(default="Asia/Shanghai", min_length=1, description="每日评估IANA时区，默认上海")
     knowledge_relation_policy_path: str = Field(
         default="data/knowledge/relation-policy.json",
         min_length=1,

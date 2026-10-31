@@ -20,6 +20,144 @@ TEST_DATABASE = "mewhelp_ch09_test"
 OWNED_TABLES = ("qa_extraction_staging", "qa_extraction_batches", "knowledge_chunks", "messages", "low_confidence_questions", "faith_cases", "eval_runs", "review_queue", "conversations")
 
 
+def _save_eval_artifact_process(config, artifact):
+    """子进程独立连接专库保存同一产物，不调用模型。参数：专库配置/目录；返回：保存结果；异常：数据库错误。"""
+    import asyncio
+    from pathlib import Path
+    from app.repositories.evaluations import evaluation_repository_runtime
+
+    async def save():
+        """只连接显式专库。参数：无；返回：最少结果；异常：配置/数据库错误。"""
+        assert config.mysql_database == TEST_DATABASE
+        async with evaluation_repository_runtime(config) as repository:
+            result = await repository.save_completed_run(Path(artifact), "手动")
+            return {"id": result["id"], "saved": result["saved"]}
+
+    return asyncio.run(save())
+
+
+async def test_same_artifact_is_saved_once_across_processes(isolated_mysql, tmp_path):
+    """两个独立进程保存相同artifact必须恰好一行，新连接可见且重复内容冲突拒绝。参数：空专库/目录；返回：None；异常：断言失败。"""
+    import asyncio
+    import json
+    from concurrent.futures import ProcessPoolExecutor
+    from sqlalchemy import select
+    from app.models.flywheel import EvalRun
+    from app.repositories.evaluations import evaluation_repository_runtime
+    from app.evaluation.runner import atomic_json
+    from app.evaluation.policy import digest_json
+    from tests.flywheel.test_eval_runs import completed_artifact
+    config, engine, factory, _ = isolated_mysql
+    async with engine.begin() as connection:
+        await connection.run_sync(lambda sync: EvalRun.__table__.create(sync))
+    artifact = completed_artifact(tmp_path / "run")
+    with ProcessPoolExecutor(max_workers=2) as pool:
+        loop = asyncio.get_running_loop()
+        outcomes = await asyncio.gather(*(loop.run_in_executor(pool, _save_eval_artifact_process, config, str(artifact)) for _ in range(2)))
+    assert outcomes[0]["id"] == outcomes[1]["id"] and sorted(row["saved"] for row in outcomes) == [False, True]
+    async with factory() as session:
+        rows = (await session.scalars(select(EvalRun))).all()
+        assert len(rows) == 1 and rows[0].dataset_size == 48
+        assert rows[0].metrics["faithfulness"] is None and rows[0].metrics["aggregate"]["recall@10"]["denominator"] == 40
+    # 仅更改诊断耗时仍是一份自洽完整产物，但相同artifact_id不能覆盖旧内容。
+    result_rows = [json.loads(line) for line in (artifact / "results.jsonl").read_text(encoding="utf-8").splitlines()]
+    result_rows[0]["elapsed_seconds"] = 2.0
+    (artifact / "results.jsonl").write_text("".join(json.dumps(row) + "\n" for row in result_rows), encoding="utf-8")
+    manifest = json.loads((artifact / "manifest.json").read_text(encoding="utf-8"))
+    manifest["results_digest"] = digest_json(result_rows)
+    atomic_json(artifact / "manifest.json", manifest)
+    async with evaluation_repository_runtime(config) as repository:
+        with pytest.raises(ValueError, match="不同内容"):
+            await repository.save_completed_run(artifact, "手动")
+        assert len((await repository.list_runs(0, 1))["items"]) == 1
+    print("两个真实进程相同artifact仅一行；新连接可见；48/40原分母和null保持；同ID不同内容拒绝")
+
+
+async def test_cli_and_manager_share_database_execution_lock(isolated_mysql, tmp_path, monkeypatch):
+    """独立CLI与manager子进程均在资源/付费前因同一真实锁退出busy，释放后可重取。参数：空专库/目录/环境；返回：None；异常：断言失败。"""
+    import asyncio
+    import subprocess
+    import sys
+    from pathlib import Path
+    from app.evaluation.jobs import EvaluationJobManager
+    from app.repositories.evaluations import evaluation_repository_runtime
+    config, _, _, _ = isolated_mysql
+    values = {"MYSQL_DATABASE": TEST_DATABASE, "MYSQL_HOST": config.mysql_host, "MYSQL_PORT": str(config.mysql_port),
+        "MYSQL_USER": config.mysql_user, "MYSQL_PASSWORD": config.mysql_password.get_secret_value(),
+        "PYTHONIOENCODING": "utf-8", "KNOWLEDGE_MODEL_PATH": str(tmp_path / "no-model")}
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+    root = Path(__file__).resolve().parents[2]
+    manager = EvaluationJobManager(root, tmp_path / "reports", timeout_seconds=20)
+    try:
+        async with evaluation_repository_runtime(config) as repository:
+            async with repository.execution():
+                assert await repository.execution_busy() is True
+                manager.start(root / "data/evaluation/ch04.json", [], profile="production",
+                    policy_path=root / "data/knowledge/evidence-policy.json")
+                process = await asyncio.create_subprocess_exec(sys.executable, "-m", "app.evaluation.cli", "evaluate-production",
+                    "--dataset", "data/evaluation/ch04.json", "--policy", "data/knowledge/evidence-policy.json",
+                    "--target", "application-readonly", "--output-dir", str(tmp_path / "cli-output"), cwd=root,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                    **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}))
+                try:
+                    stdout, stderr = await asyncio.wait_for(process.communicate(), 20)
+                finally:
+                    if process.returncode is None:
+                        process.kill()
+                        await process.wait()
+                assert process.returncode == 3, (stdout.decode(), stderr.decode())
+                async with asyncio.timeout(20):
+                    while manager.status()["status"] == "running":
+                        await asyncio.sleep(0.02)
+                assert manager.status()["status"] == "busy" and manager.status()["admission"] == "busy"
+                assert not (tmp_path / "cli-output").exists()
+                assert not list((tmp_path / "reports").glob("*-production-*"))
+            assert await repository.execution_busy() is False
+            async with repository.execution() as lease:
+                await lease.assert_held()
+        print("独立CLI与真实manager子进程共用MySQL执行锁，均退出3/busy且没有产物/模型资源；释放后重新获取成功")
+    finally:
+        await manager.close()
+
+
+async def test_eval_save_lost_owned_connection_rolls_back(isolated_mysql, tmp_path, monkeypatch):
+    """INSERT后断开本轮自有锁连接不得提交，新执行者可重取保存锁完成一次。参数：专库/目录/替身；返回：None；异常：断言失败。"""
+    from sqlalchemy import select
+    from app.models.flywheel import EvalRun
+    from app.repositories.evaluations import evaluation_repository_runtime, MySqlWriteLease, EVALUATION_SAVE_LOCK
+    from tests.flywheel.test_eval_runs import completed_artifact
+    config, engine, factory, _ = isolated_mysql
+    async with engine.begin() as connection:
+        await connection.run_sync(lambda sync: EvalRun.__table__.create(sync))
+    artifact = completed_artifact(tmp_path / "run")
+    original = MySqlWriteLease.assert_held
+    checks = 0
+
+    async def disconnect_owned(lease):
+        """在当前自有保存连接第二次核锁前真实断开它。参数：本轮lease；返回：None；异常：连接故障。"""
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            identifier = await lease.connection.scalar(text("SELECT CONNECTION_ID()"))
+            assert await lease.connection.scalar(text("SELECT DATABASE()")) == TEST_DATABASE
+            async with factory() as session:
+                assert await session.scalar(text("SELECT IS_USED_LOCK(:name)"), {"name": EVALUATION_SAVE_LOCK}) == identifier
+                assert await session.scalar(text("SELECT DATABASE()")) == TEST_DATABASE
+                await session.execute(text(f"KILL CONNECTION {int(identifier)}"))
+        await original(lease)
+
+    async with evaluation_repository_runtime(config) as repository:
+        monkeypatch.setattr(MySqlWriteLease, "assert_held", disconnect_owned)
+        with pytest.raises(Exception):
+            await repository.save_completed_run(artifact, "手动")
+        monkeypatch.setattr(MySqlWriteLease, "assert_held", original)
+        async with factory() as session:
+            assert (await session.scalars(select(EvalRun))).all() == []
+        assert (await repository.save_completed_run(artifact, "手动"))["saved"] is True
+    print("真实断开本轮专庫自有保存连接：未提交零行；释放后新连接成功补存一行")
+
+
 @pytest.fixture
 async def isolated_mysql():
     """连接已准备专库并保护已存在表，只删除本轮创建表。

@@ -38,8 +38,17 @@ class EvaluationJobManager:
         self._owned: dict[tuple[int, float | None], psutil.Process] = {}
         self._closed = False
 
-    def start(self, dataset: Path, strategies: list[str]) -> dict:
-        """同步占用本实例后安排后台作业。参数：dataset题集/strategies策略；返回：启动状态；异常：RuntimeError冲突、OSError写盘失败。"""
+    def start(self, dataset: Path, strategies: list[str], *, profile: str = "legacy", policy_path: Path | None = None,
+              triggered_by: str = "手动") -> dict:
+        """同步接受本实例作业，生产数据库准入由子进程报告。
+
+        参数：题集/策略列表、legacy或production、生产冻结策略路径、中文触发来源。
+        返回：started/本实例状态，production初始admission=pending；异常：配置非法、关闭/忙/清理冲突。
+        """
+        if profile not in {"legacy", "production"} or triggered_by not in {"手动", "定时"}:
+            raise ValueError("评估profile或触发来源非法")
+        if profile == "production" and (policy_path is None or strategies):
+            raise ValueError("生产评估只接受一个明确冻结策略路径，不接受旧策略列表")
         if self._closed:
             raise RuntimeError("评估管理器已关闭")
         if self._task is not None and not self._task.done():
@@ -52,13 +61,20 @@ class EvaluationJobManager:
         token = uuid4().hex[:8]
         calibration = self.reports_root / f"{stamp}-calibrate-{token}"
         comparison = self.reports_root / f"{stamp}-compare-{token}"
+        if profile == "production":
+            comparison = self.reports_root / f"{stamp}-production-{token}"
         self._state = {"status": "running", "pid": None, "process_created_at": None,
             "started_at": datetime.now(timezone.utc).isoformat(), "finished_at": None,
             "returncode": None, "dataset": dataset.name, "strategies": list(strategies),
             "calibration_dir": calibration.name, "comparison_dir": comparison.name,
             "message": "正在校准并比较策略，完成后刷新页面查看"}
+        self._state.update(profile=profile, triggered_by=triggered_by)
+        if profile == "production":
+            self._state.update(admission="pending", calibration_dir=None, artifact_dir=comparison.name,
+                message="本实例已接受；子进程取得数据库执行锁后才开始冻结策略评估")
         self._write_state()
-        self._task = asyncio.create_task(self._run(dataset, list(strategies), calibration, comparison))
+        self._task = asyncio.create_task(self._run(dataset, list(strategies), calibration, comparison,
+            profile=profile, policy_path=policy_path, triggered_by=triggered_by))
         return {"started": True, **self._state}
 
     def status(self) -> dict:
@@ -96,24 +112,30 @@ class EvaluationJobManager:
             if error:
                 self._finish("failed", "评估进程清理失败", cleanup_error=error)
 
-    async def _run(self, dataset: Path, strategies: list[str], calibration: Path, comparison: Path) -> None:
-        """在同一整体时限内运行两段CLI。参数：题集/策略/两阶段目录；返回：None；异常：内部记录为终态。"""
+    async def _run(self, dataset: Path, strategies: list[str], calibration: Path, comparison: Path, *,
+                   profile: str, policy_path: Path | None, triggered_by: str) -> None:
+        """共用超时/进程回收；生产只运行一次evaluate。参数：题集/策略/目录/profile/冻结路径/来源；返回：None；异常：记录终态。"""
         status, message, returncode = "done", "评估完成，刷新页面查看最新结果", 0
         cleanup_error = None
         try:
             with self.log_path.open("w", encoding="utf-8", buffering=1) as log:
                 async with asyncio.timeout(self.timeout_seconds):
-                    for index, (command, split, output) in enumerate(
-                        (("calibrate", "calibration", calibration), ("compare", "evaluation", comparison)), 1
-                    ):
+                    stages = (("evaluate-production", "evaluation", comparison),) if profile == "production" else (
+                        ("calibrate", "calibration", calibration), ("compare", "evaluation", comparison))
+                    for index, (command, split, output) in enumerate(stages, 1):
                         argv = [sys.executable, "-m", "app.evaluation.cli", command, "--split", split,
                                 "--dataset", str(dataset), "--strategies", *strategies, "--output-dir", str(output)]
                         if command == "compare":
                             argv += ["--policy", str(calibration / "policy.json")]
+                        if profile == "production":
+                            argv = [sys.executable, "-m", "app.evaluation.cli", command, "--dataset", str(dataset),
+                                "--policy", str(policy_path), "--triggered-by", triggered_by,
+                                "--target", "application-readonly", "--output-dir", str(output)]
                         log.write("\n$ " + " ".join(argv) + "\n")
                         # Popen同步取得句柄：创建与登记之间没有取消点，不丢失已启动进程。
                         process = psutil.Popen(argv, cwd=str(self.repo_root), stdout=log, stderr=subprocess.STDOUT,
-                                               env={**os.environ, "PYTHONUNBUFFERED": "1"})
+                                               env={**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"},
+                                               **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}))
                         # 先保留带psutil身份保护的句柄，元信息读取失败也不能丢所有权。
                         self._owned[(process.pid, None)] = process
                         self._state["pid"] = process.pid
@@ -131,6 +153,14 @@ class EvaluationJobManager:
                         cleanup_error = await self._clean_owned()
                         if cleanup_error:
                             status, message = "failed", "评估进程清理失败"
+                            break
+                        if profile == "production":
+                            status, message = {0: ("completed", "冻结策略评估已完成并保存"),
+                                2: ("completed_with_errors", "评估已保存，部分题发生真实错误，分母保持完整"),
+                                3: ("busy", "数据库已有评估执行者，本次未调用模型"),
+                                4: ("persist_failed", "评估文件已完成，仅落表失败，可使用persist-run补存")}.get(
+                                    returncode, ("failed", f"生产评估失败，退出码 {returncode}，见日志"))
+                            self._state["admission"] = "busy" if returncode == 3 else "accepted" if returncode in (0, 2, 4) else "unknown"
                             break
                         if returncode != 0:
                             status, message = "failed", f"第 {index} 阶段失败，退出码 {returncode}，见日志"

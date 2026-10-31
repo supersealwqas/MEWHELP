@@ -7,11 +7,105 @@ import importlib.util
 import json
 import sys
 import threading
+from types import SimpleNamespace
 from contextlib import asynccontextmanager
 
 import psutil
 import pytest
 from fastapi.testclient import TestClient
+
+
+@pytest.mark.parametrize("startup_failure", [False, True])
+def test_scheduler_then_manager_close_before_runtime(monkeypatch, startup_failure):
+    """定时器和自有进程必须在数据库退出前收回，启动失败也不漏清理。参数：替身/失败开关；返回：None；异常：断言失败。"""
+    import app.main as main
+    events = []
+
+    class Manager:
+        """记录真实lifespan调用的外部作业所有者。"""
+        async def close(self):
+            """记录清理。参数：无；返回：None；异常：无。"""
+            events.append("manager")
+
+    class Scheduler:
+        """以最小边界记录应用启动/清理顺序。"""
+        def __init__(self, *args, **kwargs):
+            """接收调度配置。参数：任意；返回：None；异常：无。"""
+
+        def start(self):
+            """模拟启动失败。参数：无；返回：None；异常：RuntimeError。"""
+            if startup_failure:
+                raise RuntimeError("调度启动失败")
+
+        async def close(self):
+            """记录先停止新触发。参数：无；返回：None；异常：无。"""
+            events.append("scheduler")
+
+    @asynccontextmanager
+    async def runtime():
+        """标记数据库资源退出时点。参数：无；返回：服务；异常：透传。"""
+        try:
+            yield SimpleNamespace(evaluations=object())
+        finally:
+            events.append("runtime")
+
+    monkeypatch.setattr(main, "create_job_manager", lambda: Manager())
+    monkeypatch.setattr("app.evaluation.scheduler.EvaluationScheduler", Scheduler)
+    application = main.create_app(runtime_factory=runtime)
+    if startup_failure:
+        with pytest.raises(RuntimeError):
+            with TestClient(application):
+                pass
+    else:
+        with TestClient(application):
+            pass
+    assert events[:3] == ["scheduler", "manager", "runtime"]
+
+
+def test_production_api_shares_manager_and_reports_global_busy(monkeypatch, tmp_path):
+    """生产/旧重跑共用忙状态，分页保留None且API明确数据库占用。参数：替身/目录；返回：None；异常：断言失败。"""
+    import app.main as main
+    from app.api import rageval
+    events = []
+    parent = ProcessDouble()
+    manager, calls = _manager(monkeypatch, tmp_path, [parent])
+
+    class Repository:
+        """只替换外部数据库读取。"""
+        async def list_runs(self, after_id, limit):
+            """记录分页边界并保留缺失指标。参数：游标/页长；返回：页；异常：无。"""
+            events.append((after_id, limit))
+            return {"items": [{"id": "7", "metrics": {"faithfulness": None}}], "next_after_id": "7"}
+
+        async def execution_busy(self):
+            """模拟其他进程已持有数据库执行锁。参数：无；返回：bool；异常：无。"""
+            return True
+
+    @asynccontextmanager
+    async def runtime():
+        """只保留API必需资源。参数：无；返回：服务；异常：无。"""
+        yield SimpleNamespace(evaluations=Repository())
+
+    monkeypatch.setattr(main, "create_job_manager", lambda: manager)
+    with TestClient(main.create_app(runtime_factory=runtime)) as client:
+        assert client.get("/api/rag-eval/production/job").json()["database_busy"] is True
+        page = client.get("/api/rag-eval/production/runs?after_id=5&limit=2")
+        assert page.status_code == 200 and page.json()["items"][0]["metrics"]["faithfulness"] is None
+        assert events == [(5, 2)]
+        response = client.post("/api/rag-eval/production/rerun")
+        assert response.status_code == 200 and response.json()["admission"] == "pending"
+        assert client.post("/api/rag-eval/rerun").status_code == 409
+        assert client.post("/api/rag-eval/production/rerun").status_code == 409
+    assert len(calls) <= 1 and not parent.is_running() if calls else True
+
+
+def test_production_api_without_lifespan_is_unavailable():
+    """无数据库生命周期时所有生产入口返回503。参数：无；返回：None；异常：断言失败。"""
+    from app.main import create_app
+    client = TestClient(create_app())
+    for path in ("job", "runs"):
+        assert client.get("/api/rag-eval/production/" + path).status_code == 503
+    assert client.post("/api/rag-eval/production/rerun").status_code == 503
 
 
 class ProcessDouble:
@@ -92,6 +186,24 @@ async def _finished(manager):
         while manager.status()["status"] == "running":
             await asyncio.sleep(0.01)
     return manager.status()
+
+
+@pytest.mark.parametrize("code,status", [(0, "completed"), (2, "completed_with_errors"), (3, "busy"), (4, "persist_failed"), (1, "failed")])
+async def test_production_runs_once_and_reports_database_admission(monkeypatch, tmp_path, code, status):
+    """生产作业不得校准且退出码不能掩盖争锁/补存失败。参数：外部进程替身及状态；返回：None；异常：断言失败。"""
+    manager, calls = _manager(monkeypatch, tmp_path, [ProcessDouble(code=code)])
+    result = manager.start(tmp_path / "dataset.json", [], profile="production",
+        policy_path=tmp_path / "frozen.json", triggered_by="定时")
+    try:
+        assert result["admission"] == "pending" and result["profile"] == "production"
+        assert (await _finished(manager))["status"] == status
+        assert len(calls) == 1
+        argv = calls[0][0]
+        assert argv[3] == "evaluate-production" and "--split" not in argv and "--strategies" not in argv
+        assert argv[argv.index("--policy") + 1] == str(tmp_path / "frozen.json")
+        assert argv[argv.index("--triggered-by") + 1] == "定时"
+    finally:
+        await manager.close()
 
 
 async def test_success_runs_both_stages_and_keeps_unique_artifacts(monkeypatch, tmp_path):

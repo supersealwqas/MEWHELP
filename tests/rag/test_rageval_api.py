@@ -161,7 +161,10 @@ def test_rag_eval_page_is_served(monkeypatch, tmp_path) -> None:
     client = _client(monkeypatch, tmp_path, {})
     response = client.get("/rag-eval")
     assert response.status_code == 200
-    assert "RAG 评估看板" in response.text
+    assert response.headers["content-type"].startswith("text/html")
+    assert "/static/rag-eval.mjs" in response.text
+    script = client.get("/static/rag-eval.mjs")
+    assert script.status_code == 200 and "production/runs" in script.text
 
 
 def test_case_count_divides_by_strategy_count() -> None:

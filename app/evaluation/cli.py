@@ -41,14 +41,20 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--evidence-budget", type=int, default=8000)
         if name == "compare":
             command.add_argument("--policy", type=Path, required=True, help="真实校准运行产生的policy.json（校准题数须与当前数据集一致）")
-    for name in ("calibrate-production", "validate-production-policy"):
+    for name in ("calibrate-production", "validate-production-policy", "evaluate-production"):
         command = commands.add_parser(name, help="共享生产知识流程的只读校准或一次冻结策略验收")
         command.add_argument("--env-file", type=Path)
         command.add_argument("--dataset", type=Path, default=Path("data/evaluation/ch04.json"))
         command.add_argument("--output-dir", type=Path, required=True, help="必须不存在，禁止覆盖已采样的报告")
         command.add_argument("--target", choices=["application-readonly"], required=True)
-        if name == "validate-production-policy":
+        if name != "calibrate-production":
             command.add_argument("--policy", type=Path, required=True)
+        if name == "evaluate-production":
+            command.add_argument("--triggered-by", choices=["手动", "定时"], default="手动")
+    command = commands.add_parser("persist-run", help="离线核验已完成生产产物并补存应用库，不重新评估")
+    command.add_argument("--env-file", type=Path)
+    command.add_argument("--artifact-dir", type=Path, required=True)
+    command.add_argument("--triggered-by", choices=["手动", "定时"], help="默认保留原始产物的触发来源")
     return parser
 
 
@@ -77,6 +83,25 @@ async def run(args: argparse.Namespace) -> int:
     异常：取消直接传播，保留已写记录；文件系统报告错误可能传播。
     """
     _load_environment(args.env_file)
+    if args.command == "evaluate-production":
+        from app.config import Settings
+        from app.evaluation.production import run_complete_production
+        return await run_complete_production(args, Settings())
+    if args.command == "persist-run":
+        from app.config import Settings
+        from app.evaluation.runner import validate_completed_artifact
+        from app.repositories.evaluations import evaluation_repository_runtime
+        try:
+            # 本地预验先于数据库资源；补存不加载生产检索或调用模型。
+            metrics = validate_completed_artifact(args.artifact_dir)
+            async with evaluation_repository_runtime(Settings()) as repository:
+                saved = await repository.save_completed_run(args.artifact_dir,
+                    args.triggered_by or metrics["metadata"]["triggered_by"])
+            print(json.dumps({"status": "persisted", "id": saved["id"], "saved": saved["saved"]}, ensure_ascii=False))
+            return 0
+        except Exception as error:
+            print(json.dumps({"status": "persist_failed", "error_type": type(error).__name__}, ensure_ascii=False))
+            return 4
     if args.command in {"calibrate-production", "validate-production-policy"}:
         from app.config import Settings
         from app.evaluation.production import run_production
