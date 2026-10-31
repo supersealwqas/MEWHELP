@@ -173,12 +173,12 @@ async def test_new_scan_preparation_preserves_completed_archive_and_allows_upgra
         await upgraded.close()
 
 
-@pytest.mark.parametrize("length", [2600, 4000])
-async def test_legal_chat_length_at_front_does_not_block_later_page(tmp_path, length):
-    """合法长原问必须走完201条分页并保留截断标记。参数：tmp_path隔离目录、length为2600或4000字符；返回：None；异常：断言失败。"""
+@pytest.mark.parametrize("length,prefix", [(2600, ""), (4000, ""), (4000, "联系人张三，"), (4000, "姓名:王，")])
+async def test_legal_chat_length_at_front_does_not_block_later_page(tmp_path, length, prefix):
+    """合法长原问脱敏后也须走完分页。参数：tmp_path隔离目录、length为2600/4000字符、prefix为虚构个人字段或空串；返回：None；异常：断言失败。"""
     from app.schemas.chat import ChatRequest
     from app.topics.pool import derive_pool
-    raw = "问" * length
+    raw = prefix + "问" * (length - len(prefix))
     assert ChatRequest(session_id="test-long", message=raw).message == raw
     record = NS(id=1, conversation_id=1, source="self_check", raw_question=raw, matched_review_id=None, created_at=None)
     repo = MemoryRepository(201)

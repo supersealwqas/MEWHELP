@@ -15,6 +15,27 @@ SOURCES = {"application_demo", "application_history", "synthetic", "augmentation
 SPLITS = {"train": .8, "validation": .1, "test": .1}
 
 
+def _mask_personal_field(match: re.Match) -> str:
+    """替换已匹配的个人字段值，保证脱敏不会扩大合法输入长度。
+
+    参数：match为第一组含字段前缀、后续正文含非空字段值的正则匹配。
+    返回：str；业务问句/状态描述保持原样，个人长值使用[个人信息]，短值使用等长星号。
+    异常：仅接受本模块的匹配结构，不产生业务异常。
+    """
+    prefix = match.group(1)
+    value = match.group(0)[len(prefix):]
+    # 先规范字段值再判断业务语法；不能把保护条件放进可回溯的空白匹配后面。
+    content = value.lstrip()
+    if re.match(r"(?:[是为]\s*)?(?:谁|否|哪|什么|怎么|如何|能|可|要|需|应|必|不|没|未|无|"
+                r"填|改|换|加|查|看|忘|写|选|保留|变更|有误|错误|相同|不同|一样|姓名|名字|电话|信息|方式|名单)", content):
+        return match.group(0)
+    if prefix.rstrip().endswith("联系人") and content.startswith("工"):
+        # “联系人工客服”中的“联系人”只是动词和角色名重叠，不是姓名字段。
+        return match.group(0)
+    placeholder = "[个人信息]"
+    return prefix + (placeholder if len(value) >= len(placeholder) else "*" * len(value))
+
+
 def clean_question(text: str) -> str:
     """清理明确格式和个人信息。参数：text原话；返回：脱敏文本；异常：非法类型或空文本ValueError。"""
     if not isinstance(text, str) or not text.strip():
@@ -29,13 +50,12 @@ def clean_question(text: str) -> str:
     text = re.sub(r"((?:订单号|订单编号|身份证号|证件号)\s*(?:[:：]|是|为)?\s*)[A-Za-z0-9-]{8,}", r"\1[编号]", text)
     # 省略“号”时只识别长订单标识，避免把订单日期2026-11-01当作编号。
     text = re.sub(r"(订单\s*(?:[:：]|是|为)?\s*)[A-Za-z0-9-]{12,}", r"\1[编号]", text)
-    # “地址是否能改/姓名是谁”等问句没有提供个人字段值，不能吞掉其业务含义。
+    # 字段识别与值判断分开；回调保留“地址是否能改/姓名是 什么意思”等业务问句。
     text = re.sub(r"((?:姓名|收件人|联系人|收货地址|联系地址|地址)\s*(?:[:：]|[是为]\s*[:：]?)\s*)"
-                  r"(?!谁|否|哪里|在哪|什么|怎么|如何|能否|可以)[^，,；;。！？?!\n]+", r"\1[个人信息]", text)
+                  r"[^，,；;。！？?!\n]+", _mask_personal_field, text)
     # 无分隔符的显式联系人仅接受紧邻标点的姓名，不把“联系人怎么修改”视作姓名。
-    text = re.sub(r"((?:姓名|收件人|联系人)\s*)"
-                  r"(?!(?:[是为])?(?:谁|否|哪|什么|怎么|如何|能否|可以|需要|修改|工客服|姓名|名字|电话|信息|方式|加))"
-                  r"[\u4e00-\u9fffA-Za-z·]{2,4}(?=[，,；;。！？?!\n]|$)", r"\1[个人信息]", text)
+    text = re.sub(r"((?:姓名|收件人|联系人)\s*)[\u4e00-\u9fffA-Za-z·]{2,4}(?=[，,；;。！？?!\n]|$)",
+                  _mask_personal_field, text)
     return re.sub(r"\s+", " ", text).strip()
 
 

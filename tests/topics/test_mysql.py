@@ -138,6 +138,32 @@ async def test_mysql_group_union_review_scope_big_id_and_utc_upsert(mysql_env):
     assert (await repo.classified_rows())[0]["classified_at"] == "2026-10-31T00:00:00"
 
 
+async def test_mysql_unsigned_pool_ids_keep_exact_original_turn(mysql_env):
+    """合法无符号大ID不能在JSON筛选时转成负数而漏掉原轮。
+
+    参数：mysql_env为已门禁空专库；返回：None。
+    异常：数据库错误或原轮、分布断言失败；只写本轮专库夹具。
+    """
+    _, engine, _, repo, factory = mysql_env
+    await apply(engine)
+    identifiers = [2**63, 2**64 - 1]
+    async with factory.begin() as session:
+        session.add(Conversation(id=1, session_id="demo-unsigned", user_id="test"))
+        await session.flush()
+        session.add_all([LowConfidenceQuestion(id=identifier, conversation_id=1,
+            raw_question="运费是多少", source=source)
+            for identifier, source in zip(identifiers, ["self_check", "user_feedback"])])
+        session.add(Message(id=1, conversation_id=1, role="user", content="运费是多少",
+            turn_id="unsigned-turn", rag_metadata={"knowledge_pool": {"pool_ids": {
+                "self_check": identifiers[0], "user_feedback": identifiers[1]}}}))
+    rows = await repo.pending(200)
+    assert [row["question_id"] for row in rows] == [str(value) for value in identifiers]
+    assert not any(row["history_uncertain"] for row in rows)
+    assert rows[0]["group_id"] == rows[1]["group_id"]
+    distribution = await repo.distribution("all")
+    assert distribution["total_questions"] == 1 and distribution["known_original_turns"] == 1
+
+
 async def test_mysql_real_shared_lock_and_disconnect_rollback(mysql_env, monkeypatch):
     """真实跨连接排它与写后KILL原租约回滚，不能换连接提交。参数：专库/替换器；返回：None；异常：断言失败。"""
     _, engine, _, repo, factory = mysql_env

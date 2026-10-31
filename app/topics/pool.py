@@ -4,7 +4,7 @@ import hashlib
 from asyncio import to_thread
 from collections import defaultdict
 
-from sqlalchemy import or_, select
+from sqlalchemy import String, cast, or_, select
 from sqlalchemy.orm import load_only
 
 
@@ -89,7 +89,9 @@ async def read_pool(factory, *, after_id: int = 0, limit: int | None = None,
         messages = (await session.scalars(select(Message).options(load_only(
             Message.id, Message.conversation_id, Message.role, Message.rag_metadata,
         )).where(Message.role == "user", Message.conversation_id.in_(conversation_ids), or_(*[
-            Message.rag_metadata["knowledge_pool"]["pool_ids"][source].as_integer().in_(identifiers)
+            # MySQL的SIGNED转换会溢出合法BIGINT UNSIGNED；文本比较保留完整十进制值。
+            cast(Message.rag_metadata["knowledge_pool"]["pool_ids"][source].as_string(), String).in_(
+                [str(identifier) for identifier in identifiers])
             for source, identifiers in source_ids.items()
         ])))).all() if conversation_ids else []
         conversations = (await session.scalars(select(Conversation).options(load_only(
