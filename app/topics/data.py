@@ -16,7 +16,21 @@ SPLITS = {"train": .8, "validation": .1, "test": .1}
 
 # 正反情态词和候选连接词只表达语法，不据此放行后续任意正文。
 _FIELD_MODAL = r"(?:可不可以|需不需要|应不应该|(?P<modal>可以|需要|应该|必须|支持|允许|能|可|该|应|得|须|要|想|需|会)(?:不(?P=modal))?)"
-_FIELD_CHOICE = r"(?:而不是|并不是|而非|并非|不是|不为|还是|或者|或是|或|和)"
+_FIELD_NEGATIVE = r"(?:不用|无需|无法|不必|没有|不|没|别)?"
+_FIELD_ACTION = r"(?:修改|更改|变更|更换|填写|设置|改|换|填|写)"
+_FIELD_MODIFIERS = (_FIELD_NEGATIVE + r"(?:" + _FIELD_MODAL + r"\s*)?" + _FIELD_NEGATIVE
+                    + r"(?:再|重新|再次|直接|继续|正常)?")
+# 同一赋值规则同时用于外层定位和内部解析，避免“可以改为”到不了值遮盖逻辑。
+_FIELD_ASSIGNMENT = (_FIELD_MODIFIERS + r"(?:不是|不为|并非|就是|还是|是|为|"
+                     + _FIELD_ACTION + r"(?:成|为))\s*[:：]?\s*")
+_FIELD_CONFIRMATION = r"(?:是不是|是否|能否|可否)"
+_FIELD_QUESTION = (r"(?:[是为]\s*[:：]?\s*)?(?:" + _FIELD_CONFIRMATION
+                   + r"|谁|哪里|在哪|哪个|哪些|什么|怎么|如何)\s*")
+_FIELD_CHOICE = r"(?:而不是|并不是|而是|而非|并非|不是|不为|还是|或者|或是|或|和)"
+_FIELD_BODY = r"[^，,、；;。！？?!\n]+"
+# 单字“是”仅在分隔符之后表示续接，不在姓名/地址正文中任意拆字。
+_FIELD_FOLLOWUP = r"[，,、]\s*(?:" + _FIELD_CHOICE + r"|是)\s*" + _FIELD_BODY
+_NAME_FOLLOWUP = r"[，,、]\s*[\u4e00-\u9fff·]{2,4}[吗呢呀吧么]*\s*(?=[，,、；;。！？?!\n]|$)"
 
 
 def _is_field_business_phrase(text: str) -> bool:
@@ -27,15 +41,29 @@ def _is_field_business_phrase(text: str) -> bool:
     """
     relation = r"(?:(?:不是|不为|并非|是|为)\s*[:：]?\s*)?"
     particles = r"[的了吗呢呀吧么过]*"
-    negative = r"(?:不用|无需|无法|不必|没有|不|没|别)?"
-    action = re.fullmatch(relation + negative + r"(?:" + _FIELD_MODAL + r"\s*)?" + negative +
-                         r"(?:再|重新|再次|直接|继续|正常)?(?:修改|更改|变更|更换|填写|提供|确认|保留|删除|使用|配送|改|换|填|写|选|加|删)"
+    action = re.fullmatch(relation + _FIELD_MODIFIERS +
+                         r"(?:" + _FIELD_ACTION + r"|提供|确认|保留|删除|使用|配送|选|加|删)"
                          r"(?:一下|个人|本人|姓名|名字|地址|电话|错|漏|好|掉|过|"
-                         r"(?:成|为)(?:公司|家庭|收货|联系|新)?(?:姓名|名字|地址|电话))?" + particles, text.strip())
-    description = re.fullmatch(relation + negative + r"(?:不变|没变|未变|未定|一样|不同|有误|错误|"
+                         r"(?:成|为)(?:公司|家庭|收货|联系|原|新)?(?:姓名|名字|地址|电话))?" + particles, text.strip())
+    description = re.fullmatch(relation + _FIELD_NEGATIVE + r"(?:不变|没变|未变|未定|一样|不同|有误|错误|"
                                r"正确|有效|无效|必填(?:项)?|选填(?:项)?|姓名|名字|电话|信息|方式|名单|意思|含义|"
                                r"(?:公司|家庭|收货|联系|新)?地址)" + particles, text.strip())
     return bool(action or description)
+
+
+def _is_followup_business_phrase(text: str) -> bool:
+    """识别姓名之后的完整短业务诉求，避免将“能退吗”等当作裸姓名候选。
+
+    参数：text为分隔符后的完整短分句，仅用于姓名候选续接的业务保护。
+    返回：bool，完整符合诉求语法时为True。异常：无业务异常。
+    """
+    question = re.match(_FIELD_QUESTION, text.strip())
+    if question and _is_field_business_phrase(text.strip()[question.end():]):
+        return True
+    return bool(re.fullmatch(
+        r"(?:我(?:想|要)?|能不能|可不可以|能否|可否|可以|不能|不可以|无法|不要|不想|能|可|要|想|不|没)?"
+        r"(?:申请)?(?:退款|退货|换货|退换货|维修|保修|发货|到货|取消|退|换)[了吗呢呀吧么]*",
+        text.strip()))
 
 
 def _mask_field_candidates(text: str) -> str:
@@ -44,10 +72,12 @@ def _mask_field_candidates(text: str) -> str:
     参数：text为已移除疑问及比较前缀的字段正文，可含多个候选和逗号续接。
     返回：str；不增长长度且可重复清洗的正文。异常：无业务异常。
     """
-    parts = re.split(r"([，,]?\s*" + _FIELD_CHOICE + r"\s*)", text)
+    parts = re.split(r"(\s*(?:[，,、]\s*(?:(?:" + _FIELD_CHOICE + r"|是)\s*)?|"
+                     + _FIELD_CHOICE + r"\s*))", text)
     for index in range(0, len(parts), 2):
         part = parts[index]
-        if not part.strip() or _is_field_business_phrase(part):
+        if (not part.strip() or _is_field_business_phrase(part)
+                or (index > 0 and _is_followup_business_phrase(part))):
             continue
         # 只保留确定的语气词；未知字段值整体遮盖，不按姓名首字或长度放行。
         value = re.fullmatch(r"(\s*)(.*?)([吗呢呀吧么]*\s*)", part, flags=re.DOTALL)
@@ -71,13 +101,12 @@ def _mask_personal_field(match: re.Match) -> str:
         # “联系人工客服”中的“联系人”只是动词和角色名重叠，不是姓名字段。
         return original
     syntax = re.sub(r"^(?:姓名|收件人|联系人|收货地址|联系地址|地址)", "", original).lstrip().lstrip(":：").lstrip()
-    question = re.match(r"(?:[是为]\s*[:：]?\s*)?(?:是不是|是否|能否|可否|谁|哪里|在哪|哪个|哪些|什么|怎么|如何)\s*", syntax)
+    question = re.match(_FIELD_QUESTION, syntax)
     remainder = syntax[question.end():] if question else syntax
     if _is_field_business_phrase(syntax) or (question and (not remainder or _is_field_business_phrase(remainder))):
         return original
     # 疑问前缀仅界定值的位置；“是否是张三”仍需遮盖张三，不能整段返回。
-    predicate = re.match(r"(?:" + _FIELD_MODAL + r"\s*)?(?:不是|不为|并非|就是|还是|是|为|"
-                         r"(?:修改|更改|更换|填写|设置|改|换|填|写)(?:成|为))\s*[:：]?\s*", remainder)
+    predicate = re.match(_FIELD_ASSIGNMENT, remainder)
     if predicate:
         remainder = remainder[predicate.end():]
     retained = original[:len(original) - len(remainder)]
@@ -98,14 +127,15 @@ def clean_question(text: str) -> str:
     text = re.sub(r"((?:订单号|订单编号|身份证号|证件号)\s*(?:[:：]|是|为)?\s*)[A-Za-z0-9-]{8,}", r"\1[编号]", text)
     # 省略“号”时只识别长订单标识，避免把订单日期2026-11-01当作编号。
     text = re.sub(r"(订单\s*(?:[:：]|是|为)?\s*)[A-Za-z0-9-]{12,}", r"\1[编号]", text)
-    # 确认/否定问句也进入字段解析；逗号后明确续接的候选不能遗漏第二个姓名。
-    text = re.sub(r"((?:姓名|收件人|联系人|收货地址|联系地址|地址)\s*"
-                  r"(?:[:：]|[是为]\s*[:：]?|(?=(?:不是|不为|并非|能否|可否|"
-                  r"(?:能|可|该|应|得|须|要|想|需|会)不|可不可以|需不需要|应不应该)))\s*)"
-                  r"[^，,；;。！？?!\n]+(?:[，,]\s*" + _FIELD_CHOICE + r"\s*[^，,；;。！？?!\n]+)*",
-                  _mask_personal_field, text)
+    # 裸短候选只续接姓名字段；地址需有明确更正/选择关系，避免贪婪吞掉业务尾句。
+    for fields, followups in ((r"姓名|收件人|联系人", _FIELD_FOLLOWUP + "|" + _NAME_FOLLOWUP),
+                              (r"收货地址|联系地址|地址", _FIELD_FOLLOWUP)):
+        text = re.sub(r"((?:" + fields + r")\s*(?:[:：]\s*|(?=(?:"
+                      + _FIELD_ASSIGNMENT + "|" + _FIELD_CONFIRMATION + r"))))"
+                      + _FIELD_BODY + r"(?:" + followups + r")*", _mask_personal_field, text)
     # 无分隔符的显式联系人仅接受紧邻标点的姓名，不把“联系人怎么修改”视作姓名。
-    text = re.sub(r"((?:姓名|收件人|联系人)\s*)[\u4e00-\u9fffA-Za-z·]{2,4}(?=[，,；;。！？?!\n]|$)",
+    text = re.sub(r"((?:姓名|收件人|联系人)\s*)[\u4e00-\u9fffA-Za-z·]{2,4}(?=[，,、；;。！？?!\n]|$)"
+                  r"(?:" + _FIELD_FOLLOWUP + "|" + _NAME_FOLLOWUP + r")*",
                   _mask_personal_field, text)
     return re.sub(r"\s+", " ", text).strip()
 

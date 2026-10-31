@@ -72,6 +72,9 @@ def test_redaction_keeps_size_and_negation():
     "姓名是不是必填项？", "姓名不是必填项吗？", "收件人能否修改？", "地址是否不是必填项？",
     "姓名是否可以不填？", "姓名是什么含义？", "地址能否改为公司地址？",
     "姓名是否不正确？", "地址是否无效？", "地址能否正常使用？", "地址是否支持配送？",
+    "收件人可以修改吗？", "收件人不可以修改吗？", "收货地址可以改为公司地址吗？",
+    "地址需要重新设置为公司地址？", "收件人可以不改为原姓名吗？",
+    "实体店地址在哪里？", "不要退货换货了，告诉我售后修理的地址在哪就行。",
 ])
 def test_explicit_field_questions_keep_business_meaning(question):
     """查询字段或人工客服不等于提供姓名，日期型号也不能被误删。参数：question无个人资料的业务问题；返回：None；异常：断言失败。"""
@@ -85,6 +88,34 @@ def test_confirmation_redaction_preserves_valid_long_input():
     cleaned = clean_question(original)
     assert "张三" not in cleaned
     assert "姓名是否是" in cleaned
+    assert len(cleaned) <= 4000
+    assert clean_question(cleaned) == cleaned
+
+
+@pytest.mark.parametrize("tail", ["XL不退", "能退吗", "型号M200", "申请退款", "我想退货", "不退货"])
+def test_name_candidates_keep_following_business_clause(tail):
+    """姓名候选全部遮盖且后续业务分句保持原义。
+
+    参数：tail为不含个人资料的独立业务尾句。返回：None。异常：断言失败。
+    """
+    original = "姓名是张三，李四，" + tail
+    cleaned = clean_question(original)
+    assert "张三" not in cleaned and "李四" not in cleaned
+    assert cleaned.endswith("，" + tail)
+    assert clean_question(cleaned) == cleaned
+    assert len(cleaned) <= len(original)
+
+
+def test_multiple_name_candidates_preserve_4000_character_limit():
+    """多候选及业务分句在4000字符边界仍不扩长且幂等。
+
+    参数：无。返回：None。异常：断言失败。
+    """
+    prefix = "姓名是张三，李四，王五？XL不退。"
+    original = prefix + "问" * (4000 - len(prefix))
+    cleaned = clean_question(original)
+    assert all(name not in cleaned for name in ("张三", "李四", "王五"))
+    assert "XL不退" in cleaned
     assert len(cleaned) <= 4000
     assert clean_question(cleaned) == cleaned
 

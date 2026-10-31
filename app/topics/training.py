@@ -59,7 +59,16 @@ def _validate_base(base_dir: Path) -> dict:
 
 
 def _inputs(tokenizer, rows: list[dict], taxonomy: dict, device, max_length: int):
-    """构造真实分词和浮点多热标签。参数：分词器、样本、主题表、设备、长度；返回：输入及float32标签；异常：分词/张量错误。"""
+    """按权威标签顺序构造分词输入和浮点多热标签，并移至指定设备。
+
+    参数：tokenizer为支持批量文本及return_tensors="pt"的配套分词器；rows为非空规范样本列表，
+    每行含text正文和labels标签；taxonomy为已校验的17类权威表；device为目标torch设备；
+    max_length为至少2的token截断上限。上述样本和长度约束由调用方保证，此处不重复校验。
+    返回：tuple[dict[str, torch.Tensor], torch.Tensor]；前项为已补齐、截断且位于device的模型输入，
+    后项为形状[样本数, 17]的float32标签张量，按权威顺序用0或1表示各主题是否出现。
+    异常：样本或主题表缺字段可抛KeyError；分词、张量创建或设备迁移错误原样传播，
+    包括ValueError、RuntimeError；torch依赖导入失败原样传播。
+    """
     import torch
     tokens = tokenizer([row["text"] for row in rows], padding=True, truncation=True,
                        max_length=max_length, return_tensors="pt")
@@ -110,7 +119,17 @@ def _train_epoch(model, tokenizer, rows: list[dict], taxonomy: dict, optimizer, 
 
 
 def _evaluate(model, tokenizer, rows: list[dict], taxonomy: dict, *, device, micro_batch: int, max_length: int) -> dict:
-    """前向评估一个显式数据集合。参数：模型/分词/样本/主题表/设备/批长；返回：损失、概率和参考标签；异常：非有限输出ValueError。"""
+    """在评估模式下对指定数据集执行无梯度前向计算，保留逐题概率和参考标签。
+
+    参数：model为已位于device、输出loss和17维logits的分类模型；tokenizer为配套分词器；
+    rows为非空规范样本列表，每行含text和labels；taxonomy为已校验的17类权威表；
+    device为输入及模型所在torch设备；micro_batch为正整数批量；max_length为至少2且不超过
+    模型位置上限的token截断长度。样本与批量/长度约束由调用方保证，此处不重复校验。
+    返回：dict；loss为按样本数加权的float平均损失，probabilities为按rows顺序排列的
+    list[list[float]]独立主题概率，targets为同序0/1参考标签列表，两者每行均为17项。
+    异常：损失或logits非有限、logits末维不为17时抛ValueError；依赖导入、样本取值、
+    分词、模型或设备执行错误原样传播，例如KeyError、ValueError、RuntimeError。
+    """
     import torch
     model.eval()
     total_loss, probabilities, targets = 0.0, [], []
@@ -128,7 +147,17 @@ def _evaluate(model, tokenizer, rows: list[dict], taxonomy: dict, *, device, mic
 
 
 def _test_reports(output_dir: Path, rows: list[dict], predictions: list[dict], taxonomy: dict) -> None:
-    """按整体/来源/审核状态分别统计一次测试预测。参数：输出目录、样本、预测、主题表；返回：无；异常：IO/指标错误。"""
+    """按整体、来源和审核状态统计保存的测试预测，写出指标、逐题结果与全部错例。
+
+    参数：output_dir为已存在的可写目录，test_predictions.jsonl须不存在；rows为非空规范测试
+    样本列表，每行含id、text、labels、source和annotation_status；predictions为与rows等长且
+    逐项对齐的预测字典列表，labels可为空表示未确定，其余预测字段原样保存；taxonomy为已
+    校验的17类权威表。逐项对应关系由调用方保证；等长、非空和标签合法性交由指标函数校验。
+    返回：None；写入test_metrics.json的整体及分层指标、test_predictions.jsonl的参考标签与
+    预测字段，以及test_errors.md的标签集合不一致记录；指标和错例文件允许覆盖。
+    异常：预测文件已存在抛FileExistsError；空集、数量或标签非法由指标函数抛ValueError；
+    缺字段可抛KeyError，JSON序列化可抛TypeError/ValueError，文件读写及同步可抛OSError。
+    """
     expected = [row["labels"] for row in rows]
     predicted = [row["labels"] for row in predictions]
     reports = dict(overall=compute_metrics(expected, predicted, taxonomy), by_source={}, by_annotation_status={})
