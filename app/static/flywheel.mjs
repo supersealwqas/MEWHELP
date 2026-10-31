@@ -16,7 +16,8 @@ function score(value) { return typeof value === "number" && Number.isFinite(valu
 function percent(value) { return typeof value === "number" && Number.isFinite(value) ? `${(value * 100).toFixed(1)}%` : "未知"; }
 function time(value) {
   if (!value) return "时间未记录";
-  const parsed = new Date(value);
+  // MySQL 会话保存 UTC；无时区的 DATETIME 响应须先标明 UTC，再转成本机时间。
+  const parsed = new Date(/(?:Z|[+-]\d{2}:\d{2})$/i.test(value) ? value : `${value}Z`);
   return Number.isNaN(parsed.getTime()) ? "时间未记录" : parsed.toLocaleString("zh-CN", { hour12: false });
 }
 function messageFor(response, data) {

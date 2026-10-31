@@ -406,7 +406,12 @@ function initializeProduction() {
   const completed = new Set(["completed", "completed_with_errors"]);
   const finite = (value) => typeof value === "number" && Number.isFinite(value);
   const valueText = (value) => finite(value) ? value.toFixed(4) : "未取得";
-  const stamp = (value) => value && Number.isFinite(new Date(value).getTime()) ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "时间未记录";
+  const stamp = (value) => {
+    if (!value) return "时间未记录";
+    // 无时区的数据库时间是 UTC；带时区的调度时间保留其原始偏移。
+    const parsed = new Date(/(?:Z|[+-]\d{2}:\d{2})$/i.test(value) ? value : `${value}Z`);
+    return Number.isFinite(parsed.getTime()) ? parsed.toLocaleString("zh-CN", { hour12: false }) : "时间未记录";
+  };
   const valid = (run) => run?.metrics?.schema_version === 1 && run.metrics.scope === "production_knowledge_subpipeline" && completed.has(run.metrics.status);
   const comparable = (current, previous) => valid(current) && valid(previous) && Boolean(current.metrics.comparison_key) && current.metrics.comparison_key === previous.metrics.comparison_key;
   const busy = () => starting || job.status === "running" || job.database_busy === true;
