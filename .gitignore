@@ -30,6 +30,9 @@ build/
 # 可视化 brainstorm 的临时示意、进程记录与本地访问密钥，不入库
 /.superpowers/brainstorm/
 
+# CH10 本地脱敏语料、模型运行日志与审查临时产物。
+/.superpowers/sdd/2026-10-31-ch10-topic-classifier/
+
 # 评估/真实运行产物目录（reports/ 下逐次运行的 cases.jsonl、summary 等）
 # 只保留生成规则与文档；结果按运行时间戳产生，不入库
 /reports/
