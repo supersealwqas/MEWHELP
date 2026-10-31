@@ -30,7 +30,10 @@ def _mask_personal_field(match: re.Match) -> str:
     relation = r"(?:[是为]\s*[:：]?\s*)?"
     particles = r"[的了吗呢呀吧么过]*"
     question = re.match(relation + r"(?:是否|能否|可否|谁|哪里|在哪|哪个|哪些|什么|怎么|如何)", syntax)
-    action = re.fullmatch(relation + r"(?:(?:可以|需要|应该|必须|能|可|该|应|得|须|要|想|需|会)\s*)?"
+    # 否定可在情态词前后；正反问句重复同一情态词，兼容“可不可以”等缩写。
+    negative = r"(?:不用|无需|不必|没有|不|没|别)?"
+    modal = r"(?:可不可以|需不需要|应不应该|(?P<modal>可以|需要|应该|必须|能|可|该|应|得|须|要|想|需|会)(?:不(?P=modal))?)"
+    action = re.fullmatch(relation + negative + r"(?:" + modal + r"\s*)?" + negative +
                          r"(?:再|重新|再次|直接|继续)?(?:修改|更改|变更|更换|填写|提供|确认|保留|删除|改|换|填|写|选|加|删)"
                          r"(?:一下|个人|本人|姓名|名字|地址|电话|错|漏|好|掉|过)?" + particles, syntax)
     description = re.fullmatch(relation + r"(?:不变|没变|未变|未定|一样|不同|有误|错误|"
