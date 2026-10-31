@@ -1,6 +1,7 @@
 """CH10真实MySQL专库集成，显式门禁、空库保护与本轮白名单清理。"""
 
 import asyncio
+from contextlib import asynccontextmanager
 import os
 
 import httpx
@@ -237,3 +238,42 @@ async def test_mysql_save_rejects_lease_for_other_lock(mysql_env):
         assert await repo.classified_rows() == []
     finally:
         await lease.release()
+
+
+@pytest.mark.parametrize("zero_watermark", [False, True])
+async def test_mysql_lost_lock_at_empty_scan_end_never_confirms_complete(mysql_env, monkeypatch, zero_watermark):
+    """真实空页/零上界读取中释放自有锁，不得推进完成。参数：专库/替换器/零上界；返回：None；异常：断言失败。"""
+    config, engine, _, repo, factory = mysql_env
+    await apply(engine)
+    if not zero_watermark:
+        await add_pool(factory)
+        async with repo.execution() as lease:
+            await repo.save([dict(question_id="1", labels=["物流"])], lease=lease)
+    current = []
+    original_execution = repo.execution
+    @asynccontextmanager
+    async def captured():
+        """参数：无；返回：真实执行租约；异常：连接或锁错误。"""
+        async with original_execution() as lease:
+            current.append(lease)
+            yield lease
+    monkeypatch.setattr(repo, "execution", captured)
+    original_read = repo.high_watermark if zero_watermark else repo.pending
+    async def release_after_read(*args, **kwargs):
+        """只在门禁专库的原持锁连接释放本轮主题锁。参数：读分页参数；返回：真实读结果；异常：断言或连接错误。"""
+        result = await original_read(*args, **kwargs)
+        connection = current[0].connection
+        assert await connection.scalar(text("SELECT DATABASE()")) == TEST_DATABASE
+        owner = await connection.scalar(text("SELECT CONNECTION_ID()"))
+        assert await connection.scalar(text("SELECT IS_USED_LOCK(:name)"), {"name": TOPIC_EXECUTION_LOCK}) == owner
+        assert await connection.scalar(text("SELECT RELEASE_LOCK(:name)"), {"name": TOPIC_EXECUTION_LOCK}) == 1
+        return result
+    monkeypatch.setattr(repo, "high_watermark" if zero_watermark else "pending", release_after_read)
+    service = TopicBatchService(repo, config, httpx.AsyncClient(transport=httpx.MockTransport(response)))
+    try:
+        report = await service.process()
+        assert report["status"] == "failed" and report["cursor"] == "0"
+        assert report["error"]["type"] == "LeaseLost"
+        assert not await repo.execution_busy()
+    finally:
+        await service.close()

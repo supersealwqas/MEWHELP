@@ -318,3 +318,76 @@ async def test_trigger_status_write_failure_releases_acquired_lock(tmp_path, mon
         await service.trigger()
     assert not repo.busy
     await service.close()
+
+
+async def test_shared_latest_failed_status_overrides_local_completed_state(tmp_path):
+    """A旧完成不能掩盖同目录B最新失败。参数：目录；返回：None；异常：断言失败。"""
+    repo = MemoryRepository(1)
+    first = make_service(tmp_path, repo, response)
+    assert (await first.process())["status"] == "complete"
+    def fail_classify(request):
+        """参数：请求；返回：健康成功/分类503；异常：无。"""
+        return response(request) if request.url.path == "/health" else httpx.Response(503)
+    second = make_service(tmp_path, repo, fail_classify)
+    try:
+        assert (await second.process(reclassify=True))["status"] == "failed"
+        state = await first.status()
+        assert state["status"] == state["last_batch"]["status"] == "failed"
+        assert state["error"]["type"] == "HTTPStatusError"
+    finally:
+        await second.close()
+        await first.close()
+
+
+async def test_unheld_poller_does_not_overwrite_shared_owner_status(tmp_path):
+    """竞争失败的poller不能把owner已写状态覆盖成running。参数：目录；返回：None；异常：断言失败。"""
+    attempted = asyncio.Event()
+    class Contended(MemoryRepository):
+        """在锁获取边界标记一次poll。"""
+        @asynccontextmanager
+        async def execution(self):
+            """参数：无；返回：租约；异常：共同锁忙。"""
+            attempted.set()
+            async with super().execution() as lease:
+                yield lease
+    repo = Contended(1)
+    owner = make_service(tmp_path, repo, response)
+    owner._set_state(status="failed", error={"type": "OwnerFailure"})
+    repo.busy = True
+    poller = make_service(tmp_path, repo, response)
+    poller.start()
+    try:
+        await asyncio.wait_for(attempted.wait(), 3)
+        assert json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))["status"] == "failed"
+        assert (await poller.status())["status"] == "running"
+        repo.busy = False
+        assert (await poller.status())["status"] == "failed"
+    finally:
+        await poller.close()
+        await owner.close()
+
+
+@pytest.mark.parametrize("zero_watermark", [False, True])
+async def test_lease_lost_during_empty_read_never_completes_or_advances(tmp_path, zero_watermark):
+    """空候选页及零上界末路都必须核锁。参数：目录/零上界开关；返回：None；异常：断言失败。"""
+    class LostOnRead(MemoryRepository):
+        """在末次只读操作中丢失租约的外部边界。"""
+        async def high_watermark(self):
+            """参数：无；返回：冻结上界；异常：无。"""
+            if zero_watermark:
+                self.lost = True
+                return 0
+            return 1
+        async def pending(self, limit, reclassify=False, after_id=0):
+            """参数：分页参数；返回：空页；异常：无。"""
+            self.lost = True
+            return []
+    repo = LostOnRead(0)
+    service = make_service(tmp_path, repo, response)
+    try:
+        result = await service.process()
+        assert result["status"] == "failed" and result["cursor"] == "0"
+        assert result["error"]["type"] == "LeaseLost"
+        assert json.loads((tmp_path / "scan.json").read_text(encoding="utf-8"))["status"] == "failed"
+    finally:
+        await service.close()

@@ -124,6 +124,7 @@ class TopicBatchService:
             raise ValueError("待确认批次原件缺失或身份不符")
         await lease.assert_held()
         actual = {r["question_id"]: r for r in await self.repository.classified_rows()}
+        await lease.assert_held()
         matches = [actual.get(row["question_id"]) == row for row in batch["saved_rows"]]
         if all(matches):
             self._complete_batch(scan, batch)
@@ -157,6 +158,7 @@ class TopicBatchService:
                 high = await self.repository.high_watermark()
                 if automatic:
                     pending = await self.repository.pending(self.config.topic_batch_min_size)
+                    await lease.assert_held()
                     known_times = [datetime.fromisoformat(r["created_at"]) for r in pending if r.get("created_at")]
                     now = datetime.now(timezone.utc)
                     old = any((now - (time.replace(tzinfo=timezone.utc) if time.tzinfo is None else time)).total_seconds()
@@ -175,6 +177,8 @@ class TopicBatchService:
                 await lease.assert_held()
                 rows = await self.repository.pending(self.config.topic_batch_size, reclassify=reclassify,
                                                      after_id=int(scan["cursor"]))
+                # 空页也可能在数据库读取期间失锁，不能跳过save就绕过所有权保护。
+                await lease.assert_held()
                 rows = [row for row in rows if int(row["question_id"]) <= int(scan["high_watermark"])]
                 if not rows:
                     break
@@ -197,6 +201,8 @@ class TopicBatchService:
                 await self.repository.save(saved, lease=lease)
                 self._complete_batch(scan, batch)
                 current_ids = []
+            # 零高水位不进入循环；最终完成和高水位游标更新仍必须受原租约保护。
+            await lease.assert_held()
             scan.update(status="complete", cursor=scan["high_watermark"], error=None)
             self._write_scan(scan)
             self._set_state(status="complete", last_batch=scan, error=None)
@@ -287,18 +293,20 @@ class TopicBatchService:
         try:
             state = self._state.copy()
             stored_state = self._read(self.root / "status.json")
-            if stored_state and state["status"] == "idle":
+            # 共享持久状态是最后持锁执行者的事实，不受本实例曾完成/失败的旧缓存限制。
+            if stored_state:
                 state.update({key: value for key, value in stored_state.items() if key != "database"})
             persisted = self._read(self.root / "scan.json")
             busy = await self.repository.execution_busy()
             state["model_version"] = await self._model_version()
             if persisted:
                 state["last_batch"] = persisted
-                if not self._active and state["status"] == "idle":
+                if not stored_state:
                     state["status"] = persisted["status"]
             if busy:
                 state["status"] = "running"
-            elif state["status"] == "running" and not self._active:
+            elif state["status"] == "running":
+                # 本地活动任务也可能正在取连接或已经失锁，只有实际共同锁可证明运行中。
                 state["status"] = "interrupted"
             return state
         except Exception as error:
@@ -324,9 +332,10 @@ class TopicBatchService:
                     reclassify = scan["reclassify"] if scan and scan["status"] != "complete" else False
                     await self._process_locked(lease, reclassify=reclassify, automatic=True)
             except ConcurrentKnowledgeWrite:
-                self._set_state(status="running", error=None)
+                # 未持锁的poller不能覆盖owner刚写的完成/失败状态；API另查实际锁。
+                self._state.update(status="running", error=None)
             except Exception as error:
-                self._set_state(status="failed", error=dict(type=type(error).__name__, message="主题依赖不可用，稍后重试"))
+                self._state.update(status="failed", error=dict(type=type(error).__name__, message="主题依赖不可用，稍后重试"))
             await asyncio.sleep(self.config.topic_poll_seconds)
 
     async def close(self):
