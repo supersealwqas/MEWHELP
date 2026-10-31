@@ -238,6 +238,16 @@ async def test_timeout_returns_504_and_holds_slot_until_worker_finishes(trained_
     endpoint = next(route.endpoint for route in application.routes if getattr(route, "path", None) == "/classify")
     request = Request({"type": "http", "app": application})
     async with application.router.lifespan_context(application):
+        submitted = []
+        real_submit = application.state.inference_executor.submit
+
+        def record_compute(compute):
+            """记录完整计算任务。参数：compute为含槽释放的零参数函数；返回：真实Future；异常：提交错误。"""
+            future = real_submit(compute)
+            submitted.append(future)
+            return future
+
+        monkeypatch.setattr(application.state.inference_executor, "submit", record_compute)
         started = time.monotonic()
         try:
             with pytest.raises(HTTPException) as timeout:
@@ -245,12 +255,17 @@ async def test_timeout_returns_504_and_holds_slot_until_worker_finishes(trained_
             assert timeout.value.status_code == 504 and time.monotonic() - started < 2
             assert "私密输入" not in str(timeout.value.detail)
             assert entered.is_set() and not finished.is_set()
+            assert len(submitted) == 1 and not submitted[0].done()
             with pytest.raises(HTTPException) as busy:
                 await endpoint(ClassifyRequest(texts=["我要退货"]), request)
             assert busy.value.status_code == 503
         finally:
             release.set()
-            assert await asyncio.to_thread(finished.wait, 10)
-        monkeypatch.setattr(predictor, "predict", real_predict)
-        recovered = await endpoint(ClassifyRequest(texts=["我要退货"]), request)
-        assert len(recovered["results"]) == 1
+            # 预测器的finished早于外层槽释放；必须等待包含finally的完整compute任务。
+            assert len(submitted) == 1
+            results = await asyncio.wait_for(asyncio.wrap_future(submitted[0]), timeout=10)
+            assert len(results) == 1
+        # 此处验证槽恢复，不要求另一轮真实模型推理在测试专用的30毫秒内完成。
+        slot = application.state.inference_slot
+        assert slot.acquire(blocking=False)
+        slot.release()
