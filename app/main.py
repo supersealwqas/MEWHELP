@@ -77,9 +77,9 @@ class SecurityHeadersMiddleware:
             if message["type"] == "http.response.start":
                 headers = MutableHeaders(scope=message)
                 headers["X-Content-Type-Options"] = "nosniff"
-                is_chat_path = scope["path"] == "/" or scope["path"].startswith("/static/")
-                if is_chat_path and headers.get("content-type", "").startswith("text/html"):
-                    # 首页和静态 HTML 共用策略，避免直接访问 index.html 绕过防护。
+                is_page_path = scope["path"] in {"/", "/flywheel", "/rag-eval"} or scope["path"].startswith("/static/")
+                if is_page_path and headers.get("content-type", "").startswith("text/html"):
+                    # 聊天、审核和评估页共用策略，直接访问静态 HTML 也不能绕过防护。
                     headers["Content-Security-Policy"] = (
                         "default-src 'self'; script-src 'self'; style-src 'self'; "
                         "img-src 'self'; connect-src 'self'; "
@@ -109,7 +109,7 @@ async def chat_page() -> FileResponse:
 
 
 async def rag_eval_page() -> FileResponse:
-    """返回四策略评估看板页面。
+    """返回生产趋势和历史四策略评估看板页面。
 
     参数：无；页面与评估 API 同源，不接外部图表库。
     返回：FileResponse，UTF-8 HTML；数据由 /api/rag-eval/overview 提供。
@@ -117,6 +117,20 @@ async def rag_eval_page() -> FileResponse:
     """
     return FileResponse(
         STATIC_DIR / "rag-eval.html",
+        media_type="text/html",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+async def flywheel_page() -> FileResponse:
+    """返回知识待审与用量页面。
+
+    参数：无；页面通过同源 API 读取待审问题并提交人工核准答案。
+    返回：FileResponse，UTF-8 HTML 页面。
+    异常：RuntimeError，部署时缺失 flywheel.html。
+    """
+    return FileResponse(
+        STATIC_DIR / "flywheel.html",
         media_type="text/html",
         headers={"Cache-Control": "no-cache"},
     )
@@ -283,6 +297,7 @@ def create_app(runtime_factory=None) -> FastAPI:
     application.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     application.add_api_route("/", chat_page, response_class=FileResponse, include_in_schema=False)
     application.add_api_route("/rag-eval", rag_eval_page, response_class=FileResponse, include_in_schema=False)
+    application.add_api_route("/flywheel", flywheel_page, response_class=FileResponse, include_in_schema=False)
     return application
 
 

@@ -38,20 +38,22 @@ def test_chat_homepage() -> None:
     assert response.headers["x-content-type-options"] == "nosniff"
 
 
-@pytest.mark.parametrize("url", ["/", "/static/index.html"])
+@pytest.mark.parametrize("url", ["/", "/static/index.html", "/flywheel", "/static/flywheel.html", "/rag-eval", "/static/rag-eval.html"])
 def test_chat_html_entrypoints_have_same_security_headers(url: str) -> None:
-    """验证所有聊天 HTML 入口均限制脚本与请求来源，避免绕过首页响应头。
+    """验证聊天、审核和评估的 HTML 入口均限制脚本与请求来源。
 
     参数:
-        url: 首页或静态 HTML 的直接访问路径。
+        url: 聊天、审核、评估页面或静态 HTML 的直接访问路径。
     返回值:
-        None: 断言两种入口使用一致的内容安全策略和 MIME 保护。
+        None: 断言所有入口使用一致的内容安全策略和 MIME 保护。
     异常:
         AssertionError: 某个入口缺少关键防护指令时抛出。
     """
     with TestClient(app) as client:
         response = client.get(url)
         homepage = client.get("/")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
     policy = response.headers.get("content-security-policy", "")
     assert policy == homepage.headers["content-security-policy"]
     assert "script-src 'self'" in policy
