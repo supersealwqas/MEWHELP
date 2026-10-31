@@ -242,3 +242,38 @@ async def test_invalid_artifact_never_acquires_database_lease(tmp_path, monkeypa
     monkeypatch.setattr(repository.MySqlWriteLease, "acquire", forbidden)
     with pytest.raises(ValueError):
         await repository.EvaluationRepository(None, None).save_completed_run(path, "手动")
+
+
+async def test_cli_lease_initializes_utc_before_timestamp_writes(monkeypatch):
+    """保存锁独立连接必须设UTC，避免CURRENT_TIMESTAMP随服务器时区偏移。参数：引擎构造边界替身；返回：None；异常：断言失败。"""
+    from app.repositories import evaluations
+    from sqlalchemy.pool import NullPool
+    configured, closed = [], []
+
+    class Engine:
+        """替换外部数据库引擎，记录配置和本轮资源释放。"""
+        def __init__(self, name):
+            """保存资源名称。参数：name引擎标签；返回：None；异常：无。"""
+            self.name = name
+            self.url = "mysql+asyncmy://unused@localhost/not-connected"
+
+        async def dispose(self):
+            """记录已结束的本轮引擎。参数：无；返回：None；异常：无。"""
+            closed.append(self.name)
+
+    engine, factory = Engine("application"), object()
+
+    def create_lease_engine(url, **kwargs):
+        """捕获真实仓储传给SQLAlchemy的连接选项，不连接数据库。参数：地址/选项；返回：隔离引擎；异常：无。"""
+        configured.append({"url": url, **kwargs})
+        return Engine("lease")
+
+    monkeypatch.setattr("app.db.session.create_database", lambda config: (engine, factory))
+    monkeypatch.setattr(evaluations, "create_async_engine", create_lease_engine)
+    async with evaluations.evaluation_repository_runtime(object()) as repository:
+        assert repository.factory is factory
+        assert len(configured) == 1 and configured[0]["url"] == engine.url
+        assert configured[0]["poolclass"] is NullPool
+        assert configured[0]["connect_args"]["connect_timeout"] == 5
+        assert configured[0]["connect_args"].get("init_command") == "SET time_zone = '+00:00'"
+    assert closed == ["lease", "application"]

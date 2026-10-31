@@ -92,7 +92,12 @@ async def evaluation_repository_runtime(config):
     """CLI自有应用库资源；不建表、不加载知识或模型。参数：明确应用Settings；返回：仓储；异常：配置/数据库错误。"""
     from app.db.session import create_database
     engine, factory = create_database(config)
-    lease_engine = create_async_engine(engine.url, poolclass=NullPool, connect_args={"connect_timeout": 5})
+    # 保存发生在独立持锁连接上，CURRENT_TIMESTAMP必须沿用应用库的UTC约定。
+    lease_engine = create_async_engine(
+        engine.url,
+        poolclass=NullPool,
+        connect_args={"connect_timeout": 5, "init_command": "SET time_zone = '+00:00'"},
+    )
     try:
         yield EvaluationRepository(factory, lease_engine)
     finally:
