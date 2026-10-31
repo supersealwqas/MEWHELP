@@ -20,6 +20,8 @@ dependencies = [
     "pymilvus==2.6.17",
     "markdown-it-py==4.2.0",
     "torch==2.11.0",
+    "transformers==5.20.2",
+    "safetensors==0.8.0",
     "tzdata==2026.5",
     "langgraph>=1.0.8,<2",
     "langgraph-checkpoint-sqlite>=3.1.2",

@@ -1,4 +1,4 @@
-"""CH10 只读导出和可恢复语料准备CLI，输出模型预标及待人工复核材料。"""
+"""CH10数据准备、离线全参数训练和独立主题推理CLI。"""
 
 import argparse
 import asyncio
@@ -107,8 +107,8 @@ async def prepare_dataset(source: Path, output_dir: Path, *, per_label: int = 60
 
 
 def main() -> None:
-    """执行只读数据CLI。参数：命令行；返回：无；异常：输出错误类型并非零退出。"""
-    parser = argparse.ArgumentParser(description="CH10 主题派生语料（模型预标，人工复核待完成）")
+    """执行数据或显式本地模型CLI。参数：命令行；返回：无；异常：输出错误类型并非零退出。"""
+    parser = argparse.ArgumentParser(description="CH10 主题数据、离线全参数训练和推理")
     commands = parser.add_subparsers(dest="command", required=True)
     export = commands.add_parser("export-pool")
     export.add_argument("--output-dir", type=Path, required=True)
@@ -119,16 +119,37 @@ def main() -> None:
     prepare.add_argument("--multi", type=int, default=204)
     prepare.add_argument("--seed", type=int, default=42)
     prepare.add_argument("--max-calls", type=int, default=60)
+    train = commands.add_parser("train")
+    train.add_argument("--dataset-dir", type=Path, required=True)
+    train.add_argument("--base-dir", type=Path, required=True)
+    train.add_argument("--output-dir", type=Path, required=True)
+    train.add_argument("--epochs", type=int, default=8)
+    train.add_argument("--micro-batch", type=int, default=2)
+    train.add_argument("--accumulate", type=int, default=8)
+    train.add_argument("--max-length", type=int, default=128)
+    train.add_argument("--seed", type=int, default=42)
+    predict = commands.add_parser("predict")
+    predict.add_argument("--model-dir", type=Path, required=True)
+    predict.add_argument("--text", action="append", required=True)
     args = parser.parse_args()
     try:
         if args.command == "export-pool":
             result = asyncio.run(export_pool(args.output_dir))
-        else:
+        elif args.command == "prepare":
             result = asyncio.run(prepare_dataset(args.source, args.output_dir, per_label=args.per_label, multi=args.multi, seed=args.seed, max_calls=args.max_calls))
+        elif args.command == "train":
+            from app.topics.training import train_model
+            result = train_model(args.dataset_dir, args.base_dir, args.output_dir, epochs=args.epochs,
+                                 micro_batch=args.micro_batch, accumulate=args.accumulate, max_length=args.max_length, seed=args.seed)
+        else:
+            from app.topics.inference import TopicPredictor
+            predictor = TopicPredictor(args.model_dir)
+            metadata = predictor.metadata
+            result = dict(model_version=metadata["version"], taxonomy_digest=metadata["taxonomy_digest"], results=predictor.predict(args.text))
         print(json.dumps(result, ensure_ascii=False, indent=2))
     except Exception as error:
         # CLI不打印可能包含凭据的网络异常，只提示具体异常类别；原件保留恢复目录。
-        parser.exit(1, f"主题数据任务失败：{type(error).__name__}；请查看本地恢复目录原件。\n")
+        parser.exit(1, f"主题任务失败：{type(error).__name__}；请查看本地制品或恢复目录。\n")
 
 
 if __name__ == "__main__":

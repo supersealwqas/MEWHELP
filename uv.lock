@@ -2179,8 +2179,10 @@ dependencies = [
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "pymilvus" },
+    { name = "safetensors" },
     { name = "sqlalchemy", extra = ["asyncio"] },
     { name = "torch" },
+    { name = "transformers" },
     { name = "tzdata" },
     { name = "uvicorn", extra = ["standard"] },
 ]
@@ -2215,8 +2217,10 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.9.0" },
     { name = "pydantic-settings", specifier = ">=2.14.2" },
     { name = "pymilvus", specifier = "==2.6.17" },
+    { name = "safetensors", specifier = "==0.8.0" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0,<2.1" },
     { name = "torch", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cu128" },
+    { name = "transformers", specifier = "==5.20.2" },
     { name = "tzdata", specifier = "==2026.5" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.51.0" },
 ]
