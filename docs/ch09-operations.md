@@ -68,3 +68,71 @@ PYTHONIOENCODING=utf-8 uv run python -m app.db.migrate_ch09 --env-file .env --da
 第一条预览，第二条应用，最后一条应返回空 `statements`。Windows显式指定stdout的UTF-8编码便于核对中文枚举；数据库连接仍由迁移实现按utf8mb4处理。命令会核对实际库名和既有结构，不用 `create_all` 代替增量迁移。
 
 2026-10-30本机应用库已按以上流程迁移，完整结构核验通过；迁移前后163个会话、1367条消息、17条问题池原件、52条知识块的数量一致。后续服务启动继续严格核验表结构，不重复执行已经完成的DDL。
+
+已有应用库也必须完成前章迁移。2026-10-30真实确认验收发现CH06等待状态约束尚未升级，已运行 `uv run python -m app.db.migrate_ch06 --env-file .env --database mewhelp` 预览，再加 `--apply` 执行，最后复预览为空；补齐等待状态与空退款申请表，原有业务行数未变。新环境须按所缺章次预览并迁移，不能以CH09新表齐全推断前章约束也完整。
+
+## 人工审核与发布状态
+
+审核接口使用 `/api/flywheel/reviews` 列表和 `/api/flywheel/reviews/{id}` 详情。列表可传 `status=待审/通过/驳回`、`after_id`、`limit`（1–200）。主键和返回游标使用十进制字符串，浏览器不能把大整数主键转换成 Number。
+
+对某条缺口提交 `POST /api/flywheel/reviews/{id}/approve`，正文为 `{"answer":"人工核准的完整答案"}`。服务先用实际分词器校验标准问题、类别和答案合计1600字符、格式化后2048 token，再冻结正文；超限返回422，修改后可以重新提交。模型示例仅作参考，发布保存人工输入的原文。
+
+`publication_status` 是从持久状态计算的：`not_started` 表示尚未开始发布，`pending` 表示人工答案已冻结但发布待完成，`published` 表示已通过数据库和向量可见性核验。发布使用稳定来源 `ch09/review/{id}`；最后审核完成事务与知识写锁共用同一连接，等待期间失锁会保留待审。
+
+冻结后通过 `/retry` 重试，或由服务启动和周期恢复继续处理；不能换答案或驳回，重复相同核准答案不会生成新知识身份。尚未冻结的条目可以 `POST /api/flywheel/reviews/{id}/reject`。404表示条目不存在，409表示状态冲突，422表示可修正输入，503表示依赖或发布未完整完成。收到503后应重新读取详情；状态暂时读不到时界面不能猜成发布成功或失败。
+
+详情中的每条原件保留原始 `retrieved_chunks`；展示采用独立的 `retrieval_status` 和 `retrieval_snapshot`。只有 `not_retrieved` 才表示确认未检索，`empty` 表示零命中，`fault` 表示检索故障，`legacy_unavailable/legacy_incomplete` 表示旧证据缺失或不完整。旧SQL NULL本身不能证明未检索；系统不会重搜今天的知识来补造历史。
+
+## 本机验收专用知识
+
+闭环演示使用独立可辨认的“青禾校验卡”问答，来源会保存为 `ch09/review/<实际审核ID>`，不是商城商品或售后政策。核准正文固定为：“仅用于 MewHelp CH09 本机验收演示：青禾校验卡的核对词是‘青禾入库完成’。这不是商城商品、订单或售后政策。”此正文由本验收文档定义并人工核对，不使用模型给出的示例答案作为政策。
+
+先执行第一轮48题生产评估，再通过审核页发布这条演示知识，验证重新提问确实引用新增知识，最后执行同口径第二轮评估。所有正式业务FAQ仍须核对已有业务资料或用户明确提供的事实。
+
+本轮固定问题为“验收演示中，青禾校验卡的核对词是什么？”，对应审核14、来源 `ch09/review/14`。原先带“CH09”的提问触发了型号保留检查，属于检索故障原件；不能将它当成发布前缺知识的成功样例。新的原轮身份和只读核验见 `reports/ch09/acceptance/evidence-manifest-draft.json`。
+
+## 页面、反馈与用量
+
+聊天入口 `/`、审核后台 `/flywheel`、评估页 `/rag-eval` 使用同源资源。当前本机验收应用为 `http://127.0.0.1:18000`，Langfuse 为 `http://127.0.0.1:13000`；8000是上方普通启动命令的示例端口。
+
+在历史会话切回原轮后点击“没帮助”，浏览器向 `/api/chat/{session_id}/turns/{turn_id}/feedback` 提交 `{"user_id":"demo-user","resolved":false}`。只有服务器确认成功后才显示已提交；重复请求仍返回原池主键。同轮自评与用户差评可以各保留一条来源原件，但归并后的问题出现次数只计一次。
+
+后台消费取自 `GET /api/observability/costs` 的完整时间窗口。时间按设备时区输入，结束时刻不含在内；展示输入、输出、已知token、缺失用量数量与覆盖比例，未知金额不填0。服务器数据库时间按UTC保存，页面转换为设备时间。订单1001等内置业务资料带 `is_mock=true`，是本机演示数据，不能当成真实商城订单。
+
+## 生产评估与每日调度
+
+评估只运行生产知识子流程，包括理解、查询、召回/精排、证据判断、知识自评和引用处理。它不覆盖全部客服业务图，不向真实会话和问题池写入评估提问。原始题集为72题，当前成绩只使用其中48道evaluation题；24道校准题不混入成绩。
+
+在项目根目录的Git Bash执行以下命令。评估会调用已配置模型并产生实际用量；输出目录必须尚不存在。
+
+```bash
+uv run python -m app.evaluation.cli evaluate-production --dataset data/evaluation/ch04.json --policy data/knowledge/evidence-policy.json --triggered-by 手动 --target application-readonly --output-dir reports/ch09/eval-before
+# 完成核准知识发布与同问重验后，保持数据、模型和策略不变：
+uv run python -m app.evaluation.cli evaluate-production --dataset data/evaluation/ch04.json --policy data/knowledge/evidence-policy.json --triggered-by 手动 --target application-readonly --output-dir reports/ch09/eval-after
+```
+
+本轮用 `.superpowers/sdd/2026-10-30-ch09-observability-flywheel/task11-evaluate.py` 代替 `-m app.evaluation.cli` 入口，仅在进程内读取本地忽略配置并开启Langfuse观测；所有子命令和参数相同，不把密钥写入报告。
+
+每轮完整保存 `manifest.json`、`summary.json`、逐题结果、冻结题集、知识与策略原件，并向应用库 `eval_runs` 写一行。生成或裁判的真实逐题错误保留，完成但有错误与完全无错分开显示，缺少的指标保持空值。若知识/模型/协议在执行中变化或已经确认失锁，产物不可补存为正常成绩。
+
+如果只有最后落表失败、完整产物仍合法，可用以下命令补存，不重新调用模型；来源沿用原始运行记录：
+
+```bash
+uv run python -m app.evaluation.cli persist-run --artifact-dir reports/ch09/eval-before
+```
+
+生产API为 `POST /api/rag-eval/production/rerun`、`GET /api/rag-eval/production/job`、`GET /api/rag-eval/production/runs`。页面读取全部分页并按比较键判断能否直接算差值。只有知识版本改变时允许比较并标明版本；模型、题集、策略或协议改变时，不直接显示前后增减。下降也照实保留。
+
+`EVALUATION_SCHEDULE_ENABLED` 默认开启；默认 `EVALUATION_HOUR=3`、`EVALUATION_MINUTE=0`、`EVALUATION_TIMEZONE=Asia/Shanghai`。启动只安排下一次，不补跑错过的日期；手动、定时和独立CLI共享数据库执行锁。初始 `admission=pending` 只是当前实例已接受，不能据此认为已获得全库执行权。应用关闭会先停止调度，再回收自己启动的评估进程。
+
+## 真实验收与故障恢复记录
+
+`tests/verify_ch09_live.py` 只读API、数据库和Langfuse，并重新核验清单指向的原件，不自动发问、反馈、发布或评估：
+
+```bash
+uv run python tests/verify_ch09_live.py --base-url http://127.0.0.1:18000 --evidence-manifest reports/ch09/acceptance/evidence-manifest.json --output-dir reports/ch09/acceptance/final-read
+```
+
+输出目录使用新名称，保留既有失败原件。返回1表示存在失败或缺项，不能写成整体验收通过。浏览器画面与答案语义由单独具名记录负责，脚本只检查其引用和文件摘要，不把自动验证冒称人工观察。
+
+发布失败恢复的演示采用本验收进程中的定向故障开关：只有明确的审核14演示正文和内容指纹匹配时，在向量写入前产生故障；MySQL已经冻结的人工答案和待同步知识保留。其他服务和共享Milvus均不停机。撤销该独占开关后，通过真实“重试发布”恢复，并再次核对MySQL、向量指纹和同问引用。此故障由验收主动注入，应与自然网络故障区分；具体执行时间和状态以最终原件为准。
