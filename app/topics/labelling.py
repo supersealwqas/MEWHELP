@@ -3,8 +3,6 @@
 import asyncio
 import hashlib
 import json
-import re
-from collections import Counter
 from contextlib import aclosing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +15,15 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.core.structured import bind_output_tool, collect_tool_output, output_tool, parse_tool_output
 from app.topics.data import clean_question
 from app.topics.taxonomy import load_taxonomy, validate_labels
+
+
+def _safe_correction_form(text: str) -> str:
+    """仅归一已批准错字与等价标点。参数：text脱敏文本；返回：安全比较形式；异常：ValueError。"""
+    # 白名单保留所有词语及其顺序、分句关系；不能以保护词计数代替诉求绑定检查。
+    text = clean_question(text).translate(str.maketrans({",": "，", ";": "；", ":": "：", "?": "？", "!": "！", "(": "（", ")": "）"}))
+    for typo, corrected in (("发漂", "发票"), ("尺玛", "尺码")):
+        text = text.replace(typo, corrected)
+    return text
 
 
 class TopicItem(BaseModel):
@@ -56,7 +63,7 @@ class TopicLabeller:
         """发起有界单工具请求并验证业务约束。参数：无主键payload、count数量、期望标签；返回：预标；异常：模型/校验错误。"""
         if not 1 <= count <= 64:
             raise ValueError("每次请求数量须为1至64")
-        system = "你是电商主题数据预标员。只标当前原话确实表达的诉求；否定、撤回和纯引用不算。修归保修维修、退归退换货；运费管钱、物流管货。其他排他且不表示不确定。语义不足返回labels=[]、needs_review=true和原因，禁止猜上下文。只纠错格式，不添加新信息；保留否定、数量、型号。不要产生真实姓名、电话、邮箱、地址或订单号。生成时每个独立场景用不同family；同场景改写共享family；不引用或改写taxonomy正反例。主题权威表：" + json.dumps(self.taxonomy, ensure_ascii=False)
+        system = "你是电商主题数据预标员。只标当前原话确实表达的诉求；否定、撤回和纯引用不算。修归保修维修、退归退换货；运费管钱、物流管货。其他排他且不表示不确定。语义不足返回labels=[]、needs_review=true和原因，禁止猜上下文。预标正文必须原样保留全部词语、分句和顺序，包括脱敏占位符；只允许发漂→发票、尺玛→尺码两个明确错字修正和英文逗号/分号/冒号/问号/感叹号/括号转对应中文标点；其他疑似错字在review_reason说明，不能自行改写。不要产生真实姓名、电话、邮箱、地址或订单号。生成时每个独立场景用不同family；同场景改写共享family；不引用或改写taxonomy正反例。主题权威表：" + json.dumps(self.taxonomy, ensure_ascii=False)
         messages = [SystemMessage(content=system), HumanMessage(content=json.dumps(payload, ensure_ascii=False))]
         bound = bind_output_tool(self.model, output_tool(TopicOutput, "submit_topics"))
         for attempt in range(self.max_attempts):
@@ -86,9 +93,8 @@ class TopicLabeller:
                     row["text"] = clean_question(row["text"])
                     if payload["task"] == "label":
                         original = payload["items"][item.index]["text"]
-                        protected = r"[A-Za-z]+(?:[-_]?[A-Za-z0-9]+)*|\d+(?:\.\d+)?|不|没|未|无|勿|别"
-                        if Counter(re.findall(protected, original)) != Counter(re.findall(protected, row["text"])):
-                            raise ValueError("模型纠错改变了否定、数字、型号或尺码")
+                        if _safe_correction_form(original) != _safe_correction_form(row["text"]):
+                            raise ValueError("模型纠错超出安全格式与明确错字白名单")
                     if not item.labels:
                         if not item.needs_review or not item.review_reason.strip() or expected_labels is not None:
                             raise ValueError("空标签必须明确进入待复核，生成题不能空标")

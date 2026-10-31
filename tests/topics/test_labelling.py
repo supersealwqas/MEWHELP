@@ -38,7 +38,7 @@ async def test_invalid_ids_and_labels_are_rejected(tmp_path):
 @pytest.mark.asyncio
 async def test_input_is_redacted_and_output_is_model_prelabel(tmp_path):
     """外发隐私消除，模型结果不冒充人工确认。参数：临时目录；返回：无；异常：断言失败。"""
-    model = Model([dict(index=0, text="XL不退，问尺寸", labels=["尺码"], family="one", needs_review=False, review_reason="")])
+    model = Model([dict(index=0, text="[电话]，XL不退，问尺寸", labels=["尺码"], family="one", needs_review=False, review_reason="")])
     result = await TopicLabeller(model, report_dir=tmp_path).label(["13812345678，XL不退，问尺寸"])
     assert result[0]["labels"] == ["尺码"] and result[0]["annotation_status"] == "model_prelabel"
     assert "13812345678" not in str(model.messages)
@@ -51,6 +51,27 @@ async def test_correction_cannot_change_numbers_or_negation(tmp_path):
     model = Model([dict(index=0, text="XL要退，3件", labels=["退换货"], family="one", needs_review=False, review_reason="")])
     with pytest.raises(ValueError):
         await TopicLabeller(model, report_dir=tmp_path).label(["XL不退，2件"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("original,changed", [
+    ("XL不退，L退", "XL退，L不退"),
+    ("2件退货，3件不退", "3件退货，2件不退"),
+    ("XL不退，L换", "XL不换，L退"),
+])
+async def test_correction_cannot_rebind_protected_business_meaning(tmp_path, original, changed):
+    """相同保护词数或顺序也不能改变诉求绑定。参数：目录、原话、篡改文本；返回：无；异常：断言失败。"""
+    model = Model([dict(index=0, text=changed, labels=["退换货"], family="one", needs_review=False, review_reason="")])
+    with pytest.raises(ValueError):
+        await TopicLabeller(model, report_dir=tmp_path).label([original])
+
+
+@pytest.mark.asyncio
+async def test_explicit_safe_typo_and_punctuation_corrections_remain_available(tmp_path):
+    """限定错字和等价标点可以修正。参数：临时目录；返回：无；异常：断言失败。"""
+    model = Model([dict(index=0, text="发票怎么补开？", labels=["发票"], family="one", needs_review=False, review_reason="")])
+    output = await TopicLabeller(model, report_dir=tmp_path).label(["发漂怎么补开?"])
+    assert output[0]["text"] == "发票怎么补开？" and output[0]["original_text"] == "发漂怎么补开?"
 
 
 @pytest.mark.asyncio

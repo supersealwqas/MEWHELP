@@ -96,11 +96,13 @@ async def prepare_dataset(source: Path, output_dir: Path, *, per_label: int = 60
             else:
                 rows.append(row)
     parts = split_examples(rows, taxonomy, seed)
-    parts["train"] = augment_training(parts["train"], taxonomy)
+    reserved = {text for split in ("validation", "test") for row in parts[split]
+                for text in (row["text"], row.get("original_text", row["text"]))}
+    parts["train"] = augment_training(parts["train"], taxonomy, reserved_texts=reserved)
+    (cache / "pending.json").write_text(json.dumps(pending, ensure_ascii=False, indent=2), encoding="utf-8")
     manifest = write_dataset(output_dir, parts, taxonomy, seed=seed, metadata={**config, "logical_requests": len(plan),
                 "raw_records": str(cache / "raw"), "pending_count": len(pending), "pending_review_records": str(cache / "pending.json"),
                 "customer_generalization": "尚无可证实客户语料支持", "token_usage": "见逐请求原件；未返回用量保持null"}, pending_rows=pending)
-    (cache / "pending.json").write_text(json.dumps(pending, ensure_ascii=False, indent=2), encoding="utf-8")
     return manifest
 
 

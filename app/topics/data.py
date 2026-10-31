@@ -7,6 +7,7 @@ import re
 from collections import Counter, defaultdict
 from copy import deepcopy
 from pathlib import Path
+from uuid import uuid4
 
 from app.topics.taxonomy import label_names, load_taxonomy, taxonomy_digest, validate_labels
 
@@ -120,10 +121,11 @@ def split_examples(rows: list[dict], taxonomy: dict, seed: int = 42) -> dict[str
     return result
 
 
-def augment_training(rows: list[dict], taxonomy: dict) -> list[dict]:
-    """仅为传入训练集作安全句式增强。参数：rows训练样本、taxonomy主题表；返回：原样本及派生；异常：ValueError。"""
+def augment_training(rows: list[dict], taxonomy: dict, *, reserved_texts: set[str] | None = None) -> list[dict]:
+    """仅为训练集作安全增强。参数：rows训练样本、taxonomy主题表、reserved_texts全部留出正文；返回：原样本及派生；异常：ValueError。"""
     result = deepcopy(rows)
-    texts = {row["text"] for row in rows}
+    # 留出当前正文和纠错前正文均禁止成为训练派生，避免增强后才发现跨集连通。
+    texts = {row["text"] for row in rows} | (reserved_texts or set())
     for row in rows:
         _validate_row(row, taxonomy)
         if row["source"] == "augmentation" or not row["text"].startswith("请问"):
@@ -142,9 +144,9 @@ def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def write_dataset(directory: Path, parts: dict[str, list[dict]], taxonomy: dict, *, seed: int, metadata: dict | None = None,
-                  pending_rows: list[dict] | None = None) -> dict:
-    """写不可覆盖制品和人工抽审包。参数：目录、三份、主题表、种子、元信息、待复核题；返回：清单；异常：IO/校验错误。"""
+def _write_dataset_contents(directory: Path, parts: dict[str, list[dict]], taxonomy: dict, *, seed: int, metadata: dict | None = None,
+                            pending_rows: list[dict] | None = None) -> dict:
+    """写临时制品并验证全部约束。参数：临时目录、三份、主题表、种子、元信息、待复核题；返回：清单；异常：IO/校验错误。"""
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=False)
     all_rows = [row for split in SPLITS for row in parts[split]]
@@ -173,6 +175,26 @@ def write_dataset(directory: Path, parts: dict[str, list[dict]], taxonomy: dict,
     (directory / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     validate_dataset(directory)
     return manifest
+
+
+def write_dataset(directory: Path, parts: dict[str, list[dict]], taxonomy: dict, *, seed: int, metadata: dict | None = None,
+                  pending_rows: list[dict] | None = None) -> dict:
+    """校验通过后原子发布不可覆盖制品。参数：目录、三份、主题表、种子、元信息、待复核题；返回：清单；异常：IO/校验错误，失败保留临时诊断。"""
+    directory = Path(directory)
+    if directory.exists():
+        raise FileExistsError("制品目录已存在")
+    temporary = directory.with_name(f".{directory.name}.building-{uuid4().hex}")
+    try:
+        manifest = _write_dataset_contents(temporary, parts, taxonomy, seed=seed, metadata=metadata, pending_rows=pending_rows)
+        if directory.exists():
+            raise FileExistsError("制品目录已由另一个任务创建")
+        # 同一父目录改名使读者只看到完整且已校验的制品，失败不阻止原入口恢复。
+        temporary.rename(directory)
+        return manifest
+    except Exception as error:
+        if temporary.exists():
+            (temporary / "failure.json").write_text(json.dumps({"status": "failed", "error_type": type(error).__name__}, ensure_ascii=False), encoding="utf-8")
+        raise
 
 
 def validate_dataset(directory: Path) -> dict:

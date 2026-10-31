@@ -131,3 +131,79 @@ def test_manifest_counts_cannot_hide_label_or_source_support(tmp_path):
     path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
     with pytest.raises(ValueError):
         validate_dataset(output)
+
+
+def test_augmentation_skips_holdout_collision_and_keeps_holdout_unchanged(tmp_path):
+    """自然留出问法与训练增强碰撞时跳过派生。参数：临时目录；返回：无；异常：断言失败。"""
+    rows = [sample(str(i), f"尺寸问题{i}", str(i)) for i in range(40)]
+    rows[0]["text"] = "请问XL尺寸多少"
+    rows[16]["text"] = "想问一下XL尺寸多少"
+    parts = split_examples(rows, load_taxonomy(), seed=42)
+    before = deepcopy(parts)
+    assert "0" in {row["id"] for row in parts["train"]}
+    assert "16" in {row["id"] for row in parts["validation"]}
+    reserved = {row["text"] for split in ("validation", "test") for row in parts[split]}
+    parts["train"] = augment_training(parts["train"], load_taxonomy(), reserved_texts=reserved)
+    assert parts["validation"] == before["validation"] and parts["test"] == before["test"]
+    assert "想问一下XL尺寸多少" not in {row["text"] for row in parts["train"]}
+    write_dataset(tmp_path / "no-collision", parts, load_taxonomy(), seed=42)
+
+
+def test_failed_final_validation_preserves_diagnostics_and_allows_retry(tmp_path, monkeypatch):
+    """末尾校验失败不占最终目录，原命令可恢复。参数：目录、替换器；返回：无；异常：断言失败。"""
+    from app.topics import data as topic_data
+    output = tmp_path / "recoverable"
+    parts = split_examples([sample(str(i), f"尺寸问题{i}", str(i)) for i in range(40)], load_taxonomy())
+    real_validate = topic_data.validate_dataset
+
+    def reject_once(directory):
+        """模拟实际制品检查失败。参数：directory临时制品；返回：无；异常：ValueError。"""
+        raise ValueError("diagnostic failure")
+
+    monkeypatch.setattr(topic_data, "validate_dataset", reject_once)
+    with pytest.raises(ValueError):
+        write_dataset(output, parts, load_taxonomy(), seed=42)
+    assert not output.exists()
+    diagnostics = list(tmp_path.glob(".recoverable.building-*/failure.json"))
+    assert diagnostics and json.loads(diagnostics[0].read_text(encoding="utf-8"))["error_type"] == "ValueError"
+    monkeypatch.setattr(topic_data, "validate_dataset", real_validate)
+    write_dataset(output, parts, load_taxonomy(), seed=42)
+    assert validate_dataset(output)["total"] == 40
+
+
+def test_prepare_recovers_after_final_validation_without_new_model_calls(tmp_path, monkeypatch):
+    """制品校验失败后CLI重跑复用全部付费批次。参数：目录、替换器；返回：无；异常：断言失败。"""
+    import asyncio
+    from app.topics import data as topic_data
+    from app.topics.cli import prepare_dataset
+
+    class LabelOnly:
+        """替代付费网络，统计已成功预标批次。"""
+
+        def __init__(self):
+            """初始化计数。参数：无；返回：无；异常：无。"""
+            self.calls = 0
+
+        async def label(self, texts):
+            """返回模型边界结果。参数：文本；返回：模型预标列表；异常：无。"""
+            self.calls += 1
+            return [dict(index=i, text=t, labels=["尺码"], needs_review=False) for i, t in enumerate(texts)]
+
+    source = tmp_path / "pool.json"
+    source.write_text(json.dumps([dict(question_id="1", text="请问XL尺寸多少", source="application_demo",
+                                     group_id="legacy-pool:1", history_uncertain=True, provenance={})]), encoding="utf-8")
+    output = tmp_path / "cli-recoverable"
+    model = LabelOnly()
+    real_validate = topic_data.validate_dataset
+
+    def reject(directory):
+        """模拟末尾检查失败。参数：临时目录；返回：无；异常：ValueError。"""
+        raise ValueError("validation failure")
+
+    monkeypatch.setattr(topic_data, "validate_dataset", reject)
+    with pytest.raises(ValueError):
+        asyncio.run(prepare_dataset(source, output, per_label=0, multi=0, labeller=model))
+    assert not output.exists() and model.calls == 1
+    monkeypatch.setattr(topic_data, "validate_dataset", real_validate)
+    asyncio.run(prepare_dataset(source, output, per_label=0, multi=0, labeller=model))
+    assert model.calls == 1 and validate_dataset(output)["human_review_status"] == "pending"
