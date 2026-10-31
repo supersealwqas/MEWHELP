@@ -143,8 +143,8 @@ curl -sS 'http://127.0.0.1:18000/api/flywheel/topics?scope=all'
 
 ## 最新本机实例（2026-11-01 修复后）
 
-主应用`127.0.0.1:18000`已于北京时间02:51加载产品提交`f6b8166`，启动时PID42640，171个app源码摘要验证一致。入口为`.superpowers/sdd/2026-11-01-ch10-merge-fixes/run-local-app.py`，正常停机标记是同目录的`stop-local-app`。原主PID36392通过旧目录标记正常退出，旧标记保留，不能再直接用旧入口启动。维护时必须重新核实监听身份，不能只据本文PID结束进程。
+主应用`127.0.0.1:18000`已于北京时间03:43加载提交`1d4de55`，该提交仅同步测试，产品源码与`f37ec79`一致。启动时PID46900，171个app源码摘要验证一致。入口为`.superpowers/sdd/2026-11-01-ch10-field-boundary-fixes/run-local-app.py`，启动清单为同目录的`app-runtime-20261031T194311Z.json`，正常停机标记是同目录的`stop-local-app`。原主PID42640通过旧`merge-fixes/stop-local-app`标记正常退出，旧标记保留，不能再直接用旧入口启动。维护时必须重新核实监听身份，不能只据本文PID结束进程。
 
-分类服务`127.0.0.1:18010`保留原PID43020，其入口仍为`.superpowers/sdd/2026-11-01-ch10-review-fixes/run-topic-service.py`。完整导入链不加载本轮修改的data/labelling模块，因此无需重启；固定模型仍为v4。入口默认旧模型版本，若今后重新启动，必须显式设置`CH10_SERVING_RUN=20261031-v4`。原观测配置和CH09检查点继续保留。
+分类服务`127.0.0.1:18010`保留原PID43020，创建时间仍为`2026-10-31T17:21:31.946070Z`，其入口仍为`.superpowers/sdd/2026-11-01-ch10-review-fixes/run-topic-service.py`。完整导入链不加载本轮修改的`data.py`和`training.py`模块，因此本轮只更新主应用；原CPU-v4模型保持运行，健康检查为`ready`，版本为`ch10-topic-1412cf9dd328ccfb`，没有重训。入口默认旧模型版本，若今后重新启动，必须显式设置`CH10_SERVING_RUN=20261031-v4`。原观测配置和CH09检查点继续保留。
 
-最新验收位于`.superpowers/sdd/2026-11-01-ch10-merge-fixes/runtime-acceptance-20261031T185130Z-ef04e9cbca00/`，确认新主源码身份、原分类器身份与健康、一次普通归类和两个统计范围。新轮检查1条、保存0条、未确定1条；默认18/17/1、全部历史20/19/1，原21行完整摘要不变。验收脚本会触发普通归类，不是纯只读健康检查，重跑前应先检查现有状态。固定双标签与4000/4001推理边界仍沿用未改分类器的前轮验收`review-fixes/runtime-acceptance-20261031T172236Z-0816a86ea740/`，不称本轮重复执行。
+最新验收位于`.superpowers/sdd/2026-11-01-ch10-field-boundary-fixes/runtime-acceptance-20261031T194310Z-759e75e9b25f/`，确认新主源码身份、原分类器身份与健康、一次普通归类和两个统计范围。普通归类新轮`5bd11ee397e74be99faf691d8d34374a`完成，检查1条、保存0条、未确定1条；默认18/17/1、全部历史20/19/1，原21行完整摘要不变。验收脚本先等待新端口和完整启动清单再发请求；普通归类会生成扫描原件，可能更新派生分类表，重跑前应先检查现有状态。前轮`merge-fixes/runtime-acceptance-20261031T185130Z-ef04e9cbca00/`仍保留为历史原件。固定双标签与4000/4001推理边界继续引用未改分类器的前轮验收`review-fixes/runtime-acceptance-20261031T172236Z-0816a86ea740/`，本轮未重复推理边界或前端视觉验收。
