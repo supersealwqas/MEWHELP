@@ -162,7 +162,7 @@ async def database_runtime():
         lease_engine = create_async_engine(
             engine.url,
             poolclass=NullPool,
-            connect_args={"connect_timeout": 5},
+            connect_args={"connect_timeout": 5, "init_command": "SET time_zone = '+00:00'"},
         )
         store = KnowledgeStore(factory, lease_engine)
         from app.knowledge.flywheel import FlywheelModel

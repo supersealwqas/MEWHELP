@@ -177,7 +177,13 @@ def verify_evaluation_pair(directories, database_rows):
 
 
 def verify_knowledge_loop(before, after, review, chunks, fingerprints, approved):
-    """核验原问缺口到同问引用核准正文的完整链。参数：前后实库/审核/知识/向量/核准原件；返回：身份；异常：ValueError。"""
+    """核验原问缺口到同问引用核准正文的完整链，分别验证公开答案与三格知识指纹。
+
+    参数：before/after 为发布前后原轮实库证据；review 为审核行；chunks 为知识行；
+        fingerprints 为主键到向量内容指纹/嵌入版本的映射；approved 为核准原件。
+    返回：dict，含审核、知识块、来源身份及三格知识 content_hash。
+    异常：ValueError，原轮、核准正文、身份、指纹或发布状态不一致。
+    """
     from app.knowledge.answering import FIXED_KNOWLEDGE_REFUSAL
     from app.knowledge.schemas import KnowledgeText
     from app.knowledge.text import content_fingerprint
@@ -197,16 +203,18 @@ def verify_knowledge_loop(before, after, review, chunks, fingerprints, approved)
     chunk = published[0]
     require(chunk["answer"] == approved["answer"] and chunk["questions"] == review["normalized_question"]
             and chunk["category"] == "商品与购物 FAQ" and chunk["content_type"] == "faq", "发布正文或固定分类不符")
-    expected_hash = content_fingerprint(KnowledgeText(category=chunk["category"], questions=chunk["questions"], answer=chunk["answer"]))
-    require(chunk["content_hash"] == expected_hash and chunk["vectorize_status"] == "done" and chunk["vector_id"] == str(chunk["id"])
-            and fingerprints.get(chunk["id"]) == (expected_hash, chunk["embedding_revision"]), "MySQL或强一致向量指纹不符")
+    expected_chunk_hash = content_fingerprint(KnowledgeText(category=chunk["category"], questions=chunk["questions"], answer=chunk["answer"]))
+    require(chunk["content_hash"] == expected_chunk_hash and chunk["vectorize_status"] == "done" and chunk["vector_id"] == str(chunk["id"])
+            and fingerprints.get(chunk["id"]) == (expected_chunk_hash, chunk["embedding_revision"]), "MySQL或强一致向量指纹不符")
     citations = new["completion_metadata"].get("citations", [])
-    require(any(row.get("chunk_id") == chunk["id"] and row.get("source_key") == key and row.get("content_hash") == expected_hash
+    # answer_metadata 的公开引用合同只对答案正文求摘要，不能与三格知识指纹互换。
+    expected_answer_hash = hashlib.sha256(approved["answer"].encode("utf-8")).hexdigest()
+    require(any(row.get("chunk_id") == chunk["id"] and row.get("source_key") == key and row.get("content_hash") == expected_answer_hash
                 and row.get("answer") == approved["answer"] for row in citations), "发布后答案没有引用本条核准事实")
     snapshot = new.get("retrieval_snapshot") or {}
-    require(any(row.get("chunk_id") == chunk["id"] and row.get("source_key") == key and row.get("content_hash") == expected_hash
+    require(any(row.get("chunk_id") == chunk["id"] and row.get("source_key") == key and row.get("content_hash") == expected_chunk_hash
                 and row.get("answer") == approved["answer"] for attempt in snapshot.get("attempts", []) for row in attempt["chunks"]), "发布后原轮快照未记录核准来源")
-    return {"review_id": str(review["id"]), "chunk_id": chunk["id"], "source_key": key, "content_hash": expected_hash}
+    return {"review_id": str(review["id"]), "chunk_id": chunk["id"], "source_key": key, "content_hash": expected_chunk_hash}
 
 
 def verify_feedback(before, after, repeated, current):

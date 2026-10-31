@@ -158,9 +158,11 @@ def test_eval_rejects_forged_summary_before_database_comparison(tmp_path):
 
 def loop_sample():
     """创建可手算发布闭环，快照来自同一已知来源。参数：无；返回：六个证据参数；异常：无。"""
-    from app.knowledge.answering import FIXED_KNOWLEDGE_REFUSAL
+    from app.knowledge.answering import EvidenceCitation, FIXED_KNOWLEDGE_REFUSAL
     from app.knowledge.schemas import KnowledgeText
+    from app.knowledge.sources import answer_metadata
     from app.knowledge.text import content_fingerprint
+    from app.schemas.tools import ToolContext
     _, before, _ = sample()
     after = copy.deepcopy(before)
     before["workflow"]["answer"] = FIXED_KNOWLEDGE_REFUSAL
@@ -171,7 +173,10 @@ def loop_sample():
     text = KnowledgeText(category="商品与购物 FAQ", questions="问题", answer="核准事实")
     chunk = {"id": 9, "source_key": "ch09/review/8", "category": text.category, "questions": "问题", "answer": text.answer,
              "content_type": "faq", "content_hash": content_fingerprint(text), "embedding_revision": "emb", "vectorize_status": "done", "vector_id": "9", "is_active": True}
-    after["workflow"]["completion_metadata"]["citations"] = [{"chunk_id": 9, "source_key": chunk["source_key"], "content_hash": chunk["content_hash"], "answer": chunk["answer"]}]
+    # 合法引用必须走生产合同：公开指纹只覆盖答案，知识/向量/检索快照覆盖完整三格。
+    after["workflow"]["completion_metadata"].update(answer_metadata(
+        ToolContext(**after["workflow"]["context"]),
+        [EvidenceCitation(n=1, chunk_id=9, source_key=chunk["source_key"], question="问题", answer=chunk["answer"])]))
     after["workflow"]["retrieval_snapshot"] = {"schema_version": 1, "status": "ok", "attempts": [{"attempt_id": "a", "query": "问题", "status": "ok", "candidate_count": 1, "top_k": 5,
         "chunks": [{"chunk_id": 9, "source_key": chunk["source_key"], "content_hash": chunk["content_hash"], "embedding_revision": "emb", "question": "问题", "answer": "核准事实", "rank": 1}]}]}
     review = {"id": "8", "review_status": "通过", "publication_status": "published", "approved_answer": "核准事实", "normalized_question": "问题"}
@@ -203,6 +208,39 @@ def test_knowledge_loop_checks_actual_source_and_publication(damage):
             verifier().verify_knowledge_loop(*args)
     else:
         assert verifier().verify_knowledge_loop(*args)["chunk_id"] == 9
+
+
+@pytest.mark.parametrize("target,field,value,message", [
+    ("chunk", "content_hash", "f" * 64, "MySQL或强一致向量指纹不符"),
+    ("vector", "content_hash", "f" * 64, "MySQL或强一致向量指纹不符"),
+    ("vector", "embedding_revision", "another", "MySQL或强一致向量指纹不符"),
+    ("citation", "content_hash", "f" * 64, "发布后答案没有引用本条核准事实"),
+    ("citation", "content_hash", "364c834e4c5eef9671172b9ad5905bac50769b3776b72dc045f097acc647ab83", "发布后答案没有引用本条核准事实"),
+    ("citation", "chunk_id", 10, "发布后答案没有引用本条核准事实"),
+    ("citation", "answer", "另一条事实", "发布后答案没有引用本条核准事实"),
+    ("snapshot", "content_hash", "f" * 64, "发布后原轮快照未记录核准来源"),
+    ("snapshot", "content_hash", "c286e99465ef23045ea3b0659ae037cfc1bedf6619867eecd58f0b3063514d34", "发布后原轮快照未记录核准来源"),
+    ("snapshot", "chunk_id", 10, "发布后原轮快照未记录核准来源"),
+    ("snapshot", "source_key", "ch09/review/99", "发布后原轮快照未记录核准来源"),
+    ("snapshot", "answer", "另一条事实", "发布后原轮快照未记录核准来源"),
+])
+def test_knowledge_loop_rejects_damaged_fingerprints_and_evidence_identity(target, field, value, message):
+    """两类指纹互换、单独损坏或来源身份串用都必须在对应边界拒绝。
+
+    参数：target 为知识/向量/公开引用/检索快照；field 为被损坏字段；value 为非法替换值；message 为预期拒绝边界。
+    返回：None；异常：AssertionError，坏证据通过或在错误边界失败。
+    """
+    args = loop_sample()
+    _, after, _, chunks, fingerprints, _ = args
+    targets = {"chunk": chunks[0], "citation": after["workflow"]["completion_metadata"]["citations"][0],
+               "snapshot": after["workflow"]["retrieval_snapshot"]["attempts"][0]["chunks"][0]}
+    if target == "vector":
+        content_hash, revision = fingerprints[9]
+        fingerprints[9] = (value, revision) if field == "content_hash" else (content_hash, value)
+    else:
+        targets[target][field] = value
+    with pytest.raises(ValueError, match=message):
+        verifier().verify_knowledge_loop(*args)
 
 
 def test_feedback_rejects_repeated_new_pool_id():

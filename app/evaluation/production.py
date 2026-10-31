@@ -52,15 +52,32 @@ class ProductionEvaluationRuntime:
         self.last_judge_usage = record
 
     async def judge(self, query: str, answer: str, selected: list):
-        """独立裁判完整selected，不写长期台账。参数：原问/答案/模型证据全集；返回：裁判模型；异常：模型或失锁错误。"""
-        await self.check_execution()
-        return await self.faithfulness_judge.judge(query, answer, selected)
+        """在本题评估追踪下独立裁判完整证据，不写长期台账。
+
+        参数：query 原问、answer 已生成答案、selected 模型证据全集。
+        返回：裁判模型；用量保留 evaluation 类别并链接本题最初执行根。
+        异常：模型或失锁错误原样传播，退出时清理当前观测上下文。
+        """
+        observed = nullcontext()
+        if self.observability:
+            from app.schemas.tools import ToolContext
+            identity = self.last_attempt.get("trace_identity")
+            capture = self.last_attempt.get("capture")
+            # execute 已关闭根观测；复用本题身份建立后续执行，不能让裁判消费落入客服。
+            if identity is None or capture is None or capture.request_key != sha256(query.encode()).hexdigest():
+                context = ToolContext(session_id="production-evaluation", user_id="evaluation", conversation_id=1,
+                                      turn_id=str(uuid4()), user_message=query)
+                identity = self.observability.identity_for(context)
+            observed = self.observability.execution(identity, kind="evaluation")
+        with observed:
+            await self.check_execution()
+            return await self.faithfulness_judge.judge(query, answer, selected)
 
     async def execute(self, query: str, filters: dict, *, retrieval_only: bool) -> dict:
         """执行真实理解、分类、共享检索及可选知识生成。
 
         参数：query完整原问、filters真实筛选、retrieval_only是否只采样检索。
-        返回：实际检索结果；完整模式追加answer/refused/citations/usage，不写聊天。
+        返回：实际检索结果；完整模式追加answer/refused/citations/usage，启用观测时附trace_id，不写聊天。
         异常：预算/依赖/参数错误原样传播。
         """
         from app.schemas.tools import ToolContext
@@ -75,8 +92,9 @@ class ProductionEvaluationRuntime:
                               turn_id=turn_id, user_message=query)
         state, ledger = new_turn_state(context, [], 0), BudgetLedger.from_settings(self.settings)
         capture = RetrievalCapture(turn_id, sha256(query.encode()).hexdigest())
-        self.last_attempt = {"stage": "understand", "ledger": ledger, "capture": capture}
-        observed = self.observability.execution(self.observability.identity_for(context), kind="evaluation") if self.observability else nullcontext()
+        identity = self.observability.identity_for(context) if self.observability else None
+        self.last_attempt = {"stage": "understand", "ledger": ledger, "capture": capture, "trace_identity": identity}
+        observed = self.observability.execution(identity, kind="evaluation") if self.observability else nullcontext()
         with observed:
             await self.check_execution()
             understood = await understand_query(self.model, model_messages(state, self.settings, UNDERSTANDING_PROMPT,
@@ -102,6 +120,9 @@ class ProductionEvaluationRuntime:
             await self.check_execution()
             result = await pipeline.retrieve(prepared, capture=capture)
             result.update(route=route, filters=actual_filters, intent=intent.intent, intent_confidence=intent.confidence)
+            if self.observability and self.observability.enabled:
+                # 逐题原件可直接定位生成与裁判共同的追踪，不把身份混入模型输入或计分。
+                result["trace_id"] = identity.trace_id
             self.last_attempt["result"] = result
             if not retrieval_only:
                 self.last_attempt["stage"] = "generate"

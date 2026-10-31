@@ -536,7 +536,8 @@ function initializeProduction() {
     if (starting) message = "正在提交生产评估…";
     else if (job.status === "running") message = job.profile === "legacy" ? "四策略评估正在运行，两个入口共用执行位置。" : job.admission === "pending" ? "本实例已接收，正在确认执行位置；尚未正式开始评估。" : "生产评估正在运行，完成后会自动刷新历史。";
     else message = ({ idle: "暂无正在运行的评估。", completed: "生产评估已完成并保存。", completed_with_errors: "生产评估已保存，但含错误样本，请核对分母与错误数。", done: "四策略评估已完成。", busy: "另一个评估正在占用执行位置，本次未开始。", persist_failed: "评估运行结束，但保存失败；本次尚未进入历史记录。", failed: "评估未成功完成，请检查服务后重试。", interrupted: "上次评估已中断，可核对服务后重新运行。" })[job.status] || "正在确认评估状态。";
-    if (job.database_busy && job.status !== "running") message += " 当前有其他进程正在评估，暂不能重跑。";
+    if (job.database_busy && job.status === "idle") message = "当前有一轮评估正在执行，暂不能重跑。";
+    else if (job.database_busy && job.status !== "running") message += " 当前有另一轮评估正在执行，暂不能重跑。";
     if (job.next_run_at) message += ` 下次定时评估：${stamp(job.next_run_at)}。`;
     $("productionJob").textContent = extra || message;
     buttons();

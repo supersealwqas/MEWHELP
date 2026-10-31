@@ -313,6 +313,78 @@ async def test_full_ranked_precedes_cross_query_cap_and_audit_topk():
     assert features[0] == features[1]
 
 
+@pytest.mark.parametrize("query_scores,expected_ids,expected_scores", [
+    pytest.param([{1: 0.4, 3: 0.2}, {2: 0.9}, {3: 0.2}], [2, 1, 3], [0.9, 0.4, 0.2], id="later-query-higher-score"),
+    pytest.param([{2: 0.6, 1: 0.2}, {1: 0.9}, {3: 0.4}], [1, 2, 3], [0.9, 0.6, 0.4], id="same-chunk-promoted"),
+    pytest.param([{2: 0.7, 3: 0.2}, {1: 0.7}, {3: 0.2}], [1, 2, 3], [0.7, 0.7, 0.2], id="tied-score-stable-id"),
+])
+@pytest.mark.parametrize("policy", [False, True], ids=["faq", "policy"])
+async def test_pipeline_full_ranking_drives_metrics_without_changing_model_evidence(
+        query_scores, expected_ids, expected_scores, policy):
+    """完整排名按跨查询最高分计分，候选上限、预算与模型证据仍走原路径。
+
+    参数：query_scores 为三条查询各知识主键的相关分；expected_ids/expected_scores 为手算合并排名与分数；
+        policy 为普通或政策检索入口，分别保留原有两条或六条候选上限。
+    返回：None；异常：AssertionError，排名、Recall/MRR、预算或实际模型证据偏离约定。
+    """
+    import json
+    from app.knowledge.pipeline import ProductionKnowledgePipeline
+    from app.knowledge.rerank import RankedChunk
+    from app.knowledge.snapshots import RetrievalCapture
+    from tests.rag.test_retrieval import _chunk, _search
+    from tests.workflow.fakes import ScriptedWorkflowModel
+    from tests.workflow.graph_fakes import turn
+
+    queries = ["商品保修期限", "商品退换条件", "商品维修流程"]
+    scores_by_query = dict(zip(queries, query_scores, strict=True))
+    search, _, _, reranker = _search([_chunk(i) for i in (1, 2, 3)],
+        groups={query: list(scores) for query, scores in scores_by_query.items()}, rerank_top_k=2)
+
+    async def rank(query, chunks, *, top_n):
+        """仅替换外部精排模型，保留真实跨查询合并、候选裁剪和快照。
+
+        参数：query 为当前已准备查询；chunks 为权威回读块；top_n 为本查询输出上限。
+        返回：list[RankedChunk]，本查询分数降序结果；异常：KeyError，检索产生了未约定候选。
+        """
+        rows = [RankedChunk(chunk=chunk, score=scores_by_query[query][chunk.id]) for chunk in chunks]
+        return sorted(rows, key=lambda row: (-row.score, row.chunk.id))[:top_n]
+
+    reranker.rank = rank
+    query = "商品保修期限和商品退换条件及维修流程"
+    model = ScriptedWorkflowModel(answers=[["依据知识回答。[1]"]])
+    pipeline = ProductionKnowledgePipeline(search, search.config, query_expander=None,
+        model=model, state=turn(query), policy=policy, prepared_queries=queries)
+    ledger = BudgetLedger.from_settings(search.config)
+    prepared = await pipeline.prepare(query, {}, messages=[], budget=ledger)
+    initial_budget = ledger.snapshot()
+    result = await pipeline.retrieve(prepared, capture=RetrievalCapture("ranking", "test", top_k=1))
+
+    # 普通候选仍裁到两条；政策候选仍保留三条，审计 Top1 不应裁掉完整排名。
+    expected_selected = expected_ids if policy else expected_ids[:2]
+    assert [(row.n, row.chunk_id) for row in result["selected"]] == list(enumerate(expected_selected, 1))
+    assert result["budget"] == initial_budget == ledger.snapshot()
+    assert [row.chunk.id for row in result["ranked"]] == expected_ids
+    assert [row.score for row in result["ranked"]] == expected_scores
+
+    # 穿过真实评估记录入口，既核对高分第一名，也验证未必入模的第三名。
+    first, third = {"refused": None}, {"refused": None}
+    production()._capture_result(first, result, [{expected_ids[0]}])
+    production()._capture_result(third, result, [{3}])
+    assert first["ranked_ids"] == expected_ids
+    assert first["retrieval"]["recall@1"] == first["retrieval"]["mrr@10"] == 1.0
+    assert third["retrieval"]["recall@1"] == 0.0
+    assert third["retrieval"]["recall@3"] == 1.0 and third["retrieval"]["mrr@10"] == 1 / 3
+
+    generated = await pipeline.generate(prepared, {**result, "gate": {"passed": True}})
+    context_message = next(row["content"] for row in model.inputs[0]["messages"]
+        if row["content"].startswith("上下文资料（"))
+    evidence = json.loads(context_message.split("\n", 1)[1])["本轮知识证据"]
+    expected_model_ids = [expected_ids[0], 3, expected_ids[1]] if policy else expected_selected
+    assert [row["chunk_id"] for row in evidence] == expected_model_ids
+    assert [row["answer"] for row in evidence] == [f"权威答案{identifier}。" for identifier in expected_model_ids]
+    assert generated["answer"] == "依据知识回答。[1]" and generated["usage"]["model_calls"] == 1
+
+
 def test_merge_cannot_hide_same_identity_conflicting_text():
     """跨查询取高分不能吞原文冲突。参数：无；返回：None；异常：断言失败。"""
     from tests.flywheel.test_confidence import ranked

@@ -88,11 +88,12 @@ class ProductionKnowledgePipeline:
                 "filters": dict(filters), "policy": self.policy, "ledger": budget}
 
     async def retrieve(self, prepared: dict, *, capture: RetrievalCapture | None = None) -> dict:
-        """一次检索同时保留全精排并集与原候选预算结果，不依赖门禁。
+        """一次检索保留按最高分合并排序的完整精排并集与原候选预算结果，不依赖门禁。
 
         参数：prepared请求私有准备结果、capture可选审计快照；返回：ranked/selected/budget/查询/快照。
         异常：检索故障、原文冲突、非空候选全被预算排除；均不产生问题池信号。
         """
+        from app.knowledge.retrieval import merge_ranked_chunks
         from app.workflow.context import select_evidence
         from app.workflow.routing import citations_from_ranked
         ledger, full_ranked = prepared["ledger"], []
@@ -105,7 +106,8 @@ class ProductionKnowledgePipeline:
             self.stage_callback("policy", "running")
         async with asyncio.timeout(self.settings.knowledge_timeout_seconds):
             candidates = await retrieve(prepared["query"], **options)
-        ranked = unique_ranked(full_ranked)
+        # 捕获列表保留各查询出现次序；评估名次须沿用真实合并排序，且不能裁成预算候选。
+        ranked = merge_ranked_chunks([full_ranked])
         # 明确要求搜索器履行全候选协议，不能悄悄把已裁剪返回列表当完整并集。
         if candidates and not ranked:
             raise ValueError("检索器未提供跨查询裁剪前的完整ranked")
