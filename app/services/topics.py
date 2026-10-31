@@ -31,6 +31,7 @@ class TopicBatchService:
             follow_redirects=False, trust_env=False)
         self._active, self._background, self._closing = set(), None, False
         self._leases = {}
+        self._local_attempt_error = None
         self._state = dict(status="idle", last_batch=None, model_version="unknown", error=None,
                            retry_after_seconds=config.topic_poll_seconds)
 
@@ -51,7 +52,15 @@ class TopicBatchService:
     def _set_state(self, **values):
         """持久保存依赖失败等状态，重启不得遗忘错误。参数：状态更新字段；返回：None；异常：写盘错误。"""
         self._state.update(values)
+        self._state["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+        self._local_attempt_error = None
         atomic_json(self.root / "status.json", {**self._state, "database": self.config.mysql_database})
+
+    def _record_local_attempt_error(self, error):
+        """记录本实例新启动或清理失败，不覆盖其他持锁实例的共享记录。参数：依赖异常；返回：None；异常：无。"""
+        self._local_attempt_error = dict(type=type(error).__name__, message="主题执行依赖不可用，稍后重试",
+            occurred_at=datetime.now(timezone.utc).isoformat(timespec="microseconds"))
+        self._state.update(status="failed", error=self._local_attempt_error)
 
     def _new_scan(self, high_watermark, reclassify):
         """创建独立扫描轮次。参数：冻结上界/重跑开关；返回：扫描字典；异常：无。"""
@@ -231,6 +240,12 @@ class TopicBatchService:
         try:
             async with self.repository.execution() as lease:
                 return await self._process_locked(lease, reclassify=reclassify)
+        except ConcurrentKnowledgeWrite:
+            self._local_attempt_error = None
+            raise
+        except Exception as error:
+            self._record_local_attempt_error(error)
+            raise
         finally:
             # 获取连接和释放租约期间也属于本服务；停机须一直等待到收尾结束。
             self._active.discard(task)
@@ -244,6 +259,12 @@ class TopicBatchService:
         self._active.add(request_task)
         try:
             lease = await manager.__aenter__()
+        except ConcurrentKnowledgeWrite:
+            self._local_attempt_error = None
+            raise
+        except Exception as error:
+            self._record_local_attempt_error(error)
+            raise
         finally:
             self._active.discard(request_task)
         async def run():
@@ -261,7 +282,9 @@ class TopicBatchService:
             task = asyncio.create_task(run(), context=Context())
             self._active.add(task)
             self._leases[task] = manager
-        except BaseException:
+        except BaseException as error:
+            if isinstance(error, Exception):
+                self._record_local_attempt_error(error)
             await finish_cleanup(manager.__aexit__(None, None, None))
             raise
         return dict(status="running", message="主题批次已在后台启动")
@@ -303,6 +326,11 @@ class TopicBatchService:
                 state["last_batch"] = persisted
                 if not stored_state:
                     state["status"] = persisted["status"]
+            # 本地新取锁失败必须可见，但更晚的共享执行结果仍可覆盖它。旧原件无时间视为历史。
+            local_error = self._local_attempt_error
+            if (not busy and local_error and local_error["occurred_at"] >=
+                    (stored_state or {}).get("updated_at", "")):
+                state.update(status="failed", error=local_error, updated_at=local_error["occurred_at"])
             if busy:
                 state["status"] = "running"
             elif state["status"] == "running":
@@ -334,8 +362,10 @@ class TopicBatchService:
             except ConcurrentKnowledgeWrite:
                 # 未持锁的poller不能覆盖owner刚写的完成/失败状态；API另查实际锁。
                 self._state.update(status="running", error=None)
+                # 能取得明确busy响应说明本地连接已恢复，旧启动错误不再参与时间比较。
+                self._local_attempt_error = None
             except Exception as error:
-                self._state.update(status="failed", error=dict(type=type(error).__name__, message="主题依赖不可用，稍后重试"))
+                self._record_local_attempt_error(error)
             await asyncio.sleep(self.config.topic_poll_seconds)
 
     async def close(self):

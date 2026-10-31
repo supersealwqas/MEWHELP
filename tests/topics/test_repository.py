@@ -46,3 +46,20 @@ async def test_save_rejects_invalid_or_duplicate_before_connection(rows):
     repo = module().TopicRepository(None, None)
     with pytest.raises(ValueError):
         await repo.save(rows, lease=NS())
+
+
+def test_source_counts_are_pool_rows_with_scope_filter():
+    """来源按池行统计，同组两入口不能合并成一条；审核范围必须过滤。参数：无；返回：None；异常：断言失败。"""
+    rows = [dict(question_id=str(i), group_id=group, history_uncertain=history, review_status=review, source=source)
+        for i, group, history, review, source in [
+            (1, "turn:a", False, None, "application_demo"),
+            (2, "turn:a", False, "待审", "application_demo"),
+            (3, "legacy-pool:3", True, None, "application_history"),
+            (4, "turn:b", False, "通过", "application_demo"),
+            (5, "legacy-pool:5", True, "驳回", "application_history")]]
+    pending = module().aggregate_distribution(rows, [], "pending")
+    assert pending["source_counts"] == {"application_demo": 2, "application_history": 1}
+    assert pending["total_questions"] == 2 and pending["pool_rows"] == 3
+    assert "演示记录2条" in pending["source_note"] and "来源未核实历史1条" in pending["source_note"]
+    assert module().aggregate_distribution(rows, [], "all")["source_counts"] == {
+        "application_demo": 3, "application_history": 2}

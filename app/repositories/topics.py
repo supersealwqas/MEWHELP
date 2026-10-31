@@ -33,11 +33,16 @@ def aggregate_distribution(pool, classifications, scope="pending"):
         if not row["history_uncertain"]:
             known.add(group)
     classified = sum(bool(values) for values in groups.values())
+    # 来源说明按所选池行计数，同轮多入口仍是多条可见来源记录。
+    source_counts = {source: sum(row.get("source") == source for row in selected)
+                     for source in ("application_demo", "application_history")}
     return dict(labels=[dict(label=name, count=sum(name in values for values in groups.values()))
                         for name in label_names(taxonomy)],
         total_questions=len(groups), classified_questions=classified, unclassified_questions=len(groups) - classified,
         known_original_turns=len(known), history_uncertain_pool_rows=sum(r["history_uncertain"] for r in selected),
-        pool_rows=len(selected), classified_pool_rows=classified_rows, unclassified_pool_rows=len(selected) - classified_rows)
+        pool_rows=len(selected), classified_pool_rows=classified_rows, unclassified_pool_rows=len(selected) - classified_rows,
+        source_counts=source_counts,
+        source_note=f"演示记录{source_counts['application_demo']}条；来源未核实历史{source_counts['application_history']}条。")
 
 
 def classification_payload(row):

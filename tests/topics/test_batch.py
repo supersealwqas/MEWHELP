@@ -317,6 +317,7 @@ async def test_trigger_status_write_failure_releases_acquired_lock(tmp_path, mon
     with pytest.raises(OSError):
         await service.trigger()
     assert not repo.busy
+    assert (await service.status())["status"] == "failed"
     await service.close()
 
 
@@ -389,5 +390,60 @@ async def test_lease_lost_during_empty_read_never_completes_or_advances(tmp_path
         assert result["status"] == "failed" and result["cursor"] == "0"
         assert result["error"]["type"] == "LeaseLost"
         assert json.loads((tmp_path / "scan.json").read_text(encoding="utf-8"))["status"] == "failed"
+    finally:
+        await service.close()
+
+
+async def test_new_local_prelease_failure_overrides_old_success_until_new_shared_attempt(tmp_path, monkeypatch):
+    """新取锁失败可见，随后他实例更新又须胜过旧本地失败。参数：目录/替换器；返回：None；异常：断言失败。"""
+    repo, attempted = MemoryRepository(1), asyncio.Event()
+    first = make_service(tmp_path, repo, response)
+    assert (await first.process())["status"] == "complete"
+    original_execution = repo.execution
+    @asynccontextmanager
+    async def connection_failed():
+        """参数：无；返回：无；异常：取租约前ConnectionError。"""
+        attempted.set()
+        raise ConnectionError("租约新连接不可用")
+        yield
+    monkeypatch.setattr(repo, "execution", connection_failed)
+    first.start()
+    second = None
+    try:
+        await asyncio.wait_for(attempted.wait(), 3)
+        state = await first.status()
+        assert state["status"] == "failed" and state["error"]["type"] == "ConnectionError"
+        assert json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))["status"] == "complete"
+        monkeypatch.setattr(repo, "execution", original_execution)
+        def fail_classify(request):
+            """参数：请求；返回：健康成功/分类503；异常：无。"""
+            return response(request) if request.url.path == "/health" else httpx.Response(503)
+        second = make_service(tmp_path, repo, fail_classify)
+        assert (await second.process(reclassify=True))["status"] == "failed"
+        latest = await first.status()
+        assert latest["status"] == "failed" and latest["error"]["type"] == "HTTPStatusError"
+    finally:
+        if second is not None: await second.close()
+        await first.close()
+
+
+@pytest.mark.parametrize("entry", ["process", "trigger"])
+async def test_manual_prelease_failure_is_visible_without_shared_write(tmp_path, monkeypatch, entry):
+    """手动入口新连接失败也不能留下旧完成状态。参数：目录/替换器/入口；返回：None；异常：断言失败。"""
+    repo = MemoryRepository(1)
+    service = make_service(tmp_path, repo, response)
+    await service.process()
+    @asynccontextmanager
+    async def unavailable():
+        """参数：无；返回：无；异常：取锁前连接失败。"""
+        raise ConnectionError("租约连接失败")
+        yield
+    monkeypatch.setattr(repo, "execution", unavailable)
+    try:
+        with pytest.raises(ConnectionError):
+            await getattr(service, entry)()
+        state = await service.status()
+        assert state["status"] == "failed" and state["error"]["type"] == "ConnectionError"
+        assert json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))["status"] == "complete"
     finally:
         await service.close()
