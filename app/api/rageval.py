@@ -117,12 +117,13 @@ def _read_summary(directory: Path) -> dict | None:
         json.dumps(summary, allow_nan=False)
         if any(not isinstance(summary.get(key, {}), dict) for key in ("buckets", "difficulties")):
             return None
-        # 有运行清单时核对明确的校准标志，拒绝被改名的异类报告。
+        # 清单是已有运行的状态依据；摘要覆盖失败时不能用旧完成文字推翻明确失效状态。
         manifest_path = directory / "manifest.json"
         if manifest_path.exists():
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             identity = _run_identity(directory)
             if (not isinstance(manifest, dict) or identity is None
+                    or manifest.get("status") not in ("completed", "completed_with_errors")
                     or manifest.get("retrieval_only") is not (identity[0] == "calibration")):
                 return None
         return summary

@@ -55,6 +55,58 @@ def test_redaction_keeps_size_and_negation():
     assert "XL不退" in text and "MH-W99" in text and "3天" in text
 
 
+@pytest.mark.parametrize("separator", ["，", ",", "、", "\n", "\r\n"])
+@pytest.mark.parametrize("tail", ["XL不退，型号M200", "请问能改地址吗", "我想退货", "地址无法修改"])
+def test_split_address_redacts_every_segment_and_keeps_business_tail(separator, tail):
+    """地址被分隔符拆开后，街道楼栋不能泄露或吞掉业务尾句。
+
+    参数：separator为地址段分隔符；tail为不含个人值的业务尾句。
+    返回：None，检查脱敏、业务保留、幂等与长度。异常：断言失败。
+    """
+    original = "收货地址：北京市" + separator + "海淀区示例路88号" + separator + "A座2单元301室，" + tail
+    cleaned = clean_question(original)
+    assert all(private not in cleaned for private in ("北京市", "海淀区", "示例路88号", "A座2单元301室"))
+    assert cleaned.endswith("，" + tail)
+    assert clean_question(cleaned) == cleaned
+    assert len(cleaned) <= len(original)
+
+
+def test_split_address_keeps_long_input_inside_original_limit():
+    """长地址的续接脱敏不扩张原始输入。
+
+    参数：无。返回：None，检查4000字符边界与业务否定。异常：断言失败。
+    """
+    prefix = "地址是北京市海淀区，示例路88号，2单元301室，XL不退。"
+    original = prefix + "问" * (4000 - len(prefix))
+    cleaned = clean_question(original)
+    assert "示例路88号" not in cleaned and "2单元301室" not in cleaned
+    assert "XL不退" in cleaned and len(cleaned) <= 4000
+    assert clean_question(cleaned) == cleaned
+
+
+@pytest.mark.parametrize("address,private,tail", [
+    ("北京市，海淀区示例路88号（北门），2单元301室", ["北京市", "示例路88号", "北门", "301室"], "XL不退"),
+    ("北京市，海淀区示例路88号(北门)，2单元301室", ["北京市", "示例路88号", "北门", "301室"], "XL不退"),
+    ("北京市，海淀区示例路88号", ["北京市", "示例路88号"], "不能送上楼"),
+    ("北京市，海淀区示例路88号", ["北京市", "示例路88号"], "不支持配送上楼"),
+    ("北京市，海淀区示例路88号，2单元，301", ["北京市", "示例路88号", "2单元", "301"], "XL不退"),
+    ("北京市，海淀区示例路88号，2单元，301", ["北京市", "示例路88号", "2单元", "301"], "M200型号，2件不退"),
+    ("北京市，海淀区示例路88号，2单元", ["北京市", "示例路88号", "2单元"], "型号M200，2件不退，3天"),
+])
+def test_address_review_boundary_redacts_location_and_preserves_business(address, private, tail):
+    """审查反例中的门口说明、裸房号及送货否定保持正确边界。
+
+    参数：address为虚构地址；private为须隐藏的固定片段；tail为须原样保留的业务尾句。
+    返回：None，检查隐私、业务否定、幂等和长度。异常：断言失败。
+    """
+    original = "收货地址：" + address + "，" + tail
+    cleaned = clean_question(original)
+    assert all(fragment not in cleaned for fragment in private)
+    assert cleaned.endswith("，" + tail)
+    assert clean_question(cleaned) == cleaned
+    assert len(cleaned) <= len(original)
+
+
 @pytest.mark.parametrize("question", [
     "怎么联系人工客服处理账号申诉", "怎么联系人工客服帮我查会员积分？",
     "我用积分兑换的商品，下单后发现收件人名字写错了能改吗？",

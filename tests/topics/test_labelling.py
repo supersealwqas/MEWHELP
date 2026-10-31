@@ -45,6 +45,42 @@ async def test_input_is_redacted_and_output_is_model_prelabel(tmp_path):
     assert list(tmp_path.glob("*.json"))
 
 
+@pytest.mark.parametrize("original,private,tail", [
+    ("收货地址：北京市，海淀区示例路88号2单元301室，XL不退", ["北京市", "海淀区", "示例路88号", "301室"], "XL不退"),
+    ("地址是北京市海淀区，示例路88号，2单元301室，请问能改地址吗", ["北京市海淀区", "示例路88号", "2单元301室"], "请问能改地址吗"),
+    ("收货地址：北京市海淀区\n示例路88号2单元301室，XL不退", ["北京市海淀区", "示例路88号", "301室"], "XL不退"),
+    ("联系地址：北京市海淀区,示例路88号,A座,2单元301室，M200型号，3天，不退货", ["北京市海淀区", "示例路88号", "A座", "301室"], "M200型号，3天，不退货"),
+    ("收货地址：北京市，海淀区示例路88号（北门），2单元301室，XL不退", ["北京市", "示例路88号", "北门", "301室"], "XL不退"),
+    ("收货地址：北京市，海淀区示例路88号，不能送上楼", ["北京市", "示例路88号"], "不能送上楼"),
+    ("收货地址：北京市，海淀区示例路88号，2单元，301，XL不退", ["北京市", "示例路88号", "2单元", "301"], "XL不退"),
+    ("收货地址：北京市，海淀区示例路88号，2单元，301，M200型号，2件不退", ["北京市", "示例路88号", "2单元", "301"], "M200型号，2件不退"),
+])
+async def test_split_addresses_never_reach_actual_prelabel_request(tmp_path, original, private, tail):
+    """真实预标请求须遮盖所有地址段并完整保留型号、时间和否定。
+
+    参数：tmp_path为隔离原件目录；original为虚构输入；private为敏感段；tail为业务尾句。
+    返回：None，检查实际请求与预标结果。异常：断言失败或解析错误。
+    """
+    import json
+
+    class EchoModel(Model):
+        """仅回显外部模型收到的正文，保持真实清洗及解析链路。"""
+
+        async def astream(self, messages):
+            """回显实际请求。参数：messages为模型消息；返回：工具流；异常：JSON错误。"""
+            text = json.loads(messages[1].content)["items"][0]["text"]
+            self.rows = [dict(index=0, text=text, labels=["订单修改"], family="fictional", needs_review=False, review_reason="")]
+            async for chunk in super().astream(messages):
+                yield chunk
+
+    model = EchoModel([])
+    result = await TopicLabeller(model, report_dir=tmp_path, max_attempts=1).label([original])
+    outbound = json.loads(model.messages[1].content)["items"][0]["text"]
+    assert all(fragment not in outbound for fragment in private)
+    assert outbound.endswith("，" + tail)
+    assert result[0]["original_text"] == outbound
+
+
 @pytest.mark.asyncio
 async def test_correction_cannot_change_numbers_or_negation(tmp_path):
     """纠错不能删否定或改变业务数字。参数：临时目录；返回：无；异常：断言失败。"""

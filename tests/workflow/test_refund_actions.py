@@ -9,6 +9,9 @@ from app.repositories.actions import ActionRepository
 from app.repositories.chat import PersistenceUncertain
 from tests.workflow.service_fakes import service_runtime, collect
 from tests.workflow.test_ch06_graph import order_result
+from tests.workflow.graph_fakes import call
+from app.schemas.tools import ToolContext, ToolError, ToolResult
+from app.tools.contracts import ToolIdentity, binding_dict
 
 
 def submission(action, **override):
@@ -36,6 +39,94 @@ async def test_refund_receipt_is_idempotent_and_independent(tmp_path):
             assert rows[0].reason_code == "quality_issue"
         current = await service.get_current_actions("s", "demo-user")
         assert current.refund_action.action_id == action["action_id"] and current.refund_receipt == first
+
+
+@pytest.mark.parametrize("agent_query", [False, True])
+async def test_verified_order_refund_turn_finishes_with_dynamic_or_program_call(tmp_path, agent_query):
+    """动态查单和程序查单都应保存真实退款轮，不能只按旧编号放行。
+
+    参数：tmp_path 隔离数据库目录；agent_query 是否由主Agent先查单。
+    返回：None；异常：数据库、图或行为断言失败。
+    """
+    decisions = ([workflow.AgentDecision(kind="tools", tool_calls=[call("agent-order", order_id="1001")])]
+                 if agent_query else []) + [workflow.AgentDecision(kind="answer")]
+    async with service_runtime(tmp_path, intents=["退款退货"], decisions=decisions,
+            results=[order_result()], answers=[]) as (service, deps, factory):
+        events = await collect(service, "订单1001想退款")
+        saved = await deps.chat.get_workflow_turn("s", "demo-user")
+        assert events[-1].event == "done"
+        assert saved["turn_status"] == "completed" and saved["answer"]
+        action = saved["completion_metadata"]["refund_action"]
+        receipt = await ActionRepository(factory).submit_refund(submission(action))
+        assert receipt.order_id == "1001" and receipt.status == "待处理"
+        async with factory() as session:
+            results = (await session.scalars(select(customer_service.Message).where(
+                customer_service.Message.role == "tool"))).all()
+            # 动态查询事实应被复用，不能靠补做旧固定编号查询绕过仓储缺陷。
+            assert len(results) == 1
+            if agent_query:
+                assert results[0].tool_call_id == "agent-order"
+
+
+@pytest.mark.parametrize("case", [
+    "dynamic", "legacy", "missing_binding", "mcp", "legacy_mcp", "malformed_binding",
+    "identity_only", "wrong_name", "failed", "error_with_success", "coerced_success",
+    "wrong_order", "wrong_args", "other_owner", "old_call", "old_result", "missing_result",
+])
+async def test_refund_finish_requires_current_owned_successful_builtin_evidence(tmp_path, case):
+    """在完成事务内拒绝伪造事实，缺任一可信条件都不能留下正文或退款卡。
+
+    参数：tmp_path 隔离目录；case 调用、结果或身份反例。
+    返回：None；异常：数据库或断言失败。
+    """
+    async with service_runtime(tmp_path) as (_, deps, factory):
+        context = await deps.chat.start_turn(ToolContext(session_id="s", user_id="demo-user",
+            turn_id="refund-current", user_message="订单1001退款"), "订单1001退款")
+        old = await deps.chat.start_turn(context.model_copy(update={"turn_id": "refund-old"}), context.user_message)
+        identifier = (f"ch06:order:{context.turn_id}:1001" if case in {"legacy", "legacy_mcp"} else "agent-order")
+        definition = deps.registry.get_definition(ToolIdentity("builtin", None, "query_order"))
+        binding = binding_dict(definition.binding)
+        if case in {"mcp", "legacy_mcp"}:
+            binding["identity"] = {"source": "mcp", "server": "forged", "name": "query_order"}
+        elif case == "malformed_binding":
+            binding["schema_hash"] = "bad"
+        elif case == "identity_only":
+            binding.pop("schema_hash")
+        elif case == "wrong_name":
+            binding["identity"]["name"] = "query_product"
+        query = call(identifier, order_id="1002" if case == "wrong_args" else "1001")
+        bindings = None if case in {"legacy", "missing_binding"} else {identifier: binding}
+        await deps.chat.save_tool_calls(old if case == "old_call" else context, [query], bindings=bindings)
+        result = order_result("1002" if case == "wrong_order" else "1001")
+        if case == "failed":
+            result = ToolResult.failed("NOT_FOUND", "未找到")
+        elif case == "error_with_success":
+            result = result.model_copy(update={"error": ToolError(code="NOT_FOUND", message="未找到")})
+        result_context = (old if case == "old_result" else context).model_copy(update={"tool_call_id": identifier})
+        if case != "missing_result":
+            await deps.chat.save_tool_result(result_context, result)
+        if case == "coerced_success":
+            async with factory.begin() as session:
+                row = await session.scalar(select(customer_service.Message).where(customer_service.Message.role == "tool"))
+                row.content = '{"ok":"true","data":{"order_id":"1001"}}'
+        if case == "other_owner":
+            async with factory.begin() as session:
+                conversation = await session.get(customer_service.Conversation, context.conversation_id)
+                conversation.user_id = "nobody"
+            context = context.model_copy(update={"user_id": "nobody"})
+        action = workflow.RefundAction(action_id=str(uuid5(NAMESPACE_URL,
+            f"mewhelp:ch06:{context.conversation_id}:{context.turn_id}:submit_refund")),
+            source_turn_id=context.turn_id, question=context.user_message, order_id="1001")
+        metadata = {"intent": "退款退货", "route": "order_policy", "order_id": "1001"}
+        if case in {"dynamic", "legacy"}:
+            await deps.chat.finish_turn(context, "可提交待处理申请", workflow_metadata=metadata, refund_action=action)
+            saved = await deps.chat.get_workflow_turn("s", context.user_id, context.turn_id)
+            assert saved["turn_status"] == "completed" and saved["completion_metadata"]["refund_action"]["order_id"] == "1001"
+        else:
+            with pytest.raises(ValueError, match="退款动作"):
+                await deps.chat.finish_turn(context, "可提交待处理申请", workflow_metadata=metadata, refund_action=action)
+            saved = await deps.chat.get_workflow_turn("s", context.user_id, context.turn_id)
+            assert saved["turn_status"] == "running" and saved["answer"] is None
 
 
 async def test_refund_snapshot_rolls_back_with_answer(tmp_path):

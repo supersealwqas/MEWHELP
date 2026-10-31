@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import time
@@ -14,9 +15,11 @@ from app.evaluation.faithfulness import FaithfulnessError
 from app.evaluation.metrics import aggregate_results, retrieval_metrics
 from app.evaluation.policy import STRATEGIES
 from app.knowledge.answering import FIXED_KNOWLEDGE_REFUSAL, decide_answer
+from app.knowledge.errors import LeaseLost
 
 PRODUCTION_SCOPE = "production_knowledge_subpipeline"
 PRODUCTION_SCHEMA_VERSION = 1
+logger = logging.getLogger(__name__)
 
 
 def production_comparison_key(metadata: dict) -> str:
@@ -223,6 +226,37 @@ def markdown_report(report: dict) -> str:
     return "\n".join(lines)
 
 
+def invalidate_evaluation_artifacts(output_dir: Path, *, manifest: dict | None = None,
+                                    summary: dict | None = None) -> None:
+    """撤销本轮已写出的完成标记，保留逐题记录以供排查。
+
+    参数：output_dir 调用方已确认属于本轮的产物目录；manifest/summary 可提供尚未落盘的本轮报告。
+    返回：None。
+    异常：各文件清理错误仅记录类型，不覆盖调用方正在处理的 LeaseLost。
+    """
+    # 策略可脱离报告独立使用，必须先撤销；展示文件不可写不能阻断权威产物失效。
+    for name in ("policy.json", "manifest.json", "summary.json", "summary.md"):
+        try:
+            path = output_dir / name
+            if name == "policy.json":
+                path.unlink(missing_ok=True)
+                continue
+            value = manifest if name == "manifest.json" else summary
+            if value is None:
+                source = output_dir / ("summary.json" if name == "summary.md" else name)
+                value = json.loads(source.read_text(encoding="utf-8"))
+            invalidated = {**value, "status": "invalidated"}
+            if name == "manifest.json":
+                invalidated["error_type"] = "LeaseLost"
+            if name == "summary.md":
+                path.write_text(markdown_report(invalidated), encoding="utf-8")
+            else:
+                atomic_json(path, invalidated)
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            # 独立继续其他撤销步骤，并保留原失锁原因；日志不记录文件内容或异常正文。
+            logger.warning("evaluation artifact invalidation failed artifact=%s error_type=%s", name, type(error).__name__)
+
+
 async def evaluate_dataset(cases: list, runtime, output_dir: Path, *,
                            strategies: list[str] | None = None, thresholds: dict[str, float | None] | None = None,
                            evidence_resolver: Callable | None = None, retrieval_only: bool = False,
@@ -232,7 +266,8 @@ async def evaluate_dataset(cases: list, runtime, output_dir: Path, *,
     参数：cases 严格加载题；runtime 冻结资源和模型；output_dir 不存在的独占目录；strategies 四策略子集；
         thresholds 各策略校准门槛或None；evidence_resolver 默认dataset解析器；retrieval_only 校准仅检索；progress 可选状态回调。
     返回：dict，状态、逐策略/分桶统计与版本信息。
-    异常：ValueError，参数非法；FileExistsError，目录已存在；OSError，报告失败；取消保留已落盘样本后传播。
+    异常：ValueError，参数非法；FileExistsError，目录已存在；LeaseLost，失锁使整轮失效；
+        OSError，报告失败；取消保留已落盘样本后传播。
     """
     strategies = list(STRATEGIES) if strategies is None else strategies
     if not cases or not strategies or len(set(strategies)) != len(strategies) or set(strategies) - set(STRATEGIES):
@@ -254,10 +289,12 @@ async def evaluate_dataset(cases: list, runtime, output_dir: Path, *,
     try:
         with (output_dir / "results.jsonl").open("x", encoding="utf-8", newline="\n") as log:
             for case in cases:
+                await runtime.assert_held()
                 # 规则只读取原问，不能以标注bucket/answerable改变检索路径。
                 prepared = None
                 preparation_attempted, preparation_error = False, None
                 for strategy in strategies:
+                    await runtime.assert_held()
                     begin, stage = time.perf_counter(), "dataset"
                     row = {"id": case.id, "split": case.split, "bucket": case.bucket, "difficulty": case.difficulty,
                            "strategy": strategy, "query": case.query, "answerable": case.answerable,
@@ -271,9 +308,12 @@ async def evaluate_dataset(cases: list, runtime, output_dir: Path, *,
                             preparation_attempted = True
                             try:
                                 prepared = await runtime.prepare(case.query)
+                            except LeaseLost:
+                                raise
                             except Exception as error:
                                 # 失败也共用同一准备结果，不能每策略重新调用模型改变比较条件。
                                 preparation_error = error
+                        await runtime.assert_held()
                         if preparation_error is not None:
                             raise preparation_error
                         stage = "dataset"
@@ -283,7 +323,9 @@ async def evaluate_dataset(cases: list, runtime, output_dir: Path, *,
                         row["prepared_bm25_queries"] = prepared.bm25_queries
                         row["prepared_rerank_queries"] = prepared.rerank_queries
                         stage, tick = "retrieval", time.perf_counter()
+                        await runtime.assert_held()
                         result = await runtime.retrieve(prepared, strategy, case.filters)
+                        await runtime.assert_held()
                         row["timings"]["retrieval_seconds"] = time.perf_counter() - tick
                         row["ranked_ids"] = [item.chunk.id for item in result.ranked]
                         row["ranking"] = [{"chunk_id": item.chunk.id, "source_key": item.chunk.source_key,
@@ -297,7 +339,9 @@ async def evaluate_dataset(cases: list, runtime, output_dir: Path, *,
                                            refusal_reason="empty" if not result.selected else "threshold")
                             else:
                                 stage, tick = "generation", time.perf_counter()
+                                await runtime.assert_held()
                                 decision, citations = await runtime.generate(case.query, result.selected)
+                                await runtime.assert_held()
                                 row["timings"]["generation_seconds"] = time.perf_counter() - tick
                                 row["citations"] = [item.model_dump() for item in citations]
                                 row["decision"] = decision.model_dump()
@@ -309,7 +353,9 @@ async def evaluate_dataset(cases: list, runtime, output_dir: Path, *,
                                 row["citation_valid"] = True if decision.useful else None
                                 if decision.useful:
                                     stage, tick = "judge", time.perf_counter()
+                                    await runtime.assert_held()
                                     judged = await runtime.judge(case.query, row["answer"], citations)
+                                    await runtime.assert_held()
                                     if not judged.facts:
                                         raise FaithfulnessError("非拒答答案裁判没有可核对事实")
                                     numbers = {item.n for item in citations}
@@ -321,9 +367,13 @@ async def evaluate_dataset(cases: list, runtime, output_dir: Path, *,
                                     row["total_count"] = len(judged.facts)
                                     row["faithfulness"] = row["supported_count"] / row["total_count"]
                                     row["timings"]["judge_seconds"] = time.perf_counter() - tick
+                    except LeaseLost:
+                        # 资源锁属于整轮，不得记成普通题目错误继续消费模型。
+                        raise
                     except Exception as error:
                         # 不把依赖失败冒充拒答；异常文字可能带端点凭据，日志仅保留类型和阶段。
                         row["error"] = {"stage": stage, "type": type(error).__name__}
+                    await runtime.assert_held()
                     row["elapsed_seconds"] = time.perf_counter() - begin
                     log.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
                     log.flush()
@@ -331,12 +381,26 @@ async def evaluate_dataset(cases: list, runtime, output_dir: Path, *,
                     rows.append(row)
                     if progress:
                         progress(row)
+        await runtime.assert_held()
         status = "completed_with_errors" if any(row["error"] for row in rows) else "completed"
+    except LeaseLost:
+        status = "invalidated"
+        raise
     finally:
         report = {**summarize(rows, strategies), "status": status, "expected_sample_count": len(cases) * len(strategies),
                   "elapsed_seconds": time.perf_counter() - started, "metadata": runtime.metadata}
-        atomic_json(output_dir / "summary.json", report)
-        atomic_json(output_dir / "manifest.json", {**manifest, "status": status, "completed_sample_count": len(rows)})
-        # Markdown是同源展示，JSON摘要和逐题日志为权威数据。
-        (output_dir / "summary.md").write_text(markdown_report(report), encoding="utf-8")
+        completed_manifest = {**manifest, "status": status, "completed_sample_count": len(rows)}
+        if status == "invalidated":
+            invalidate_evaluation_artifacts(output_dir, manifest=completed_manifest, summary=report)
+        else:
+            atomic_json(output_dir / "summary.json", report)
+            atomic_json(output_dir / "manifest.json", completed_manifest)
+            # Markdown是同源展示，JSON摘要和逐题日志为权威数据。
+            (output_dir / "summary.md").write_text(markdown_report(report), encoding="utf-8")
+    try:
+        # 文件写出期间也可能断线；返回前再次核验并撤销已完成标记。
+        await runtime.assert_held()
+    except LeaseLost:
+        invalidate_evaluation_artifacts(output_dir)
+        raise
     return report

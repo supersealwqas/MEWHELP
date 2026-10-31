@@ -65,6 +65,68 @@ def generations(exporter):
             if span.attributes.get("langfuse.observation.type") == "generation"]
 
 
+async def test_real_otlp_send_ignores_proxy_and_closes_session_once(monkeypatch):
+    """真实SDK出口不能把追踪及认证头交给环境代理，关闭必须释放专用会话。
+
+    参数：monkeypatch为受控网络出口补丁。返回：None，检查实际发送参数及关闭次序。
+    异常：断言失败；禁止任何真实socket连接。
+    """
+    import socket
+    import requests
+
+    sent, closed = [], []
+    real_close = requests.Session.close
+
+    def no_network(*args, **kwargs):
+        """禁止真实连接。参数：任意网络参数；返回：无；异常：AssertionError。"""
+        raise AssertionError("观测回归禁止真实网络")
+
+    def capture_send(session, request, **kwargs):
+        """截获最终出口。参数：会话、准备请求及发送参数；返回：成功响应；异常：无。"""
+        sent.append((session, request, kwargs))
+        response = requests.Response()
+        response.status_code, response._content = 200, b""
+        response.request, response.url = request, request.url
+        return response
+
+    def capture_close(session):
+        """记录资源释放顺序。参数：真实requests会话；返回：None；异常：真实close错误。"""
+        closed.append((session, len(sent)))
+        real_close(session)
+
+    for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.setenv(key, "http://fictional-proxy.invalid:8080")
+    monkeypatch.setenv("NO_PROXY", "")
+    monkeypatch.setenv("no_proxy", "")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_COMPRESSION", "none")
+    monkeypatch.setattr(requests.Session, "send", capture_send)
+    monkeypatch.setattr(requests.Session, "close", capture_close)
+    monkeypatch.setattr(socket.socket, "connect", no_network)
+    monkeypatch.setattr(socket, "create_connection", no_network)
+    runtime = runtime_module().ObservabilityRuntime(Settings(_env_file=None,
+        chat_base_url="http://localhost", chat_model="test", chat_api_key="test",
+        observability_enabled=True, langfuse_base_url="http://127.0.0.1:13000",
+        langfuse_public_key="pk-local-export-" + uuid4().hex, langfuse_secret_key="fictional-secret"))
+    try:
+        with runtime.execution(runtime.identity_for(context()), kind="chat") as observation:
+            observation.update(output={"text": "fictional-private-observation"})
+        assert closed == []
+    finally:
+        await runtime.aclose()
+    assert len(sent) == 1
+    session, request, options = sent[0]
+    assert request.url == "http://127.0.0.1:13000/api/public/otel/v1/traces"
+    assert b"fictional-private-observation" in request.body
+    assert request.headers["Authorization"].startswith("Basic ")
+    assert session.trust_env is False
+    assert not options.get("proxies")
+    assert options["allow_redirects"] is False
+    assert closed == [(session, 1)]
+    await runtime.aclose()
+    assert closed == [(session, 1)]
+    assert runtime.health["status"] == "ready"
+
+
 async def test_concurrent_turns_and_resume_keep_separate_trace_trees(observed_runtime):
     """当前身份共享或恢复丢父 ID 时失败。参数：运行时夹具；返回：None；异常：断言失败。"""
     runtime, exporter = observed_runtime

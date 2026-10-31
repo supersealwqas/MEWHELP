@@ -16,6 +16,7 @@ from app.schemas.tools import ToolContext, ToolResult
 from app.repositories.chat import PersistenceUncertain
 from app.tools.confirmation import TicketIntentState, request_ticket_authorization, ticket_context_notes, ticket_write_rejection
 from app.tools.contracts import KnowledgeCallContext, ToolExecutionScope, binding_dict, binding_from_dict
+from app.tools.business import list_user_orders
 from app.tools.knowledge import merge_knowledge_budget, retrieve_verified_knowledge, restore_turn_knowledge, unresolved_knowledge_faults
 from app.workflow.citations import CitationStreamFilter
 from app.workflow.answer_policy import query_fault_answer
@@ -24,7 +25,7 @@ from app.workflow.prompts import ANSWER_PROMPT, DECISION_PROMPT
 from app.workflow.state import ConversationState, message_row
 from app.workflow.stages import publish_stage
 from app.workflow.policy_context import verified_business_prefix, optional_probe_miss, knowledge_failure_reason
-from app.workflow.routing import _active_order_tokens, knowledge_input_stop_reason, _trusted_history
+from app.workflow.routing import _active_order_tokens, knowledge_input_stop_reason, order_candidate, _trusted_history
 from app.workflow.resilience import DEPENDENCY_ERRORS, degradation
 from app.workflow.model import WorkflowOutputError
 from app.workflow.context import assemble_context
@@ -225,7 +226,10 @@ def build_agent_graph(deps: "WorkflowDependencies", *, decision=None):
                 # 旧回执缺快照时保留已恢复的未知/原件，新回执也只能累加而不能覆盖前次尝试。
                 knowledge_state["retrieval_snapshot"] = merged.model_dump(mode="json") if merged is not None else None
             if result.ok and call["name"] == "query_order" and result.data and result.data.get("order_id"):
-                knowledge_state.update(order_id=result.data["order_id"], order_data=deepcopy(result.data))
+                # 订单政策先确定办理对象；附带查询只保留在真实工具流水中，不能替换候选或提前生成退款卡。
+                if (state.get("route") != "order_policy"
+                        or order_candidate(knowledge_state, list_user_orders(context.user_id)) == result.data["order_id"]):
+                    knowledge_state.update(order_id=result.data["order_id"], order_data=deepcopy(result.data))
             if not result.ok and result.error is not None:
                 if (binding is not None and binding.identity.source == "builtin"
                         and binding.identity.name == "query_refund_policy" and result.error.code == "ORDER_REQUIRED"

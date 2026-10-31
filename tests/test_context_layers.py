@@ -8,6 +8,7 @@ from langchain_core.messages import ToolMessage
 
 from app.core.context_budget import ContextBudgetExceeded, TokenEstimator, derive_history_budget
 from app.schemas.history import StoredMessage, StoredTurn
+from app.schemas.chat import InvalidToolDecision
 
 
 def _turn(start, *, user="猫" * 100, answer="答" * 100, status="completed"):
@@ -99,6 +100,57 @@ def test_incomplete_tool_pair_is_not_summarized_or_shown_as_a_success():
     assert not any(getattr(m, "tool_calls", []) or isinstance(m, ToolMessage) for m in snapshot.layer1)
     with pytest.raises(ValueError, match="未完成|配对"):
         _snapshot([_tool_turn(paired=False)], layer1_from=29)
+
+
+@pytest.mark.parametrize("diagnostic", [False, True])
+@pytest.mark.parametrize("status", ["completed", "failed", "cancelled"])
+def test_finished_protocol_diagnostic_allows_history_demotion_without_replay(diagnostic, status):
+    """已结束的非执行诊断不得挡住长会话，也不能重放诊断中的工具申请。
+
+    参数：diagnostic 是否保存官方诊断；status 已结束状态。
+    返回：None；异常：历史分层或断言失败。
+    """
+    old = StoredTurn(turn_id="old", turn_status=status, messages=[StoredMessage(id=1, role="user", content="之前的问题")])
+    if diagnostic:
+        old.messages.append(StoredMessage(id=2, role="assistant", content="", tool_calls=[
+            InvalidToolDecision(raw_output="bad", tool_calls=[
+                {"id": "never-executed", "name": "create_ticket", "args": {}}]).audit_record]))
+    before = old.model_dump()
+    result = _snapshot([old, *[_turn(start) for start in (10, 20, 30, 40)]])
+    assert result.layer1_from_msg_id > 2
+    assert not any(getattr(message, "tool_calls", []) or isinstance(message, ToolMessage)
+                   for message in [*result.layer1, *result.layer2])
+    assert old.model_dump() == before
+
+
+@pytest.mark.parametrize("case", ["marker_only", "executable_disguise", "unknown", "bad_shape", "pending_tool", "orphan_result"])
+def test_diagnostic_cannot_hide_unknown_or_unpaired_business(case):
+    """伪造诊断标签或夹带真实未配对调用仍须阻止边界推进。
+
+    参数：case 非可信诊断或真实待完成业务情形。
+    返回：None；异常：断言或历史校验失败。
+    """
+    diagnostic = InvalidToolDecision(raw_output="bad").audit_record
+    if case == "marker_only":
+        diagnostic = {"type": "invalid_tool_decision"}
+    elif case == "executable_disguise":
+        diagnostic.update(id="write", name="create_ticket", args={})
+    elif case == "unknown":
+        diagnostic["type"] = "unknown"
+    elif case == "bad_shape":
+        diagnostic["tool_calls"] = "not-a-list"
+    rows = [StoredMessage(id=1, role="user", content="旧问"),
+        StoredMessage(id=2, role="assistant", content="", tool_calls=[diagnostic])]
+    if case == "pending_tool":
+        rows.append(StoredMessage(id=3, role="assistant", content="", tool_calls=[
+            {"id": "write", "name": "create_ticket", "args": {}}]))
+    elif case == "orphan_result":
+        rows.append(StoredMessage(id=3, role="tool", content='{"ok":true}', tool_call_id="write"))
+    old = StoredTurn(turn_id="old", turn_status="failed", messages=rows)
+    with pytest.raises(ContextBudgetExceeded):
+        _snapshot([old, *[_turn(start) for start in (10, 20, 30, 40)]])
+    with pytest.raises(ValueError, match="未完成|配对"):
+        _snapshot([old, _turn(10)], layer1_from=rows[-1].id)
 
 
 @pytest.mark.parametrize("status", ["running", "awaiting_input", "uncertain"])

@@ -304,3 +304,44 @@ def test_nullable_source_revision_and_unreadable_policy_keep_comparison(monkeypa
     body = client.get("/api/rag-eval/overview").json()
     assert body["present"] is True and body["meta"]["source_revision"] == ""
     assert body["calibration"]["present"] is False
+
+
+@pytest.mark.parametrize("status", ["invalidated", "failed", "interrupted", "running", None, [], "completed", "completed_with_errors"])
+def test_manifest_state_controls_whether_completed_summary_is_available(monkeypatch, tmp_path, status):
+    """现有清单未有效完成时不能采用残留完成摘要。参数：替换器/目录/清单状态；返回：None；异常：断言失败。"""
+    name = "20261101T000000Z-compare-123456ab"
+    client = _client(monkeypatch, tmp_path, {name: _summary()})
+    manifest = tmp_path / "ch04" / name / "manifest.json"
+    manifest.write_text(json.dumps({"status": status, "retrieval_only": False}), encoding="utf-8")
+    try:
+        expected = status in ("completed", "completed_with_errors")
+        assert client.get("/api/rag-eval/overview").json()["present"] is expected
+        assert client.get("/api/rag-eval/runs").json()["runs"] == ([{"name": name}] if expected else [])
+    finally:
+        client.close()
+
+
+def test_invalidation_hides_run_even_when_summary_cannot_be_replaced(monkeypatch, tmp_path):
+    """真实撤销写入清单后，摘要替换失败也不能展示旧成绩。参数：替换器/目录；返回：None；异常：断言失败。"""
+    from app.evaluation import runner
+    name = "20261101T000000Z-compare-123456ab"
+    client = _client(monkeypatch, tmp_path, {name: _summary()})
+    directory = tmp_path / "ch04" / name
+    (directory / "manifest.json").write_text(json.dumps({"status": "completed", "retrieval_only": False}), encoding="utf-8")
+    original_replace = runner.os.replace
+
+    def blocked_summary_replace(source, target):
+        """只模拟摘要的文件系统替换失败，其他写入真实执行。参数：源与目标路径；返回：Path；异常：PermissionError/IO错误。"""
+        if Path(target) == directory / "summary.json":
+            raise PermissionError("测试隔离摘要替换失败")
+        return original_replace(source, target)
+
+    monkeypatch.setattr(runner.os, "replace", blocked_summary_replace)
+    try:
+        runner.invalidate_evaluation_artifacts(directory)
+        assert json.loads((directory / "manifest.json").read_text(encoding="utf-8"))["status"] == "invalidated"
+        assert json.loads((directory / "summary.json").read_text(encoding="utf-8"))["status"] == "completed"
+        assert client.get("/api/rag-eval/overview").json()["present"] is False
+        assert client.get("/api/rag-eval/runs").json()["runs"] == []
+    finally:
+        client.close()

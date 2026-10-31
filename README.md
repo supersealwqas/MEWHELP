@@ -1,26 +1,61 @@
 # MewHelp
 
-喵购商城客服演示项目：CH08 由模型从动态工具清单选择订单、知识及 MCP 物流/售后查询；完整建单申请先显示预览，用户确认后才写入。后端使用 FastAPI、SQLAlchemy、MySQL 和 LangGraph，SQLite 保存可恢复的工作流；知识沿用 BGE-M3、Milvus 混合检索和本地重排。运行与验收见 [CH08 运行手册](docs/ch08-runbook.md)。
+喵购商城客服演示项目，当前已实现到 CH10。模型从动态工具清单选择订单、知识及 MCP 物流/售后查询；完整建单申请先显示预览，用户确认后才写入。CH09 提供本机观测、人工审核与评估，CH10 提供可选主题分类。后端使用 FastAPI、SQLAlchemy、MySQL 和 LangGraph，SQLite 保存可恢复的工作流；知识沿用 BGE-M3、Milvus 混合检索和本地重排。运行与验收见 [CH08 运行手册](docs/ch08-runbook.md)、[CH09 操作手册](docs/ch09-operations.md)和 [CH10 操作手册](docs/ch10-operations.md)。
 
 ## 启动与演示
 
-在项目根目录用 Git Bash 执行。先把 `.env.example` 中的配置补到本地 `.env`，填写已有模型配置及两个本地 MySQL 密码；不要覆盖已有模型凭据。
+在项目根目录用 Git Bash 执行。先把 `.env.example` 中的配置补到本地 `.env`，填写已有模型配置及两个本地 MySQL 密码；不要覆盖已有模型凭据。以下库名 `mewhelp` 必须与 `.env` 的目标应用库一致，自定义库名时同步替换。
+
+新环境先执行基础初始化；已有环境跳过 `init_db`，复用已有业务数据：
 
 ```bash
 uv sync
 docker compose -f compose.yaml -f compose.milvus.yaml up -d --wait
 uv run python -m app.db.init_db
-# 显式补齐质量表和消息引用列；自定义库名时相应替换 mewhelp。
+```
+
+新环境和已有库均需核对下面的升级步骤。先补齐 CH04 质量表和引用列；这两条命令直接补缺失结构，没有 `--apply` 预览模式。然后按 CH06 → CH07 → CH08 → CH09 顺序逐章预览，核对输出后应用，再复预览确认 `statements` 为空：
+
+```bash
 uv run python -m app.db.migrate_rag_quality
 uv run python -m app.db.migrate_citations --database mewhelp
-# 已有库先预览 CH07/CH08 迁移，核对库名后分别加 --apply。
+uv run python -m app.db.migrate_ch06 --env-file .env --database mewhelp
+uv run python -m app.db.migrate_ch06 --env-file .env --database mewhelp --apply
+uv run python -m app.db.migrate_ch06 --env-file .env --database mewhelp
+uv run python -m app.db.migrate_ch07 --env-file .env --database mewhelp
+uv run python -m app.db.migrate_ch07 --env-file .env --database mewhelp --apply
 uv run python -m app.db.migrate_ch07 --env-file .env --database mewhelp
 uv run python -m app.db.migrate_ch08 --env-file .env --database mewhelp
+uv run python -m app.db.migrate_ch08 --env-file .env --database mewhelp --apply
+uv run python -m app.db.migrate_ch08 --env-file .env --database mewhelp
+PYTHONIOENCODING=utf-8 uv run python -m app.db.migrate_ch09 --env-file .env --database mewhelp
+PYTHONIOENCODING=utf-8 uv run python -m app.db.migrate_ch09 --env-file .env --database mewhelp --apply
+PYTHONIOENCODING=utf-8 uv run python -m app.db.migrate_ch09 --env-file .env --database mewhelp
+```
+
+CH06 补齐等待状态及退款申请表；CH07/CH08 补齐历史摘要和工具审计；CH09 补齐审核、评估表及问题池关联列。**CH09 结构是当前应用启动的必需条件，即使关闭观测和主题分类也必须迁移。** `init_db` 不会升级已有表，也不会创建 CH09 质量表；不要用重复初始化代替增量迁移。迁移失败时先核对原因，不继续启动。
+
+新环境再准备知识资源；已有环境按 [CH04 运行手册](docs/ch04-runbook.md)复用或升级知识，不为验收重复导入：
+
+```bash
 # 新环境先建知识表/旧集合，再准备独立 CH04 集合并导入六份资料。
 uv run python -m app.knowledge.cli init
 uv run python -m app.knowledge.cli prepare-hybrid
 uv run python -m app.knowledge.cli import-docs --mode hybrid --manifest data/kb/manifest.json
 uv run python -m app.knowledge.cli sync --mode hybrid
+```
+
+若设置 `TOPIC_ENABLED=true`，启动前还需按下面三步迁移 CH10，并按 [CH10 操作手册](docs/ch10-operations.md)配置模型、独立分类服务与 `TOPIC_SERVICE_URL`。关闭主题功能时可以跳过 CH10：
+
+```bash
+uv run python -m app.db.migrate_ch10 --env-file .env --database mewhelp
+uv run python -m app.db.migrate_ch10 --env-file .env --database mewhelp --apply
+uv run python -m app.db.migrate_ch10 --env-file .env --database mewhelp
+```
+
+完成结构核验和知识准备后启动应用；启用观测时先按 [CH09 操作手册](docs/ch09-operations.md)准备本机 Langfuse：
+
+```bash
 uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
 ```
 
@@ -105,6 +140,8 @@ uv run pytest -m mysql tests/integration -q
 # CH03 专用 MySQL 与 Milvus 测试库；先确认 Docker 和 milvus-standalone 运行
 uv run pytest tests/knowledge_integration --run-knowledge-integration -q
 ```
+
+CH01 基础能力验收可对专用、已启动的服务执行 `uv run python tests/verify_ch01_live.py --base-url http://127.0.0.1:8000`。它调用真实模型，检查抽取、多轮记忆和能力边界，并保留三个新验收会话；不会清空已有记录。`--help` 不连接服务，任一验收失败返回非零退出码。
 
 CH02 数据库测试会重建 **mewhelp_test** 中的四表，不操作应用库 mewhelp。CH03 集成测试只清理 **mewhelp_ch03_test** 与 Milvus 测试库自己的数据，覆盖发布、批次、来源补扫、向量重写与恢复。
 

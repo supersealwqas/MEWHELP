@@ -19,6 +19,9 @@ class RuntimeBoundary:
         self.refuse, self.judge_error, self.inputs = refuse, judge_error, []
         self.metadata = {"corpus_digest": "fixture", "model": "test", "prompt_digest": "fixture"}
 
+    async def assert_held(self):
+        """提供稳定的外部持锁边界。参数：无；返回：None；异常：无。"""
+
     async def prepare(self, query):
         """替换外部改写模型，保留确定准备。参数：原问；返回：准备查询；异常：ValueError。"""
         from app.knowledge.retrieval import prepare_query

@@ -17,6 +17,9 @@ from app.topics.data import clean_question
 from app.topics.taxonomy import load_taxonomy, validate_labels
 
 
+MAX_LABEL_TEXT_LENGTH = 1500  # 单题预标外发与模型输出共同遵守的字符预算。
+
+
 def _safe_correction_form(text: str) -> str:
     """仅归一已批准错字与等价标点。参数：text脱敏文本；返回：安全比较形式；异常：ValueError。"""
     # 白名单保留所有词语及其顺序、分句关系；不能以保护词计数代替诉求绑定检查。
@@ -31,7 +34,7 @@ class TopicItem(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True)
     index: int = Field(ge=0, description="本次输入临时序号，必须准确回配")
-    text: str = Field(min_length=1, max_length=1500, description="脱敏纠错后的问题，保留否定、数字和当前诉求")
+    text: str = Field(min_length=1, max_length=MAX_LABEL_TEXT_LENGTH, description="脱敏纠错后的问题，保留否定、数字和当前诉求")
     labels: list[str] = Field(max_length=17, description="权威标签名称；语义不足时为空并标待复核")
     family: str = Field(min_length=1, max_length=80, description="同一生成场景或其改写共享的临时家族名")
     needs_review: bool = Field(description="语义不足、纠错不确定或标签有争议时为真")
@@ -139,8 +142,8 @@ class TopicLabeller:
         if not isinstance(texts, list) or not 1 <= len(texts) <= 64:
             raise ValueError("预标输入须为1至64条文本数组")
         cleaned = [clean_question(text) for text in texts]
-        if any(len(text) > 1500 for text in cleaned):
-            raise ValueError("预标输入单题不能超过1500字符")
+        if any(len(text) > MAX_LABEL_TEXT_LENGTH for text in cleaned):
+            raise ValueError(f"预标输入单题不能超过{MAX_LABEL_TEXT_LENGTH}字符")
         result = await self._call({"task": "label", "items": [{"index": i, "text": text} for i, text in enumerate(cleaned)]}, len(cleaned))
         for row in result:
             row["original_text"] = cleaned[row["index"]]

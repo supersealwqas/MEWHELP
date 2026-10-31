@@ -1,18 +1,21 @@
 # SQL 脚本说明
 
-当前应用实现到第三章。第二章客服四表以 `app/models/customer_service.py` 为准，第三章知识库三表以 `app/models/knowledge.py` 为准。在线 FAQ 来自 `data/kb` 权威文档构建的知识库；`ch02-seed.sql` 与 `app/db/seed.py` 中的 6 条 FAQ 保留为旧演示数据。
+当前应用实现到 CH10。业务和摘要表以 `app/models/customer_service.py` 为准，知识库表以 `app/models/knowledge.py` 为准；质量、审核、评估及主题表须按对应迁移核验。在线 FAQ 来自 `data/kb` 权威文档构建的知识库；`ch02-seed.sql` 与 `app/db/seed.py` 中的 6 条 FAQ 保留为旧演示数据。
 
 ## 当前应用初始化
 
-推荐在项目根目录执行：
+新环境在项目根目录按 [首页启动顺序](../README.md#启动与演示)执行基础建表、增量迁移和 hybrid 知识准备。已有库跳过基础初始化，按下表补齐缺失结构，复用已有知识：
 
-```bash
-uv run python -m app.db.init_db
-uv run python -m app.knowledge.cli init
-uv run python -m app.knowledge.cli import-docs --manifest data/kb/manifest.json
-```
+| 顺序 | 命令模块 | 执行方式 |
+|---|---|---|
+| 1 | `app.db.init_db` | 仅新环境建业务、摘要、退款和审计表并补种子；不升级旧表，不包含 CH09 质量表。 |
+| 2 | `app.db.migrate_rag_quality`、`app.db.migrate_citations` | 显式补齐 CH04 两张质量表及消息引用列；直接执行，无预览模式。引用迁移需 `--database mewhelp`。 |
+| 3 | `app.db.migrate_ch06` | 等待状态约束与独立退款申请表；预览 → `--apply` → 复预览。 |
+| 4 | `app.db.migrate_ch07`、`app.db.migrate_ch08` | 按顺序补摘要及工具审计结构；各自预览 → `--apply` → 复预览。 |
+| 5 | `app.db.migrate_ch09` | 审核队列、评估记录和问题池关联结构；预览 → `--apply` → 复预览。关闭观测或主题功能仍必需。 |
+| 6 | `app.db.migrate_ch10` | 仅启用 `TOPIC_ENABLED=true` 时必需；预览 → `--apply` → 复预览。 |
 
-第一条命令创建缺失的客服四表，并补充旧 FAQ、演示会话、工具调用消息和人工工单；FAQ 按固定 ID 补缺失项，不覆盖已有记录。第二条创建缺失的知识库三表，并检查或创建独立 Milvus 数据库与集合。第三条导入清单中的六份文档，发布知识原文并同步向量。连接配置、本地模型及检索策略的准备见项目根 [README](../README.md) 和 [CH03 runbook](../docs/ch03-runbook.md)。
+CH06–CH10 命令均须传 `--env-file .env --database mewhelp`；自定义库名时同步替换并核对目标。每章复预览应返回空 `statements`，已兼容结构重复迁移不会清空数据。完整命令在首页，[CH09 操作手册](../docs/ch09-operations.md#ch09-表结构迁移)和 [CH10 操作手册](../docs/ch10-operations.md)说明章次要求。知识资源由 `app.knowledge.cli init`、`prepare-hybrid`、`import-docs --mode hybrid --manifest data/kb/manifest.json`、`sync --mode hybrid` 准备，不能以旧 CH03 dense 导入命令替代当前 hybrid 初始化。
 
 如果需要手动检查或在空库中建立第二章客服四表，先选择目标数据库，再按顺序执行：
 
@@ -35,20 +38,20 @@ uv run python -m app.knowledge.cli import-docs --manifest data/kb/manifest.json
 
 更新第二章种子文件不会自动刷新数据库里的旧 FAQ。需要重建第二章测试数据时，先停止使用测试库的服务，再按项目根 README 的流程重建 `mewhelp_test`；不要为刷新 FAQ 清空应用库。第三章资料更新后重新执行上述 `import-docs` 命令；知识库测试使用独立的 `mewhelp_ch03_test`，具体流程见 CH03 runbook。
 
-## 后续章节
+## CH04–CH10 脚本
 
-以下脚本保留作后续章节使用，不需要为了运行当前应用而全部导入：
+以下是已实现章节的 DDL 参考。当前应用的必需结构通过上方增量迁移准备，不直接把整组 SQL 反复导入：
 
 | 脚本 | 前置条件与用途 |
 |---|---|
 | `ch04-ddl.sql` | 依赖第二章会话表，建立低置信度问题池和编造个案台账。 |
-| `ch06-ticket-type.sql` | 第六章再启用“退款”工单类型；当前代码只支持售后、投诉、咨询。 |
+| `ch06-ticket-type.sql` | 历史工单类型设计，不是当前退款迁移入口；当前退款使用 `refund_applications`，执行 `app.db.migrate_ch06`。 |
 | `ch07-ddl.sql`、`ch07-layers.sql` | CH07依赖会话/消息表；两份按顺序应用，增加摘要投影、两个锚点及只追加摘要表。已有部分结构时使用下方增量命令。 |
 | `ch08-ddl.sql` | CH08 工具审计表；执行器以独立短事务写入五种中文状态。已有库使用下方增量迁移。 |
-| `ch09-ddl.sql` | 依赖第四章问题池，建审核队列、评估记录并补充关联字段。 |
-| `ch10-ddl.sql` | 依赖第四章问题池，建主题分类表。 |
+| `ch09-ddl.sql` | 依赖第四章问题池，建审核队列、评估记录并补充关联字段；当前启动必需。 |
+| `ch10-ddl.sql` | 依赖第四章问题池，建主题分类表；启用主题功能时必需。 |
 
-后续 `CREATE TABLE` / `ALTER TABLE` 脚本按对应章节执行一次，不应作为可任意重跑的初始化命令。
+原始 `CREATE TABLE` / `ALTER TABLE` 脚本不应作为可任意重跑的初始化命令；已有部分结构优先使用对应迁移模块。
 
 CH07已有库升级先预览，再显式应用；重复应用只补缺失结构，不清空原文或重写摘要：
 

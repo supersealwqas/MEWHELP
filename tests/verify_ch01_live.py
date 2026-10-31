@@ -1,37 +1,31 @@
 """真实上游大模型端到端在线验证与标注样本评测脚本。
 
-本脚本直接调用当前应用配置（.env）中的真实上游大语言模型，
-通过 FastAPI ASGI 客户端在进程内调用接口，接口再通过网络请求真实上游模型，执行三类验证：
+本脚本通过显式指定的已启动 MewHelp 服务访问当前 API，
+由目标服务使用自己的模型和数据库配置，执行三类验证：
 1. 售后信息结构化提取验证：对 5 条具有代表性的标注售后文本执行抽取（POST /api/extract），
    精确校验订单号与诉求类别（退款/换货/维修/投诉/其他），方案做非空和关键词级检查。
 2. 客服多轮会话流式交互与记忆继承验证：对 SSE 流式对话端点（POST /api/chat）发起连续 2 轮对话，
    核验 SSE 数据帧、标准结束标识（[DONE]）以及第二轮对首轮上下文（"猫粮"）的保留。
 3. 客服能力与承诺边界验证：检查查询/转人工与退款/赔付两条样本，并输出全文供人工复核。
 
-本脚本不经过本地 HTTP 服务器，不能验证服务器到客户端的逐块传输时延。
+脚本会消耗目标服务的模型额度，并保留三个新建验收会话；不清空已有会话，
+不提交退款或建单确认。请使用专用验收服务。关键词检查不代替人工语义复核，
+也不测量服务器到客户端的逐块传输时延。导入和 --help 不读取应用 .env 或启动服务。
 
 运行方式：
-    uv run python tests/verify_ch01_live.py
+    uv run python tests/verify_ch01_live.py --base-url http://127.0.0.1:8000
 """
 
+import argparse
 import asyncio
 from datetime import datetime, timedelta, timezone
 import json
-from pathlib import Path
 import sys
 import uuid
 from typing import Any, Dict, List
+from urllib.parse import urlsplit
 
-# 将工程根目录添加至 sys.path，支持通过 python tests/verify_ch01_live.py 独立直接运行
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from httpx import ASGITransport, AsyncClient
-
-from app.config import settings
-from app.main import app
-from app.api.chat import store
+from httpx import AsyncClient
 
 
 # 标注售后测试样本数据集契约
@@ -106,9 +100,8 @@ def log_step(message: str) -> None:
     异常:
         OSError: 控制台输出不可写时抛出。
     """
-    # 输出前统一遮盖凭据，避免上游错误信息意外回显真实密钥。
-    safe_message = message.replace(settings.chat_api_key, "<REDACTED>")
-    print(f"[{get_current_time_str()}] {safe_message}", flush=True)
+    # 客户端不加载模型凭据；调用失败只由调用处输出异常类型或 HTTP 状态。
+    print(f"[{get_current_time_str()}] {message}", flush=True)
 
 
 async def verify_extract_samples(client: AsyncClient) -> bool:
@@ -118,7 +111,7 @@ async def verify_extract_samples(client: AsyncClient) -> bool:
     诉求分类枚举值（退款/换货/维修/投诉/其他）以及期望方案的有效性。
 
     参数:
-        client (AsyncClient): 已绑定 FastAPI ASGI Transport 的异步 HTTP 客户端。
+        client (AsyncClient): 已指定服务 base_url 的异步 HTTP 客户端。
 
     返回值:
         bool: 若 5 条样本全部符合标注预期则返回 True，若有任一条不匹配则返回 False。
@@ -144,12 +137,12 @@ async def verify_extract_samples(client: AsyncClient) -> bool:
 
         try:
             # 向提取接口发送 POST 请求
-            # ASGITransport 不提供真实网络超时，用外层截止时间限制完整模型调用。
+            # 外层截止时间限制完整调用，HTTP 超时另限制每次网络读写等待。
             async with asyncio.timeout(130):
                 response = await client.post("/api/extract", json={"text": text_input}, timeout=60.0)
 
             if response.status_code != 200:
-                log_step(f"    [X] 失败: 接口响应非 200 状态码 (status_code={response.status_code}, body={response.text})")
+                log_step(f"    [X] 失败: 接口响应非 200 状态码 (status_code={response.status_code})")
                 all_passed = False
                 continue
 
@@ -199,7 +192,7 @@ async def verify_chat_stream_and_context(client: AsyncClient, session_id: str) -
       以证明上下文跨轮次准确记忆。
 
     参数:
-        client (AsyncClient): 已绑定 FastAPI ASGI Transport 的异步 HTTP 客户端。
+        client (AsyncClient): 已指定服务 base_url 的异步 HTTP 客户端。
         session_id (str): 用于串联本组多轮对话的唯一会话标识符。
 
     返回值:
@@ -329,7 +322,7 @@ async def verify_role_boundaries(client: AsyncClient) -> bool:
     """用真实模型检查两类容易产生越权承诺的客服话术。
 
     参数:
-        client: 绑定当前 FastAPI 应用的客户端。
+        client: 指向已启动 MewHelp 服务的客户端。
     返回值:
         bool: 两条回复均正常结束且明确说明能力限制时返回 True。
     异常:
@@ -366,19 +359,17 @@ async def verify_role_boundaries(client: AsyncClient) -> bool:
         except Exception as exc:
             log_step(f"边界样本 {index}: FAIL；异常类型: {type(exc).__name__}")
             all_passed = False
-        finally:
-            store.clear(session_id)
     return all_passed
 
 
-async def main() -> int:
+async def run_verification(client: AsyncClient) -> int:
     """真实模型端到端评测主执行入口。
 
-    初始化 ASGI 测试客户端，依次执行 5 条售后抽取、2 轮上下文对话和 2 条边界话术评测，
-    清理测试会话后打印验收报告摘要。
+    依次执行 5 条售后抽取、2 轮上下文对话和 2 条边界话术评测，
+    保留独立验收会话后打印验收报告摘要。
 
     参数:
-        无；使用当前应用配置与固定标注样本。
+        client: 指向目标服务的客户端，由调用方负责关闭。
 
     返回值:
         int: 若全部验证通过返回 0，若有任一项失败返回 1。
@@ -390,23 +381,13 @@ async def main() -> int:
     print("\n" + "=" * 70)
     print("      MewHelp Chapter 01 真实大模型在线端到端能力验证评测")
     print("=" * 70)
-    print("上游模型端点: 已从当前项目配置读取（不输出连接详情）")
-    log_step(f"当前评测模型: {settings.chat_model}")
-    print(f"上下文 Token 预算: {settings.token_budget}")
+    print("模型与预算由目标服务决定；验收会话保留，不自动删除。")
     print("=" * 70 + "\n")
 
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        # 1. 验证 5 条售后样本提取
-        extract_ok = await verify_extract_samples(client)
-
-        # 2. 验证多轮流式对话上下文
-        session_id = f"live-verify-{uuid.uuid4().hex}"
-        try:
-            chat_ok = await verify_chat_stream_and_context(client, session_id=session_id)
-        finally:
-            store.clear(session_id)
-        boundary_ok = await verify_role_boundaries(client)
+    extract_ok = await verify_extract_samples(client)
+    session_id = f"live-verify-{uuid.uuid4().hex}"
+    chat_ok = await verify_chat_stream_and_context(client, session_id=session_id)
+    boundary_ok = await verify_role_boundaries(client)
 
     # 输出最终验收报告摘要
     print("\n" + "=" * 70)
@@ -425,6 +406,43 @@ async def main() -> int:
         return 1
 
 
+async def run_online(base_url: str) -> int:
+    """建立直连客户端执行验收并关闭资源。
+
+    参数：base_url为已校验的HTTP服务根地址。
+    返回：int，全部通过为0，检查失败为1。
+    异常：客户端初始化或关闭错误由命令入口处理。
+    """
+    # 禁止环境代理和重定向，验收请求只发送到显式指定的目标服务。
+    async with AsyncClient(base_url=base_url, timeout=60.0, trust_env=False, follow_redirects=False) as client:
+        return await run_verification(client)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """解析显式服务目标并返回进程验收结果。
+
+    参数：argv为可选参数列表；None使用真实命令行。
+    返回：int，全部通过0，验证或连接失败1。
+    异常：SystemExit，帮助退出0，缺少或非法参数退出2。
+    """
+    parser = argparse.ArgumentParser(description="CH01 在线验收：消耗模型额度并保留三个新会话，请使用专用验收服务")
+    parser.add_argument("--base-url", required=True, help="已启动服务的根地址，例如 http://127.0.0.1:8000")
+    args = parser.parse_args(argv)
+    try:
+        target = urlsplit(args.base_url)
+        valid = (target.scheme in {"http", "https"} and target.hostname and target.port != 0
+                 and not target.username and not target.password and not target.query
+                 and not target.fragment and target.path in {"", "/"})
+    except ValueError:
+        valid = False
+    if not valid:
+        parser.error("--base-url 必须是无凭据、查询参数或子路径的 HTTP 服务根地址")
+    try:
+        return asyncio.run(run_online(args.base_url.rstrip("/")))
+    except Exception as error:
+        log_step(f"验收失败：{type(error).__name__}")
+        return 1
+
+
 if __name__ == "__main__":
-    exit_code = asyncio.run(main())
-    sys.exit(exit_code)
+    sys.exit(main())

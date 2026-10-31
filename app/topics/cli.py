@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 
 from app.topics.data import augment_training, clean_question, split_examples, write_dataset
-from app.topics.labelling import TopicLabeller
+from app.topics.labelling import MAX_LABEL_TEXT_LENGTH, TopicLabeller
 from app.topics.pool import read_pool
 from app.topics.taxonomy import label_names, load_taxonomy, taxonomy_digest
 
@@ -31,6 +31,18 @@ async def export_pool(output_dir: Path) -> dict:
     return summary
 
 
+def _pool_metadata(original: dict) -> dict:
+    """保留原池来源与分组，供预标和隔离记录共用。
+
+    参数：original为export-pool派生行，须含来源、分组、池ID、原文和历史不确定标记。
+    返回：dict，包含来源证据、完整脱敏原文及原池审核状态。
+    异常：必需字段缺失抛KeyError；原文清洗失败抛ValueError。
+    """
+    return dict(source=original["source"], group_id=original["group_id"], pool_ids=[original["question_id"]],
+                provenance=original.get("provenance", {}), history_uncertain=original["history_uncertain"],
+                original_text=clean_question(original["text"]), pool_review_status=original.get("review_status"))
+
+
 async def prepare_dataset(source: Path, output_dir: Path, *, per_label: int = 60, multi: int = 204,
                           seed: int = 42, max_calls: int = 60, labeller=None) -> dict:
     """复用成功预标/生成批次并冻结可核对的数据制品。
@@ -38,7 +50,8 @@ async def prepare_dataset(source: Path, output_dir: Path, *, per_label: int = 60
     参数：source为export-pool输出的pool.json数组文件；output_dir为尚不存在的制品目录；
     per_label为每类模拟问题数量、multi为多诉求模拟数量，均为0至500；seed为确定性分组整数种子；
     max_calls为1至60的逻辑请求上限；labeller为可选label/generate接口实例，None时按需构建TopicLabeller。
-    返回：dict制品清单，包含切分/标签/来源计数、摘要、预标状态与待复核记录路径。
+    返回：dict制品清单，包含切分/标签/来源计数、摘要、预标状态、超长隔离数与待复核记录路径；
+    超过外发预算的脱敏原问完整留待复核，不进入模型请求或三份数据；全部超长时仍写出抽审包。
     异常：目标已存在抛FileExistsError；输入、上限或恢复身份不符抛ValueError；模型网络、输出校验和IO错误传播。
     """
     source, output_dir = Path(source), Path(output_dir)
@@ -49,6 +62,20 @@ async def prepare_dataset(source: Path, output_dir: Path, *, per_label: int = 60
     data = json.loads(source.read_text(encoding="utf-8"))
     if not isinstance(data, list):
         raise ValueError("source须为export-pool生成的pool.json数组")
+    eligible, pending = [], []
+    for source_index, original in enumerate(data):
+        text = clean_question(original["text"])
+        if len(text) <= MAX_LABEL_TEXT_LENGTH:
+            eligible.append(original)
+            continue
+        # 外发预算不等于源数据准入限制：保留完整脱敏原话及来源，不截断或冒称模型已预标。
+        pending.append(dict(id=f"source:{source_index}:overlong", text=text, labels=[], parent_id=None,
+                            annotation_status="pending_review", needs_review=True,
+                            review_reason=f"脱敏原问超过{MAX_LABEL_TEXT_LENGTH}字符外发上限，未发送模型，请复核完整原问",
+                            **_pool_metadata(original)))
+    overlong_count = len(pending)
+    # 请求计划、批内连续序号及缓存回配统一使用同一筛选列表；改变批次的旧缓存会被config拒绝。
+    data = eligible
     taxonomy = load_taxonomy()
     plan = []
     for offset in range(0, len(data), 32):
@@ -71,8 +98,11 @@ async def prepare_dataset(source: Path, output_dir: Path, *, per_label: int = 60
     if frozen.exists() and json.loads(frozen.read_text(encoding="utf-8")) != config:
         raise ValueError("恢复目录参数或输入摘要不同，请指定新制品目录")
     frozen.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+    pending_path = cache / "pending.json"
+    # 先保留本地隔离结果，即使之后模型中断也能查看长题；重跑按冻结输入重建，不累加重复行。
+    pending_path.write_text(json.dumps(pending, ensure_ascii=False, indent=2), encoding="utf-8")
     model = labeller
-    rows, pending = [], []
+    rows = []
     for batch, step in enumerate(plan):
         checkpoint = cache / f"batch-{batch:03d}.json"
         if checkpoint.exists():
@@ -93,9 +123,7 @@ async def prepare_dataset(source: Path, output_dir: Path, *, per_label: int = 60
                    "pool_ids": [], "parent_id": None, "annotation_status": "model_prelabel"}
             if step["kind"] == "label":
                 original = data[step["offset"] + output["index"]]
-                row.update(source=original["source"], group_id=original["group_id"], pool_ids=[original["question_id"]],
-                           provenance=original.get("provenance", {}), history_uncertain=original["history_uncertain"],
-                           original_text=clean_question(original["text"]), pool_review_status=original.get("review_status"))
+                row.update(_pool_metadata(original))
             else:
                 row["source"] = "synthetic"
             if not row["labels"]:
@@ -106,9 +134,10 @@ async def prepare_dataset(source: Path, output_dir: Path, *, per_label: int = 60
     reserved = {text for split in ("validation", "test") for row in parts[split]
                 for text in (row["text"], row.get("original_text", row["text"]))}
     parts["train"] = augment_training(parts["train"], taxonomy, reserved_texts=reserved)
-    (cache / "pending.json").write_text(json.dumps(pending, ensure_ascii=False, indent=2), encoding="utf-8")
+    pending_path.write_text(json.dumps(pending, ensure_ascii=False, indent=2), encoding="utf-8")
     manifest = write_dataset(output_dir, parts, taxonomy, seed=seed, metadata={**config, "logical_requests": len(plan),
-                "raw_records": str(cache / "raw"), "pending_count": len(pending), "pending_review_records": str(cache / "pending.json"),
+                "raw_records": str(cache / "raw"), "pending_count": len(pending), "overlong_count": overlong_count,
+                "pending_review_records": str(pending_path),
                 "customer_generalization": "尚无可证实客户语料支持", "token_usage": "见逐请求原件；未返回用量保持null"}, pending_rows=pending)
     return manifest
 

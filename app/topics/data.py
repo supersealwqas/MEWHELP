@@ -31,6 +31,15 @@ _FIELD_BODY = r"[^，,、；;。！？?!\n]+"
 # 单字“是”仅在分隔符之后表示续接，不在姓名/地址正文中任意拆字。
 _FIELD_FOLLOWUP = r"[，,、]\s*(?:" + _FIELD_CHOICE + r"|是)\s*" + _FIELD_BODY
 _NAME_FOLLOWUP = r"[，,、]\s*[\u4e00-\u9fff·]{2,4}[吗呢呀吧么]*\s*(?=[，,、；;。！？?!\n]|$)"
+# 裸数字只紧接楼栋/单元单位时作为房号，不把型号、件数和天数当作地址续接。
+_ADDRESS_ROOM_FOLLOWUP = (r"(?:(?<=单元)|(?<=栋)|(?<=幢)|(?<=楼)|(?<=层)|(?<=座))"
+                         r"\s*[，,、\n]\s*\d{1,6}\s*(?=[，,、；;。！？?!\n]|$)")
+# 显式地址后的行政区、道路及楼栋可跨逗号/换行续接，括号附注仍属于所在地址段。
+_ADDRESS_FOLLOWUP = (r"[，,、\n]\s*[\u4e00-\u9fffA-Za-z0-9# /-]*"
+                     r"(?:省|市|区|县|镇|乡|村|街|路|道|巷|弄|(?<!型)号|栋|幢|楼|层|单元|室|座|园|苑|大厦|公寓)"
+                     r"[A-Za-z0-9#/-]*(?:" + _ADDRESS_ROOM_FOLLOWUP + r")?"
+                     r"(?:\s*(?:（[^（）\n]*）|\([^()\n]*\)))?"
+                     r"[吗呢呀吧么]*\s*(?=[，,、；;。！？?!\n]|$)")
 
 
 def _is_field_business_phrase(text: str) -> bool:
@@ -52,9 +61,9 @@ def _is_field_business_phrase(text: str) -> bool:
 
 
 def _is_followup_business_phrase(text: str) -> bool:
-    """识别姓名之后的完整短业务诉求，避免将“能退吗”等当作裸姓名候选。
+    """识别个人字段之后的完整短业务诉求，保留退货和配送否定。
 
-    参数：text为分隔符后的完整短分句，仅用于姓名候选续接的业务保护。
+    参数：text为分隔符后的完整短分句，用于姓名及地址续接的业务保护。
     返回：bool，完整符合诉求语法时为True。异常：无业务异常。
     """
     text = text.strip()
@@ -62,7 +71,10 @@ def _is_followup_business_phrase(text: str) -> bool:
     if question:
         text = text[question.end():]
     # 疑问词只剥离一次，余下正文同时使用完整字段动作与业务诉求语法判断。
-    return _is_field_business_phrase(text) or bool(re.fullmatch(
+    # “不能送上楼”等完整配送分句虽以“楼”结尾，也不能当作楼栋地址遮盖。
+    delivery = re.fullmatch(r"(?:我(?:想|要)?|请)?" + _FIELD_MODIFIERS
+                            + r"(?:配送|送货|送)(?:上楼|到家|上门)[的了吗呢呀吧么]*", text)
+    return _is_field_business_phrase(text) or bool(delivery or re.fullmatch(
         r"(?:我(?:想|要)?|能不能|可不可以|能否|可否|可以|不能|不可以|无法|不要|不想|能|可|要|想|不|没)?"
         r"(?:申请)?(?:退款|退货|换货|退换货|维修|保修|发货|到货|取消|退|换)[了吗呢呀吧么]*",
         text))
@@ -74,12 +86,15 @@ def _mask_field_candidates(text: str) -> str:
     参数：text为已移除疑问及比较前缀的字段正文，可含多个候选和逗号续接。
     返回：str；不增长长度且可重复清洗的正文。异常：无业务异常。
     """
-    parts = re.split(r"(\s*(?:[，,、]\s*(?:(?:" + _FIELD_CHOICE + r"|是)\s*)?|"
+    parts = re.split(r"(\s*(?:[，,、\n]\s*(?:(?:" + _FIELD_CHOICE + r"|是)\s*)?|"
                      + _FIELD_CHOICE + r"\s*))", text)
     for index in range(0, len(parts), 2):
         part = parts[index]
         if (not part.strip() or _is_field_business_phrase(part)
                 or (index > 0 and _is_followup_business_phrase(part))):
+            continue
+        # 换行会在最终格式清理时变为空格；已遮盖的多个地址段不能在重复清洗时被合并压缩。
+        if re.fullmatch(r"(?:\*+|\[个人信息\])(?:\s+(?:\*+|\[个人信息\]))*", part.strip()):
             continue
         # 只保留确定的语气词；未知字段值整体遮盖，不按姓名首字或长度放行。
         value = re.fullmatch(r"(\s*)(.*?)([吗呢呀吧么]*\s*)", part, flags=re.DOTALL)
@@ -129,9 +144,10 @@ def clean_question(text: str) -> str:
     text = re.sub(r"((?:订单号|订单编号|身份证号|证件号)\s*(?:[:：]|是|为)?\s*)[A-Za-z0-9-]{8,}", r"\1[编号]", text)
     # 省略“号”时只识别长订单标识，避免把订单日期2026-11-01当作编号。
     text = re.sub(r"(订单\s*(?:[:：]|是|为)?\s*)[A-Za-z0-9-]{12,}", r"\1[编号]", text)
-    # 裸短候选只续接姓名字段；地址需有明确更正/选择关系，避免贪婪吞掉业务尾句。
+    # 姓名续接裸短候选；地址续接完整地址段及明确更正关系，业务尾句不纳入匹配。
     for fields, followups in ((r"姓名|收件人|联系人", _FIELD_FOLLOWUP + "|" + _NAME_FOLLOWUP),
-                              (r"收货地址|联系地址|地址", _FIELD_FOLLOWUP)):
+                              (r"收货地址|联系地址|地址", _FIELD_FOLLOWUP + "|" + _ADDRESS_FOLLOWUP
+                               + "|" + _ADDRESS_ROOM_FOLLOWUP)):
         text = re.sub(r"((?:" + fields + r")\s*(?:[:：]\s*|(?=(?:"
                       + _FIELD_ASSIGNMENT + "|" + _FIELD_CONFIRMATION + r"))))"
                       + _FIELD_BODY + r"(?:" + followups + r")*", _mask_personal_field, text)

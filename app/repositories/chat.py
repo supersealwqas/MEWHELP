@@ -50,24 +50,46 @@ async def validate_refund_evidence(session, context: ToolContext, action: Refund
     返回：None；异常：ValueError，快照/意图/归属/查询事实不匹配；数据库错误。
     """
     from app.tools.business import owns_order
+    from app.tools.contracts import ToolIdentity, binding_from_dict
     expected = str(uuid5(NAMESPACE_URL, f"mewhelp:ch06:{context.conversation_id}:{context.turn_id}:submit_refund"))
     workflow_metadata = workflow_metadata or {}
     if (action.action_id != expected or action.source_turn_id != context.turn_id or action.question != context.user_message
             or not owns_order(context.user_id, action.order_id) or workflow_metadata.get("intent") != "退款退货"
             or workflow_metadata.get("route") != "order_policy" or workflow_metadata.get("order_id") != action.order_id):
         raise ValueError("退款动作与来源不一致")
-    call_id = f"ch06:order:{context.turn_id}:{action.order_id}"
-    result = await session.scalar(result_query(context.model_copy(update={"tool_call_id": call_id})))
-    fact = ToolResult.model_validate_json(result.content) if result is not None else None
-    calls = (await session.scalars(select(Message).where(Message.conversation_id == context.conversation_id,
-        Message.turn_id == context.turn_id, Message.role == "assistant", Message.tool_calls.is_not(None)))).all()
-    expected_call = {"id": call_id, "name": "query_order", "args": {"order_id": action.order_id}}
-    if (fact is None or not fact.ok or not fact.data or fact.data.get("order_id") != action.order_id
-            or not any(all(call.get(key) == value for key, value in expected_call.items())
-                       and (not call.get("binding") or call["binding"].get("identity") == {
-                           "source": "builtin", "server": None, "name": "query_order"})
-                       for row in calls for call in row.tool_calls)):
-        raise ValueError("退款动作缺少本轮已核实订单事实")
+    rows = (await session.scalars(select(Message).where(Message.conversation_id == context.conversation_id,
+        Message.turn_id == context.turn_id).order_by(Message.id))).all()
+    calls = [(row, call) for row in rows if row.role == "assistant" for call in row.tool_calls or []
+             if isinstance(call, dict)]
+    legacy_id = f"ch06:order:{context.turn_id}:{action.order_id}"
+    identity = ToolIdentity("builtin", None, "query_order")
+    for row, call in calls:
+        call_id = call.get("id")
+        if (not isinstance(call_id, str) or not call_id or call_id != call_id.strip()
+                or call.get("name") != "query_order" or call.get("args") != {"order_id": action.order_id}
+                or sum(other.get("id") == call_id for _, other in calls) != 1):
+            continue
+        # 新动态调用必须有服务器保存的完整内置绑定；只为旧固定编号兼容无绑定历史。
+        if "binding" not in call:
+            if call_id != legacy_id:
+                continue
+        else:
+            try:
+                if binding_from_dict(call["binding"]).identity != identity:
+                    continue
+            except (KeyError, TypeError, ValueError):
+                continue
+        results = [result for result in rows if result.role == "tool" and result.tool_call_id == call_id]
+        # 同轮唯一申请必须先于唯一结果，不能借用跨轮事实或歧义编号。
+        if len(results) != 1 or results[0].id <= row.id:
+            continue
+        try:
+            fact = ToolResult.model_validate_json(results[0].content, strict=True)
+        except ValueError:
+            continue
+        if fact.ok and fact.error is None and fact.data and fact.data.get("order_id") == action.order_id:
+            return
+    raise ValueError("退款动作缺少本轮已核实订单事实")
 
 
 def result_query(context: ToolContext):
@@ -187,29 +209,36 @@ class ChatRepository:
         self.factory = session_factory
 
     async def _complete_sources(self, session, citations: list[EvidenceCitation]) -> list[EvidenceCitation]:
-        """从权威仓储补齐缺失来源，仅完整正文一致的主键可匹配。
+        """从权威仓储补齐缺失来源或文件版本，仅来源和完整正文一致时匹配。
 
         参数：session 当前短事务；citations 模型已经看到的证据。
         返回：新引用列表，正文不变；无法核对来源或旧版本时保留空字段。
         异常：数据库读取错误透传，使回答不能假装成功提交。
         """
-        missing = [item.chunk_id for item in citations if item.source_key is None]
+        # 正常检索已提供source_key，仍须核对缺失的文档版本；已有版本不能被当前文件覆盖。
+        missing = [item.chunk_id for item in citations if item.source_key is None
+                   or item.source_key.startswith("doc:") and item.source_revision is None]
         if not missing:
             return citations
         columns = (KnowledgeChunk.id, KnowledgeChunk.source_key, KnowledgeChunk.ordinal, KnowledgeChunk.category,
                    KnowledgeChunk.questions, KnowledgeChunk.answer, KnowledgeChunk.section_path)
-        rows = (await session.execute(select(*columns).where(KnowledgeChunk.id.in_(missing)))).all()
+        # 被撤回的旧块可能仍保留原正文，不能因其他现行块匹配新文件就给旧引用补造版本。
+        rows = (await session.execute(select(*columns).where(
+            KnowledgeChunk.id.in_(missing), KnowledgeChunk.is_active == True))).all()
         by_id = {row.id: row for row in rows}
         revisions = {}
         completed = []
         for item in citations:
             row = by_id.get(item.chunk_id)
-            if item.source_key is None and row is not None and (row.questions, row.answer, row.section_path) == (item.question, item.answer, item.section_path):
-                if row.source_key.startswith("doc:") and row.source_key not in revisions:
+            if (row is not None and item.source_key in (None, row.source_key)
+                    and (row.questions, row.answer, row.section_path) == (item.question, item.answer, item.section_path)):
+                revision = item.source_revision
+                if revision is None and row.source_key.startswith("doc:") and row.source_key not in revisions:
                     source_rows = (await session.execute(select(*columns).where(
                         KnowledgeChunk.source_key == row.source_key, KnowledgeChunk.is_active == True))).all()
                     revisions[row.source_key] = verified_source_revision(row.source_key, source_rows)
-                item = item.model_copy(update={"source_key": row.source_key, "source_revision": revisions.get(row.source_key)})
+                item = item.model_copy(update={"source_key": row.source_key,
+                                               "source_revision": revision if revision is not None else revisions.get(row.source_key)})
             completed.append(item)
         return completed
 

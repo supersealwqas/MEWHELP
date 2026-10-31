@@ -16,6 +16,7 @@ from time import monotonic
 from typing import Any
 from urllib.parse import urlparse
 
+import requests
 from langchain_core.callbacks import BaseCallbackHandler
 from langgraph.errors import GraphInterrupt
 from langfuse import Langfuse, propagate_attributes
@@ -224,11 +225,15 @@ class ObservabilityRuntime:
             raise ValueError("启用观测需要本机项目的公钥与密钥")
         # 自有 provider 不注册无界 atexit；SDK.shutdown 会先注销其自身 atexit 再 flush。
         self.tracer_provider = TracerProvider(sampler=ALWAYS_ON, shutdown_on_exit=False)
-        exporter = span_exporter if span_exporter is not None else OTLPSpanExporter(
-            endpoint=f"{endpoint}/api/public/otel/v1/traces", timeout=3,
-            headers={"Authorization": "Basic " + base64.b64encode(f"{public}:{secret}".encode()).decode(),
-                     "x-langfuse-sdk-name": "python", "x-langfuse-sdk-version": "4.15.4",
-                     "x-langfuse-public-key": public, "x-langfuse-ingestion-version": "4"})
+        exporter = span_exporter
+        if exporter is None:
+            # 回环URL仍可能被环境代理转发；专用会话禁用环境代理及netrc，由真实导出器shutdown释放。
+            session = requests.Session()
+            session.trust_env = False
+            exporter = OTLPSpanExporter(endpoint=f"{endpoint}/api/public/otel/v1/traces", timeout=3, session=session,
+                headers={"Authorization": "Basic " + base64.b64encode(f"{public}:{secret}".encode()).decode(),
+                         "x-langfuse-sdk-name": "python", "x-langfuse-sdk-version": "4.15.4",
+                         "x-langfuse-public-key": public, "x-langfuse-ingestion-version": "4"})
         self.client = Langfuse(public_key=public, secret_key=secret, base_url=endpoint, sample_rate=1.0,
             timeout=3, tracer_provider=self.tracer_provider, span_exporter=_HealthExporter(self, exporter))
         self.callback_handler = _UsageCallbackHandler(public_key=public)

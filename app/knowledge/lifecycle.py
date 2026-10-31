@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import math
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from app.knowledge.contracts import KnowledgeEncoder, KnowledgeModel
@@ -131,18 +131,25 @@ class KnowledgeLifecycle:
         )
 
     async def _relations(
-        self, items: list[EvidenceItem], pairs: list[tuple[str, str]], *, dense: bool = True
+        self,
+        items: list[EvidenceItem],
+        pairs: list[tuple[str, str]],
+        *,
+        assert_held: Callable[[], Awaitable[None]],
+        dense: bool = True,
     ) -> dict[tuple[str, str], RelationDecision]:
         """用 Dense 候选阈值筛选后请求关系判定。
 
         参数:
             items: 证据项。
             pairs: 待筛候选组合；不得重复或引用不存在的证据。
+            assert_held: 当前writer的异步核锁接口；失锁时停止新增外部工作。
             dense: 是否使用Dense阈值；文档相互检查必须为False。
         返回值:
             dict: pair 到关系结论。
         异常:
             KnowledgeModelError: 模型缺失或多出请求 pair。
+            LeaseLost、存储或编码异常：原样传播，不能继续后续批次。
         """
         if not pairs:
             return {}
@@ -166,7 +173,10 @@ class KnowledgeLifecycle:
         if dense and candidates:
             needed = {ref for pair in candidates for ref in pair}
             encoded_items = [item for item in items if item.ref in needed]
+            await assert_held()
             vectors = await self.encoder.encode([format_knowledge(item.text) for item in encoded_items])
+            # 外部等待期间可能失锁，先保留失锁原因，再校验返回内容。
+            await assert_held()
             if len(vectors) != len(encoded_items):
                 raise KnowledgeModelError("关系候选编码数量不一致")
             by_ref = {item.ref: vector for item, vector in zip(encoded_items, vectors)}
@@ -195,7 +205,9 @@ class KnowledgeLifecycle:
         # 所有决定收齐且逐条校验后才允许调用者构造一次Publication。
         for group in groups:
             evidence = group_items(group)
+            await assert_held()
             decisions = await self.model.relate(evidence, group)
+            await assert_held()
             refs = {item.ref for item in evidence}
             group_map = {}
             for decision in decisions:
@@ -295,7 +307,7 @@ class KnowledgeLifecycle:
         返回值:
             list[ChunkSnapshot]: 发布或撤回后的快照。
         异常:
-            KnowledgeModelError、SnapshotChanged、存储异常。
+            KnowledgeModelError、LeaseLost、SnapshotChanged、存储异常。
         """
         frame = await writer.frame()
         old = await writer.chunks_by_sources(source_keys)
@@ -312,7 +324,9 @@ class KnowledgeLifecycle:
         document_pairs = [(left.ref, right.ref)
                           for index, left in enumerate(document_items)
                           for right in document_items[index + 1:]]
-        document_decisions = await self._relations(document_items, document_pairs, dense=False)
+        document_decisions = await self._relations(
+            document_items, document_pairs, assert_held=writer.assert_held, dense=False
+        )
         if any(decision.relation in ("conflict", "uncertain") for decision in document_decisions.values()):
             raise KnowledgeModelError("权威文档存在冲突或不确定，停止文档切换")
 
@@ -332,7 +346,7 @@ class KnowledgeLifecycle:
             for item in items[: len(drafts)]
             for other in items[len(drafts) :]
         ]
-        decisions = await self._relations(items, pairs)
+        decisions = await self._relations(items, pairs, assert_held=writer.assert_held)
         if any(decision.relation == "uncertain" for decision in decisions.values()):
             raise KnowledgeModelError("关系判定不确定，停止文档切换")
         inactive_ids: set[int] = set()
@@ -429,7 +443,7 @@ class KnowledgeLifecycle:
         返回值:
             list[ChunkSnapshot]: 本次新发布或撤回的块。
         异常:
-            KnowledgeModelError、SnapshotChanged、存储异常。
+            KnowledgeModelError、LeaseLost、SnapshotChanged、存储异常。
         """
         frame = await writer.frame()
         raw_candidates = [
@@ -441,7 +455,7 @@ class KnowledgeLifecycle:
             return []
 
         candidates, oversized_changes = self._prepare_staging_candidates(raw_candidates)
-        relations = await self._staging_relations(frame, candidates)
+        relations = await self._staging_relations(frame, candidates, assert_held=writer.assert_held)
         changes = self._staging_group_changes(
             frame, candidates, relations, oversized_changes
         )
@@ -488,13 +502,18 @@ class KnowledgeLifecycle:
         return candidates, oversized_changes
 
     async def _staging_relations(
-        self, frame: StoreFrame, candidates: list[StagedQA]
+        self,
+        frame: StoreFrame,
+        candidates: list[StagedQA],
+        *,
+        assert_held: Callable[[], Awaitable[None]],
     ) -> _StagingRelations:
         """收齐候选关系，并补判候选触达的历史知识与权威文档的关系。
 
-        参数：frame为固定发布快照；candidates为已通过单块硬限的候选，允许为空。
+        参数：frame为固定发布快照；candidates为已通过单块硬限的候选，允许为空；
+        assert_held为当前writer的异步核锁接口，覆盖候选判定与历史知识补判。
         返回：完整关系组、风险引用及可用于整组处置的文档审计证据。
-        异常：KnowledgeModelError、编码器异常或关系引用不存在时的KeyError。
+        异常：KnowledgeModelError、LeaseLost、存储/编码器异常或关系引用不存在时的KeyError。
         """
         active_mined = [
             row
@@ -523,7 +542,9 @@ class KnowledgeLifecycle:
                 pairs.append((f"staged:{left.id}", f"chunk:{chunk.id}"))
         decisions = self._historical_exact_relations(candidates, frame.staged, active_mined)
         # 历史精确匹配先于Dense/模型；仍进入同一组件、文档裁定与来源发布门禁。
-        decisions.update(await self._relations(items, [pair for pair in pairs if pair not in decisions]))
+        decisions.update(await self._relations(
+            items, [pair for pair in pairs if pair not in decisions], assert_held=assert_held
+        ))
 
         # 稳定ref图包含所有暂存审计来源，不能先排除存在风险的节点。
         staged_by_id = {row.id: row for row in frame.staged}
@@ -559,7 +580,9 @@ class KnowledgeLifecycle:
             for item in authority_items
             for document in document_items
         ]
-        decisions.update(await self._relations(authority_items + document_items, authority_pairs))
+        decisions.update(await self._relations(
+            authority_items + document_items, authority_pairs, assert_held=assert_held
+        ))
         return self._summarize_staging_relations(components, decisions, chunk_by_id)
 
     def _summarize_staging_relations(

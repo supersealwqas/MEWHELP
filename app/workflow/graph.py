@@ -149,10 +149,6 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
         if any(knowledge_input_stop_reason(state[key]) for key in ("raw_query", "resolved_query", "standard_query")):
             return {"stop_reason": "input_limit"}
         context = ToolContext.model_validate(state["context"])
-        if (state.get("order_data") and state.get("order_id")
-                and state["order_data"].get("order_id") == state["order_id"]
-                and owns_order(context.user_id, state["order_id"])):
-            return {"stop_reason": None}
         orders = list_user_orders(context.user_id)
         if not orders:
             return {"answer": "暂未找到您的订单，请核对当前账号或联系人工客服。", "stop_reason": "no_owned_orders"}
@@ -168,6 +164,9 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer):
         # 恢复值也不可信，必须再次核对完整订单号及当前归属。
         if not isinstance(identifier, str) or identifier not in {row["order_id"] for row in orders} or not owns_order(context.user_id, identifier):
             raise ValueError("所选订单不属于当前用户")
+        # 原话候选或明确选单先确定办理对象，再复用同一对象的动态查询，不能按最后查询跳过选单。
+        if state.get("order_data") and state["order_data"].get("order_id") == identifier:
+            return {"order_id": identifier, "selection_action": action, "stop_reason": None}
         publish_stage(state, "order", "running")
         call = {"id": f"ch06:order:{context.turn_id}:{identifier}", "name": "query_order", "args": {"order_id": identifier}}
         definition = next(row for row in deps.registry.snapshot() if row.name == "query_order" and row.identity.source == "builtin")

@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import subprocess
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -29,6 +31,7 @@ from app.knowledge.answering import (
 )
 from app.knowledge.documents import CHUNKING_VERSION
 from app.knowledge.embedding import BgeM3Encoder, EMBEDDING_REVISION
+from app.knowledge.errors import LeaseLost
 from app.knowledge.hybrid_index import MilvusHybridIndex
 from app.knowledge.rerank import BgeReranker, RERANKER_REVISION
 from app.knowledge.query_rewrite import QueryRewriter, QUERY_REWRITE_RULES
@@ -45,6 +48,7 @@ EVAL_MARKER = "mewhelp:ch04:evaluation:v1"
 QUERY_RULES_VERSION = "single-turn:rewrite1:synonyms4:clauses4:policy3:50-50-50:per-clause10:v2"
 _IDENTITY_TABLE = "ch04_eval_identity"
 _LOCK_NAME = "mewhelp:ch04:evaluation:exclusive"
+logger = logging.getLogger(__name__)
 
 
 def eval_config(config: Settings, *, target: str) -> Settings:
@@ -167,13 +171,40 @@ def runtime_metadata(config: Settings, chunks: list[ChunkSnapshot], *, evidence_
             "mysql_database": EVAL_DATABASE, "milvus_database": EVAL_DATABASE, "collection": EVAL_COLLECTION}
 
 
+class EvaluationLease:
+    """记录最初的物理连接身份，防止断线重连后接续旧评估。"""
+
+    def __init__(self, connection, connection_id: int) -> None:
+        """绑定持锁连接。参数：connection 专用连接；connection_id 取锁时编号；返回：None；异常：无。"""
+        self.connection, self.connection_id = connection, connection_id
+
+    async def assert_held(self) -> None:
+        """核对原连接与当前锁持有者，并结束检查产生的短事务。
+
+        参数：无。
+        返回：None。
+        异常：LeaseLost，连接断开、连接更换、所有权丢失或检查失败。
+        """
+        try:
+            current = await self.connection.scalar(text("SELECT CONNECTION_ID()"))
+            owner = await self.connection.scalar(text("SELECT IS_USED_LOCK(:name)"), {"name": _LOCK_NAME})
+            # 新连接即使重新拿到同名锁，也不能证明旧轮次期间语料始终被冻结。
+            if current != self.connection_id or owner != self.connection_id:
+                raise LeaseLost("评估资源锁已丢失，本轮成绩失效")
+            await self.connection.commit()
+        except LeaseLost:
+            raise
+        except Exception as error:
+            raise LeaseLost("无法确认原评估连接仍持锁，本轮成绩失效") from error
+
+
 @asynccontextmanager
 async def _resource_lock(config: Settings, *, create: bool):
     """在唯一评估资源上持命名锁，阻止准备和比较交错修改语料。
 
     参数：config 已限制配置；create 是否显式允许创建数据库。
-    返回：AsyncConnection，持锁到上下文退出。
-    异常：ValueError，身份或锁冲突；数据库错误；取消在清理后传播。
+    返回：EvaluationLease，绑定最初连接并持锁到上下文退出。
+    异常：ValueError，身份或锁冲突；LeaseLost，运行中失锁；数据库错误；取消在清理后传播。
     """
     validate_resources(config)
     target_engine, _ = create_database(config)
@@ -185,6 +216,10 @@ async def _resource_lock(config: Settings, *, create: bool):
             if acquired != 1:
                 raise ValueError("另一个评估准备或运行正在占用专用资源")
             try:
+                connection_id = await connection.scalar(text("SELECT CONNECTION_ID()"))
+                if connection_id is None:
+                    raise LeaseLost("无法确认评估资源锁的原连接身份")
+                lease = EvaluationLease(connection, connection_id)
                 exists = await connection.scalar(text("SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME=:name"), {"name": EVAL_DATABASE})
                 if not exists:
                     if not create:
@@ -194,13 +229,24 @@ async def _resource_lock(config: Settings, *, create: bool):
                 if await connection.scalar(text("SELECT DATABASE()")) != EVAL_DATABASE:
                     raise ValueError("评估物理连接数据库身份不符")
                 await connection.commit()
-                yield connection
+                await lease.assert_held()
+                yield lease
+                await lease.assert_held()
             finally:
+                failed = sys.exc_info()[0] is not None
                 with anyio.CancelScope(shield=True):
-                    if connection.in_transaction():
-                        await connection.rollback()
-                    await connection.execute(text("SELECT RELEASE_LOCK(:name)"), {"name": _LOCK_NAME})
-                    await connection.commit()
+                    try:
+                        if connection.in_transaction():
+                            await connection.rollback()
+                        released = await connection.scalar(text("SELECT RELEASE_LOCK(:name)"), {"name": _LOCK_NAME})
+                        if released != 1:
+                            raise LeaseLost("评估资源锁释放时已不属于原连接")
+                        await connection.commit()
+                    except Exception as error:
+                        # 断线会同时导致释放失败；不能用清理错误覆盖失锁或原业务异常。
+                        if not failed:
+                            raise LeaseLost("评估资源锁释放失败，本轮状态无法确认") from error
+                        logger.warning("evaluation lock cleanup failed error_type=%s", type(error).__name__)
     finally:
         with anyio.CancelScope(shield=True):
             await server.dispose()
@@ -293,7 +339,8 @@ async def prepare_resources(config: Settings, manifest_path: Path) -> dict:
     try:
         chunks = local_corpus(manifest_path, count_tokens=encoder.count_tokens)
         expected = corpus_digest(chunks)
-        async with _resource_lock(config, create=True) as connection:
+        async with _resource_lock(config, create=True) as lease:
+            connection = lease.connection
             identity = await _read_identity(connection, create=True)
             if identity.get("corpus_digest") not in (None, expected):
                 raise ValueError("评估库已冻结为其他语料，禁止覆盖既有评估资源")
@@ -341,14 +388,24 @@ async def prepare_resources(config: Settings, manifest_path: Path) -> dict:
 class EvaluationRuntime:
     """只读知识、生成与独立裁判的评估实例，没有应用写仓储。"""
 
-    def __init__(self, search, chunks, config, *, evidence_budget: int, metadata: dict) -> None:
-        """保存冻结依赖。参数：search/chunks/config/evidence_budget/metadata；返回：None；异常：无。"""
+    def __init__(self, search, chunks, config, *, evidence_budget: int, metadata: dict,
+                 lease: EvaluationLease | None = None) -> None:
+        """保存冻结依赖。参数：检索、语料、配置、预算、元信息及可选资源租约；返回：None；异常：无。"""
         self.search, self.chunks, self.config = search, chunks, config
         self.evidence_budget, self.metadata = evidence_budget, metadata
+        self.lease = lease
         self.answer_model = ChatModelAdapter()
         self.query_rewriter = QueryRewriter(request_budget=config.request_token_budget)
         # 裁判可显式换用其它模型，避免生成与评判同一模型带来的自评偏差。
         self.judge_model = FaithfulnessJudge(model_name=config.judge_model or config.chat_model)
+
+    async def assert_held(self) -> None:
+        """确认专用资源仍冻结；纯模型运行时没有数据库租约。
+
+        参数：无；返回：None；异常：LeaseLost，实际评估连接或持锁者变化。
+        """
+        if self.lease is not None:
+            await self.lease.assert_held()
 
     async def prepare(self, query: str) -> PreparedQuery:
         """只按原问准备一次，不接收题集答案。参数：query 当前原问；返回：四策略共用结果；异常：改写/预算错误。"""
@@ -384,7 +441,8 @@ async def evaluation_runtime(config: Settings, *, manifest_path: Path, evidence_
     validate_resources(config)
     encoder, reranker, index = BgeM3Encoder(config), BgeReranker(config), MilvusHybridIndex(config)
     try:
-        async with _resource_lock(config, create=False) as connection:
+        async with _resource_lock(config, create=False) as lease:
+            connection = lease.connection
             identity = await _read_identity(connection, create=False)
             async with knowledge_storage(config) as store:
                 chunks = await _all_chunks(store)
@@ -394,8 +452,9 @@ async def evaluation_runtime(config: Settings, *, manifest_path: Path, evidence_
                 await index.ensure_ready(create=False)
                 await _verify_vectors(index, chunks)
                 metadata = runtime_metadata(config, chunks, evidence_budget=evidence_budget)
+                await lease.assert_held()
                 yield EvaluationRuntime(EvaluationSearch(store, encoder, index, reranker, config), chunks, config,
-                                        evidence_budget=evidence_budget, metadata=metadata)
+                                        evidence_budget=evidence_budget, metadata=metadata, lease=lease)
     finally:
         with anyio.CancelScope(shield=True):
             try:

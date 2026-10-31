@@ -99,11 +99,29 @@ def project_summaries(summaries: list[dict], max_tokens: int, estimator: TokenEs
     return "\n".join(row["content"] for row in chosen), [row["seq"] for row in chosen]
 
 
+def _is_nonexecuting_diagnostic(call: dict) -> bool:
+    """识别服务器保存的非执行协议诊断，不能只凭类型标签忽略真实申请。
+
+    参数：call 原始审计项；返回：是否符合已知诊断结构且不含可执行顶层字段。
+    异常：无，未知或损坏结构保守地返回False。
+    """
+    required = {"type", "tool_calls", "invalid_tool_calls", "tool_call_chunks"}
+    optional = {"terminal_decision", "error_type", "missing_fields"}
+    return (call.get("type") == "invalid_tool_decision" and required <= call.keys()
+            and call.keys() <= required | optional
+            and all(isinstance(call[key], list) for key in required - {"type"})
+            and ("terminal_decision" not in call or isinstance(call["terminal_decision"], dict))
+            and ("error_type" not in call or isinstance(call["error_type"], str))
+            and ("missing_fields" not in call or isinstance(call["missing_fields"], list)))
+
+
 def _safe_to_demote(turn: StoredTurn, messages: list[BaseMessage]) -> bool:
     """判断轮次能否跨入摘要区。参数：原始轮及已配对视图；返回：安全性；异常：无。"""
     if turn.receipt_pending or turn.turn_status not in {"completed", "failed", "cancelled"}:
         return False
-    calls = [call for row in turn.messages for call in (row.tool_calls or [])]
+    # 诊断内嵌的坏模型申请从未执行；仅移除已知诊断，原文和审计内容仍完整保留。
+    calls = [call for row in turn.messages for call in (row.tool_calls or [])
+             if row.role != "assistant" or not _is_nonexecuting_diagnostic(call)]
     if not valid_tool_calls(calls):
         return False
     expected = [call["id"] for call in calls]

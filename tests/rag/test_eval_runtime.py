@@ -1,10 +1,346 @@
 """评估资源身份与实际模型证据预算的纯离线保护测试。"""
 
 import pytest
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from app.knowledge.retrieval import RetrievalCandidate
 from tests.knowledge.fakes import make_settings
 from tests.rag.test_retrieval import _chunk
+
+
+class EvaluationConnection:
+    """模拟会话级命名锁，区分原连接、重新连接及锁转移。"""
+
+    def __init__(self):
+        """建立独占连接事实。参数：无；返回：None；异常：无。"""
+        self.current, self.owner, self.lost = 41, 41, False
+        self.release_result = 1
+        self.queries = []
+
+    async def scalar(self, statement, parameters=None):
+        """返回真实SQL边界所需事实。参数：statement/parameters SQL及绑定；返回：标量；异常：ConnectionError。"""
+        from app.evaluation.runtime import EVAL_DATABASE
+        sql = str(statement)
+        self.queries.append(sql)
+        if self.lost:
+            raise ConnectionError("isolated lost connection")
+        if "CONNECTION_ID" in sql:
+            return self.current
+        if "IS_USED_LOCK" in sql:
+            return self.owner
+        if "RELEASE_LOCK" in sql:
+            if isinstance(self.release_result, Exception):
+                raise self.release_result
+            return self.release_result
+        return 1 if "GET_LOCK" in sql else EVAL_DATABASE
+
+    async def execute(self, statement, parameters=None):
+        """模拟控制SQL，断线后释放也失败。参数：statement/parameters；返回：None；异常：ConnectionError。"""
+        await self.scalar(statement, parameters)
+
+    async def commit(self):
+        """结束短事务。参数：无；返回：None；异常：ConnectionError，断线时。"""
+        if self.lost:
+            raise ConnectionError("isolated lost connection")
+
+    def in_transaction(self):
+        """返回没有未提交业务。参数：无；返回：False；异常：无。"""
+        return False
+
+
+@pytest.fixture
+def evaluation_boundaries(monkeypatch):
+    """仅隔离数据库、索引及模型，保留真实锁、运行时和评估编排。
+
+    参数：monkeypatch 外部依赖替换器；返回：连接、配置、上下文工厂和工作记录。
+    异常：替换目标错误或断言失败。
+    """
+    import app.evaluation.runtime as module
+    from sqlalchemy import URL
+    from app.evaluation.faithfulness import FaithfulnessDecision, FactJudgment
+    from app.knowledge.answering import KnowledgeAnswer
+    from app.knowledge.query_rewrite import QueryRewrite
+    from app.knowledge.retrieval import EvaluationRetrieval
+
+    connection, chunk, calls = EvaluationConnection(), _chunk(1), []
+    control = SimpleNamespace(loss_at=None, fail_stage=False)
+
+    @asynccontextmanager
+    async def connect():
+        """提供隔离物理连接。参数：无；返回：连接；异常：调用方异常原样传播。"""
+        yield connection
+
+    @asynccontextmanager
+    async def storage(settings):
+        """隔离存储会话。参数：settings 专用配置；返回：仓储边界；异常：调用方异常原样传播。"""
+        yield object()
+
+    def record(stage):
+        """记录新工作并在指定边界断线。参数：stage 阶段；返回：None；异常：RuntimeError，可模拟模型同时失败。"""
+        calls.append(stage)
+        if control.loss_at == stage:
+            connection.lost = True
+            if control.fail_stage:
+                raise RuntimeError("isolated model failure")
+
+    async def rewrite(query):
+        """提供合法模型改写。参数：query 原问；返回：改写；异常：RuntimeError，可控外部失败。"""
+        record("rewrite")
+        return QueryRewrite(standard_query=query, synonyms=[])
+
+    async def retrieve(*args, **kwargs):
+        """提供真实候选协议。参数：检索参数；返回：排名及证据；异常：RuntimeError，可控外部失败。"""
+        record("retrieve")
+        item = RetrievalCandidate(chunk=chunk, score=0.9)
+        return EvaluationRetrieval(ranked=[item], selected=[item])
+
+    async def answer(messages):
+        """提供可引用答案。参数：messages 模型消息；返回：知识答案；异常：RuntimeError，可控外部失败。"""
+        record("generate")
+        return KnowledgeAnswer(useful=True, reason="", answer="权威答案1。[1]", citation_numbers=[1])
+
+    async def judge(query, answer, citations):
+        """提供合法逐事实裁判。参数：问答及证据；返回：裁判；异常：RuntimeError，可控外部失败。"""
+        record("judge")
+        return FaithfulnessDecision(facts=[FactJudgment(claim="权威答案1。", supported=True,
+            reason="证据1支持", evidence_numbers=[1])])
+
+    engine = SimpleNamespace(connect=connect, dispose=AsyncMock())
+    target = SimpleNamespace(url=URL.create("mysql+asyncmy", username="offline", database=module.EVAL_DATABASE),
+                             dispose=AsyncMock())
+    resource = SimpleNamespace(aclose=AsyncMock(), ensure_ready=AsyncMock(), count_tokens=len)
+    replacements = {
+        "create_database": lambda config: (target, None), "create_async_engine": lambda *args, **kwargs: engine,
+        "BgeM3Encoder": lambda config: resource, "BgeReranker": lambda config: resource,
+        "MilvusHybridIndex": lambda config: resource, "knowledge_storage": storage,
+        "_read_identity": AsyncMock(return_value={"corpus_digest": module.corpus_digest([chunk])}),
+        "_all_chunks": AsyncMock(return_value=[chunk]), "local_corpus": lambda *args, **kwargs: [chunk],
+        "_verify_vectors": AsyncMock(), "runtime_metadata": lambda *args, **kwargs: {},
+        "EvaluationSearch": lambda *args: SimpleNamespace(retrieve=retrieve),
+        "ChatModelAdapter": lambda: SimpleNamespace(answer_knowledge=answer),
+        "QueryRewriter": lambda **kwargs: SimpleNamespace(rewrite=rewrite),
+        "FaithfulnessJudge": lambda **kwargs: SimpleNamespace(judge=judge),
+    }
+    for name, replacement in replacements.items():
+        monkeypatch.setattr(module, name, replacement)
+    config = module.eval_config(make_settings(), target="eval")
+    return SimpleNamespace(connection=connection, calls=calls, control=control, config=config,
+                           runtime=module.evaluation_runtime, engine=engine, target=target)
+
+
+@pytest.mark.parametrize("stage,expected", [
+    ("initial", []), ("rewrite", ["rewrite"]), ("retrieve", ["rewrite", "retrieve"]),
+    ("generate", ["rewrite", "retrieve", "generate"]),
+    ("judge", ["rewrite", "retrieve", "generate", "judge"]),
+])
+async def test_lock_loss_stops_next_stage_and_invalidates_artifacts(tmp_path, evaluation_boundaries, stage, expected):
+    """失锁必须停止后续阶段，不能逐题吞掉或发布完成成绩。参数：目录、隔离边界、阶段和预期工作；返回：None；异常：断言失败。"""
+    import json
+    from app.evaluation.runner import evaluate_dataset
+    from app.knowledge.errors import LeaseLost
+    from tests.rag.test_eval_runner import case
+
+    boundary, output = evaluation_boundaries, tmp_path / "lost"
+    boundary.control.loss_at = stage
+    with pytest.raises(LeaseLost):
+        async with boundary.runtime(boundary.config, manifest_path=tmp_path / "unused") as runtime:
+            if stage == "initial":
+                boundary.connection.lost = True
+            await evaluate_dataset([case(), case()], runtime, output, strategies=["dense"],
+                                   evidence_resolver=lambda *args: [{1}])
+    assert boundary.calls == expected
+    assert json.loads((output / "manifest.json").read_text(encoding="utf-8"))["status"] == "invalidated"
+    assert json.loads((output / "summary.json").read_text(encoding="utf-8"))["status"] == "invalidated"
+
+
+@pytest.mark.parametrize("current,owner", [(41, 99), (41, None), (99, 99)])
+async def test_lock_owner_and_original_connection_are_both_required(tmp_path, evaluation_boundaries, current, owner):
+    """新连接即使持同名锁也不能接续旧轮次。参数：隔离边界与当前连接/持锁者；返回：None；异常：断言失败。"""
+    from app.evaluation.runner import evaluate_dataset
+    from app.knowledge.errors import LeaseLost
+    from tests.rag.test_eval_runner import case
+
+    boundary = evaluation_boundaries
+    with pytest.raises(LeaseLost):
+        async with boundary.runtime(boundary.config, manifest_path=tmp_path / "unused") as runtime:
+            boundary.connection.current, boundary.connection.owner = current, owner
+            await evaluate_dataset([case()], runtime, tmp_path / "replaced", strategies=["dense"],
+                                   evidence_resolver=lambda *args: [{1}])
+    assert boundary.calls == []
+
+
+@pytest.mark.parametrize("between_cases", [False, True])
+async def test_lock_loss_after_saved_row_stops_new_work(tmp_path, evaluation_boundaries, between_cases):
+    """题间或策略间失锁保留旧行并阻止新增工作。参数：隔离边界及切换种类；返回：None；异常：断言失败。"""
+    from app.evaluation.runner import evaluate_dataset
+    from app.knowledge.errors import LeaseLost
+    from tests.rag.test_eval_runner import case
+
+    boundary, output = evaluation_boundaries, tmp_path / "between"
+
+    def lose_after_row(row):
+        """已落盘后模拟断线。参数：row 完成行；返回：None；异常：无。"""
+        boundary.connection.lost = True
+
+    with pytest.raises(LeaseLost):
+        async with boundary.runtime(boundary.config, manifest_path=tmp_path / "unused") as runtime:
+            await evaluate_dataset([case(), case()] if between_cases else [case()], runtime, output,
+                strategies=["dense"] if between_cases else ["dense", "bm25"],
+                evidence_resolver=lambda *args: [{1}], progress=lose_after_row)
+    assert boundary.calls == ["rewrite", "retrieve", "generate", "judge"]
+    assert len((output / "results.jsonl").read_text(encoding="utf-8").splitlines()) == 1
+
+
+@pytest.mark.parametrize("filename", ["summary.json", "manifest.json"])
+async def test_lock_loss_during_completion_revokes_completed_artifacts(tmp_path, monkeypatch, evaluation_boundaries, filename):
+    """完成文件写出期间断线，也要撤销已发布完成状态。参数：隔离边界及触发文件；返回：None；异常：断言失败。"""
+    import json
+    from app.evaluation import runner
+    from app.knowledge.errors import LeaseLost
+    from tests.rag.test_eval_runner import case
+
+    boundary, output, original = evaluation_boundaries, tmp_path / "completion", runner.atomic_json
+
+    def lose_after_write(path, value):
+        """执行真实落盘后模拟断线。参数：path/value 文件和内容；返回：None；异常：文件错误。"""
+        original(path, value)
+        if path.name == filename and value.get("status") == "completed":
+            boundary.connection.lost = True
+
+    monkeypatch.setattr(runner, "atomic_json", lose_after_write)
+    with pytest.raises(LeaseLost):
+        async with boundary.runtime(boundary.config, manifest_path=tmp_path / "unused") as runtime:
+            await runner.evaluate_dataset([case()], runtime, output, strategies=["dense"],
+                                          evidence_resolver=lambda *args: [{1}])
+    for name in ("summary.json", "manifest.json"):
+        assert json.loads((output / name).read_text(encoding="utf-8"))["status"] == "invalidated"
+    assert "invalidated" in (output / "summary.md").read_text(encoding="utf-8")
+
+
+async def test_lock_loss_with_model_error_still_aborts_run(tmp_path, evaluation_boundaries):
+    """模型失败与失锁同时发生时，不能只记题目错误继续运行。参数：隔离边界；返回：None；异常：断言失败。"""
+    from app.evaluation.runner import evaluate_dataset
+    from app.knowledge.errors import LeaseLost
+    from tests.rag.test_eval_runner import case
+
+    boundary = evaluation_boundaries
+    boundary.control.loss_at, boundary.control.fail_stage = "rewrite", True
+    with pytest.raises(LeaseLost):
+        async with boundary.runtime(boundary.config, manifest_path=tmp_path / "unused") as runtime:
+            await evaluate_dataset([case(), case()], runtime, tmp_path / "model-failure",
+                strategies=["dense", "bm25"], evidence_resolver=lambda *args: [{1}])
+    assert boundary.calls == ["rewrite"]
+
+
+async def test_lock_cleanup_preserves_original_exception(tmp_path, evaluation_boundaries):
+    """断线后的释放错误不能覆盖原始失败，资源仍全部释放。参数：隔离边界；返回：None；异常：断言失败。"""
+    boundary, original = evaluation_boundaries, LookupError("original failure")
+    with pytest.raises(LookupError) as caught:
+        async with boundary.runtime(boundary.config, manifest_path=tmp_path / "unused"):
+            boundary.connection.lost = True
+            raise original
+    assert caught.value is original
+    assert boundary.engine.dispose.await_count == boundary.target.dispose.await_count == 1
+
+
+@pytest.mark.parametrize("failure", ["after_runner", "release_zero", "release_null", "release_error", "readonly_markdown"])
+async def test_cli_late_lock_loss_invalidates_finished_run(tmp_path, monkeypatch, evaluation_boundaries, capsys, failure):
+    """运行器返回后失锁，CLI必须撤销完成报告及不可用校准策略。参数：隔离边界；返回：None；异常：断言失败。"""
+    import json
+    from app import config
+    from app.evaluation import runner, dataset
+    from app.evaluation.cli import build_parser, run
+    from pathlib import Path
+    from tests.rag.test_eval_runner import case
+
+    boundary, output, original = evaluation_boundaries, tmp_path / "late", runner.evaluate_dataset
+    sample = case()
+    sample.split = "calibration"
+    sample.model_dump = lambda **kwargs: {"id": sample.id, "split": sample.split}
+    blocked_paths, write_text = set(), Path.write_text
+
+    def write_display(path, text, *args, **kwargs):
+        """只隔离展示文件的权限错误，其余产物真实落盘。参数：文件、内容及写入参数；返回：字符数；异常：PermissionError。"""
+        if path in blocked_paths:
+            raise PermissionError("isolated readonly Markdown")
+        return write_text(path, text, *args, **kwargs)
+
+    async def lose_after_evaluation(*args, **kwargs):
+        """保留真实评估，再模拟退出上下文前断线。参数：评估参数；返回：原报告；异常：真实评估错误。"""
+        result = await original(*args, **kwargs, evidence_resolver=lambda *args: [{1}])
+        if failure == "after_runner":
+            boundary.connection.lost = True
+        else:
+            boundary.connection.release_result = {"release_zero": 0, "release_null": None,
+                "release_error": ConnectionError("release disconnected"), "readonly_markdown": 0}[failure]
+        if failure == "readonly_markdown":
+            blocked_paths.add(output / "summary.md")
+        return result
+
+    monkeypatch.setattr(config, "Settings", lambda: boundary.config)
+    monkeypatch.setattr(dataset, "load_dataset", lambda *args, **kwargs: [sample])
+    monkeypatch.setattr(runner, "evaluate_dataset", lose_after_evaluation)
+    monkeypatch.setattr(Path, "write_text", write_display)
+    args = build_parser().parse_args(["calibrate", "--output-dir", str(output), "--strategies", "dense"])
+    assert await run(args) == 1
+    assert json.loads((output / "summary.json").read_text(encoding="utf-8"))["status"] == "invalidated"
+    assert json.loads((output / "manifest.json").read_text(encoding="utf-8"))["status"] == "invalidated"
+    assert not (output / "policy.json").exists()
+    assert json.loads((output / "startup-error.json").read_text(encoding="utf-8"))["error_type"] == "LeaseLost"
+    assert '"status": "completed"' not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("stage", ["rewrite", "completion"])
+async def test_runner_readonly_markdown_preserves_lock_loss(tmp_path, monkeypatch, evaluation_boundaries, stage, caplog):
+    """展示清理失败不能覆盖整轮失锁，前后两种报告边界都保留权威失效状态。
+
+    参数：临时目录、权限边界替换器、外部运行资源、失锁阶段和日志捕获。
+    返回：None；异常：AssertionError，原锁异常或权威状态被二次写盘失败破坏。
+    """
+    import json
+    from pathlib import Path
+    from app.evaluation.runner import evaluate_dataset
+    from app.knowledge.errors import LeaseLost
+    from tests.rag.test_eval_runner import case
+
+    boundary, output, write_text = evaluation_boundaries, tmp_path / "readonly", Path.write_text
+    boundary.control.loss_at = stage
+
+    def readonly_display(path, text, *args, **kwargs):
+        """模拟展示文件被占用，其余产物继续真实写盘。参数：文件和写入数据；返回：字符数；异常：PermissionError。"""
+        if path == output / "summary.md":
+            if boundary.connection.lost:
+                raise PermissionError("isolated readonly Markdown")
+            result = write_text(path, text, *args, **kwargs)
+            boundary.connection.lost = True
+            return result
+        return write_text(path, text, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", readonly_display)
+    with pytest.raises(LeaseLost):
+        async with boundary.runtime(boundary.config, manifest_path=tmp_path / "unused") as runtime:
+            await evaluate_dataset([case()], runtime, output, strategies=["dense"],
+                                   evidence_resolver=lambda *args: [{1}])
+    for name in ("manifest.json", "summary.json"):
+        assert json.loads((output / name).read_text(encoding="utf-8"))["status"] == "invalidated"
+    assert "PermissionError" in caplog.text
+
+
+async def test_healthy_lock_completes_all_cases_and_strategies(tmp_path, evaluation_boundaries):
+    """合法持锁仍完成全部比较，单题改写继续由策略共享。参数：隔离边界；返回：None；异常：断言失败。"""
+    import json
+    from app.evaluation.runner import evaluate_dataset
+    from tests.rag.test_eval_runner import case
+
+    boundary, output = evaluation_boundaries, tmp_path / "healthy"
+    async with boundary.runtime(boundary.config, manifest_path=tmp_path / "unused") as runtime:
+        report = await evaluate_dataset([case(), case()], runtime, output, strategies=["dense", "bm25"],
+                                        evidence_resolver=lambda *args: [{1}])
+    assert report["status"] == "completed"
+    assert boundary.calls == ["rewrite", "retrieve", "generate", "judge", "retrieve", "generate", "judge"] * 2
+    assert json.loads((output / "manifest.json").read_text(encoding="utf-8"))["completed_sample_count"] == 4
 
 
 async def test_runtime_prepare_passes_only_current_question_to_model():

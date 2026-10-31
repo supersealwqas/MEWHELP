@@ -122,8 +122,9 @@ async def run(args: argparse.Namespace) -> int:
                           "validation": "原文字符切分与证据定位；真实token硬限在prepare检查"}, ensure_ascii=False, indent=2))
         return 0
     # 离线validate只需要题集和原文；下面的真实运行依赖才允许加载聊天/数据库配置。
-    from app.evaluation.runner import atomic_json, evaluate_dataset
+    from app.evaluation.runner import atomic_json, evaluate_dataset, invalidate_evaluation_artifacts
     from app.evaluation.runtime import eval_config, evaluation_runtime, prepare_resources
+    from app.knowledge.errors import LeaseLost
     from app.config import Settings
 
     output = args.output_dir or Path("reports/ch04") / (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + args.command + "-" + uuid4().hex[:8])
@@ -170,22 +171,26 @@ async def run(args: argparse.Namespace) -> int:
             result = await evaluate_dataset(selected, runtime, output, strategies=args.strategies,
                                               thresholds=thresholds, retrieval_only=args.command == "calibrate", progress=_progress)
             owns_output = True
+            await runtime.assert_held()
             if args.command == "calibrate":
                 rows = [json.loads(line) for line in (output / "results.jsonl").read_text(encoding="utf-8").splitlines()]
                 policy = {"version": POLICY_VERSION, "calibration_case_count": len(selected), "metadata": runtime.metadata,
                           "thresholds": {strategy: calibrate_threshold([row for row in rows if row["strategy"] == strategy], strategy=strategy)
                                          for strategy in args.strategies}}
                 atomic_json(output / "policy.json", policy)
-            print(json.dumps({"status": result["status"], "output_dir": str(output.resolve())}, ensure_ascii=False))
-            # completed_with_errors 是“跑完了但部分样本出错”，结果可用，不算任务失败；
-            # 错误样本已逐条记在 results.jsonl，由报告与看板展示，不用退出码代替。
-            return int(result["status"] not in {"completed", "completed_with_errors"})
+            await runtime.assert_held()
+        # 资源上下文退出也可能确认失锁，成功消息必须在退出之后发布。
+        print(json.dumps({"status": result["status"], "output_dir": str(output.resolve())}, ensure_ascii=False))
+        # completed_with_errors 已在逐题记录中保留错误，仍表示合法完整运行。
+        return int(result["status"] not in {"completed", "completed_with_errors"})
     except Exception as error:
         if not output.exists():
             output.mkdir(parents=True, exist_ok=False)
             owns_output = True
         # 只写本调用确实创建的目录；运行器内部失败已保留自己的interrupted报告。
         if owns_output:
+            if isinstance(error, LeaseLost) and (output / "summary.json").exists():
+                invalidate_evaluation_artifacts(output)
             failure = {"status": "failed", "stage": args.command, "error_type": type(error).__name__}
             atomic_json(output / "startup-error.json", failure)
             if args.command == "prepare":
