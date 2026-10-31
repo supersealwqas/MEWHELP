@@ -84,6 +84,48 @@ class MemoryRepository:
         """
         return await self.get_pending_ticket(context)
 
+    async def verified_business_prefix(self, state):
+        """从本轮已保存的内置订单调用和匹配结果生成可信前缀。
+
+        参数：state 含原轮上下文、意图及可选工具绑定事实。
+        返回：str，已核实订单的展示前缀；没有订单结果时为空。
+        异常：身份或不支持的工单确认断言失败、结果结构校验错误。
+        工单确认及事务防伪使用专用真实 SQLite 仓储测试。
+        """
+        from app.schemas.tools import ToolContext, ToolResult
+        from app.tools.contracts import binding_from_dict
+        from app.workflow.policy_context import verified_order_text
+
+        context = ToolContext.model_validate(state["context"]).model_copy(update={"tool_call_id": ""})
+        assert context in self.contexts
+        saved_turn = self.turns[context.turn_id]
+        assert saved_turn.ticket_confirmation is None, "工单回执需使用真实 SQLite 测试仓储"
+        calls, orders = {}, {}
+        facts = state.get("tool_call_facts")
+        for row in saved_turn.messages:
+            if row.role == "assistant" and row.tool_calls:
+                for call in row.tool_calls:
+                    try:
+                        binding = binding_from_dict(call["binding"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if (binding.identity.source != "builtin" or binding.identity.server is not None
+                            or binding.identity.name != call.get("name") or call["name"] != "query_order"):
+                        continue
+                    if facts is not None and facts.get(call["id"]) != {
+                            "turn_id": context.turn_id, "binding": call["binding"], "access": "read"}:
+                        continue
+                    calls[call["id"]] = call
+            elif row.role == "tool" and row.tool_call_id in calls:
+                # 只配对一次真实保存的调用；相同订单再次成功查询时使用最新结果。
+                call = calls.pop(row.tool_call_id)
+                result = ToolResult.model_validate_json(row.content, strict=True)
+                if (result.ok and result.error is None and result.data
+                        and result.data.get("order_id") == call["args"].get("order_id")):
+                    orders[result.data["order_id"]] = result.data
+        return "".join(verified_order_text({"order_data": order, "intent": state.get("intent")})
+                       for order in orders.values())
+
     async def save_tool_calls(self, context, calls, *, deduplicate=False, bindings=None):
         """保存申请。参数：上下文、申请；返回：None；异常：无。"""
         calls = [{**call, **({"binding": bindings[call["id"]]} if bindings and call["id"] in bindings else {})} for call in calls]
@@ -282,8 +324,11 @@ def make_workflow_service(*, intents=("订单",), decisions=None, answers=None, 
     from tests.workflow.graph_fakes import dependencies
 
     deps = dependencies(intents=intents, decisions=decisions if decisions is not None else [AgentDecision(kind="answer")],
-                        answers=answers if answers is not None else [["已", "查到"]], ranked=ranked)
+                        answers=answers if answers is not None else [["已", "查到"]], ranked=ranked,
+                        **(settings.model_dump() if settings is not None else {}))
     if settings is not None:
+        # 共享原隔离配置对象，同时保留按该配置生成的临时策略，避免回到生产默认路径。
+        settings.evidence_policy_path = deps.settings.evidence_policy_path
         deps.settings = settings
     repository, support = MemoryRepository(), FAQRepository()
     deps.chat = repository

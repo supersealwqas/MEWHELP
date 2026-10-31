@@ -1,6 +1,7 @@
 """完成元数据发布、引用接口隔离和数据库快照的回归测试。"""
 
 from contextlib import asynccontextmanager
+import json
 
 import pytest
 from fastapi.testclient import TestClient
@@ -32,15 +33,26 @@ async def test_failed_commit_has_no_metadata_or_done():
 
 
 async def test_all_model_evidence_is_persisted_before_metadata():
-    """只引用第一条时也保存模型看到的完整证据快照。参数：无；返回：None；异常：断言错误。"""
+    """发布实际引用前保存模型看到的两条完整原文。参数：无；返回：None；异常：断言错误。"""
     from tests.workflow.graph_fakes import ranked
-    service, repository, _, _ = make_workflow_service(intents=["商品咨询"], answers=[["答复[1]"]],
-                                                    ranked=[ranked(number=1), ranked(number=2)])
-    events = [event async for event in service.stream_turn(ChatRequest(session_id="cited", message="政策"))]
+    service, repository, _, model = make_workflow_service(intents=["商品咨询"], answers=[["答复[1]"]],
+        ranked=[ranked(number=1, answer="第一条完整政策原文"), ranked(number=2, answer="第二条完整政策原文")])
+    events = []
+    async for event in service.stream_turn(ChatRequest(session_id="cited", message="政策")):
+        events.append(event)
+        if event.event == "answer_metadata":
+            turn_id = event.data["turn_id"]
+            assert repository.turns[turn_id].turn_status == "completed"
+            snapshot = repository.retrieval_snapshots[turn_id]
+            # 公开引用按正文选择；独立检索快照须在完成事件外发前保存所有原文。
+            assert {chunk.chunk_id: chunk.answer for attempt in snapshot.attempts for chunk in attempt.chunks} == {
+                1: "第一条完整政策原文", 2: "第二条完整政策原文"}
+            assert repository.completion_inputs[turn_id][1] == snapshot
     assert events[-2].event == "answer_metadata"
     metadata = events[-2].data
-    assert metadata["citations"][0]["answer"]
-    assert len(metadata["citations"]) == 2
+    assert [(item["n"], item["answer"]) for item in metadata["citations"]] == [(1, "第一条完整政策原文")]
+    answer_input = json.dumps(next(item["messages"] for item in model.inputs if item["stage"] == "answer"), ensure_ascii=False)
+    assert "第一条完整政策原文" in answer_input and "第二条完整政策原文" in answer_input
     assert repository.metadata[metadata["turn_id"]] == metadata
 
 

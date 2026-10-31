@@ -96,13 +96,17 @@ async def test_committed_ticket_does_not_hide_read_fault_or_lose_receipt(tmp_pat
         assert events[-1].event == "done", [(event.event, event.data) for event in events]
         ticket_no = (await rows(factory, "SELECT ticket_no FROM tickets"))[0][0]
         streamed = "".join(event.data.get("delta", "") for event in events)
-        assert streamed == f"工单已创建，工单号：{ticket_no}，状态：待处理。\n\n" + FAULT_TEXT
+        # 知识查询故障沿用完整检索责任出口，回执仍须与同一固定正文一起发布及保存。
+        assert streamed == (f"工单已创建，工单号：{ticket_no}，状态：待处理。\n\n"
+                            "资料查询暂时不可用，相关规则目前无法核实。您可以稍后重试或联系人工客服继续处理。")
         assert "answer" not in [item["stage"] for item in deps.model.inputs]
         current = await service.get_current_actions("ticket-query-fault", "demo-user")
         assert current.answer == streamed and current.ticket_receipt.ticket_no == ticket_no
+        assert current.turn_status == "completed"
         assert await rows(factory, "SELECT ticket_no FROM tickets") == [(ticket_no,)]
         assert await rows(factory, "SELECT tool_name FROM tool_audit_logs WHERE tool_name='create_ticket'") == [("create_ticket",)]
         completed = await service.graph.aget_state(graph_config)
+        assert completed.values["stop_reason"] == "retrieval_unavailable" and completed.values["knowledge_faults"]
         assert {key: value["access"] for key, value in completed.values["tool_call_facts"].items()} == {
             "ticket-1": "write", "faq-2": "read"}
 
