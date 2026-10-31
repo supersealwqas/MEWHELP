@@ -1,8 +1,8 @@
 # CH10 交付记录
 
-日期：2026-11-01。工作目录：`D:/AI/my_AI_project/MEWHELP`。本章保留在`codex/ch10-topic-classifier`，基础提交`8a8b7d2`。
+日期：2026-11-01。工作目录：`D:/AI/my_AI_project/MEWHELP`。本章已按用户授权从`codex/ch10-topic-classifier`快进合入本机`main`，合并范围为`8a8b7d2 → 25c84ca`，原功能分支保留。
 
-最新结论：[再次合并前审查及关闭记录](superpowers/reviews/2026-11-01-ch10-final-merge-audit.md)中的S1/S2/S3及修复中R1全部关闭，当前达到本机main合并前要求。产品修复为`f37ec79`，测试同步修正及最终受测提交为`1d4de55`；全仓2939通过、44跳过、101未选，本机更新验收通过。分支尚未合并，模型仍为实验定位；下方较早版本的结果保留为历史证据。
+最新状态：[再次合并前审查及关闭记录](superpowers/reviews/2026-11-01-ch10-final-merge-audit.md)中的S1/S2/S3及修复中R1全部关闭，用户“那就合并吧”后已完成本机`main`快进合并。产品修复为`f37ec79`，测试同步修正及最终受测提交为`1d4de55`；沿用其全仓2939通过、44跳过、101未选及本机更新验收证据，合并未改变已测产品和测试，未重新执行全仓。模型仍为实验定位；下方较早版本的结果保留为历史证据。
 
 ## 已完成的功能和可验证结果
 
@@ -99,7 +99,7 @@
 - 训练指标：`models/ch10/classifier-20261031-v4/test_metrics.json`；矩阵表：`reports/ch10/training/20261031-v4/per-label-confusion.csv`；错例代审：同目录`error-review.json`。
 - 页面证据：`reports/ch10/browser-resume/desktop-final.png`、`narrow-before-final.png`、`narrow-final.json`；停机演练记录`service-unavailable.json`。空集和未启用状态另在不连接数据库的临时UI服务中观察，原件`empty-fixture.json`、`disabled-fixture.json`明确标为夹具，观察后该服务已停止。
 
-程序和文档提交本功能分支，按既有范围不合并main。模型、原问派生语料及运行原件因体积/隐私被Git忽略，均在本机保留，换机器需要另外备份`models/ch10/`、`reports/ch10/`及本章台账。原有CH06等草稿未纳入提交。
+程序和文档已合入本机`main`，原功能分支继续保留；没有配置远程，未推送。合并前后的原有修改、暂存状态和未跟踪文件摘要一致，CH06等草稿未纳入提交。模型、原问派生语料及运行原件因体积/隐私被Git忽略，均在本机保留，换机器需要另外备份`models/ch10/`、`reports/ch10/`及本章台账。
 
 ## 本章执行裁决
 
