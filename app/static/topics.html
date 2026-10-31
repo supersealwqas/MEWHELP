@@ -1,0 +1,55 @@
+<!doctype html>
+<!-- CH10 主题分布：只呈现后端统计，分类任务独立于实时客服。 -->
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#285b49">
+  <title>主题分布 · MewHelp</title>
+  <link rel="icon" href="/static/mew.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/flywheel.css">
+  <link rel="stylesheet" href="/static/topics.css">
+  <script type="module" src="/static/topics.mjs"></script>
+</head>
+<body class="fw-page topic-page">
+<a class="fw-skip" href="#topic-chart">跳到主题分布</a>
+<div class="fw-shell">
+  <header class="fw-header">
+    <a class="fw-brand" href="/"><img src="/static/mew.svg" width="40" height="40" alt="">MewHelp <span>客服工作台</span></a>
+    <nav class="fw-nav" aria-label="工作台导航"><a href="/">对话</a><a href="/flywheel">知识改进</a><a href="/topics" aria-current="page">主题分布</a><a href="/rag-eval">质量评估</a></nav>
+  </header>
+  <main>
+    <div class="fw-intro">
+      <div><p class="fw-eyebrow">看清问题，安排下一次知识补充</p><h1>哪些主题的问题还没答好</h1><p>把积累的问题按主题归类，先关注堆积较多的知识缺口。</p></div>
+      <a class="fw-button fw-secondary" href="/flywheel">去审核知识 →</a>
+    </div>
+    <section class="topic-control fw-section" aria-label="统计范围与分类操作">
+      <div class="topic-control-top">
+        <div class="fw-toolbar topic-scope"><label for="topic-scope">统计范围</label><select id="topic-scope"><option value="pending">待补知识的问题</option><option value="all">全部历史问题</option></select></div>
+        <div class="fw-actions"><button id="topic-refresh" class="fw-button fw-secondary" type="button">刷新统计</button><button id="topic-run" class="fw-button" type="button">归类问题</button></div>
+      </div>
+      <div class="topic-control-bottom"><label class="topic-check"><input id="topic-reclassify" type="checkbox">同时重新归类已有结果</label><span id="topic-job-status" class="fw-muted" role="status">正在连接分类服务…</span></div>
+      <p id="topic-error" class="topic-error" role="alert" hidden></p>
+    </section>
+    <section id="topic-stats" class="topic-stats" aria-label="问题统计" aria-busy="true">
+      <div class="topic-stat"><span>统计问题</span><strong id="topic-total">—</strong><small>按可核实的原轮去重</small></div>
+      <div class="topic-stat"><span>已归类</span><strong id="topic-classified">—</strong><small id="topic-coverage">等待统计结果</small></div>
+      <div class="topic-stat"><span>待归类</span><strong id="topic-unclassified">—</strong><small>还没有可用的主题结果</small></div>
+    </section>
+    <div class="topic-layout">
+      <section class="fw-section topic-chart-card" aria-labelledby="topic-chart-title">
+        <div class="fw-section-heading"><div><h2 id="topic-chart-title">主题分布</h2><p class="fw-muted">按问题数量从多到少排列</p></div><span id="topic-chart-unit" class="topic-unit">单位：问题</span></div>
+        <p id="topic-chart-message" class="topic-empty" role="status">正在读取主题统计…</p>
+        <ol id="topic-chart" class="topic-chart" aria-label="各主题问题数量" aria-busy="true"></ol>
+        <p class="fw-footnote">一个问题可以涉及多个主题，因此各主题数量相加可能超过问题总数。</p>
+      </section>
+      <aside class="topic-aside">
+        <section class="fw-section topic-focus" aria-labelledby="topic-focus-title"><p class="fw-eyebrow">当前关注</p><h2 id="topic-focus-title">等待统计结果</h2><p id="topic-focus-text" class="fw-muted">归类完成后，这里会显示数量最多的主题。</p><a href="/flywheel" class="topic-text-link">查看待审知识 →</a></section>
+        <section class="fw-section topic-method" aria-labelledby="topic-method-title"><h2 id="topic-method-title">怎么看这些数字</h2><p>默认统计尚未归并或仍在待审的问题。已通过、已驳回的记录可在“全部历史问题”中查看。</p><p>同一轮问题从多个入口进入问题池时，只为同一主题计一次。</p><p id="topic-history-note">历史记录的原轮信息正在核对。</p><p id="topic-source-note" hidden></p><p id="topic-version-note" hidden></p><p id="topic-updated" class="topic-updated">尚未取得更新时间</p></section>
+      </aside>
+    </div>
+  </main>
+  <footer class="fw-footer">MewHelp · 主题归类在后台运行，不改变实时客服回答</footer>
+</div>
+</body>
+</html>
