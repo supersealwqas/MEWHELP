@@ -15,13 +15,15 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 from starlette.concurrency import run_in_threadpool
 
+from app.topics.limits import MAX_TOPIC_TEXT_LENGTH
+
 
 class ClassifyRequest(BaseModel):
     """仅接收有限长度文本，不允许客户端控制模型目录或设备。"""
 
     model_config = ConfigDict(extra="forbid", strict=True)
-    texts: list[Annotated[str, StringConstraints(min_length=1, max_length=2000)]] = Field(
-        min_length=1, max_length=64, description="待分类文本，1至64条，每条1至2000字符")
+    texts: list[Annotated[str, StringConstraints(min_length=1, max_length=MAX_TOPIC_TEXT_LENGTH)]] = Field(
+        min_length=1, max_length=64, description=f"待分类文本，1至64条，每条1至{MAX_TOPIC_TEXT_LENGTH}字符")
 
     @field_validator("texts")
     @classmethod
@@ -69,7 +71,7 @@ def create_app(predictor_factory=None, *, inference_timeout: float = 30.0) -> Fa
     @application.exception_handler(RequestValidationError)
     async def invalid_input(request, error):
         """隐藏Pydantic默认错误中的原始输入。参数：request请求、error校验错误；返回：422响应；异常：无。"""
-        return JSONResponse(status_code=422, content={"detail": "texts必须为1至64条非空文本，每条最多2000字符"})
+        return JSONResponse(status_code=422, content={"detail": f"texts必须为1至64条非空文本，每条最多{MAX_TOPIC_TEXT_LENGTH}字符"})
 
     @application.get("/health")
     async def health(request: Request):

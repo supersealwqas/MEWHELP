@@ -33,7 +33,14 @@ async def export_pool(output_dir: Path) -> dict:
 
 async def prepare_dataset(source: Path, output_dir: Path, *, per_label: int = 60, multi: int = 204,
                           seed: int = 42, max_calls: int = 60, labeller=None) -> dict:
-    """恢复预标/生成批次并冻结制品。参数：源JSON、输出目录及数量/种子/请求上限；返回：清单；异常：模型/IO/校验错误。"""
+    """复用成功预标/生成批次并冻结可核对的数据制品。
+
+    参数：source为export-pool输出的pool.json数组文件；output_dir为尚不存在的制品目录；
+    per_label为每类模拟问题数量、multi为多诉求模拟数量，均为0至500；seed为确定性分组整数种子；
+    max_calls为1至60的逻辑请求上限；labeller为可选label/generate接口实例，None时按需构建TopicLabeller。
+    返回：dict制品清单，包含切分/标签/来源计数、摘要、预标状态与待复核记录路径。
+    异常：目标已存在抛FileExistsError；输入、上限或恢复身份不符抛ValueError；模型网络、输出校验和IO错误传播。
+    """
     source, output_dir = Path(source), Path(output_dir)
     if output_dir.exists():
         raise FileExistsError("制品目录已经存在，请生成新目录")

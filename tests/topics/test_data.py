@@ -55,6 +55,19 @@ def test_redaction_keeps_size_and_negation():
     assert "XL不退" in text and "MH-W99" in text and "3天" in text
 
 
+@pytest.mark.parametrize("question", [
+    "怎么联系人工客服处理账号申诉", "怎么联系人工客服帮我查会员积分？",
+    "我用积分兑换的商品，下单后发现收件人名字写错了能改吗？",
+    "买的电池发票抬头能写个人姓名加身份证号吗？",
+    "订单号能改一下收件人电话吗？还有发票抬头刚才忘记选单位了。",
+    "不取消订单，能不能直接更改收件人姓名", "联系人是谁？", "姓名是什么？",
+    "地址是否可以修改？", "订单 2026-11-01 能到吗？型号M01012345678，XL不退",
+])
+def test_explicit_field_questions_keep_business_meaning(question):
+    """查询字段或人工客服不等于提供姓名，日期型号也不能被误删。参数：question无个人资料的业务问题；返回：None；异常：断言失败。"""
+    assert clean_question(question) == question
+
+
 def test_manifest_detects_tampering_and_split_leakage(tmp_path):
     """制品摘要和家族隔离不能被跳过。参数：tmp_path临时目录；返回：无；异常：断言失败。"""
     output = tmp_path / "dataset"

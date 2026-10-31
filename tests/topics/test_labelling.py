@@ -103,3 +103,22 @@ async def test_invalid_raw_result_is_preserved(tmp_path):
         await TopicLabeller(model, report_dir=tmp_path).label(["尺寸多少"])
     records = [json.loads(path.read_text(encoding="utf-8")) for path in tmp_path.glob("*.json")]
     assert records and all(record["status"] == "failed" and record["raw_chunks"] for record in records)
+
+
+@pytest.mark.parametrize("original,private,business", [
+    ("电话：010-88886666，我想退货", "010-88886666", "我想退货"),
+    ("电话(010)88886666 转123，我想退货", "88886666", "我想退货"),
+    ("电话+86 13812345678，XL不退，2026-11-01问M200型号", "13812345678", "XL不退，2026-11-01问M200型号"),
+    ("我的订单 12345678901234567890 到哪了", "12345678901234567890", "到哪了"),
+    ("姓名是张三，地址是北京市朝阳区示例路1号，请问能改地址吗", "张三", "请问能改地址吗"),
+    ("联系人张三，收货地址是北京市朝阳区示例路1号，XL不退", "北京市朝阳区示例路1号", "XL不退"),
+])
+async def test_explicit_private_fields_never_reach_prelabel_payload(tmp_path, original, private, business):
+    """拦截实际预标载荷验证脱敏边界。参数：tmp_path隔离目录、original虚构原话、private私密片段、business业务原意；返回：None；异常：断言失败。"""
+    from app.topics.data import clean_question
+    model = Model([dict(index=0, text=clean_question(original), labels=["物流"], family="one", needs_review=False, review_reason="")])
+    await TopicLabeller(model, report_dir=tmp_path).label([original])
+    payload = str(model.messages)
+    assert private not in payload
+    assert "张三" not in payload and "北京市朝阳区示例路1号" not in payload
+    assert business in payload

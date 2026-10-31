@@ -117,6 +117,114 @@ def response(request, version="v1", uncertain=False):
         for _ in texts]))
 
 
+@pytest.mark.parametrize("stage", ["watermark_failure", "precheck_failure", "watermark_cancel", "precheck_cancel"])
+async def test_new_scan_preparation_preserves_completed_archive_and_allows_upgrade(tmp_path, stage):
+    """新轮准备故障不得污染旧完成事实。参数：tmp_path隔离目录、stage高水位或自动预检查的失败/取消；返回：None；异常：断言失败。"""
+    class PreparationRepository(MemoryRepository):
+        """在新轮准备边界注入一次外部依赖故障。"""
+        armed = False
+
+        async def fault(self, boundary):
+            """仅在指定边界失败一次。参数：boundary为watermark/precheck；返回：None；异常：RuntimeError或CancelledError。"""
+            if self.armed and stage.startswith(boundary):
+                self.armed = False
+                if stage.endswith("cancel"):
+                    raise asyncio.CancelledError()
+                raise RuntimeError("准备阶段暂时不可用")
+
+        async def high_watermark(self):
+            """读上界并注入准备故障。参数：无；返回：int最大池ID；异常：一次故障或取消。"""
+            await self.fault("watermark")
+            return await super().high_watermark()
+
+        async def pending(self, limit, reclassify=False, after_id=0):
+            """读候选并注入预检查故障。参数：limit为1至200、reclassify重跑开关、after_id非负游标；返回：list[dict]；异常：一次故障或取消。"""
+            await self.fault("precheck")
+            return await super().pending(limit, reclassify, after_id)
+
+    repo = PreparationRepository(1)
+    first = make_service(tmp_path, repo, response)
+    complete = await first.process()
+    await first.close()
+    paths = [tmp_path / "scan.json", tmp_path / f"scan-{complete['batch_id']}.json"]
+    originals = [path.read_bytes() for path in paths]
+    repo.rows.append(dict(question_id="2", text="新问题", created_at="2020-01-01T00:00:00"))
+    repo.armed = True
+    upgraded = make_service(tmp_path, repo, lambda request: response(request, version="v2"))
+    try:
+        if stage.startswith("precheck"):
+            async with repo.execution() as lease:
+                if stage.endswith("cancel"):
+                    with pytest.raises(asyncio.CancelledError):
+                        await upgraded._process_locked(lease, automatic=True)
+                else:
+                    assert (await upgraded._process_locked(lease, automatic=True))["status"] == "failed"
+        elif stage.endswith("cancel"):
+            with pytest.raises(asyncio.CancelledError):
+                await upgraded.process()
+        else:
+            assert (await upgraded.process())["status"] == "failed"
+        assert [path.read_bytes() for path in paths] == originals
+        retried = await upgraded.process()
+        assert retried["status"] == "complete" and retried["model_version"] == "v2"
+        assert retried["counts"]["saved"] == 1 and "2" in repo.saved
+        assert paths[1].read_bytes() == originals[1]
+    finally:
+        await upgraded.close()
+
+
+@pytest.mark.parametrize("length", [2600, 4000])
+async def test_legal_chat_length_at_front_does_not_block_later_page(tmp_path, length):
+    """合法长原问必须走完201条分页并保留截断标记。参数：tmp_path隔离目录、length为2600或4000字符；返回：None；异常：断言失败。"""
+    from app.schemas.chat import ChatRequest
+    from app.topics.pool import derive_pool
+    raw = "问" * length
+    assert ChatRequest(session_id="test-long", message=raw).message == raw
+    record = NS(id=1, conversation_id=1, source="self_check", raw_question=raw, matched_review_id=None, created_at=None)
+    repo = MemoryRepository(201)
+    repo.rows[0].update(derive_pool([record], [], [], [])[0])
+
+    def handler(request):
+        """返回已截断的合法合同结果。参数：request受控HTTP请求；返回：httpx.Response；异常：无。"""
+        value = response(request)
+        if request.url.path == "/classify":
+            body = value.json()
+            texts = json.loads(request.content)["texts"]
+            for result, text in zip(body["results"], texts):
+                result["truncated"] = len(text) > 128
+            return httpx.Response(200, json=body)
+        return value
+
+    service = make_service(tmp_path, repo, handler)
+    try:
+        report = await service.process()
+        assert report["status"] == "complete" and report["counts"]["saved"] == 201
+        assert report["cursor"] == "201" and len(report["batches"]) == 2
+        first_batch = json.loads((tmp_path / f"batch-{report['batches'][0]['batch_id']}.json").read_text(encoding="utf-8"))
+        assert first_batch["results"][0]["truncated"] is True
+    finally:
+        await service.close()
+
+
+async def test_over_chat_limit_refuses_whole_batch_before_http(tmp_path):
+    """超出业务长度仍不能静默截断或半批保存。参数：tmp_path隔离目录；返回：None；异常：断言失败。"""
+    repo, calls = MemoryRepository(2), []
+    repo.rows[0]["text"] = "问" * 4001
+
+    def handler(request):
+        """记录分类外发数量。参数：request受控请求；返回：httpx.Response；异常：无。"""
+        if request.url.path == "/classify":
+            calls.append(request)
+        return response(request)
+
+    service = make_service(tmp_path, repo, handler)
+    try:
+        assert (await service.process())["status"] == "failed"
+        assert not repo.saved and not calls
+    finally:
+        await service.close()
+
+
 async def test_uncertain_first_200_does_not_starve_201(tmp_path):
     """重读第一页会使第201条永远不归类。参数：隔离目录；返回：None；异常：断言失败。"""
     repo = MemoryRepository()

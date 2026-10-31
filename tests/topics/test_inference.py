@@ -15,14 +15,15 @@ def test_predictor_validates_text_and_reports_truncation_and_readonly_metadata(t
     """捕获输入越界、静默截断和元信息可变的错误。参数：真实制品；返回：无；异常：断言失败。"""
     from app.topics.inference import TopicPredictor
     predictor = TopicPredictor(trained_tiny[2] / "model")
-    result = predictor.predict(["我要退货", "退" * 100])
+    result = predictor.predict(["我要退货", "退" * 100, "退" * 2600, "退" * 4000])
     assert result[0]["truncated"] is False and result[1]["truncated"] is True
+    assert result[2]["truncated"] is True and result[3]["truncated"] is True
     assert len(result[0]["probabilities"]) == 17
     assert result[0]["uncertain"] == (not result[0]["labels"])
     metadata = predictor.metadata
     metadata["threshold"] = 0
     assert predictor.metadata["threshold"] != 0
-    for texts in ([], [" "], [1], ["退" * 2001], ["退"] * 65):
+    for texts in ([], [" "], [1], ["退" * 4001], ["退"] * 65):
         with pytest.raises(ValueError):
             predictor.predict(texts)
 
@@ -116,11 +117,15 @@ def test_service_loads_once_validates_inputs_and_returns_model_identity(trained_
         assert response.json()["taxonomy_digest"] == trained_tiny[3]["taxonomy_digest"]
         assert response.json()["model_version"] and len(response.json()["results"]) == 1
         assert client.post("/classify", json={"texts": ["退"] * 64}).status_code == 200
+        long_response = client.post("/classify", json={"texts": ["退" * 2600, "退" * 4000]})
+        assert long_response.status_code == 200
+        assert all(row["truncated"] for row in long_response.json()["results"])
         for body in ({"texts": []}, {"texts": [" "]}, {"texts": [2]}, {"texts": ["退"] * 65},
-                     {"texts": ["退" * 2001]}, {"texts": ["退"], "model_dir": "secret"}):
+                     {"texts": ["退" * 4001]}, {"texts": ["退"], "model_dir": "secret"}):
             invalid = client.post("/classify", json=body)
             assert invalid.status_code == 422
             assert "secret" not in invalid.text
+            assert "4000" in invalid.text
     assert calls == [1]
 
 

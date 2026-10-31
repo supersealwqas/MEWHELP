@@ -8,6 +8,7 @@ from copy import deepcopy
 from pathlib import Path
 
 from app.topics.metrics import decode_labels, evaluation_plan
+from app.topics.limits import MAX_TOPIC_TEXT_LENGTH
 from app.topics.taxonomy import label_names, load_taxonomy, taxonomy_digest
 
 
@@ -21,11 +22,11 @@ def file_sha256(path: Path) -> str:
 
 
 def validate_texts(texts: list[str]) -> None:
-    """校验服务与直接推理共有输入。参数：texts1至64条、每条1至2000字符；返回：无；异常：ValueError。"""
+    """校验服务与直接推理共有输入。参数：texts为1至64条、每条1至4000字符的非空白文本；返回：None；异常：数量、类型或长度非法ValueError。"""
     if not isinstance(texts, list) or not 1 <= len(texts) <= 64:
         raise ValueError("文本数量必须为1至64")
-    if any(not isinstance(text, str) or not 1 <= len(text) <= 2000 or not text.strip() for text in texts):
-        raise ValueError("文本必须为1至2000字符的非空字符串")
+    if any(not isinstance(text, str) or not 1 <= len(text) <= MAX_TOPIC_TEXT_LENGTH or not text.strip() for text in texts):
+        raise ValueError(f"文本必须为1至{MAX_TOPIC_TEXT_LENGTH}字符的非空字符串")
 
 
 def validate_model_package(model_dir: Path) -> dict:

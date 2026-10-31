@@ -14,6 +14,7 @@ from app.evaluation.runner import atomic_json
 from app.knowledge.errors import ConcurrentKnowledgeWrite
 from app.knowledge.lease import finish_cleanup
 from app.topics.taxonomy import load_taxonomy, taxonomy_digest, validate_labels
+from app.topics.limits import MAX_TOPIC_TEXT_LENGTH
 
 
 class TopicBatchService:
@@ -102,8 +103,8 @@ class TopicBatchService:
     async def _classify(self, rows, model_version):
         """分块HTTP后核验所有结果，尚不写数据库。参数：最多200行/固定版本；返回：逐ID核验结果；异常：HTTP/合同错误/取消。"""
         if any(not isinstance(row.get("text"), str) or not row["text"].strip()
-               or len(row["text"]) > 2000 for row in rows):
-            raise ValueError("池文本为空或超过2000字符，需复核原件")
+               or len(row["text"]) > MAX_TOPIC_TEXT_LENGTH for row in rows):
+            raise ValueError(f"池文本为空或超过{MAX_TOPIC_TEXT_LENGTH}字符，需复核原件")
         output = []
         for offset in range(0, len(rows), 64):
             block = rows[offset:offset + 64]
@@ -188,6 +189,8 @@ class TopicBatchService:
                     raise ValueError("尚有未完成扫描，须沿用原重跑方式和主题表恢复")
                 await self._recover(scan, lease)
             else:
+                # 旧完成原件不属于本次活动轮；准备失败或取消只能记录本次启动错误。
+                scan = None
                 high = await self.repository.high_watermark()
                 await lease.assert_held()
                 if automatic:

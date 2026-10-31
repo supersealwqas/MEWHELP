@@ -44,3 +44,23 @@ def test_pool_preserves_review_and_demo_provenance():
     record.matched_review_id = 5
     result = derive_pool([record], [], [NS(id=1, session_id="demo-ch10", user_id="test")], [NS(id=5, review_status="通过")])
     assert result[0]["review_status"] == "通过" and result[0]["source"] == "application_demo"
+
+
+def test_original_turn_index_reads_messages_once_and_ignores_unrelated_ambiguity():
+    """防止池行逐次扫描历史消息。参数：无；返回：None；异常：断言失败。"""
+    class CountedMessages(list):
+        """计数真实派生函数访问的消息数。"""
+        reads = 0
+
+        def __iter__(self):
+            """累计迭代访问量。参数：无；返回：消息迭代器；异常：无。"""
+            for item in super().__iter__():
+                self.reads += 1
+                yield item
+
+    records = [pool(i) for i in range(1, 51)]
+    messages = CountedMessages([message(i, {"self_check": i}) for i in range(1, 51)]
+                              + [message(100, {"self_check": 999}), message(101, {"self_check": 999})])
+    result = derive_pool(records, messages, [], [])
+    assert len(result) == 50 and not any(row["history_uncertain"] for row in result)
+    assert messages.reads == len(messages), "消息索引应只构建一次"

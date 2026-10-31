@@ -91,12 +91,15 @@ class TopicRepository:
                 select(TopicClassification).order_by(TopicClassification.question_id))).all()]
 
     async def pending(self, limit: int, reclassify: bool = False, after_id: int = 0):
-        """递增读取候选，沿用Task1全池映射。参数：1至200条/reclassify/非负游标；返回：字符串ID列表；异常：输入/数据库/映射错误。"""
+        """在数据库分页并派生当前候选。
+
+        参数：limit为1至200；reclassify为True时包含已有分类；after_id为非负排他游标。
+        返回：list[dict]，含字符串question_id及脱敏问题/原轮元信息，按ID递增。
+        异常：参数ValueError、数据库错误或当前候选精确原轮映射歧义。
+        """
         if type(limit) is not int or not 1 <= limit <= 200 or type(after_id) is not int or after_id < 0:
             raise ValueError("主题分页参数非法")
-        pool = await read_pool(self.factory)
-        classified = set() if reclassify else {r["question_id"] for r in await self.classified_rows()}
-        return [r for r in pool if int(r["question_id"]) > after_id and r["question_id"] not in classified][:limit]
+        return await read_pool(self.factory, after_id=after_id, limit=limit, unclassified_only=not reclassify)
 
     async def save(self, rows: list[dict], *, lease):
         """核验整批后在同连接显式UTC短事务upsert。参数：最多200个唯一ID合法标签/主题lease；返回：saved计数；异常：输入/失锁/数据库/取消。"""

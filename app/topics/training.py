@@ -72,7 +72,14 @@ def _inputs(tokenizer, rows: list[dict], taxonomy: dict, device, max_length: int
 
 def _train_epoch(model, tokenizer, rows: list[dict], taxonomy: dict, optimizer, scaler, *,
                  device, micro_batch: int, accumulate: int, max_length: int) -> dict:
-    """执行一轮全参数训练并正确归一化尾组。参数：模型/数据/优化器/设备及批参数；返回：损失和步数；异常：非有限梯度/损失ValueError。"""
+    """执行一轮全参数训练并按尾组实际样本数归一化梯度。
+
+    参数：model为全部参数参与训练的分类模型；tokenizer为配套分词器；rows为非空规范样本列表；
+    taxonomy为权威标签表；optimizer为覆盖全部可训练参数的优化器；scaler为设备对应的梯度缩放器；
+    device为torch设备；micro_batch和accumulate为正整数；max_length为至少2的token上限。
+    返回：dict，loss为样本加权平均损失，optimizer_steps为本轮更新次数，train_samples为样本数。
+    异常：缺失或非有限梯度/损失抛ValueError；模型、分词或设备执行错误原样传播。
+    """
     import torch
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -146,7 +153,15 @@ def _test_reports(output_dir: Path, rows: list[dict], predictions: list[dict], t
 
 def train_model(dataset_dir: Path, base_dir: Path, output_dir: Path, *, epochs=8, micro_batch=2,
                 accumulate=8, max_length=128, seed=42) -> dict:
-    """训练并发布完整模型包。参数：冻结数据、本地来源模型、新输出目录及训练参数；返回：训练报告；异常：IO/校验/训练错误，取消保留状态。"""
+    """训练并发布带可核对摘要的完整全参数模型包。
+
+    参数：dataset_dir为已冻结且可校验的train/validation/test制品目录；base_dir为本地官方底座目录；
+    output_dir为尚不存在的新目录；epochs为正整数最大轮数，micro_batch为正整数微批量，
+    accumulate为正整数累计次数，max_length为至少2的token上限，seed为整数随机种子。
+    返回：dict训练报告，含配置、逐轮指标、最佳轮次/阈值、更新次数、来源及数据/模型摘要。
+    异常：输出目录已存在抛FileExistsError；配置/数据/模型非法抛ValueError；IO和训练错误传播，
+    训练阶段失败或取消时保留已生成状态与原件，不发布残缺模型包。
+    """
     dataset_dir, base_dir, output_dir = Path(dataset_dir), Path(base_dir), Path(output_dir)
     if output_dir.exists():
         raise FileExistsError("训练输出目录已存在")
