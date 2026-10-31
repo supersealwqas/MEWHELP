@@ -1,5 +1,7 @@
 # CH09 本机观测运行说明
 
+2026-10-31已完成本机收尾，最终验证、两轮真实分数与已知限制见 [CH09收尾记录](ch09-closeout.md)。最终只读清单是 `reports/ch09/acceptance/evidence-manifest-verified.json`，成功报告在 `final-read-verified/`；早期草稿和失败原件继续保留。
+
 追踪平台使用独立 Compose 项目 `mewhelp-langfuse`。客服业务继续使用现有 MySQL、Milvus 和模型配置；追踪数据仅导出到本机 Langfuse。
 
 ## 初始化与启动
@@ -130,7 +132,7 @@ uv run python -m app.evaluation.cli persist-run --artifact-dir reports/ch09/eval
 `tests/verify_ch09_live.py` 只读API、数据库和Langfuse，并重新核验清单指向的原件，不自动发问、反馈、发布或评估：
 
 ```bash
-uv run python tests/verify_ch09_live.py --base-url http://127.0.0.1:18000 --evidence-manifest reports/ch09/acceptance/evidence-manifest.json --output-dir reports/ch09/acceptance/final-read
+uv run python tests/verify_ch09_live.py --base-url http://127.0.0.1:18000 --evidence-manifest reports/ch09/acceptance/evidence-manifest-verified.json --output-dir reports/ch09/acceptance/final-read-new
 ```
 
 输出目录使用新名称，保留既有失败原件。返回1表示存在失败或缺项，不能写成整体验收通过。浏览器画面与答案语义由单独具名记录负责，脚本只检查其引用和文件摘要，不把自动验证冒称人工观察。
