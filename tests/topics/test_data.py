@@ -69,10 +69,24 @@ def test_redaction_keeps_size_and_negation():
     "收件人能不能改？", "收件人是可以不改吗？", "收件人能不改吗？",
     "收件人：可不可以改？", "收件人：需不需要换？", "姓名是可以不填的吗？",
     "地址是不用改了吗？", "收件人不改了", "收件人不能改", "联系人不想换",
+    "姓名是不是必填项？", "姓名不是必填项吗？", "收件人能否修改？", "地址是否不是必填项？",
+    "姓名是否可以不填？", "姓名是什么含义？", "地址能否改为公司地址？",
+    "姓名是否不正确？", "地址是否无效？", "地址能否正常使用？", "地址是否支持配送？",
 ])
 def test_explicit_field_questions_keep_business_meaning(question):
     """查询字段或人工客服不等于提供姓名，日期型号也不能被误删。参数：question无个人资料的业务问题；返回：None；异常：断言失败。"""
     assert clean_question(question) == question
+
+
+def test_confirmation_redaction_preserves_valid_long_input():
+    """确认问句脱敏后的4000字符输入不扩大且可重复清洗。参数：无；返回：None；异常：断言失败。"""
+    prefix = "姓名是否是张三？"
+    original = prefix + "问" * (4000 - len(prefix))
+    cleaned = clean_question(original)
+    assert "张三" not in cleaned
+    assert "姓名是否是" in cleaned
+    assert len(cleaned) <= 4000
+    assert clean_question(cleaned) == cleaned
 
 
 def test_manifest_detects_tampering_and_split_leakage(tmp_path):

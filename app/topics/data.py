@@ -14,38 +14,74 @@ from app.topics.taxonomy import label_names, load_taxonomy, taxonomy_digest, val
 SOURCES = {"application_demo", "application_history", "synthetic", "augmentation"}
 SPLITS = {"train": .8, "validation": .1, "test": .1}
 
+# 正反情态词和候选连接词只表达语法，不据此放行后续任意正文。
+_FIELD_MODAL = r"(?:可不可以|需不需要|应不应该|(?P<modal>可以|需要|应该|必须|支持|允许|能|可|该|应|得|须|要|想|需|会)(?:不(?P=modal))?)"
+_FIELD_CHOICE = r"(?:而不是|并不是|而非|并非|不是|不为|还是|或者|或是|或|和)"
+
+
+def _is_field_business_phrase(text: str) -> bool:
+    """完整识别不含具体个人值的字段动作或状态，禁止任意尾部正文。
+
+    参数：text为字段关系词之后或疑问词之后的完整短语，可含语气词。
+    返回：bool；仅完整匹配已定义业务语法时为True。异常：无业务异常。
+    """
+    relation = r"(?:(?:不是|不为|并非|是|为)\s*[:：]?\s*)?"
+    particles = r"[的了吗呢呀吧么过]*"
+    negative = r"(?:不用|无需|不必|没有|不|没|别)?"
+    action = re.fullmatch(relation + negative + r"(?:" + _FIELD_MODAL + r"\s*)?" + negative +
+                         r"(?:再|重新|再次|直接|继续|正常)?(?:修改|更改|变更|更换|填写|提供|确认|保留|删除|使用|配送|改|换|填|写|选|加|删)"
+                         r"(?:一下|个人|本人|姓名|名字|地址|电话|错|漏|好|掉|过|"
+                         r"(?:成|为)(?:公司|家庭|收货|联系|新)?(?:姓名|名字|地址|电话))?" + particles, text.strip())
+    description = re.fullmatch(relation + negative + r"(?:不变|没变|未变|未定|一样|不同|有误|错误|"
+                               r"正确|有效|无效|必填(?:项)?|选填(?:项)?|姓名|名字|电话|信息|方式|名单|意思|含义|"
+                               r"(?:公司|家庭|收货|联系|新)?地址)" + particles, text.strip())
+    return bool(action or description)
+
+
+def _mask_field_candidates(text: str) -> str:
+    """遮盖字段的全部候选值，保留否定/选择关系、标点和尾部语气词。
+
+    参数：text为已移除疑问及比较前缀的字段正文，可含多个候选和逗号续接。
+    返回：str；不增长长度且可重复清洗的正文。异常：无业务异常。
+    """
+    parts = re.split(r"([，,]?\s*" + _FIELD_CHOICE + r"\s*)", text)
+    for index in range(0, len(parts), 2):
+        part = parts[index]
+        if not part.strip() or _is_field_business_phrase(part):
+            continue
+        # 只保留确定的语气词；未知字段值整体遮盖，不按姓名首字或长度放行。
+        value = re.fullmatch(r"(\s*)(.*?)([吗呢呀吧么]*\s*)", part, flags=re.DOTALL)
+        leading, private, ending = value.groups()
+        placeholder = "[个人信息]"
+        masked = placeholder if len(private) >= len(placeholder) else "*" * len(private)
+        parts[index] = leading + masked + ending
+    return "".join(parts)
+
 
 def _mask_personal_field(match: re.Match) -> str:
-    """替换已匹配的个人字段值，保证脱敏不会扩大合法输入长度。
+    """分离字段的业务语法与具体值，避免确认问句携带个人资料。
 
-    参数：match为第一组含字段前缀、后续正文含非空字段值的正则匹配。
-    返回：str；业务问句/状态描述保持原样，个人长值使用[个人信息]，短值使用等长星号。
-    异常：仅接受本模块的匹配结构，不产生业务异常。
+    参数：match为第一组含字段前缀、后续正文含字段值的本模块正则匹配。
+    返回：str；完整业务短语保持原样，其余候选遮盖且不增加长度。
+    异常：仅接受本模块匹配结构，不产生业务异常。
     """
-    prefix = match.group(1)
-    value = match.group(0)[len(prefix):]
-    # 使用完整字段关系词与正文判句，避免字段提取把“是否”切成“是”+“否正确”。
-    content = value.lstrip()
-    syntax = re.sub(r"^(?:姓名|收件人|联系人|收货地址|联系地址|地址)", "", match.group(0)).lstrip().lstrip(":：").lstrip()
-    relation = r"(?:[是为]\s*[:：]?\s*)?"
-    particles = r"[的了吗呢呀吧么过]*"
-    question = re.match(relation + r"(?:是否|能否|可否|谁|哪里|在哪|哪个|哪些|什么|怎么|如何)", syntax)
-    # 否定可在情态词前后；正反问句重复同一情态词，兼容“可不可以”等缩写。
-    negative = r"(?:不用|无需|不必|没有|不|没|别)?"
-    modal = r"(?:可不可以|需不需要|应不应该|(?P<modal>可以|需要|应该|必须|能|可|该|应|得|须|要|想|需|会)(?:不(?P=modal))?)"
-    action = re.fullmatch(relation + negative + r"(?:" + modal + r"\s*)?" + negative +
-                         r"(?:再|重新|再次|直接|继续)?(?:修改|更改|变更|更换|填写|提供|确认|保留|删除|改|换|填|写|选|加|删)"
-                         r"(?:一下|个人|本人|姓名|名字|地址|电话|错|漏|好|掉|过)?" + particles, syntax)
-    description = re.fullmatch(relation + r"(?:不变|没变|未变|未定|一样|不同|有误|错误|"
-                               r"必填(?:项)?|姓名|名字|电话|信息|方式|名单)" + particles, syntax)
-    # 动作/状态要求整段匹配，疑问助词可组合；不能按“无/应/查”等单字放行真实字段。
-    if question or action or description:
-        return match.group(0)
+    original, prefix = match.group(0), match.group(1)
+    content = original[len(prefix):].lstrip()
     if prefix.rstrip().endswith("联系人") and re.fullmatch(r"工(?:客服|服务|处理|办理|审核|咨询)", content):
         # “联系人工客服”中的“联系人”只是动词和角色名重叠，不是姓名字段。
-        return match.group(0)
-    placeholder = "[个人信息]"
-    return prefix + (placeholder if len(value) >= len(placeholder) else "*" * len(value))
+        return original
+    syntax = re.sub(r"^(?:姓名|收件人|联系人|收货地址|联系地址|地址)", "", original).lstrip().lstrip(":：").lstrip()
+    question = re.match(r"(?:[是为]\s*[:：]?\s*)?(?:是不是|是否|能否|可否|谁|哪里|在哪|哪个|哪些|什么|怎么|如何)\s*", syntax)
+    remainder = syntax[question.end():] if question else syntax
+    if _is_field_business_phrase(syntax) or (question and (not remainder or _is_field_business_phrase(remainder))):
+        return original
+    # 疑问前缀仅界定值的位置；“是否是张三”仍需遮盖张三，不能整段返回。
+    predicate = re.match(r"(?:" + _FIELD_MODAL + r"\s*)?(?:不是|不为|并非|就是|还是|是|为|"
+                         r"(?:修改|更改|更换|填写|设置|改|换|填|写)(?:成|为))\s*[:：]?\s*", remainder)
+    if predicate:
+        remainder = remainder[predicate.end():]
+    retained = original[:len(original) - len(remainder)]
+    return retained + _mask_field_candidates(remainder)
 
 
 def clean_question(text: str) -> str:
@@ -62,9 +98,12 @@ def clean_question(text: str) -> str:
     text = re.sub(r"((?:订单号|订单编号|身份证号|证件号)\s*(?:[:：]|是|为)?\s*)[A-Za-z0-9-]{8,}", r"\1[编号]", text)
     # 省略“号”时只识别长订单标识，避免把订单日期2026-11-01当作编号。
     text = re.sub(r"(订单\s*(?:[:：]|是|为)?\s*)[A-Za-z0-9-]{12,}", r"\1[编号]", text)
-    # 字段识别与值判断分开；回调保留“地址是否能改/姓名是 什么意思”等业务问句。
-    text = re.sub(r"((?:姓名|收件人|联系人|收货地址|联系地址|地址)\s*(?:[:：]|[是为]\s*[:：]?)\s*)"
-                  r"[^，,；;。！？?!\n]+", _mask_personal_field, text)
+    # 确认/否定问句也进入字段解析；逗号后明确续接的候选不能遗漏第二个姓名。
+    text = re.sub(r"((?:姓名|收件人|联系人|收货地址|联系地址|地址)\s*"
+                  r"(?:[:：]|[是为]\s*[:：]?|(?=(?:不是|不为|并非|能否|可否|"
+                  r"(?:能|可|该|应|得|须|要|想|需|会)不|可不可以|需不需要|应不应该)))\s*)"
+                  r"[^，,；;。！？?!\n]+(?:[，,]\s*" + _FIELD_CHOICE + r"\s*[^，,；;。！？?!\n]+)*",
+                  _mask_personal_field, text)
     # 无分隔符的显式联系人仅接受紧邻标点的姓名，不把“联系人怎么修改”视作姓名。
     text = re.sub(r"((?:姓名|收件人|联系人)\s*)[\u4e00-\u9fffA-Za-z·]{2,4}(?=[，,；;。！？?!\n]|$)",
                   _mask_personal_field, text)
@@ -188,7 +227,18 @@ def _digest(path: Path) -> str:
 
 def _write_dataset_contents(directory: Path, parts: dict[str, list[dict]], taxonomy: dict, *, seed: int, metadata: dict | None = None,
                             pending_rows: list[dict] | None = None) -> dict:
-    """写临时制品并验证全部约束。参数：临时目录、三份、主题表、种子、元信息、待复核题；返回：清单；异常：IO/校验错误。"""
+    """写入隔离的临时数据制品并验证分组、标签、来源和文件摘要。
+
+    参数：directory为尚不存在的临时目录；parts包含train、validation、test三份样本列表，
+    各行须符合统一数据格式，跨份家族不得重复；taxonomy为已校验的权威主题表。
+    seed为实际切分所用的整数种子，只记录、不在此重新切分；metadata为可JSON序列化的
+    附加来源/审核说明，None按空字典记录；pending_rows为待复核行或None，只加入抽审包，
+    不进入训练/验证/测试文件及其样本计数。
+    返回：dict，包含制品版本、类目版本与摘要、seed、切分比例、文件摘要、总量、
+    各切分来源/标签计数、审核状态和metadata的清单。
+    异常：目录已存在抛FileExistsError，文件操作可抛OSError；结构/JSON数据非法可抛
+    KeyError或TypeError，分组、标签或摘要验证失败抛ValueError；调用者负责保留临时诊断。
+    """
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=False)
     all_rows = [row for split in SPLITS for row in parts[split]]
@@ -221,7 +271,18 @@ def _write_dataset_contents(directory: Path, parts: dict[str, list[dict]], taxon
 
 def write_dataset(directory: Path, parts: dict[str, list[dict]], taxonomy: dict, *, seed: int, metadata: dict | None = None,
                   pending_rows: list[dict] | None = None) -> dict:
-    """校验通过后原子发布不可覆盖制品。参数：目录、三份、主题表、种子、元信息、待复核题；返回：清单；异常：IO/校验错误，失败保留临时诊断。"""
+    """经临时目录完整校验后原子发布新制品，拒绝覆盖已有版本。
+
+    参数：directory为尚不存在的最终目录；parts为train、validation、test三份规范样本，
+    须满足标签、来源及跨份家族隔离约束；taxonomy为已校验的权威主题表。
+    seed为实际切分的整数种子，此处只记录；metadata为可JSON序列化的附加说明或None；
+    pending_rows为待复核行或None，仅写入抽审包，不计入三份数据及训练样本统计。
+    返回：dict，由临时制品校验产生的清单，包含版本/类目/文件摘要、seed、切分比例、
+    总量、来源/标签计数、审核状态及metadata；成功后全部文件位于directory。
+    异常：目标已存在或并发创建抛FileExistsError；IO、序列化和制品校验错误传播，
+    包括OSError、TypeError、KeyError、ValueError；失败保留临时目录及failure.json，
+    诊断写入本身也可能抛OSError。
+    """
     directory = Path(directory)
     if directory.exists():
         raise FileExistsError("制品目录已存在")

@@ -125,3 +125,35 @@ async def test_explicit_private_fields_never_reach_prelabel_payload(tmp_path, or
     assert private not in payload
     assert "张三" not in payload and "北京市朝阳区示例路1号" not in payload
     assert business in payload
+
+
+@pytest.mark.parametrize("original,private,structure", [
+    ("收货地址是否为北京市朝阳区示例路1号？", ["北京市朝阳区示例路1号"], ["收货地址是否为", "？"]),
+    ("姓名是否是张三？", ["张三"], ["姓名是否是", "？"]),
+    ("联系人是哪个张三？", ["张三"], ["联系人是哪个", "？"]),
+    ("地址是什么北京市朝阳区示例路1号吗？", ["北京市朝阳区示例路1号"], ["地址是什么", "吗？"]),
+    ("姓名是不是张三？", ["张三"], ["姓名是不是", "？"]),
+    ("姓名不是张三吗？", ["张三"], ["姓名不是", "吗？"]),
+    ("姓名是否不是张三？", ["张三"], ["姓名是否不是", "？"]),
+    ("收件人能否改为李四？", ["李四"], ["收件人能否改为", "？"]),
+    ("姓名是不是张三而不是李四？", ["张三", "李四"], ["姓名是不是", "而不是", "？"]),
+    ("姓名是不是张三，而不是李四？", ["张三", "李四"], ["姓名是不是", "，而不是", "？"]),
+    ("收货地址：是否为 北京市朝阳区示例路1号？XL不退，型号M200", ["北京市朝阳区示例路1号"], ["收货地址：是否为", "XL不退，型号M200"]),
+    ("姓名是否是 王五或赵六？", ["王五", "赵六"], ["姓名是否是", "或", "？"]),
+])
+async def test_personal_values_in_confirmation_questions_are_redacted(tmp_path, original, private, structure):
+    """确认问句里的全部个人值不得进入实际预标载荷。
+
+    参数：tmp_path为隔离目录；original为虚构确认问句；private为须遮盖的值；structure为须保留的业务片段。
+    返回：None；断言真实清洗及预标边界的行为。异常：断言失败或预标校验错误。
+    """
+    import json
+    from app.topics.data import clean_question
+    cleaned = clean_question(original)
+    model = Model([dict(index=0, text=cleaned, labels=["订单修改"], family="fictional", needs_review=False, review_reason="")])
+    await TopicLabeller(model, report_dir=tmp_path).label([original])
+    outbound = json.loads(model.messages[1].content)["items"][0]["text"]
+    assert all(value not in outbound for value in private)
+    assert all(fragment in outbound for fragment in structure)
+    assert len(cleaned) <= len(original)
+    assert clean_question(cleaned) == cleaned

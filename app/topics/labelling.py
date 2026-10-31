@@ -60,7 +60,22 @@ class TopicLabeller:
         self.max_attempts = max_attempts
 
     async def _call(self, payload: dict, count: int, expected_labels: list[str] | None = None) -> list[dict]:
-        """发起有界单工具请求并验证业务约束。参数：无主键payload、count数量、期望标签；返回：预标；异常：模型/校验错误。"""
+        """发起有界单工具请求，保存响应原件并校验主题预标结果。
+
+        参数：payload为调用方构造的模型业务载荷，不得包含业务原始主键或未脱敏原话；
+        task为label时，items包含从0开始的连续临时index及脱敏text；task为generate时，
+        包含labels目标主题、count数量、seed_tag批次标记和instructions生成要求。
+        count为1至64的整数，表示本次必须返回的条目数及连续序号范围。
+        expected_labels为None时不强制某组标签，空标签仅在明确待复核且附原因时允许；
+        非None时须为按权威顺序排列的非空合法标签列表，每条结果必须与该列表完全一致。
+        返回：list[dict]，按index排序，主要字段为index、脱敏text、规范labels、family、
+        needs_review、review_reason和固定为model_prelabel的annotation_status；条目已通过
+        结构、序号、标签及适用的纠错约束校验，仍是模型预标，不代表人工确认。
+        异常：数量、序号、标签或纠错约束不符抛ValueError；请求阶段的模型调用、结构化
+        解析错误及TimeoutError在有限重试耗尽后传播；工具绑定错误直接传播，原件写入
+        失败可抛OSError，任务取消向外传播；
+        内部payload结构错误可抛KeyError或TypeError，无结果返回时抛RuntimeError。
+        """
         if not 1 <= count <= 64:
             raise ValueError("每次请求数量须为1至64")
         system = "你是电商主题数据预标员。只标当前原话确实表达的诉求；否定、撤回和纯引用不算。修归保修维修、退归退换货；运费管钱、物流管货。其他排他且不表示不确定。语义不足返回labels=[]、needs_review=true和原因，禁止猜上下文。预标正文必须原样保留全部词语、分句和顺序，包括脱敏占位符；只允许发漂→发票、尺玛→尺码两个明确错字修正和英文逗号/分号/冒号/问号/感叹号/括号转对应中文标点；其他疑似错字在review_reason说明，不能自行改写。不要产生真实姓名、电话、邮箱、地址或订单号。生成时每个独立场景用不同family；同场景改写共享family；不引用或改写taxonomy正反例。主题权威表：" + json.dumps(self.taxonomy, ensure_ascii=False)
