@@ -158,6 +158,8 @@ async def test_explicit_private_fields_never_reach_prelabel_payload(tmp_path, or
     ("收货地址更改为北京市朝阳区示例路1号？", ["北京市朝阳区示例路1号"], ["收货地址更改为", "？"]),
     ("地址需要重新设置为北京市朝阳区示例路1号？", ["北京市朝阳区示例路1号"], ["地址需要重新设置为", "？"]),
     ("收件人可以改为李四，而不是王五吗？", ["李四", "王五"], ["收件人可以改为", "，而不是", "吗？"]),
+    ("姓名是张三，李四，怎么退货？", ["张三", "李四"], ["姓名是", "怎么退货？"]),
+    ("姓名是张三，李四，如何退款？", ["张三", "李四"], ["姓名是", "如何退款？"]),
 ])
 async def test_personal_values_in_confirmation_questions_are_redacted(tmp_path, original, private, structure):
     """确认问句里的全部个人值不得进入实际预标载荷。

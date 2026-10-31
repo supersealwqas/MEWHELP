@@ -57,13 +57,15 @@ def _is_followup_business_phrase(text: str) -> bool:
     参数：text为分隔符后的完整短分句，仅用于姓名候选续接的业务保护。
     返回：bool，完整符合诉求语法时为True。异常：无业务异常。
     """
-    question = re.match(_FIELD_QUESTION, text.strip())
-    if question and _is_field_business_phrase(text.strip()[question.end():]):
-        return True
-    return bool(re.fullmatch(
+    text = text.strip()
+    question = re.match(_FIELD_QUESTION, text)
+    if question:
+        text = text[question.end():]
+    # 疑问词只剥离一次，余下正文同时使用完整字段动作与业务诉求语法判断。
+    return _is_field_business_phrase(text) or bool(re.fullmatch(
         r"(?:我(?:想|要)?|能不能|可不可以|能否|可否|可以|不能|不可以|无法|不要|不想|能|可|要|想|不|没)?"
         r"(?:申请)?(?:退款|退货|换货|退换货|维修|保修|发货|到货|取消|退|换)[了吗呢呀吧么]*",
-        text.strip()))
+        text))
 
 
 def _mask_field_candidates(text: str) -> str:
