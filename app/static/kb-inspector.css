@@ -17,10 +17,11 @@
 .kb-weights label { display:grid; grid-template-columns:90px minmax(0,1fr) 42px; align-items:center; gap:8px; }
 .kb-weights input { padding:0; width:100%; accent-color:var(--primary); }
 .kb-card button:focus-visible,.kb-card input:focus-visible,.kb-card select:focus-visible,.kb-card textarea:focus-visible,.kb-card summary:focus-visible { outline:3px solid var(--primary); outline-offset:3px; }
-.kb-card .fw-table-wrap { overflow-x:auto; }
+.kb-card .fw-table-wrap { overflow:auto; max-height:480px; }
 .kb-table { min-width:470px; }
 .kb-table th,.kb-table td { vertical-align:top; text-align:left; font-size:12px; }
-.kb-table .kb-preview { max-width:210px; min-width:140px; white-space:pre-wrap; overflow-wrap:anywhere; }
+.kb-table th { position:sticky; top:0; z-index:1; background:var(--surface); }
+.kb-table .kb-preview { max-width:210px; min-width:140px; white-space:pre-wrap; overflow-wrap:anywhere; display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; max-height:4.95em; }
 .kb-id { border:0; background:transparent; color:var(--primary); text-decoration:underline; padding:0 4px; font-variant-numeric:tabular-nums; overflow-wrap:anywhere; }
 .kb-pager { margin:12px 0 20px; justify-content:space-between; }
 .kb-locate label { display:block; margin-bottom:6px; }

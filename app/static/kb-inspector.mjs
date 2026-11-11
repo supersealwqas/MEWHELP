@@ -76,7 +76,8 @@ function recordTable(target, rows, scoreColumns = []) {
     } else tr.appendChild(node('td', raw(item.mysql?.category)));
     const sync = node('td', item.sync?.label || '状态未取得');
     if (item.sync?.reasons?.length) sync.appendChild(node('small', item.sync.reasons.join('；')));
-    tr.appendChild(sync); tr.appendChild(node('td', raw(item.milvus?.text), 'kb-preview')); body.appendChild(tr);
+    const preview = node('td'); preview.appendChild(node('div', raw(item.milvus?.text), 'kb-preview'));
+    tr.appendChild(sync); tr.appendChild(preview); body.appendChild(tr);
   }
   table.appendChild(body); target.appendChild(table);
 }
