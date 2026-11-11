@@ -30,6 +30,18 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _remaining_seconds(deadline: float) -> float:
+    """检查整次预算，供实际业务等待使用，不向消费者发送任务挂载计时器。
+
+    参数：deadline为monotonic时钟上的整次结束期限。
+    返回：float，剩余正秒数；异常：TimeoutError，发送或业务执行已耗尽总预算。
+    """
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise TimeoutError("知识调试请求预算已耗尽")
+    return remaining
+
+
 class RetrievalDebugRequest(BaseModel):
     """调试专用参数，严格拒绝布尔数值、非有限权重及隐式整数转换。"""
 
@@ -183,10 +195,13 @@ class KnowledgeInspector:
                     reasons.append("记录编码版本与当前共享编码器不一致")
             except Exception:
                 reasons.append("MySQL原始记录字段不能形成合法知识快照")
-            if changed:
-                reasons.append("搜索指纹与回读指纹不同，读取期间记录已变化")
             status = "changed" if changed else "mismatch" if reasons else "ok"
             label = {"ok": "同步一致", "mismatch": "同步不一致", "changed": "读取期间已变化"}[status]
+        # 主状态保持稳定，但两库事实独立累积，SQL故障不能遮蔽Milvus变化或移除。
+        if milvus is None and status != "missing_milvus":
+            reasons.append("搜索后Milvus记录已被移除")
+        elif milvus is not None and changed:
+            reasons.append("搜索指纹与回读指纹不同，读取期间记录已变化")
         if reasons:
             snapshot = None
         raw_milvus = {**milvus, "id": str(identifier)} if milvus is not None else None
@@ -321,32 +336,43 @@ class KnowledgeInspector:
         异常：取消原样传播，其他故障转换安全终止事件；不关闭共享模型。
         """
         started, stage = monotonic(), "encoding" if request.strategy != "bm25" else "recall"
+        deadline = started + self.search.config.knowledge_timeout_seconds
         timings = {"encoding_ms": 0., "recall_ms": 0., "rerank_ms": 0.}
         try:
-            async with asyncio.timeout(self.search.config.knowledge_timeout_seconds):
-                vector = None
-                if request.strategy != "bm25":
-                    yield {"event": "status", "data": {"stage": "encoding", "message": "正在编码完整原问"}}
-                    before = monotonic()
+            vector = None
+            if request.strategy != "bm25":
+                yield {"event": "status", "data": {"stage": "encoding", "message": "正在编码完整原问"}}
+                before = monotonic()
+                async with asyncio.timeout(_remaining_seconds(deadline)):
                     vectors = await self.search.encoder.encode([request.query])
-                    if len(vectors) != 1 or not valid_dense_vector(vectors[0]):
-                        raise KnowledgeUnavailable("查询编码结果不合法")
-                    vector = vectors[0]
-                    timings["encoding_ms"] = (monotonic() - before) * 1000
-                stage, before = "recall", monotonic()
-                yield {"event": "status", "data": {"stage": "recall", "message": "正在读取原始召回与双库记录"}}
+                if len(vectors) != 1 or not valid_dense_vector(vectors[0]):
+                    raise KnowledgeUnavailable("查询编码结果不合法")
+                vector = vectors[0]
+                timings["encoding_ms"] = (monotonic() - before) * 1000
+            stage, before = "recall", monotonic()
+            _remaining_seconds(deadline)
+            yield {"event": "status", "data": {"stage": "recall", "message": "正在读取原始召回与双库记录"}}
+            # 每个实际await使用同一deadline的剩余预算；超时上下文不能跨越任何yield。
+            async with asyncio.timeout(_remaining_seconds(deadline)):
                 groups = await self._recall(request, vector)
+            async with asyncio.timeout(_remaining_seconds(deadline)):
                 recall, chunks, records = await self._recall_rows(groups, request)
-                timings["recall_ms"] = (monotonic() - before) * 1000
-                # 先发布完整召回，后续超长、模型故障或MySQL故障都不能抹掉这一阶段。
-                yield {"event": "recall", "data": recall}
-                stage, before = "rerank", monotonic()
-                if request.rerank:
-                    yield {"event": "status", "data": {"stage": "rerank", "message": "正在对全部合法候选评分"}}
+            timings["recall_ms"] = (monotonic() - before) * 1000
+            _remaining_seconds(deadline)
+            # 先发布完整召回，后续超长、模型故障或MySQL故障都不能抹掉这一阶段。
+            yield {"event": "recall", "data": recall}
+            stage, before = "rerank", monotonic()
+            # 慢发送已超过预算时，从yield返回后发送安全error，不取消仍连接的发送任务。
+            _remaining_seconds(deadline)
+            if request.rerank:
+                yield {"event": "status", "data": {"stage": "rerank", "message": "正在对全部合法候选评分"}}
+            async with asyncio.timeout(_remaining_seconds(deadline)):
                 ranked = await self._rerank(request, groups["fused"], chunks, records, mysql_failed=bool(recall["warnings"]))
-                timings["rerank_ms"] = (monotonic() - before) * 1000
-                yield {"event": "rerank", "data": ranked}
-                timings["total_ms"] = (monotonic() - started) * 1000
+            timings["rerank_ms"] = (monotonic() - before) * 1000
+            _remaining_seconds(deadline)
+            yield {"event": "rerank", "data": ranked}
+            _remaining_seconds(deadline)
+            timings["total_ms"] = (monotonic() - started) * 1000
             yield {"event": "complete", "data": {"query": request.query, "parameters": request.parameters(), "timings": timings}}
         except Exception as error:
             if stage == "rerank" and isinstance(error, ValueError):

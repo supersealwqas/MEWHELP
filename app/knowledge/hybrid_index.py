@@ -350,8 +350,9 @@ class MilvusHybridIndex(MilvusVectorIndex):
                     "is_primary": bool(field.get("is_primary", False)), "readable": readable,
                     "note": "" if readable else "由Milvus BM25函数自动生成，SDK不能读取原始稀疏向量"})
             functions = [{"name": function["name"], "type": FunctionType(int(function["type"])).name,
-                "input_fields": function.get("input_field_names", []),
-                "output_fields": function.get("output_field_names", [])} for function in schema.get("functions", [])]
+                # SDK可能返回protobuf RepeatedScalarContainer，公开响应必须转换为普通字符串列表。
+                "input_fields": list(function.get("input_field_names", [])),
+                "output_fields": list(function.get("output_field_names", []))} for function in schema.get("functions", [])]
             indexes = []
             for field in ("vector", "sparse_vector"):
                 for index_name in client.list_indexes(name, field_name=field, timeout=_RPC_TIMEOUT_SECONDS):

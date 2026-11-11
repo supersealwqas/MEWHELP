@@ -488,3 +488,120 @@ async def test_sse_send_failure_closes_stream_before_rerank() -> None:
     assert not reranker.calls and not encoder.closed
     with pytest.raises(StopAsyncIteration):
         await response.body_iterator.__anext__()
+
+
+@pytest.mark.parametrize("mysql_state", ["missing", "unavailable"])
+@pytest.mark.parametrize("milvus_state", ["changed", "removed"])
+async def test_combined_mysql_fault_preserves_milvus_change_reasons(mysql_state: str, milvus_state: str) -> None:
+    """SQL缺失/故障不能遮蔽同时发生的Milvus变化/移除。参数：两库状态；返回：None；异常：断言失败。"""
+    from app.knowledge.inspection import RetrievalDebugRequest
+    inspector, boundary, session, _, reranker = environment()
+    if mysql_state == "missing":
+        session.rows = [row for row in session.rows if row["id"] != 1]
+    else:
+        session.fail = True
+    original_get = boundary.get
+
+    def changed_get(*args, **kwargs):
+        """参数：Milvus回读载荷；返回：指纹已变化或已移除的行；异常：无。"""
+        rows = original_get(*args, **kwargs)
+        if milvus_state == "removed":
+            return [row for row in rows if row["id"] != 1]
+        next(row for row in rows if row["id"] == 1)["content_hash"] = "c" * 64
+        return rows
+
+    boundary.get = changed_get
+    events = [event async for event in inspector.debug(RetrievalDebugRequest(query="退款"))]
+    recall = next(event["data"] for event in events if event["event"] == "recall")
+    row = next(row for row in recall["fused"] if row["id"] == "1")
+    reasons = row["sync"]["reasons"]
+    assert any("MySQL" in reason for reason in reasons)
+    assert any(("变化" if milvus_state == "changed" else "移除") in reason for reason in reasons)
+    assert row["sync"]["status"] == ("missing_mysql" if mysql_state == "missing" else "mysql_unavailable")
+    assert all(chunk.id != 1 for call in reranker.calls for chunk in call[1])
+
+
+@pytest.mark.parametrize("paused_event", ["status", "recall", "rerank"])
+async def test_slow_connected_sse_send_emits_timeout_error(paused_event: str) -> None:
+    """发送仍连接但超出总预算时应安全error，不取消消费者或伪装complete。参数：延迟事件；返回：None；异常：断言失败。"""
+    from app.api.kb import retrieval_debug
+    from app.knowledge.inspection import RetrievalDebugRequest
+    inspector, _, _, encoder, reranker = environment()
+    inspector.search.config = inspector.search.config.model_copy(update={"knowledge_timeout_seconds": .08})
+    response = await retrieval_debug(RetrievalDebugRequest(query="退款"), inspector)
+    sent, delayed = [], False
+
+    async def send(message):
+        """参数：真实ASGI消息；返回：None，保持连接；异常：不主动断开或取消。"""
+        nonlocal delayed
+        if message["type"] != "http.response.body" or not message["body"]:
+            return
+        block = message["body"].decode("utf-8")
+        event = block.split("\n")[0].removeprefix("event: ")
+        sent.append((event, json.loads(block.split("data: ")[1])))
+        if event == paused_event and not delayed:
+            delayed = True
+            await asyncio.sleep(.12)
+
+    async def receive():
+        """参数：无；返回：无，ASGI2.4直接发送；异常：无主动取消。"""
+        await asyncio.sleep(10)
+
+    await response({"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send)
+    assert delayed and sent[-1][0] == "error"
+    assert sum(event == "error" for event, _ in sent) == 1 and all(event != "complete" for event, _ in sent)
+    if paused_event == "recall":
+        assert any(event == "recall" for event, _ in sent) and not reranker.calls
+    assert not encoder.closed
+
+
+async def test_real_cancel_during_sse_send_still_propagates() -> None:
+    """真正任务取消必须传播，不能转成超时error或继续重排。参数：无；返回：None；异常：断言失败。"""
+    from app.api.kb import retrieval_debug
+    from app.knowledge.inspection import RetrievalDebugRequest
+    inspector, _, _, encoder, reranker = environment()
+    response = await retrieval_debug(RetrievalDebugRequest(query="退款"), inspector)
+    sent = []
+
+    async def send(message):
+        """参数：ASGI消息；返回：None；异常：模拟实际请求任务取消。"""
+        if message["type"] == "http.response.body" and message["body"]:
+            sent.append(message["body"])
+            if b"event: recall" in message["body"]:
+                raise asyncio.CancelledError()
+
+    async def receive():
+        """参数：无；返回：无；异常：ASGI2.4不调用。"""
+        await asyncio.sleep(10)
+
+    with pytest.raises(asyncio.CancelledError):
+        await response({"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send)
+    assert not any(b"event: error" in body for body in sent) and not reranker.calls and not encoder.closed
+
+
+def protobuf_function_fields(boundary: InspectionClient) -> None:
+    """在SDK描述边界使用实际protobuf字符串容器。参数：SDK替身；返回：None；异常：SDK依赖错误。"""
+    from pymilvus.client.abstract import FunctionSchema
+    from pymilvus.grpc_gen import schema_pb2
+    function = schema_pb2.FunctionSchema(name="text_bm25", type=1, input_field_names=["text"], output_field_names=["sparse_vector"])
+    boundary.description["functions"] = [FunctionSchema(function).dict()]
+
+
+async def test_collection_adapter_serializes_real_protobuf_function_fields() -> None:
+    """SDK专用字符串容器不得泄漏给JSON消费者。参数：无；返回：None；异常：断言失败。"""
+    inspector, boundary, _, _, _ = environment()
+    protobuf_function_fields(boundary)
+    result = json.loads(json.dumps(await inspector.collection(), ensure_ascii=False, allow_nan=False))
+    assert result["functions"][0]["input_fields"] == ["text"]
+    assert result["functions"][0]["output_fields"] == ["sparse_vector"]
+
+
+def test_collection_http_serializes_real_protobuf_function_fields() -> None:
+    """真实protobuf容器必须通过HTTP公开结构编码，不能500。参数：无；返回：None；异常：断言失败。"""
+    app, _, boundary, _, _, _ = api_environment()
+    protobuf_function_fields(boundary)
+    with TestClient(app) as client:
+        response = client.get("/kb/collection")
+        assert response.status_code == 200
+        assert response.json()["functions"][0]["input_fields"] == ["text"]
+        assert response.json()["functions"][0]["output_fields"] == ["sparse_vector"]
