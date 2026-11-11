@@ -74,7 +74,7 @@ class VectorHit(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     id: int = Field(gt=0, description="命中的 MySQL/Milvus 共用主键")
-    score: float = Field(allow_inf_nan=False, description="余弦相似度分数")
+    score: float = Field(allow_inf_nan=False, description="当前召回方式的原始分数：Dense余弦、BM25、RRF或加权融合分数")
     content_hash: str = Field(min_length=64, max_length=64, description="向量的内容指纹")
     embedding_revision: str = Field(min_length=1, description="向量的编码规范标识")
 

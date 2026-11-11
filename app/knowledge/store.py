@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import date, datetime
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -159,6 +160,30 @@ class KnowledgeStore:
                 await session.scalars(select(KnowledgeChunk).where(KnowledgeChunk.id.in_(ids)))
             ).all()
             return [_snapshot_from_row(row) for row in rows]
+
+    async def get_raw_chunks(self, ids: list[int]) -> list[dict]:
+        """用一次只读select返回原始18字段，不改变共享快照的NULL映射。
+
+        参数：ids为知识主键列表，允许为空。
+        返回：list[dict]，所有原始字段；主键/前后指针为字符串，时间保留原值的ISO表示。
+        异常：数据库连接、查询或字段错误原样传播，由调试服务安全包装。
+        """
+        if not ids:
+            return []
+        columns = list(KnowledgeChunk.__table__.columns)
+        async with self._factory() as session:
+            rows = (await session.execute(select(*columns).where(KnowledgeChunk.id.in_(sorted(set(ids)))))).mappings().all()
+        result = []
+        for row in rows:
+            item = dict(row)
+            for key, value in item.items():
+                if value is not None and key in ("id", "prev_chunk_id", "next_chunk_id", "vector_id"):
+                    item[key] = str(value)
+                elif isinstance(value, (datetime, date)):
+                    # MySQL DATETIME无时区，保留原始墙钟时间，不能虚构UTC换算。
+                    item[key] = value.isoformat()
+            result.append(item)
+        return result
 
     async def pending_page(self, after_id: int, limit: int) -> list[ChunkSnapshot]:
         """按主键分页读取 active/pending 行。参数：游标与页大小；返回：快照；异常：ValueError。"""

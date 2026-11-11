@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import math
 from functools import partial
 from typing import Any
 
@@ -17,12 +18,13 @@ from app.config import Settings
 from app.knowledge.limits import VECTOR_DIM, valid_dense_vector
 from app.knowledge.schemas import VectorHit, VectorRecord
 from app.knowledge.vector import (
-    MilvusVectorIndex, VectorIndexUnavailable, _RPC_TIMEOUT_SECONDS, _run_rpc,
+    MAX_SIGNED_INT64, MilvusVectorIndex, VectorIndexUnavailable, _RPC_TIMEOUT_SECONDS, _run_rpc,
 )
 
 OWNERSHIP_MARKER = "mewhelp-ch04:hybrid:char-reference:v1"
 _TEXT_MAX_BYTES = 8192
 _SYNC_FIELDS = ["content_hash", "embedding_revision"]
+INSPECTION_FIELDS = ["id", "text", "content_hash", "embedding_revision"]
 
 
 def _limit(value: int) -> None:
@@ -282,3 +284,150 @@ class MilvusHybridIndex(MilvusVectorIndex):
         except Exception as error:
             raise VectorIndexUnavailable("Milvus 混合检索失败") from error
         return _parse_hits(results)
+
+    async def weighted_search(
+        self, vector: list[float], text: str, *, dense_weight: float = .5,
+        sparse_weight: float = .5, dense_limit: int = 50, sparse_limit: int = 50,
+        limit: int = 50,
+    ) -> list[VectorHit]:
+        """使用SDK归一化加权融合，仅发送正权重分支。
+
+        参数：vector合法Dense向量；text原问；权重有限0–1且合计正数；三项limit为正整数。
+        返回：list[VectorHit]，Milvus原生加权分数与指纹。
+        异常：ValueError，权重/文本/限额非法；VectorIndexUnavailable，向量或RPC失败。
+        """
+        from pymilvus import AnnSearchRequest, WeightedRanker
+
+        for value in (dense_limit, sparse_limit, limit):
+            _limit(value)
+        weights = (dense_weight, sparse_weight)
+        if any(type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1
+               for value in weights) or sum(weights) <= 0:
+            raise ValueError("加权检索权重必须有限、非负且合计大于零")
+        if not text.strip():
+            raise ValueError("加权查询不能为空")
+        if not valid_dense_vector(vector):
+            raise VectorIndexUnavailable("查询向量不合法")
+        requests, positive = [], []
+        for data, field, metric, size, weight in (
+            ([vector], "vector", "COSINE", dense_limit, dense_weight),
+            ([text], "sparse_vector", "BM25", sparse_limit, sparse_weight),
+        ):
+            # 零权重路不能进入融合，否则会产生无法解释的贡献。
+            if weight > 0:
+                requests.append(AnnSearchRequest(data, field, {"metric_type": metric}, size))
+                positive.append(weight / sum(weights))
+        try:
+            result = await _run_rpc(partial(self._require_client().hybrid_search,
+                self._config.milvus_collection, reqs=requests, ranker=WeightedRanker(*positive, norm_score=True),
+                limit=limit, output_fields=_SYNC_FIELDS, consistency_level="Strong", timeout=_RPC_TIMEOUT_SECONDS))
+        except Exception as error:
+            raise VectorIndexUnavailable("Milvus 加权检索失败") from error
+        return _parse_hits(result)
+
+    async def inspection_collection(self) -> dict:
+        """读取公开集合结构、索引及Strong实时数量。
+
+        参数：无，只使用启动已核验的共享client；返回：dict，公开结构与实际count。
+        异常：VectorIndexUnavailable，SDK故障或描述/数量不合法。
+        """
+        def read() -> dict:
+            """参数：无；返回：公开结构；异常：SDK或结构错误。"""
+            from pymilvus import DataType, FunctionType
+
+            client, name = self._require_client(), self._config.milvus_collection
+            schema = client.describe_collection(name, timeout=_RPC_TIMEOUT_SECONDS)
+            count = client.query(name, filter="", output_fields=["count(*)"],
+                                 consistency_level="Strong", timeout=_RPC_TIMEOUT_SECONDS)
+            value = count[0]["count(*)"]
+            if type(value) is not int or value < 0:
+                raise ValueError("集合数量非法")
+            fields = []
+            for field in schema["fields"]:
+                readable = field["name"] != "sparse_vector"
+                fields.append({"name": field["name"], "type": DataType(int(field["type"])).name,
+                    "description": field.get("description", ""), "params": field.get("params", {}),
+                    "is_primary": bool(field.get("is_primary", False)), "readable": readable,
+                    "note": "" if readable else "由Milvus BM25函数自动生成，SDK不能读取原始稀疏向量"})
+            functions = [{"name": function["name"], "type": FunctionType(int(function["type"])).name,
+                "input_fields": function.get("input_field_names", []),
+                "output_fields": function.get("output_field_names", [])} for function in schema.get("functions", [])]
+            indexes = []
+            for field in ("vector", "sparse_vector"):
+                for index_name in client.list_indexes(name, field_name=field, timeout=_RPC_TIMEOUT_SECONDS):
+                    info = client.describe_index(name, index_name, timeout=_RPC_TIMEOUT_SECONDS)
+                    indexes.append({"name": index_name, "field_name": field,
+                        "index_type": info.get("index_type"),
+                        "metric_type": info.get("metric_type") or info.get("params", {}).get("metric_type")})
+            dimension = next(int(field["params"]["dim"]) for field in fields if field["name"] == "vector")
+            return {"database": self._config.milvus_database, "collection": name, "row_count": value,
+                    "dense_dimension": dimension, "fields": fields, "functions": functions, "indexes": indexes}
+
+        try:
+            return await _run_rpc(read)
+        except Exception as error:
+            raise VectorIndexUnavailable("Milvus 集合读取暂时不可用") from error
+
+    async def inspection_page(self, after_id: int, limit: int) -> list[dict]:
+        """在同一有界同步调用内创建、读取并关闭短寿命游标。
+
+        参数：after_id为0–INT64最大值，limit为1–100；返回：排序后的limit+1条标量行。
+        异常：ValueError，游标/页大小非法；VectorIndexUnavailable，RPC或结果非法。
+        """
+        if type(after_id) is not int or not 0 <= after_id <= MAX_SIGNED_INT64:
+            raise ValueError("游标必须为非负signed INT64")
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("页大小必须为1–100整数")
+
+        def read() -> list[dict]:
+            """参数：无；返回：单批原始标量行；异常：SDK错误且finally关闭。"""
+            iterator = self._require_client().query_iterator(self._config.milvus_collection,
+                filter=f"id > {after_id}", output_fields=INSPECTION_FIELDS,
+                batch_size=limit + 1, limit=limit + 1, consistency_level="Strong", timeout=_RPC_TIMEOUT_SECONDS)
+            try:
+                return iterator.next()
+            finally:
+                iterator.close()
+
+        try:
+            rows = await _run_rpc(read)
+            self._validate_inspection_rows(rows)
+            if len(rows) > limit + 1 or any(row["id"] <= after_id for row in rows):
+                raise ValueError("分页返回超额或游标外行")
+            return sorted(rows, key=lambda row: row["id"])
+        except Exception as error:
+            raise VectorIndexUnavailable("Milvus 记录读取暂时不可用") from error
+
+    async def inspection_records(self, ids: list[int], *, vector: bool = False) -> list[dict]:
+        """批量读取明确的可读字段，仅详情请求Dense向量。
+
+        参数：ids为非重复正signed INT64列表；vector是否读取Dense向量。
+        返回：原始标量行，可选vector；空主键返回空列表。
+        异常：ValueError，主键非法；VectorIndexUnavailable，RPC或重复主键非法。
+        """
+        if not ids:
+            return []
+        if any(type(identifier) is not int or not 0 < identifier <= MAX_SIGNED_INT64 for identifier in ids):
+            raise ValueError("主键必须为正signed INT64")
+        try:
+            fields = [*INSPECTION_FIELDS, "vector"] if vector else INSPECTION_FIELDS
+            rows = await _run_rpc(partial(self._require_client().get, self._config.milvus_collection,
+                ids=sorted(set(ids)), output_fields=fields, consistency_level="Strong", timeout=_RPC_TIMEOUT_SECONDS))
+            self._validate_inspection_rows(rows)
+            if any(row["id"] not in ids for row in rows):
+                raise ValueError("回读返回范围外主键")
+            return rows
+        except Exception as error:
+            raise VectorIndexUnavailable("Milvus 记录回读暂时不可用") from error
+
+    @staticmethod
+    def _validate_inspection_rows(rows: list[dict]) -> None:
+        """核验可读行身份，阻止重复主键错配正文。
+
+        参数：rows SDK原始行；返回：None；异常：ValueError，身份/标量字段非法。
+        """
+        ids = [row["id"] for row in rows]
+        if len(ids) != len(set(ids)) or any(type(value) is not int or not 0 < value <= MAX_SIGNED_INT64 for value in ids):
+            raise ValueError("回读主键重复或非法")
+        if any(any(not isinstance(row.get(field), str) for field in INSPECTION_FIELDS[1:]) for row in rows):
+            raise ValueError("回读标量字段缺失")
