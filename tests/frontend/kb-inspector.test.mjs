@@ -11,13 +11,15 @@ const html = readFileSync(new URL('../../app/static/rag-eval.html', import.meta.
 
 /** 最小节点：保留事件、属性、后代和纯文本语义，不模拟布局。 */
 class Element extends EventTarget {
-  constructor(tag = 'div') { super(); Object.assign(this, { tagName: tag, children: [], attrs: {}, style: {}, dataset: {}, value: '', checked: false, disabled: false, hidden: false, _text: '' }); }
-  set textContent(value) { this._text = String(value); this.children = []; }
+  constructor(tag = 'div') { super(); Object.assign(this, { tagName: tag, children: [], attrs: {}, style: {}, dataset: {}, value: '', checked: false, disabled: false, hidden: false, open: false, scrollTop: 0, scrollLeft: 0, _text: '' }); }
+  set textContent(value) { if (this.ownerDocument?.activeElement && this.children.some(child => child.contains(this.ownerDocument.activeElement))) this.ownerDocument.activeElement = null; this._text = String(value); this.children = []; }
   get textContent() { return this._text + this.children.map(x => x.textContent).join(''); }
   set innerHTML(value) { throw new Error('正文禁止innerHTML'); }
   appendChild(node) { this.children.push(node); return node; }
   setAttribute(key, value) { this.attrs[key] = String(value); }
   click() { if (!this.disabled) this.dispatchEvent(new Event('click')); }
+  contains(other) { return this === other || this.children.some(child => child.contains(other)); }
+  focus(options) { this.ownerDocument.activeElement = this; this.lastFocusOptions = options; }
 }
 
 function deferred() { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
@@ -31,8 +33,8 @@ const frame = (event, data) => `event: ${event}\r\ndata: ${JSON.stringify(data)}
 function setup(hidden = false) {
   const nodes = new Map(), requests = [], timers = new Map(); let timerId = 0;
   const document = new EventTarget(); document.hidden = hidden;
-  document.getElementById = id => { if (!nodes.has(id)) nodes.set(id, new Element()); return nodes.get(id); };
-  document.createElement = tag => new Element(tag); document.createElementNS = (_, tag) => new Element(tag);
+  document.createElement = tag => Object.assign(new Element(tag), { ownerDocument: document }); document.createElementNS = (_, tag) => document.createElement(tag);
+  document.getElementById = id => { if (!nodes.has(id)) nodes.set(id, document.createElement('div')); return nodes.get(id); };
   const clipboard = { writeText: async value => { clipboard.last = value; } };
   const context = vm.createContext({ document, navigator: { clipboard }, TextDecoder, AbortController, console,
     fetch(path, options) { const pending = deferred(); requests.push({ path, options, ...pending }); return pending.promise; },
@@ -176,4 +178,35 @@ test('完整1024向量不裁剪，流中文UTF8字节跨chunk仍正确显示', a
 test('问题长度按Unicode字符匹配后端契约，不裁剪合法2000字符原问', async () => {
   const f = setup(); await initial(f); const query = '🐱'.repeat(2000); await submit(f, query); assert.equal(posts(f).length, 1); assert.equal(JSON.parse(posts(f)[0].options.body).query, query);
   const g = setup(); await initial(g); await submit(g, '🐱'.repeat(2001)); assert.equal(posts(g).length, 0); assert.match(g.node('kbSearchStatus').textContent, /1–2000/);
+});
+
+/** 根据已渲染详情取得数组展开、复制和滚动节点，不窥探生产模块内部状态。 */
+function vectorView(f) {
+  const all = descendants(f.node('kbDetail'));
+  return { fold: all.find(n => n.tagName === 'details'), summary: all.find(n => n.tagName === 'summary'), copy: all.find(n => n.tagName === 'button'), array: all.find(n => n.tagName === 'pre') };
+}
+const detail = (id = '1', vector = [3, 4, 0]) => ({ ...row(id), milvus: { ...row(id).milvus, vector } });
+async function selectDetail(f, id = '1', data = detail(id)) { f.node('kbId').value = id; f.node('kbLocate').click(); await f.respond(f.requests.length - 1, data); }
+
+test('五秒同ID无字段变化保留向量展开/滚动/焦点及列表按钮，成功时间仍刷新', async () => {
+  const f = setup(); await initial(f); await selectDetail(f); const original = vectorView(f), listButton = descendants(f.node('kbRows')).find(n => n.tagName === 'button');
+  original.fold.open = true; original.array.scrollTop = 80; original.array.scrollLeft = 12; original.copy.focus(); f.node('kbRows').scrollTop = 55;
+  await f.tick(5000); await f.respond(3, collection); await f.respond(4, { ...page(), rows: page().rows.map(item => ({ ...item, read_at: '列表行新时间' })), read_at: '列表新成功时间' }); await f.respond(5, { ...detail(), read_at: '详情新成功时间' });
+  const current = vectorView(f); assert.equal(current.fold, original.fold, '无实质变化不能重建details'); assert.equal(current.fold.open, true); assert.equal(current.array.scrollTop, 80); assert.equal(current.array.scrollLeft, 12); assert.equal(f.document.activeElement, original.copy); assert.equal(descendants(f.node('kbRows')).find(n => n.tagName === 'button'), listButton); assert.equal(f.node('kbRows').scrollTop, 55);
+  assert.match(f.node('kbDetailStatus').textContent, /详情新成功时间/); assert.match(f.node('kbListStatus').textContent, /列表新成功时间/); assert.equal(posts(f).length, 0);
+  listButton.focus(); await f.tick(5000); await f.respond(6, collection); await f.respond(7, page()); await f.respond(8, detail()); assert.equal(f.document.activeElement, listButton);
+});
+
+for (const focusTarget of ['copy', 'summary', 'array']) test(`同ID字段更新可见，保留数组展开位置和${focusTarget}焦点；换ID重置`, async () => {
+  const f = setup(); await initial(f); await selectDetail(f); const original = vectorView(f); original.fold.open = true; original.array.scrollTop = 60; original.array.scrollLeft = 9; original[focusTarget].focus();
+  await f.tick(5000); await f.respond(3, collection); await f.respond(4, { ...page(), rows: [row('99', '列表新正文')] }); const changed = detail('1', [0, 6, 8]); changed.mysql.answer = '详情新答案'; await f.respond(5, changed);
+  const current = vectorView(f); assert.notEqual(current.fold, original.fold); assert.equal(current.fold.open, true); assert.equal(current.array.scrollTop, 60); assert.equal(current.array.scrollLeft, 9); assert.equal(f.document.activeElement, current[focusTarget]); assert.equal(current[focusTarget].lastFocusOptions?.preventScroll, true); assert.match(f.node('kbDetail').textContent, /详情新答案/); assert.equal(current.array.textContent, '[0,6,8]'); assert.match(f.node('kbRows').textContent, /列表新正文/);
+  await selectDetail(f, '2', detail('2')); const next = vectorView(f); assert.equal(next.fold.open, false); assert.equal(next.array.scrollTop, 0); assert.equal(next.array.scrollLeft, 0); assert.notEqual(f.document.activeElement, next[focusTarget]);
+});
+
+test('字段变化时保留详情外其他控件焦点，故障与删除不关闭原数组或伪报新成功', async () => {
+  const f = setup(); await initial(f); await selectDetail(f); vectorView(f).fold.open = true; f.node('kbQuery').focus();
+  await f.tick(5000); await f.respond(3, collection); await f.respond(4, page()); await f.respond(5, { ...detail('1', [9, 0, 0]), read_at: '最后详情成功' }); assert.equal(f.document.activeElement, f.node('kbQuery')); assert.equal(vectorView(f).fold.open, true);
+  const current = vectorView(f); await f.tick(5000); await f.respond(6, collection); await f.respond(7, page()); await f.fail(8); assert.equal(vectorView(f).fold, current.fold); assert.match(f.node('kbDetailStatus').textContent, /读取失败.*最后详情成功/);
+  await f.tick(5000); await f.respond(9, collection); await f.respond(10, page()); await f.respond(11, { detail: '已删除' }, 404); assert.equal(vectorView(f).fold, current.fold); assert.equal(current.fold.open, true); assert.match(f.node('kbDetailStatus').textContent, /不可用.*最后详情成功/);
 });

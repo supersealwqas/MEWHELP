@@ -11,6 +11,7 @@ const resources = {
 };
 let submittedQuery = null, searchRevision = 0, searchFlight = false, pendingSearch = null, debounceTimer = null;
 let recallData = null, activeTab = 'fused', searchParameters = null, searchMeta = '', searchTiming = '';
+let renderedListContent = null, renderedDetailContent = null, detailView = null;
 
 /** 创建纯文本节点；参数为标签、文本、局部类名；返回DOM节点。 */
 function node(tag, text, cls) {
@@ -25,6 +26,12 @@ function raw(value) {
   if (value === null) return 'NULL';
   if (value === undefined) return '未取得';
   return typeof value === 'object' ? JSON.stringify(value) : String(value);
+}
+
+/** 比较记录的实质字段：读取时间单独更新，不用于触发原文DOM重建。 */
+function recordContent(record) {
+  const { read_at, ...fields } = record;
+  return fields;
 }
 
 /** 设置状态文字和错误配色；参数为控件ID、文字和错误标志。 */
@@ -127,7 +134,10 @@ async function loadList(automatic = false) {
     if (!data.rows.length && requestCursor !== '0') {
       cursor = '0'; cursorHistory = []; loadList(); return;
     }
-    recordTable(kb('kbRows'), data.rows); nextCursor = String(data.next_after_id); hasMore = data.has_more;
+    const content = JSON.stringify(data.rows.map(recordContent));
+    // 同页数据没有变化时保留原按钮和局部滚动位置，避免五秒刷新打断键盘操作。
+    if (content !== renderedListContent) { recordTable(kb('kbRows'), data.rows); renderedListContent = content; }
+    nextCursor = String(data.next_after_id); hasMore = data.has_more;
     state.success = data.read_at; pageControls();
     status('kbListStatus', `列表读取时间：${raw(state.success)}${data.warnings?.length ? `；${data.warnings.join('；')}` : ''}`, Boolean(data.warnings?.length));
   } catch {
@@ -151,18 +161,24 @@ function renderVector(target, vector) {
   const polyline = document.createElementNS('http://www.w3.org/2000/svg', 'polyline');
   polyline.setAttribute('points', vector.map((value, index) => `${index * 600 / Math.max(vector.length - 1, 1)},${max === min ? 60 : 110 - (value - min) * 100 / (max - min)}`).join(' '));
   svg.appendChild(polyline); target.appendChild(svg);
-  const fold = node('details', undefined, 'kb-fold'); fold.appendChild(node('summary', `展开完整 ${vector.length} 分量数组`));
+  const fold = node('details', undefined, 'kb-fold'), summary = node('summary', `展开完整 ${vector.length} 分量数组`); fold.appendChild(summary);
   const text = JSON.stringify(vector), copy = node('button', '复制完整向量', 'act ghost');
   copy.addEventListener('click', async () => {
     try { await navigator.clipboard.writeText(text); status('kbDetailStatus', '完整向量已复制。'); }
     catch { status('kbDetailStatus', '复制失败，请展开数组后手动选择复制。', true); }
   });
-  fold.appendChild(copy); fold.appendChild(node('pre', text, 'kb-vector-json')); target.appendChild(fold);
+  const array = node('pre', text, 'kb-vector-json'); array.setAttribute('tabindex', '0');
+  fold.appendChild(copy); fold.appendChild(array); target.appendChild(fold);
+  return { fold, summary, copy, array };
 }
 
 /** 展示记录的两库原始字段与同步原因；NULL不转换成业务默认值。 */
 function renderDetail(data) {
-  const box = kb('kbDetail'); box.textContent = '';
+  const box = kb('kbDetail'), sameRecord = detailView?.id === String(data.id), previous = sameRecord ? detailView.vector : null;
+  const active = document.activeElement;
+  const position = previous ? { open: previous.fold.open, top: previous.array.scrollTop, left: previous.array.scrollLeft } : null;
+  const boxPosition = sameRecord ? { top: box.scrollTop, left: box.scrollLeft } : { top: 0, left: 0 };
+  box.textContent = '';
   box.appendChild(node('h3', `知识 ID：${String(data.id)}`));
   box.appendChild(node('p', `${data.sync?.label || '同步状态未取得'}${data.sync?.reasons?.length ? `：${data.sync.reasons.join('；')}` : ''}`));
   for (const source of ['milvus', 'mysql']) {
@@ -170,7 +186,15 @@ function renderDetail(data) {
     if (data[source] === null || data[source] === undefined) box.appendChild(node('p', `${source === 'milvus' ? 'Milvus' : 'MySQL'}：${raw(data[source])}；${data.sync?.label || '请查看同步状态'}`));
     else rawFields(box, data[source]);
   }
-  renderVector(box, data.milvus?.vector);
+  const vector = renderVector(box, data.milvus?.vector);
+  detailView = { id: String(data.id), vector };
+  if (previous && vector) {
+    vector.fold.open = position.open;
+    // 字段发生变化时才重建；只恢复原数组相关焦点，不抢走其他控件的焦点。
+    for (const key of ['summary', 'copy', 'array']) if (active === previous[key]) vector[key].focus({ preventScroll: true });
+    vector.array.scrollTop = position.top; vector.array.scrollLeft = position.left;
+  }
+  box.scrollTop = boxPosition.top; box.scrollLeft = boxPosition.left;
 }
 
 /** 读取已选详情，保持独立编号与飞行状态；404标不可用并保留上次原文。 */
@@ -183,7 +207,9 @@ async function loadDetail(automatic = false) {
   try {
     const data = await getJson(`/kb/records/${id}`);
     if (revision !== state.revision) return;
-    renderDetail(data); state.success = data.read_at;
+    const content = JSON.stringify(recordContent(data));
+    if (content !== renderedDetailContent) { renderDetail(data); renderedDetailContent = content; }
+    state.success = data.read_at;
     status('kbDetailStatus', `详情 ID ${id}；读取时间：${raw(state.success)}`);
   } catch (error) {
     if (revision === state.revision) status('kbDetailStatus', error.status === 404 ? `知识 ${id} 当前不可用，可能已删除；上次成功：${raw(state.success)}` : `详情 ID ${id} 读取失败；上次成功：${raw(state.success)}`, true);
