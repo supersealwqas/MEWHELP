@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>RAG 评估 · 小喵客服</title>
 <link rel="stylesheet" href="/static/flywheel.css">
+<link rel="stylesheet" href="/static/kb-inspector.css">
 </head>
 <body>
 <div class="wrap">
@@ -14,6 +15,46 @@
   </header>
   <h1 class="eval-title">质量评估</h1>
   <div class="sub">查看知识改进前后的真实变化，也可继续查看四策略对照。</div>
+
+  <div class="kb-layout" id="kbInspector">
+    <section class="card kb-card" aria-labelledby="kbBrowseTitle">
+      <div class="fw-section-heading"><div><p class="fw-eyebrow">实时只读 · Milvus / MySQL</p><h2 id="kbBrowseTitle">当前知识库</h2></div></div>
+      <p class="hint">每 5 秒更新概况、当前页与已选详情。读取失败时保留上次数据；翻页是实时读取，知识变化可能影响后续页。</p>
+      <div class="actions"><button class="act ghost" id="kbRefresh">立即刷新</button><button class="act ghost" id="kbPause" aria-pressed="false">暂停自动刷新</button></div>
+      <p id="kbCollectionStatus" class="fw-muted" role="status">正在读取概况…</p>
+      <div id="kbOverview" class="kb-overview"></div>
+      <details class="kb-fold"><summary>字段、函数与索引结构</summary><div id="kbSchema"></div></details>
+      <p id="kbListStatus" class="fw-muted" role="status">正在读取知识…</p>
+      <div class="fw-table-wrap" id="kbRows"></div>
+      <div class="actions kb-pager"><button class="act ghost" id="kbPrev" disabled>上一页</button><span id="kbPage" class="fw-muted">第 1 页 · 每页 20 条</span><button class="act ghost" id="kbNext" disabled>下一页</button></div>
+      <div class="kb-locate"><label for="kbId">按知识 ID 查看</label><div class="actions"><input id="kbId" inputmode="numeric" autocomplete="off" placeholder="输入完整 ID"><button class="act ghost" id="kbLocate">查看详情</button></div></div>
+      <p id="kbDetailStatus" class="fw-muted" role="status">点击知识 ID 查看原始字段与向量。</p>
+      <div id="kbDetail"></div>
+    </section>
+
+    <section class="card kb-card" aria-labelledby="kbDebugTitle">
+      <div class="fw-section-heading"><div><p class="fw-eyebrow">原问检索 · 分阶段查看</p><h2 id="kbDebugTitle">检索调试</h2></div></div>
+      <p class="hint">召回是先找可能相关的知识，重排是再评分排序。输入问题后点击检索或按 Enter；Shift + Enter 换行。提交后调参会在 600 毫秒后刷新同一个已提交问题，新草稿仍需再次提交。</p>
+      <label for="kbQuery">检索问题</label><textarea id="kbQuery" rows="3" placeholder="输入要检索的完整问题"></textarea>
+      <div class="kb-controls">
+        <label for="kbStrategy">检索模式<select id="kbStrategy"><option value="weighted">加权融合（weighted）</option><option value="rrf">排名融合（RRF）</option><option value="dense">语义检索（Dense）</option><option value="bm25">关键词检索（BM25）</option></select></label>
+        <label for="kbDenseLimit">Dense 召回量<input id="kbDenseLimit" type="number" min="1" max="50" step="1" value="50"></label>
+        <label for="kbSparseLimit">BM25 召回量<input id="kbSparseLimit" type="number" min="1" max="50" step="1" value="50"></label>
+        <label for="kbCandidateLimit">融合候选量<input id="kbCandidateLimit" type="number" min="1" max="50" step="1" value="50"></label>
+        <label for="kbRerankTopK">重排 Top-K<input id="kbRerankTopK" type="number" min="1" max="50" step="1" value="10"></label>
+        <label class="kb-check" for="kbRerankEnabled"><input id="kbRerankEnabled" type="checkbox" checked>启用重排</label>
+      </div>
+      <fieldset class="kb-weights"><legend>加权比例（两路合计 1）</legend><label for="kbDenseWeight">Dense 权重<input id="kbDenseWeight" type="range" min="0" max="1" step="0.01" value="0.5"><output id="kbDenseWeightValue" for="kbDenseWeight">0.50</output></label><label for="kbSparseWeight">BM25 权重<input id="kbSparseWeight" type="range" min="0" max="1" step="0.01" value="0.5"><output id="kbSparseWeightValue" for="kbSparseWeight">0.50</output></label></fieldset>
+      <p class="hint">加权为 0 的一路仍作为对照显示，融合结果只列实际融合命中。各分数口径不同，不能直接相互比较。</p>
+      <div class="actions"><button class="act" id="kbSearch">检索</button></div>
+      <p id="kbSearchStatus" class="fw-muted" role="status">尚未提交检索。</p>
+      <div id="kbSearchMeta" class="kb-meta"></div>
+      <h3>初步召回</h3>
+      <div class="kb-tabs" aria-label="召回结果分组"><button class="act ghost" id="kbTabFused" aria-pressed="true">融合候选</button><button class="act ghost" id="kbTabDense" aria-pressed="false">Dense 对照</button><button class="act ghost" id="kbTabSparse" aria-pressed="false">BM25 对照</button></div>
+      <div id="kbRecall" class="fw-table-wrap"></div>
+      <h3>重排 Top-K</h3><div id="kbRerank" class="fw-table-wrap"></div>
+    </section>
+  </div>
 
   <section class="card production-card" aria-labelledby="production-title">
     <div class="fw-section-heading"><div><p class="fw-eyebrow">生产知识流程 · 历史记录</p><h2 id="production-title">知识改进后，回答变好了吗？</h2></div><div class="actions"><button class="act" id="productionRerun">运行生产评估</button><button class="act ghost" id="productionRefresh">刷新记录</button></div></div>
@@ -98,5 +139,6 @@
 </div>
 
 <script type="module" src="/static/rag-eval.mjs"></script>
+<script type="module" src="/static/kb-inspector.mjs"></script>
 </body>
 </html>

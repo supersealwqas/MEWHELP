@@ -1,0 +1,44 @@
+/* 知识检查器局部样式：复用工作台变量，保障原文、表格和窄屏控件可读。 */
+.kb-layout { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:16px; align-items:start; }
+.kb-card { min-width:0; }
+.kb-card .fw-section-heading { margin-bottom:12px; }
+.kb-card h2 { font-size:22px; }
+.kb-card h3 { font-size:16px; margin:22px 0 10px; }
+.kb-card button,.kb-card input,.kb-card select,.kb-card summary { min-height:44px; }
+.kb-card input,.kb-card select,.kb-card textarea { color:var(--ink); background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:9px 12px; max-width:100%; min-width:0; }
+.kb-card textarea { width:100%; display:block; margin:6px 0 16px; resize:vertical; }
+.kb-card label { font-size:13px; }
+.kb-controls { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
+.kb-controls label { display:flex; flex-direction:column; gap:5px; }
+.kb-controls .kb-check { flex-direction:row; align-items:center; min-height:44px; }
+.kb-check input { width:20px; min-height:20px; accent-color:var(--primary); }
+.kb-weights { margin:16px 0 10px; border:1px solid var(--border); border-radius:12px; padding:10px 12px; }
+.kb-weights legend { font-size:13px; color:var(--muted); }
+.kb-weights label { display:grid; grid-template-columns:90px minmax(0,1fr) 42px; align-items:center; gap:8px; }
+.kb-weights input { padding:0; width:100%; accent-color:var(--primary); }
+.kb-card button:focus-visible,.kb-card input:focus-visible,.kb-card select:focus-visible,.kb-card textarea:focus-visible,.kb-card summary:focus-visible { outline:3px solid var(--primary); outline-offset:3px; }
+.kb-card .fw-table-wrap { overflow-x:auto; }
+.kb-table { min-width:470px; }
+.kb-table th,.kb-table td { vertical-align:top; text-align:left; font-size:12px; }
+.kb-table .kb-preview { max-width:210px; min-width:140px; white-space:pre-wrap; overflow-wrap:anywhere; }
+.kb-id { border:0; background:transparent; color:var(--primary); text-decoration:underline; padding:0 4px; font-variant-numeric:tabular-nums; overflow-wrap:anywhere; }
+.kb-pager { margin:12px 0 20px; justify-content:space-between; }
+.kb-locate label { display:block; margin-bottom:6px; }
+.kb-locate input { flex:1 1 140px; width:100%; }
+.kb-overview { display:grid; gap:6px; background:var(--soft); padding:12px; border-radius:12px; overflow-wrap:anywhere; }
+.kb-fold { margin-top:14px; }
+.kb-card summary { cursor:pointer; padding:10px 0; }
+.kb-raw { display:grid; grid-template-columns:minmax(100px,0.4fr) minmax(0,1fr); margin:0; border-top:1px solid var(--border); }
+.kb-raw dt,.kb-raw dd { padding:8px 0; margin:0; border-bottom:1px solid var(--border); font-size:12px; overflow-wrap:anywhere; }
+.kb-raw dt { color:var(--muted); padding-right:8px; }
+.kb-raw dd { white-space:pre-wrap; }
+.kb-meta { font-size:12px; color:var(--muted); white-space:pre-wrap; overflow-wrap:anywhere; }
+.kb-vector { width:100%; height:130px; color:var(--primary); display:block; border:1px solid var(--border); border-radius:8px; background:var(--soft); }
+.kb-vector polyline { fill:none; stroke:currentColor; stroke-width:1.5; vector-effect:non-scaling-stroke; }
+.kb-vector-json { white-space:pre-wrap; overflow-wrap:anywhere; max-height:240px; overflow:auto; font-size:11px; }
+.kb-tabs { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:10px; }
+.kb-tabs button[aria-pressed="true"] { background:var(--soft); border-color:var(--primary); }
+.kb-error { color:var(--error); }
+.kb-card [aria-busy="true"] { opacity:.75; }
+@media (max-width:1000px) { .kb-layout { grid-template-columns:minmax(0,1fr); } }
+@media (max-width:480px) { .kb-card { padding:16px; } .kb-controls { grid-template-columns:minmax(0,1fr); } .kb-raw { grid-template-columns:minmax(0,1fr); } .kb-raw dt { border-bottom:0; padding-bottom:0; } .kb-weights label { grid-template-columns:80px minmax(0,1fr) 38px; } }
