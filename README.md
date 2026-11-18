@@ -24,21 +24,40 @@
 ## 🏗️ 系统架构
 
 ```mermaid
-flowchart LR
-    UI["同源 Web 工作台<br/>/ · /rag-eval · /flywheel · /topics"] -->|"HTTP / SSE"| API["FastAPI 网关<br/>SecurityHeaders + Routers"]
-    API --> SVC["ChatService<br/>会话互斥 · 取消 · 持久化"]
-    SVC --> GRAPH["LangGraph 根图<br/>理解/改写 → 意图路由 → Agent/RAG"]
+flowchart TB
+    UI["同源 Web 工作台<br/>/ 聊天 · /rag-eval · /flywheel · /topics"] -->|"HTTP / SSE · /api/chat/resume"| API["FastAPI + ChatService<br/>CSP 防护 · 会话互斥 · 三层历史组装"]
 
-    GRAPH -->|"知识检索 & 证据门控"| RAG["Hybrid RAG Pipeline<br/>Milvus (Dense+BM25) · BGE-M3 · Rerank"]
-    GRAPH -->|"业务 & 外部工具"| TOOLS["ToolExecutor + MCP Client<br/>超时 · 审计 · 权限校验"]
-    TOOLS --> MCP["MCP 微服务<br/>logistics :8101 / after_sales :8102"]
+    subgraph GRAPH["LangGraph 根图 (app/workflow/graph.py)"]
+        direction TB
+        R1["resolve_reference<br/>理解 / 消解 · 订单候选"] --> R2["classify_intent<br/>8 类意图 → 5 条路线"]
+        R2 --> R3["decide_tools<br/>先置工具决策"]
 
-    GRAPH <-->|"Checkpoint & 业务持久化"| DB["SQLite Checkpoints + MySQL"]
-    SVC -.->|"Trace / Cost"| LF["Langfuse Observability"]
+        R3 -->|"需调工具 / 追问 / business"| AGENT["main_agent 子图<br/>decision ↔ tools → answer"]
+        R3 -->|"knowledge"| RK["retrieve_knowledge"]
+        R3 -->|"order_policy"| FO["fetch_order<br/>归属核验 / interrupt 选单"] --> RP["retrieve_policy"]
+        R3 -->|"complaint / chitchat"| FIX["fixed_node<br/>固定安全出口"]
+
+        RK --> GATE["confidence_check<br/>证据门控"]
+        RP --> GATE
+        GATE -->|"通过 / 仅保留已核实业务事实"| AGENT
+        GATE -->|"证据不足"| FIX
+
+        AGENT -.->|"先行调工具后补政策核验"| RK
+        AGENT -.->|"先行调工具后补订单政策"| FO
+        AGENT --> LOG["log_turn<br/>落库 · 引用快照 · 飞轮信号"]
+        FIX --> LOG
+    end
+
+    API <-->|"SQLite Checkpoint 断点与恢复"| GRAPH
+    AGENT <-->|"内置工具 / 确认后写工单"| TOOLS["ToolExecutor + MCPToolManager<br/>权限热加载 · 审计 · logistics(:8101) / after_sales(:8102)"]
+    RK & RP -->|"BGE-M3 + BM25 + RRF + Rerank"| RAG["Milvus 混合检索"]
+    LOG -.->|"低置信度 / 点踩入池"| FW["问题池 → 人工审核 → 知识索引发布"]
+    GRAPH -.->|"Trace / Cost"| OBS["Langfuse 观测 · 离线/在线评估"]
 ```
 
----
+> 更细粒度的交互式节点说明（含全景、聊天主链路、三层上下文、知识检索、写入确认与飞轮闭环）见仓库内 [`docs/mewhelp-workflow.html`](docs/mewhelp-workflow.html)。
 
+---
 ## 📂 项目结构
 
 ```text
