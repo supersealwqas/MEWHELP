@@ -1,11 +1,15 @@
 # MewHelp
 
-喵购商城客服演示项目，当前已实现到 CH10。模型从动态工具清单选择订单、知识及 MCP 物流/售后查询；完整建单申请先显示预览，用户确认后才写入。CH09 提供本机观测、人工审核与评估，CH10 提供可选主题分类。后端使用 FastAPI、SQLAlchemy、MySQL 和 LangGraph，SQLite 保存可恢复的工作流；知识沿用 BGE-M3、Milvus 混合检索和本地重排。运行与验收见 [CH08 运行手册](docs/ch08-runbook.md)、[CH09 操作手册](docs/ch09-operations.md)和 [CH10 操作手册](docs/ch10-operations.md)。
+基于 **Python / FastAPI / LangGraph** 构建的电商智能客服系统，集成动态工具与 MCP 服务调用、Milvus + BGE-M3 混合检索、SQLite 工作流断点恢复、多轮对话上下文压缩以及人机确认工单流程。
 
-## 看两段实现
+## 核心能力与架构
 
-- **长对话压缩。** 按完整轮次压缩旧对话，将工具调用和返回结果配对处理。相关测试覆盖未返回结果的工具调用和超出长度预算的对话。[实现与测试](https://github.com/supersealwqas/MEWHELP/commit/8260eca0857b2e9703956427b53030dbd6f89bd5)
-- **工单确认。** 客服先给出建单预览，用户单独确认后执行。系统记录每次请求的处理结果，重复确认使用已有回执。[实现与测试](https://github.com/supersealwqas/MEWHELP/commit/90cc17aa349c1f07e216f6fe70b7831266f53489)
+- **工作流编排与状态恢复**：基于 LangGraph 管理客服对话状态与多阶段路由，通过 SQLite Checkpoint 持久化可恢复会话流，结合 MySQL 存储订单、工单、审计与评估数据。
+- **动态工具与 MCP 集成**：支持从工具清单动态路由订单、知识库及独立 MCP 物流/售后子服务（`mcp_servers.logistics`、`mcp_servers.after_sales`），具备单轮调用上限控制、超时限制与防重放审计。
+- **混合检索与证据门控**：基于 BGE-M3 + Milvus 实现 Dense + BM25 双路召回（RRF 融合）与本地重排，结合归一化阈值拒答机制与正文可点击证据引用 `[n]`。
+- **上下文预算与对话压缩**：内置双层 Token 预算管理，按完整交互轮次裁剪与后台分段摘要旧对话，并成对保留工具调用与工具结果。
+- **人机确认与幂等建单**：涉及创建工单等写操作时先生成原文预览与独立确认动作，用户确认后执行写入并按动作 ID 做幂等处理。
+- **可观测与离线/集成评估**：支持本机 Langfuse 链路追踪、人工审核问题池，以及覆盖离线单测、MySQL/Milvus 集成测试与固定评测集的完整验证链路（详见 [CH08 运行手册](docs/ch08-runbook.md)、[CH09 操作手册](docs/ch09-operations.md)、[CH10 操作手册](docs/ch10-operations.md)）。
 
 ## 启动与演示
 
