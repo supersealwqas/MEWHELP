@@ -152,10 +152,12 @@ async def verified_knowledge_tool(arguments: dict, context: ToolContext, scope: 
     """将两个知识工具接到同一证据和预算边界。
 
     参数：arguments 已由执行器校验的公开参数、context 可信身份、scope 当前知识资源。
-    返回：ToolResult，公开数据只说明检索状态，可信原文留在内部 verified_knowledge。
+    返回：ToolResult，无效模型关键词返回参数错误；检索状态公开，可信原文留在内部 verified_knowledge。
     异常：ValueError，缺可信资源；预算、检索错误及取消原样传播给统一执行器。
     """
+    from app.knowledge.query_rewrite import QueryRewriteError, validate_prepared_queries
     from app.workflow.policy_context import policy_query
+    from app.workflow.routing import knowledge_input_stop_reason
 
     runtime = scope.knowledge
     if runtime is None or runtime.search is None or runtime.settings is None or scope.binding is None:
@@ -165,6 +167,7 @@ async def verified_knowledge_tool(arguments: dict, context: ToolContext, scope: 
         raise ValueError("知识工具轮次不一致")
     policy = scope.binding.identity.name == "query_refund_policy"
     query = arguments["query" if policy else "keyword"]
+    prepared_queries = None if policy else [query]
     filters = {key: arguments[key] for key in ("category", "content_type") if arguments.get(key) is not None}
     if policy:
         filters["source_key"] = list(ORDER_POLICY_SOURCES)
@@ -173,9 +176,20 @@ async def verified_knowledge_tool(arguments: dict, context: ToolContext, scope: 
                 # 订单政策必须用核验后的商品与状态扩写，不能让前置申请抢占本轮唯一扩写额度。
                 return ToolResult.failed("ORDER_REQUIRED", "请先核实本次订单，再按已核实的商品和状态查询退款政策。")
             query = policy_query(state)
+    else:
+        source_query = state.get("resolved_query") or state["raw_query"]
+        # 超长输入仍交给原预算分支记责；仅模型关键词违反事实护栏时返回可纠正的参数错误。
+        if not any(knowledge_input_stop_reason(value) for value in (state["raw_query"], source_query, query)):
+            try:
+                validate_prepared_queries(source_query, [query])
+            except QueryRewriteError:
+                return ToolResult.failed("INVALID_ARGUMENTS", "检索关键词必须保留原问的型号和条件，不能新增事实；请按完整问题修正后重试。")
+        if not state.get("knowledge_cache"):
+            # 首检沿用已核验标准问；已有成功回执后允许模型用有效关键词补查。
+            prepared_queries = [state.get("standard_query") or source_query]
     outcome = await retrieve_verified_knowledge(state, runtime.ledger, search=runtime.search, settings=runtime.settings,
         query_expander=runtime.query_expander, query=query, policy=policy, filters=filters,
-        prepared_queries=None if policy else [query], chat=runtime.chat)
+        prepared_queries=prepared_queries, chat=runtime.chat)
     return ToolResult(ok=True, data={"evidence_count": len(outcome.evidence),
         "message": "已取得可核实知识证据" if outcome.gate["passed"] else "本轮没有达到可靠门槛的知识证据"},
         verified_knowledge=outcome)

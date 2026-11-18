@@ -11,7 +11,7 @@ from app.knowledge.confidence import unique_ranked
 from app.knowledge.rerank import RERANKER_REVISION
 from app.knowledge.snapshots import RetrievalCapture
 
-QUERY_PROTOCOL = "production-understanding:prepared-query:policy-expansion3:v1"
+QUERY_PROTOCOL = "production-understanding:prepared-query:measured-condition-preservation:policy-expansion3:v2"
 BUDGET_PROTOCOL = "complete-block-skip:context-evidence:window-div16:v1"
 # 线上引用修复与离线生成协议身份共用同一文案，避免实际提示漂移仍沿用旧比较键。
 KNOWLEDGE_CITATION_REPAIR_TEMPLATE = "上次知识回答引用校验未通过：{reason}。请基于同一完整证据重新提交唯一结果；不要使用未出现的编号。"

@@ -16,6 +16,11 @@ _INTENT_ROUTES = {
     "商品咨询": "knowledge", "退款退货": "order_policy", "其他": "business",
     "投诉": "complaint", "闲聊": "chitchat",
 }
+# 只识别带业务单位的数值条件；已由order_id单独保存的订单号仍可从检索问中省略。
+_MEASURED_CONDITION = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(天|日|年|月|周|小时|分钟|秒|元|块|毛|角|分|%|％|折|"
+    r"公斤|千克|kg|克|g|斤|毫升|ml|升|l|厘米|cm|毫米|mm|米|m|"
+    r"只|个|件|包(?!邮)|袋|盒|瓶|张|台|条|双|套|箱|份|次)", re.IGNORECASE)
 _FIXED_REPLIES = {
     "chitchat": "您好，我是小猫客服，可以帮您查询商品、订单、物流和售后问题。",
     "complaint": "抱歉给您带来不好的体验。您可以选择转人工或创建工单，也可以继续告诉我具体情况。",
@@ -169,7 +174,8 @@ def _understanding_outcome(raw_query: str, result: UnderstandingResult,
     """复用唯一来源校验并标记真实回退，区别正常空白恢复和来源失真。
 
     参数：raw_query原话、result严格候选、history_turns滑窗原始来源、summary_sources为实际注入摘要覆盖的原始来源。
-    返回：理解结果和是否因来源失真回退的布尔值，供模型边界准确记录失败。
+    返回：理解结果和是否因来源失真回退的布尔值，供模型边界准确记录失败；
+        合法概括遗漏带单位数值时仅将standard_query恢复为已核实完整问，不记作来源失真。
     异常：原问契约非法时抛字段校验错误。
     """
     fallback = original_understanding(raw_query)
@@ -217,6 +223,11 @@ def _understanding_outcome(raw_query: str, result: UnderstandingResult,
     except QueryRewriteError:
         return fallback, True
     normalized = result if result.needs_resolution else result.model_copy(update={"resolved_query": raw_query})
+    # 比较数字和单位的组合，避免型号中的30或20元掩盖丢失的30天、20天。
+    required_conditions = set(_MEASURED_CONDITION.findall(normalized.resolved_query))
+    if not required_conditions.issubset(set(_MEASURED_CONDITION.findall(normalized.standard_query))):
+        # 概括本身仍合法，但丢失金额/天数会让正确资料低分；复用已核实完整问，不重置订单或重调模型。
+        normalized = normalized.model_copy(update={"standard_query": normalized.resolved_query})
     return normalized, False
 
 

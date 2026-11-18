@@ -233,3 +233,51 @@ def test_excluded_prefixed_order_does_not_become_required_product_model():
     result = validate_understanding(raw, _understanding(resolved_query=raw,
         standard_query="查询订单9205物流", order_id="9205"), [])
     assert result.order_id == "9205" and result.standard_query == "查询订单9205物流"
+
+
+@pytest.mark.parametrize("raw, standard", [
+    ("收货20天了，企业账户想开电子专票，需要哪些资料，通过后多久能开出？", "企业账户开电子专票需要哪些资料，多久能开出"),
+    ("寄往新疆，实付39.9元，运费怎么算？", "寄往新疆的运费怎么算"),
+    ("MH-FD30收货30天还能退吗", "MH-FD30能退吗"),
+    ("实付20元，收货20天后能退吗", "实付20元还能退吗"),
+])
+def test_understanding_restores_query_when_measured_condition_is_omitted(raw, standard):
+    """标准问法漏掉天数或金额时仅恢复检索问，不把允许的概括记作协议错误。
+
+    参数：raw带业务条件的原问；standard漏掉条件的模型输出。
+    返回：None；异常：AssertionError，条件未恢复或错误触发整轮回退。
+    """
+    from app.workflow.routing import _understanding_outcome
+    result, failed = _understanding_outcome(raw, _understanding(
+        resolved_query=raw, standard_query=standard), [])
+    assert result.resolved_query == result.standard_query == raw
+    assert result.order_id is None and failed is False
+
+
+def test_measured_condition_restoration_preserves_resolved_order():
+    """补回数字条件时保留已核实订单和指代结果，不能重置为未知订单。
+
+    参数：无；返回：None；异常：AssertionError，可信订单或条件丢失。
+    """
+    from app.workflow.routing import _understanding_outcome
+    raw = "它收货20天了还能退吗"
+    resolved = "订单1001收货20天了还能退吗"
+    history = [{"messages": [{"role": "user", "content": "查询订单1001"}]}]
+    result, failed = _understanding_outcome(raw, _understanding(resolved_query=resolved,
+        standard_query="订单1001能退吗", needs_resolution=True, order_id="1001"), history)
+    assert result.standard_query == resolved
+    assert result.order_id == "1001" and result.needs_resolution is True and failed is False
+
+
+def test_order_before_free_shipping_is_not_a_measured_condition():
+    """包邮中的包不是计量单位，订单号仍允许从检索问省略。
+
+    参数：无；返回：None；异常：AssertionError，错误恢复订单号或丢失可信订单。
+    """
+    from app.workflow.routing import _understanding_outcome
+    raw = "订单1001包邮吗"
+    standard = "订单包邮条件是什么"
+    result, failed = _understanding_outcome(raw, _understanding(
+        resolved_query=raw, standard_query=standard, order_id="1001"), [])
+    assert result.standard_query == standard and result.order_id == "1001"
+    assert failed is False

@@ -299,7 +299,14 @@ def published_citations(answer: str, citations: list[EvidenceCitation]) -> list[
     return [item for item in citations if item.n in used]
 
 
-KNOWLEDGE_ANSWER_HANDOFF = "本轮业务查询阶段已经结束，不能再次申请或模拟业务查询、写入操作。现在只对query字段中的原始问题进行知识有用性自评，依据前面本轮完整工具事实，仅调用一次submit_knowledge_answer提交规定字段；不要输出自由文本。"
+KNOWLEDGE_ANSWER_HANDOFF = (
+    "本轮业务查询阶段已经结束，不能再次申请或模拟业务查询、写入操作。"
+    "现在只对query字段中的原始问题进行知识有用性自评，依据前面本轮完整工具事实，"
+    "仅调用一次submit_knowledge_answer提交规定字段；不要输出自由文本。"
+    "提交前逐条核对answer：只回答原问，优先保留直接对应条款的完整原句，不能省略实付、部分区域、每月等限定。"
+    "介绍配送运费或包邮规则时必须区分基础运费和附加运费，写明证据中的附加金额、具体地区范围及不参与包邮的例外；"
+    "若介绍会员或积分减免，同时保留适用费用、不抵扣范围和结转条件，不把不同条件或承担方合并成一般结论。"
+)
 
 
 def knowledge_answer_handoff(query: str) -> dict[str, str]:
@@ -321,6 +328,10 @@ KNOWLEDGE_ANSWER_RULES = """
 useful必须是JSON布尔。先检查最后用户问题需要的条件是否由本轮完整hits支持，历史FAQ、常识和之前助手文本不能补证据。
 证据不足时useful=false，answer为空、citation_numbers为空，不猜测费用、型号功能、退款到账等事实。
 可答时useful=true，用hits中的n作为角标[n]，citation_numbers只列答案实际引用编号，不得使用未出现的n。
+只回答当前问题直接需要的规则和必要例外，不把检索到的所有相关业务都列出来。
+通用邮费或包邮问题先说明配送基础运费、减免条件和偏远附加费；用户未问退换货、开票或积分累积时，不扩展这些业务。
+用户未提及会员或积分时，不额外介绍会员权益或积分抵扣；明确询问时，保留证据中的适用费用、次数、结转和除外条件。
+合并多条证据时，分别保留各自的条件和承担方；条件或承担方不同的条款必须分开，不能共用一句结论。
 角标只写本轮hits真实存在的n；本条证据编号最大到几就最多用到几，不要编造或顺延不存在的编号。多个证据可写成[1][4]或[1, 4]，两种都合法，但编号必须逐一存在于本轮hits。
 角标与citation_numbers只能使用每条证据的n字段。证据中的question、answer、section_path、category 等字段里的任何数字（如型号、期限、编号）都不是引用编号。
 所有实际hits都是证据，不因只引用两三条就忽略其余条件；区分退款处理/审核时限和到账时间，不承诺已退款或人工已接入。

@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "version": "f4bad0eb60dfc487210e9ffd4a9a2a469fee4331eef14e6e30012afaa58d6038",
+  "version": "068e911af6b7dbd7dcc70477a39a859593801f961c5d7ffc89da53fe27e7348d",
   "feature_protocol": "evidence-v2",
   "minimum_score": 0.9996993541717529,
   "count_cap": 1,
@@ -11,7 +11,7 @@
   },
   "threshold": 0.9244152307510376,
   "protocols": {
-    "query": "5dcd79849ab47deb2505c77833c5c013d739a81ce090c8b4e63c6cd06b4d1de6",
+    "query": "61bea288efa0f245a297c4cd5e6da540cbc7a7a12e462c9b474c2ba02510c2d4",
     "rerank": "bge-reranker-large:flagembedding-1.4.2:sigmoid:pair512:window64:v1:recall50:top10",
     "budget": "84e52828a90e918759804023e9873efa9c998e7012c54a2545b7cc647a76a12c"
   },
@@ -30,6 +30,179 @@
     "intent_model": "gemini-3.5-flash-lite",
     "policy_version": null,
     "scope": "single-turn-production-knowledge; no business execution or final-answer generation",
-    "corpus_version_after": "5440437906bbe5c54394e9e30ee5271d68f27f618b1224a7d227792d1fafead7"
+    "corpus_version_after": "5440437906bbe5c54394e9e30ee5271d68f27f618b1224a7d227792d1fafead7",
+    "parameter_origin": {
+      "version": "f4bad0eb60dfc487210e9ffd4a9a2a469fee4331eef14e6e30012afaa58d6038",
+      "content_sha256": "1e1b7e273bf58933bf5bc0440e48a9c7c999a1202bbf3fab77b2bdd5fd60ff0c",
+      "file_sha256": "241788126e5c3da92880825ac8cf4a6ad181a04f5457951b113665ca3ea74b26",
+      "protocols": {
+        "query": "5dcd79849ab47deb2505c77833c5c013d739a81ce090c8b4e63c6cd06b4d1de6",
+        "rerank": "bge-reranker-large:flagembedding-1.4.2:sigmoid:pair512:window64:v1:recall50:top10",
+        "budget": "84e52828a90e918759804023e9873efa9c998e7012c54a2545b7cc647a76a12c"
+      },
+      "parameters_unchanged": true
+    },
+    "query_protocol_validation": {
+      "mode": "frozen-parameter-protocol-migration",
+      "refit_performed": false,
+      "new_independent_validation": false,
+      "protocols": {
+        "query": "61bea288efa0f245a297c4cd5e6da540cbc7a7a12e462c9b474c2ba02510c2d4",
+        "rerank": "bge-reranker-large:flagembedding-1.4.2:sigmoid:pair512:window64:v1:recall50:top10",
+        "budget": "84e52828a90e918759804023e9873efa9c998e7012c54a2545b7cc647a76a12c"
+      },
+      "source_sha256": {
+        "app/workflow/prompts.py": "74a991185ffb51d99a90040bfa9159672dbb9948d237d8f3599adb59eac6b90f",
+        "app/workflow/routing.py": "2c063779528041b757a6878cc4b6a34d368aa5974b11fb542ce55c942b201a6e",
+        "app/knowledge/query_rewrite.py": "a232d8700e5b0210b34f4ff4abd7d3bff1ed52529079a7f9106d7806cabd68be",
+        "app/knowledge/pipeline.py": "b1184a5d5d8d5045872d615954e8b43ad2c41436d0d24e29af5e89c1905b390f",
+        "app/evaluation/production.py": "65bddc0e0a57dcb8cd37cfdb0114baef50e7f8efbb83ce9ad7df38d47a7ef178",
+        "app/config.py": "8f57e4000d0d2ecb1c41819c38d5c1f66713d29c4580f04cd12d137cbba02abc"
+      },
+      "models": {
+        "chat": "gemini-3.5-flash-lite",
+        "intent": "gemini-3.5-flash-lite"
+      },
+      "dataset_sha256": "84e66401ef54bd1ad78fc645a0237e396a7587434eb0adc818916cc869b6ecf3",
+      "corpus_version_before": "90a6237283efe23716c807cabb450bfc3dd181506d29a1636352de3791935a57",
+      "corpus_version_after": "90a6237283efe23716c807cabb450bfc3dd181506d29a1636352de3791935a57",
+      "historical_regression": {
+        "manifest": {
+          "path": "reports/shipping-query/20261104-regression-72-final/manifest.json",
+          "sha256": "d6ef7675c573964219e16edc05fcb1679818e44e3f88bb7e7f0942d99cb45c1b"
+        },
+        "summary": {
+          "path": "reports/shipping-query/20261104-regression-72-final/summary.json",
+          "sha256": "e52f771b437ff7c6b8e3f7addaa7d074df78a14f12106baf13210afee8286b06"
+        },
+        "results": {
+          "path": "reports/shipping-query/20261104-regression-72-final/results.jsonl",
+          "sha256": "a1ac986ad98baebc81b75d02fc744ce01a8eef8f11a6ac41b0cdbd7dc101c859"
+        },
+        "status": "completed_with_errors_or_version_drift",
+        "splits": {
+          "calibration": {
+            "completed_count": 24,
+            "usable_count": 23,
+            "error_count": 1,
+            "metrics": {
+              "positive_count": 18,
+              "negative_count": 5,
+              "false_pass": [
+                "ch04-c-17"
+              ],
+              "false_block": [
+                "ch04-c-09",
+                "ch04-c-10",
+                "ch04-c-11",
+                "ch04-c-15"
+              ],
+              "balanced_accuracy": 0.788888888888889
+            },
+            "errors": [
+              {
+                "id": "ch04-c-01",
+                "type": "RerankUnavailable",
+                "kind": "fault"
+              }
+            ]
+          },
+          "evaluation": {
+            "completed_count": 48,
+            "usable_count": 48,
+            "error_count": 0,
+            "metrics": {
+              "positive_count": 40,
+              "negative_count": 8,
+              "false_pass": [],
+              "false_block": [
+                "ch04-e-18",
+                "ch04-e-19",
+                "ch04-e-20",
+                "ch04-e-23",
+                "ch04-e-24",
+                "ch04-e-26",
+                "ch04-e-32",
+                "ch04-e-38"
+              ],
+              "balanced_accuracy": 0.9
+            },
+            "errors": []
+          }
+        },
+        "invariants": {
+          "protocols_unchanged": true,
+          "source_files_unchanged": true,
+          "policy_file_unchanged": true,
+          "dataset_unchanged": true,
+          "corpus_unchanged": true
+        }
+      },
+      "resource_retry": {
+        "summary": {
+          "path": "reports/shipping-query/20261104-regression-resource-retry/summary.json",
+          "sha256": "108e03569c0e6af0f3e94510352c3b74b3dc64bf0427085d5cf6586fae4733c3"
+        },
+        "result": {
+          "status": "completed",
+          "completed_count": 1,
+          "error": null,
+          "invariants": {
+            "same_source_as_original": true,
+            "same_protocols_as_original": true,
+            "same_corpus_as_original": true,
+            "same_old_policy_as_original": true,
+            "same_dataset_as_original": true,
+            "original_72_results_preserved": true
+          },
+          "gate": {
+            "schema_version": 2,
+            "policy_version": "f4bad0eb60dfc487210e9ffd4a9a2a469fee4331eef14e6e30012afaa58d6038",
+            "evidence_confidence": 0.9915215969085693,
+            "features": {
+              "top1_score": 0.9915215969085693,
+              "top2_score": 0.8485961556434631,
+              "score_gap": 0.1429254412651062,
+              "effective_count": 0,
+              "candidate_count": 15
+            },
+            "passed": true,
+            "max_score": 0.9915215969085693,
+            "threshold": 0.9244152307510376,
+            "low_confidence": null
+          },
+          "sufficient": true
+        }
+      },
+      "targeted_final_answers": {
+        "manifest": {
+          "path": "reports/shipping-query/20261104-targets-final/manifest.json",
+          "sha256": "6e599f5d5ca69b1aaac07dcfc3a16556a28e3364c1f6179413374ef217223b98"
+        },
+        "summary": {
+          "path": "reports/shipping-query/20261104-targets-final/summary.json",
+          "sha256": "2c9de2c522bac6316864c9dad04bfff7389ad3e1d3eb5919b4bac0a81ad4f369"
+        },
+        "results": {
+          "path": "reports/shipping-query/20261104-targets-final/results.jsonl",
+          "sha256": "78e6b9a2644a44bfddd465e8eb86f4f9397f95f3d64ce95ef358beefc1174ca9"
+        },
+        "result": {
+          "total": 10,
+          "passed": 10,
+          "failed_ids": []
+        }
+      },
+      "limitations": [
+        "旧24题和48题仅作历史检索回归，不是新的独立验收，也未验证72题最终答案。",
+        "本次只修复邮费通用短问及数字条件丢失；其余误拒答和c17证据不足放行仍存在。",
+        "原72题c01模型加载因Windows页面文件不足失败，单独补验不覆盖原失败。",
+        "保留真实校准参数，仅在新查询协议下验证兼容；不宣称重新校准或整体准确率提升。"
+      ],
+      "prompt_variation_diagnostic": {
+        "path": "reports/shipping-query/20261104-c11-c15-comparison.json",
+        "sha256": "e491abf14534e9613b1f724038716acf108b13d2ad67d7b6774468f6b4183e02"
+      }
+    }
   }
 }

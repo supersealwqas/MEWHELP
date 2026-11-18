@@ -1,6 +1,7 @@
 """CH08 知识工具必须走权威检索与证据门槛，外部普通结果不能成为政策引用。"""
 
 import json
+from copy import deepcopy
 
 import pytest
 
@@ -68,6 +69,38 @@ async def test_same_turn_evidence_is_reused(tmp_path):
     assert state["budget"]["model_calls"] == 5
     outcome = deps.chat.results[0][1].verified_knowledge
     assert state["budget"]["reserved_units"] > outcome.budget["reserved_units"]
+
+
+async def test_first_faq_uses_standard_query_then_keeps_valid_followup(tmp_path):
+    """首检被模型短关键词替代，或成功后的补检索不能使用有效新关键词时失败。
+
+    参数：tmp_path 隔离权限目录。返回：None。异常：工具调用或断言失败。
+    """
+    from app.schemas.tools import ToolContext
+    from app.tools.knowledge import verified_knowledge_tool
+
+    query, standard = "包邮条件是什么", "订单满多少包邮"
+    deps = dynamic_dependencies(tmp_path, decisions=[], ranked=[ranked()])
+    state = turn(query)
+    state.update(resolved_query=query, standard_query=standard)
+    scope, context = knowledge_scope(deps, state), ToolContext.model_validate(state["context"])
+    original_search, actual_queries = deps.search.retrieve, []
+
+    async def captured_search(search_query, **options):
+        """记录真实检索边界收到的问法，验证首检与后续补检索各自采用的来源。
+
+        参数：search_query 申请关键词、options 管线准备结果。返回：排名。异常：脚本或检索失败。
+        """
+        actual_queries.append(list(options["prepared_queries"]))
+        return await original_search(search_query, **options)
+
+    deps.search.retrieve = captured_search
+    first = await verified_knowledge_tool({"keyword": "包邮条件"}, context, scope)
+    assert first.ok and state["knowledge_cache"]
+    second = await verified_knowledge_tool({"keyword": "包邮门槛"}, context, scope)
+    assert second.ok
+    assert actual_queries == [[standard], ["包邮门槛"]]
+    assert deps.query_expander.calls == []
 
 
 async def test_order_fact_does_not_bypass_policy_gate(tmp_path):
@@ -154,6 +187,142 @@ async def test_weak_knowledge_tool_cannot_answer_policy(tmp_path):
     assert state["evidence"] == []
     assert weak_text not in json.dumps([item["messages"] for item in deps.model.inputs], ensure_ascii=False)
     assert deps.chat.finished[0]["citations"] == []
+
+
+async def test_invalid_faq_retry_preserves_low_confidence_result(tmp_path):
+    """低分成功后删型号的申请被当故障、进入检索或覆盖原知识不足结论时失败。
+
+    参数：tmp_path 隔离权限目录。返回：None。异常：图运行或断言失败。
+    """
+    from app.knowledge.answering import FIXED_KNOWLEDGE_REFUSAL
+    from app.knowledge.query_rewrite import validate_prepared_queries
+
+    query, valid_keyword = "MH-W99的运费补贴规则是什么", "MH-W99 运费补贴规则"
+    deps = dynamic_dependencies(tmp_path, intents=["商品咨询"], ranked=[ranked(0.1)], decisions=[
+        AgentDecision(kind="tools", tool_calls=[call("weak", "query_faq", keyword=valid_keyword)]),
+        AgentDecision(kind="tools", tool_calls=[call("invalid", "query_faq", keyword="运费补贴规则")]),
+        AgentDecision(kind="answer")])
+    original_search, attempted = deps.search.retrieve, []
+
+    async def validated_search(search_query, **options):
+        """在离线检索边界保留真实的已准备查询护栏及实际进入次数。
+
+        参数：search_query 检索关键词、options 原问及准备参数。返回：排名。异常：查询非法或脚本故障。
+        """
+        attempted.append(search_query)
+        validate_prepared_queries(options["source_query"], options["prepared_queries"])
+        return await original_search(search_query, **options)
+
+    deps.search.retrieve = validated_search
+    state = await build_workflow(deps, checkpointer=None).ainvoke(turn(query))
+    first, invalid = [result for _, result in deps.chat.results]
+    assert first.ok and first.verified_knowledge.gate["passed"] is False
+    assert invalid.error.code == "INVALID_ARGUMENTS" and invalid.error.category == "invalid_arguments"
+    assert invalid.verified_knowledge is None
+    # 根图出口仍可按完整原问补查；删型号的无效关键词不能进入检索。
+    assert attempted == [valid_keyword, query]
+    assert deps.search.calls == [("retrieve", valid_keyword), ("retrieve", query)]
+    assert state["knowledge_faults"] == {}
+    assert state["gate"] == first.verified_knowledge.gate
+    assert state["answer"] == FIXED_KNOWLEDGE_REFUSAL
+    assert deps.chat.finished[0]["low_confidence"].source == "retrieval_low_conf"
+
+
+def knowledge_scope(deps, state):
+    """构造直接核验本地知识工具所需的可信资源，外部依赖沿用既有离线替身。
+
+    参数：deps 测试依赖、state 原轮状态。返回：ToolExecutionScope。异常：工具登记缺失。
+    """
+    from app.core.model_budget import BudgetLedger
+    from app.tools.contracts import KnowledgeCallContext, ToolExecutionScope
+
+    definition = next(row for row in deps.registry.snapshot() if row.name == "query_faq")
+    return ToolExecutionScope(binding=definition.binding, knowledge=KnowledgeCallContext(
+        state=state, ledger=BudgetLedger.from_settings(deps.settings), search=deps.search,
+        settings=deps.settings, query_expander=deps.query_expander, chat=deps.chat))
+
+
+async def test_first_invalid_faq_query_has_no_retrieval_side_effects(tmp_path):
+    """首个删型号申请触发检索、写入知识故障或改动证据闸时失败。
+
+    参数：tmp_path 隔离权限目录。返回：None。异常：工具调用或断言失败。
+    """
+    from app.schemas.tools import ToolContext
+    from app.tools.knowledge import verified_knowledge_tool
+
+    query = "MH-W99的运费补贴规则是什么"
+    deps = dynamic_dependencies(tmp_path, decisions=[], ranked=[ranked(0.1)])
+    state = turn(query)
+    state.update(resolved_query=query, standard_query=query)
+    scope, before = knowledge_scope(deps, state), deepcopy(state)
+    result = await verified_knowledge_tool({"keyword": "运费补贴规则"},
+        ToolContext.model_validate(state["context"]), scope)
+    assert not result.ok and result.error is not None
+    assert result.error.code == "INVALID_ARGUMENTS" and result.error.category == "invalid_arguments"
+    assert "型号" in result.error.message and "条件" in result.error.message
+    assert deps.search.calls == [] and state == before
+    assert result.verified_knowledge is None
+
+
+@pytest.mark.parametrize("oversized_field", ["raw_query", "resolved_query", "keyword"])
+async def test_faq_input_precheck_preserves_existing_length_budget_failure(tmp_path, oversized_field):
+    """入口预检把原问、完整问或关键词超长的既有预算故障误归参数错时失败。
+
+    参数：tmp_path 隔离目录、oversized_field 超过2000字的字段。返回：None。异常：断言失败。
+    """
+    from app.core.memory import ContextBudgetExceeded
+    from app.schemas.tools import ToolContext
+    from app.tools.knowledge import verified_knowledge_tool
+    from app.workflow.policy_context import knowledge_failure_reason
+
+    query = "MH-W99的运费补贴规则是什么"
+    deps = dynamic_dependencies(tmp_path, decisions=[])
+    state = turn(query)
+    state.update(resolved_query=query, standard_query=query)
+    arguments = {"keyword": "运费补贴规则"}
+    if oversized_field == "keyword":
+        arguments["keyword"] = "长" * 2001
+    else:
+        state[oversized_field] = "长" * 2001
+    with pytest.raises(ContextBudgetExceeded):
+        await verified_knowledge_tool(arguments, ToolContext.model_validate(state["context"]), knowledge_scope(deps, state))
+    assert knowledge_failure_reason(state) == "budget_exceeded"
+    assert deps.search.calls == []
+
+
+@pytest.mark.parametrize("fault_kind", ["retrieval", "rewrite", "budget", "policy"])
+async def test_invalid_faq_query_does_not_hide_real_knowledge_fault(tmp_path, fault_kind):
+    """把真正检索、内部改写、预算或策略故障误归参数错，或被后续无效申请清除时失败。
+
+    参数：tmp_path 隔离目录、fault_kind 本次真实处理阶段的故障类别。返回：None。异常：断言失败。
+    """
+    from app.core.memory import ContextBudgetExceeded
+    from app.knowledge.confidence import EvidencePolicyUnavailable
+    from app.knowledge.query_rewrite import QueryRewriteError
+    from app.schemas.tools import ToolContext
+    from app.tools.knowledge import verified_knowledge_tool
+    from app.workflow.policy_context import knowledge_failure_reason
+
+    query = "MH-W99的运费补贴规则是什么"
+    deps = dynamic_dependencies(tmp_path, decisions=[])
+    state = turn(query)
+    state.update(resolved_query=query, standard_query=query)
+    scope, context = knowledge_scope(deps, state), ToolContext.model_validate(state["context"])
+    errors = {"retrieval": RuntimeError("真实检索失败"), "rewrite": QueryRewriteError("检索内部准备失败"),
+              "budget": ContextBudgetExceeded("真实证据预算不足"), "policy": EvidencePolicyUnavailable("真实策略缺失")}
+    if fault_kind == "policy":
+        # 走实际策略加载失败分支，不用输入校验异常冒充依赖故障。
+        deps.settings.evidence_policy_path = str(tmp_path / "missing-evidence-policy.json")
+    else:
+        deps.search.error = errors[fault_kind]
+    with pytest.raises(type(errors[fault_kind])):
+        await verified_knowledge_tool({"keyword": query}, context, scope)
+    faults = deepcopy(state["knowledge_faults"])
+    assert faults
+    invalid = await verified_knowledge_tool({"keyword": "运费补贴规则"}, context, scope)
+    assert invalid.error.category == "invalid_arguments"
+    assert state["knowledge_faults"] == faults
+    assert knowledge_failure_reason(state) == ("budget_exceeded" if fault_kind == "budget" else "retrieval_unavailable")
 
 
 async def test_external_text_never_becomes_policy_citation(tmp_path):
