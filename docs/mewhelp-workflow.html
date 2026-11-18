@@ -1,0 +1,596 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="MewHelp 当前项目的交互式全流程图：聊天、工具、知识检索、确认恢复与知识更新。">
+  <title>MewHelp · 项目全流程图</title>
+  <style>
+    :root{color-scheme:light;--bg:#f5f7f9;--paper:#fff;--ink:#20313d;--muted:#637480;--line:#dce3e8;--blue:#245dd1;--teal:#11786c;--orange:#a45c15;--rose:#b64e60;--slate:#536577}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.6 "Segoe UI","Microsoft YaHei",sans-serif}button,input{font:inherit}button{cursor:pointer}button:disabled{cursor:default;opacity:.45}button,a,input{outline-offset:4px}button:focus-visible,a:focus-visible,input:focus-visible{outline:3px solid #4579e5}button{touch-action:manipulation}a{color:var(--blue)}
+    .shell{max-width:1580px;margin:auto;padding:0 40px}.masthead{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:25px 0;border-bottom:1px solid var(--line)}.brand{display:flex;align-items:center;gap:11px;font-size:19px;font-weight:750;letter-spacing:-.5px}.brand svg{width:33px;height:33px;stroke:var(--ink);fill:none;stroke-width:1.6}.brand span{color:var(--muted);font-size:12px;font-weight:500;letter-spacing:1.7px;border-left:1px solid var(--line);margin-left:8px;padding-left:18px}.edition{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:8px}.edition i{width:7px;height:7px;border-radius:50%;background:var(--teal)}
+    .intro{display:flex;align-items:flex-end;justify-content:space-between;gap:28px;padding:34px 0 28px}.eyebrow{font:600 11px/1.5 "Segoe UI",sans-serif;letter-spacing:2px;color:var(--teal);margin:0 0 10px}h1{font-size:32px;font-weight:650;letter-spacing:-.8px;line-height:1.35;margin:0 0 10px}.intro p:last-child{color:var(--muted);margin:0}.intro-note{font-size:12px;color:var(--muted);text-align:right;white-space:nowrap}.intro-note strong{font-size:24px;color:var(--ink);font-weight:550;margin-right:5px}.intro-note span{display:block}
+    .nav-row{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:19px}.tabs{display:flex;gap:5px;flex-wrap:wrap;align-items:center}.tab{display:flex;align-items:center;gap:8px;background:transparent;color:var(--muted);border:1px solid transparent;border-radius:7px;min-height:44px;padding:8px 13px;font-size:14px;white-space:nowrap}.tab:hover{background:#eaf0f5}.tab[aria-current=page]{background:#fff;border-color:var(--line);color:var(--ink);box-shadow:0 2px 4px #20313d05}.crumb-separator{color:#9aa8b2;font-size:12px}.nav-tools{display:flex;gap:10px;align-items:center}#flow-select{max-width:190px;background:#fff;border:1px solid var(--line);border-radius:7px;padding:0 9px;color:var(--muted);font:12px "Microsoft YaHei",sans-serif;height:42px}.search{display:flex;align-items:center;gap:8px;padding:0 12px;background:#fff;border:1px solid var(--line);border-radius:7px;min-width:190px;height:42px}.search svg{width:17px;height:17px;fill:none;stroke:var(--muted);stroke-width:1.8}.search input{width:100%;border:0;background:transparent;min-width:0;color:var(--ink);font-size:13px}.search input:focus{outline:0}.search:focus-within{outline:2px solid var(--blue);outline-offset:2px}.node[data-subflow] .node-arrow{font-size:10px;font-weight:650}.node[data-subflow]{border-top-color:var(--tone)}
+    .workspace{display:grid;grid-template-columns:minmax(0,1fr) 290px;gap:20px;align-items:start}.map-panel{background:var(--paper);border:1px solid var(--line);border-radius:12px;overflow:hidden}.map-heading{padding:20px 22px 14px;display:flex;align-items:center;justify-content:space-between;gap:12px}.map-title{font-weight:650;font-size:17px;margin:0}.map-subtitle{font-size:12px;color:var(--muted);margin:3px 0 0}.view-toggle{display:flex;gap:2px;background:#f0f3f6;padding:3px;border-radius:6px;flex-shrink:0}.view-toggle button{border:0;background:transparent;color:var(--muted);border-radius:4px;padding:5px 11px;min-height:34px;font-size:12px}.view-toggle button[aria-pressed=true]{background:#fff;color:var(--ink);box-shadow:0 1px 3px #20313d15}
+    .hint{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:0 22px 12px;font-size:12px;color:var(--muted)}#search-status{color:var(--teal);min-height:19px}.viewport{position:relative;height:626px;overflow:auto;overscroll-behavior:contain;background-color:#fcfdfe;background-image:radial-gradient(#dbe2e9 .8px,transparent .8px);background-size:18px 18px;border-top:1px solid #edf0f3;border-bottom:1px solid #edf0f3}.stage-size{position:relative;margin:18px auto}.stage{position:relative;transform-origin:top left}.connections{position:absolute;inset:0;overflow:visible;pointer-events:none}.edge{fill:none;stroke:#96a7b5;stroke-width:1.6}.edge.dashed{stroke-dasharray:5 5;stroke:#75998f}.edge.active{stroke:var(--blue);stroke-width:2.5}.edge.dim{opacity:.18}.edge-label{font:12px "Microsoft YaHei",sans-serif;fill:#526773;stroke:#fcfdfe;stroke-width:5px;paint-order:stroke;stroke-linejoin:round}.edge-label.dim{opacity:.25}.node{position:absolute;text-align:left;background:#fff;border:1px solid #d7e0e7;border-left:3px solid var(--tone);border-radius:8px;box-shadow:0 3px 6px #20313d05;color:var(--ink);padding:12px 13px;display:flex;flex-direction:column;justify-content:center;transition:box-shadow .15s,border-color .15s,opacity .15s;min-height:84px}.node:hover{border-color:var(--tone);box-shadow:0 5px 16px #20313d12}.node[aria-pressed=true]{outline:2px solid var(--tone);outline-offset:3px;background:var(--tint)}.node.dim{opacity:.25}.node .node-tag{font-size:10px;line-height:1.2;color:var(--tone);letter-spacing:.4px;margin-bottom:5px}.node strong{font-size:15px;font-weight:650;line-height:1.45}.node small{font-size:11px;color:var(--muted);line-height:1.4;margin-top:3px}.node .node-arrow{position:absolute;right:12px;top:12px;color:var(--tone);font-size:12px}.blue{--tone:var(--blue);--tint:#f0f5ff}.teal{--tone:var(--teal);--tint:#f0f8f5}.orange{--tone:var(--orange);--tint:#fff8ef}.rose{--tone:var(--rose);--tint:#fff4f5}.slate{--tone:var(--slate);--tint:#f2f5f8}
+    .map-bottom{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:11px 16px;flex-wrap:wrap}.legend{display:flex;gap:14px;flex-wrap:wrap;color:var(--muted);font-size:11px}.legend span{display:flex;align-items:center;gap:5px}.legend i{width:7px;height:7px;border-radius:2px;background:var(--tone)}.zoom{display:flex;align-items:center;gap:4px}.zoom button,.print-button{border:1px solid var(--line);background:#fff;color:var(--ink);border-radius:5px;min-height:36px;min-width:36px;font-size:13px;padding:4px 10px}.zoom button:hover,.print-button:hover{background:#f2f5f8}#zoom-level{font-size:11px;min-width:43px;text-align:center;color:var(--muted)}
+    .detail{border:1px solid var(--line);background:var(--paper);border-radius:12px;overflow:hidden;position:sticky;top:20px}.detail-top{padding:22px 22px 18px;border-bottom:1px solid var(--line);background:var(--tint)}.detail-kicker{font-size:10px;color:var(--tone);font-weight:650;letter-spacing:1.5px;margin-bottom:12px}.detail h2{font-size:21px;line-height:1.5;margin:0 0 8px;font-weight:650}.detail-top p{font-size:13px;color:#506474;margin:0}.detail-body{padding:0 22px 22px}.detail-section{padding-top:18px}.detail-section h3{font-size:11px;color:var(--muted);font-weight:500;letter-spacing:.7px;margin:0 0 6px}.detail-section p{font-size:13px;margin:0;overflow-wrap:anywhere}.source{display:block;font:11px/1.7 Consolas,"Microsoft YaHei",monospace;overflow-wrap:anywhere;background:#f3f6f8;border-radius:4px;padding:9px 10px;color:#425969}.detail-related{display:flex;flex-wrap:wrap;gap:6px}.detail-related button{border:1px solid var(--line);background:#fff;border-radius:5px;padding:6px 9px;color:var(--blue);font-size:12px;min-height:34px}.detail-related button:hover{background:#f2f6ff}.detail-jump{width:100%;text-align:left;color:var(--teal);border:0;background:#edf7f3;border-radius:6px;padding:10px 12px;font-size:13px;margin-top:18px;min-height:44px}
+    .reading-note{margin:21px 0 0;border-left:2px solid #98b7ac;padding-left:12px;font-size:12px;color:var(--muted);line-height:1.8}.reading-note strong{font-weight:600;color:var(--ink)}.footnotes{display:grid;grid-template-columns:repeat(3,1fr);gap:28px;padding:30px 0 25px;margin-top:6px}.footnotes h3{font-size:12px;margin:0 0 6px;display:flex;gap:8px;align-items:center}.footnotes h3 span{font:10px Consolas,monospace;color:var(--teal)}.footnotes p{color:var(--muted);font-size:12px;line-height:1.8;margin:0}.footer{border-top:1px solid var(--line);padding:17px 0 25px;display:flex;justify-content:space-between;gap:12px;font-size:11px;color:var(--muted)}.footer a{text-decoration:none}.footer a:hover{text-decoration:underline}.noscript{background:#fff4e6;padding:24px;margin:20px 0}.print-area{display:none}
+    .viewport.list-mode{height:auto;max-height:720px;background:#fafbfd;padding:18px}.list-mode .stage-size{width:100%!important;height:auto!important;margin:0}.list-mode .stage{width:100%!important;height:auto!important;transform:none!important;display:grid;gap:12px}.list-mode .connections{display:none}.list-mode .node{position:relative!important;left:auto!important;top:auto!important;width:100%!important;height:auto!important;min-height:94px}.list-mode .node small{font-size:12px}.list-mode .node.dim{display:none}
+    @media(min-width:1500px){.viewport{height:680px}}
+    @media(max-width:1180px){.shell{padding:0 24px}.workspace{grid-template-columns:minmax(0,1fr) 260px;gap:14px}.tab{padding:8px 9px}.search{min-width:185px;width:210px}.intro-note{display:none}.detail-body,.detail-top{padding-left:17px;padding-right:17px}}
+    @media(max-width:900px){.workspace{grid-template-columns:1fr}.detail{position:static}.detail-body{display:grid;grid-template-columns:1fr 1fr;gap:0 24px}.detail-top{padding:18px}.detail h2{font-size:19px}.detail-kicker{margin-bottom:6px}.detail-jump{align-self:end}.nav-row{display:block}.nav-tools{margin-top:12px}.search{width:100%;height:44px;min-width:0}#flow-select{max-width:145px;height:44px}.viewport{height:600px}.footnotes{gap:18px}.intro{padding:25px 0 20px}h1{font-size:28px}}
+    @media(max-width:560px){.shell{padding:0 16px}.masthead{padding:18px 0}.brand span{display:none}.brand{font-size:17px}.edition{font-size:10px}.intro{padding-top:23px}h1{font-size:25px}.intro p:last-child{font-size:13px}.tabs{gap:3px}.tab{font-size:12px;padding:6px 8px;min-height:42px}.tab b{font-size:10px}.map-heading{padding:16px 14px 10px;align-items:flex-start}.map-title{font-size:16px}.map-subtitle{font-size:11px;max-width:190px}.hint{padding:0 14px 11px;font-size:11px}.hint>span:first-child{max-width:65%}.map-bottom{padding:10px 12px}.legend{gap:10px}.zoom{margin-top:4px;width:100%;justify-content:flex-end}.zoom button{min-height:44px;min-width:44px}.viewport{height:540px}.detail-body{display:block;padding:0 18px 20px}.footnotes{grid-template-columns:1fr;gap:16px;padding:23px 0}.footer{display:block;line-height:1.9}.footer span{display:block}.view-toggle button{padding:5px 8px;min-height:36px}.node strong{font-size:16px}.list-mode .node small{font-size:13px}.detail-section p,.detail-top p{font-size:14px}}
+    @media(prefers-reduced-motion:reduce){*{transition:none!important;scroll-behavior:auto!important}}
+    @media print{@page{size:A3 portrait;margin:12mm}body{background:#fff}.shell{display:none}.print-area{display:block}.print-sheet{break-after:page;break-inside:avoid}.print-sheet:last-child{break-after:auto}.print-sheet h1{font-size:22px}.print-sheet>p{font-size:12px;color:#536577}.print-sheet .stage{transform:scale(.85);transform-origin:top left}.print-sheet .node{box-shadow:none;print-color-adjust:exact;-webkit-print-color-adjust:exact}.print-sheet .node-arrow{display:none}.print-sheet .node[aria-pressed=true]{outline:0}.print-sheet .connections{position:absolute}.print-sheet .edge-label{stroke:#fff}.print-caption{font-size:11px;margin-top:8px}}
+  </style>
+</head>
+<body>
+<div class="shell">
+  <header class="masthead">
+    <div class="brand"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M6 13 5 4l9 5h4l9-5-1 9c2 2 3 5 2 8-1 5-6 8-12 8S5 26 4 21c-1-3 0-6 2-8Z"/><path d="M10 18h2m8 0h2m-8 4 2 2 2-2M2 19l5 1m18 0 5-1"/></svg>MewHelp<span>SYSTEM MAP</span></div>
+    <div class="edition"><i></i>代码快照 · 2026.11.13</div>
+  </header>
+  <section class="intro">
+    <div><p class="eyebrow">FROM A QUESTION TO AN ANSWER</p><h1>一条消息，怎样变成答案。</h1><p>从用户提问到知识更新，把 MewHelp 的完整处理过程连起来看。</p></div>
+    <div class="intro-note"><strong>总览 → 子流程</strong><span>点击「展开 ↗」，逐层查看技术细节</span></div>
+  </section>
+  <noscript><div class="noscript">此页面的交互流程图需要 JavaScript。流程概要：用户提问 → 校验与保存 → 理解、分类、工具决策 → 知识检索 / 订单处理 / 固定答复 → 流式回答 → 保存结果。证据不足的问题进入问题池，经过标准化、查重、人工审核和索引同步后补充知识。详见 <a href="../README.md">项目说明</a>。</div></noscript>
+  <div class="nav-row"><nav class="tabs" aria-label="当前位置，可返回上级流程" id="tabs"></nav><div class="nav-tools"><select id="flow-select" aria-label="跳转到任一子流程"></select><label class="search"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><input id="search" type="search" placeholder="搜索当前流程…" aria-label="搜索当前流程图节点"></label></div></div>
+  <main class="workspace">
+    <section class="map-panel" aria-labelledby="map-title">
+      <div class="map-heading"><div><h2 class="map-title" id="map-title" tabindex="-1"></h2><p class="map-subtitle" id="map-subtitle"></p></div><div class="view-toggle" aria-label="展示方式"><button id="graph-view" type="button" aria-pressed="true">图形</button><button id="list-view" type="button" aria-pressed="false">步骤</button></div></div>
+      <div class="hint"><span id="map-hint">点击任一步骤查看说明；画布可滚动。</span><span id="search-status" role="status" aria-live="polite"></span></div>
+      <div class="viewport" id="viewport" tabindex="0" aria-label="流程图，可用方向键滚动"><div class="stage-size" id="stage-size"><div class="stage" id="stage"></div></div></div>
+      <div class="map-bottom"><div class="legend" aria-label="节点颜色图例"><span class="blue"><i></i>请求 / 模型</span><span class="teal"><i></i>知识 / 数据</span><span class="orange"><i></i>工具 / 确认</span><span class="rose"><i></i>停止 / 人工</span></div><div class="zoom"><button id="zoom-out" type="button" aria-label="缩小流程图">−</button><span id="zoom-level">100%</span><button id="zoom-in" type="button" aria-label="放大流程图">＋</button><button id="fit" type="button">适合宽度</button><button id="print" type="button" aria-label="打印当前流程图">打印本图</button></div></div>
+    </section>
+    <aside><section class="detail" id="detail" aria-label="所选步骤的详细说明"></section><p class="reading-note"><strong>怎么读这张图</strong><br>带「展开 ↗」的节点可直接进入子流程；顶部路径可返回上一级。实线表示处理顺序，虚线表示数据、旁路或返回。图中配置值均为源码默认或文件快照，非运行状态。</p></aside>
+  </main>
+  <section class="footnotes" aria-label="贯穿流程的基础能力">
+    <article><h3><span>01 /</span>对话有记忆</h3><p>近期完整轮次、较早问答和长期摘要共同提供上下文。MySQL 保存业务事实，SQLite 保存工作流进度；摘要在后台追加。</p></article>
+    <article><h3><span>02 /</span>操作有边界</h3><p>工具调用会检查参数、身份和权限，并限制次数与时长。写入操作需要确认；退款申请不等于退款到账，工单也不等于接通人工。</p></article>
+    <article><h3><span>03 /</span>结果可追溯</h3><p>回答关联证据快照、工具审计与停止原因。可选 Langfuse 记录调用过程，评估和知识诊断帮助排查质量问题。</p></article>
+  </section>
+  <footer class="footer"><span>MEWHELP · CH01–CH10 / 本地代码快照，包含未提交改动 · 基准 886d5fc</span><span><a href="../README.md">项目说明</a> &nbsp;·&nbsp; 单文件 HTML，可离线打开</span></footer>
+</div>
+<div id="print-area" class="print-area" aria-hidden="true"></div>
+<script>
+/* MewHelp 流程地图：所有图形和说明内置，不请求网络，也不操作业务服务。
+ * 修改流程时同步检查节点、连线和详情；source 用于定位代码，不代表运行状态。 */
+'use strict';
+const categories={blue:'请求与模型',teal:'知识与数据',orange:'工具与确认',rose:'停止与人工',slate:'流程控制'};
+// 节点保留固定布局；详情使用普通文本渲染，避免将检索输入当作 HTML。
+const n=(id,x,y,title,sub,tone,body,input,output,source,jump)=>({id,x,y,w:240,h:88,title,sub,tone,body,input,output,source,jump});
+const e=(from,to,label='',via=[],dashed=false,side='bottom',end='top')=>({from,to,label,via,dashed,side,end});
+const maps=[
+  {id:'overview',name:'全局总览',title:'从一次提问，到下一次更好的回答',subtitle:'主线负责回答，知识更新和观测在旁路持续进行。',w:1030,h:850,nodes:[
+    n('user',395,25,'用户发送消息','聊天页 · POST /api/chat','blue','用户在聊天页输入问题。页面通过事件流接收处理进度、工具状态和逐段生成的回答。','会话标识、用户标识、原始问题。','交给后端处理的新一轮对话。','app/static/ · app/api/chat.py'),
+    n('accept',395,150,'校验请求，保存这一轮','同会话互斥 · MySQL','blue','校验输入和会话归属，同一个会话一次只处理一轮。保存用户消息，再对照数据库和检查点恢复上下文。','合法请求与历史记录。','本轮身份、用户消息与工作流初始状态。','app/services/chat.py · ChatService'),
+    n('context',35,275,'上下文管理','三层历史 · 裁剪 · 后台摘要','teal','读取原文、半压历史与已提交摘要，为模型组装可容纳的输入。仅修改模型视图，数据库和检查点中的原始消息仍然保留。','完整历史与三个独立游标。','本轮冻结的历史快照。','app/workflow/context.py · app/core/context_layers.py','context'),
+    n('understand',395,275,'理解 → 分类 → 工具决策','八类意图 · 五个处理出口','blue','结合可信历史理解问题，识别意图，再让决策器判断是否先调用工具或追问。需要回答时进入对应业务路径。','原话、历史、当前可用工具。','知识、订单政策、业务、投诉或闲聊路径。','app/workflow/graph.py · build_workflow','chat'),
+    n('knowledge',35,430,'查知识 / 核实订单政策','检索资料，检查证据是否足够','teal','商品问题查询知识。退款退货和售后先核实本人订单，再按实际业务条件查询政策。政策不足时不能编造条款。','当前问题、必要的订单事实。','可用证据，或明确的证据不足结论。','app/workflow/graph.py · retrieve_node / confidence_node','knowledge'),
+    n('tools',395,430,'查询业务 / 执行工具','订单、物流、售后等','orange','根据工具结果继续决定下一步。写入工具先展示预览，得到用户确认后再执行；选单或确认会暂停并续跑原轮。','动态工具清单、授权和可信参数。','业务事实、追问或待确认动作。','app/workflow/agent.py · app/tools/executor.py','actions'),
+    n('fixed',755,430,'固定答复 / 安全停止','投诉、闲聊或失败出口','rose','投诉与闲聊有固定答复。证据不足、预算耗尽或依赖失败会给出受限答复并保留已确认的业务事实。','路由结果、停止原因及已提交回执。','明确的答复或处理限制。','app/workflow/graph.py · fixed_node'),
+    n('answer',395,570,'向用户输出回答','业务可逐段输出；知识先校验','blue','普通业务回答可以边生成边阅读。知识回答先完成结构、自评和引用校验，再发布正文；完成后可查看对应证据。','已核实事实与可用知识。','正文及过程事件。','app/workflow/agent.py · answer_node'),
+    n('save',395,710,'保存结果，结束本轮','MySQL → SQLite → metadata → DONE','teal','先提交最终回答、引用、建议和审计，再确认工作流最终状态，随后通知页面完成。中止的流不会被当成完整回答。','回答、引用、工具轨迹与停止原因。','持久记录、完成通知及后台摘要任务。','app/workflow/graph.py · log_node / app/services/chat.py'),
+    n('kb',35,710,'知识库持续补充','审核通过，确认索引可读','teal','权威资料导入和人工审核结果都要经过发布、编码和索引同步。下次检索才可以使用确认可读的新版本。','资料或人工核准的答案。','可在线检索的知识。','app/knowledge/ · app/services/review_publish.py','improve'),
+    n('pool',755,710,'问题池与人工审核','知识缺口 / 用户反馈未解决','rose','检索不足、自评无用或用户点踩形成的问题进入后台处理。标准化、查重之后仍须人工核准答案；可选主题分类帮助整理问题。','知识缺口或有效的未解决反馈。','待审问题或审核后的新增知识。','app/services/flywheel.py · app/api/feedback.py','improve'),
+    n('observe',755,275,'观测、评估与诊断','贯穿处理过程的旁路','slate','可选 Langfuse 记录模型和工具过程。独立评估与知识浏览、检索诊断帮助定位问题，不是聊天必须顺序经过的节点。','过程事件、检索快照和评估样本。','可核对的记录与质量报告。','app/observability/ · app/evaluation/ · app/api/kb.py')
+  ],edges:[e('user','accept'),e('accept','context','准备历史',[[515,250],[155,250]]),e('context','understand','冻结快照',[],false,'right','left'),e('understand','knowledge','知识 / 订单政策',[[515,396],[155,396]]),e('understand','tools','业务 / 工具',[[515,396]]),e('understand','fixed','固定出口',[[515,396],[875,396]]),e('knowledge','answer','',[[155,544],[515,544]]),e('tools','answer'),e('fixed','answer','',[[875,544],[515,544]]),e('answer','save'),e('save','pool','知识缺口',[],true,'right','left'),e('pool','kb','人工审核后发布',[[875,825],[155,825]],true),e('kb','knowledge','供下次检索',[[16,754],[16,474]],true,'left','left'),e('understand','observe','过程记录',[],true,'right','left')]},
+  {id:'chat',name:'聊天主链路',title:'先理解，再决定怎样处理',subtitle:'以当前根图为准：工具可以先执行，知识与订单政策仍需核验。',w:1120,h:1290,nodes:[
+    n('load',440,20,'接收与恢复上下文','三层历史 · 原文、半压、摘要','blue','校验身份、获取会话锁并写入用户消息。合并 MySQL 增量历史和 SQLite 检查点；近期轮次、较早问答、摘要共同组装上下文。','当前请求及可恢复状态。','ConversationState。','app/services/chat.py · ChatService','context'),
+    n('resolve',440,145,'理解问题与指代','resolve_reference','blue','节点名沿用旧名称，当前会调用理解模型，并验证派生问法和订单候选。理解失败时保留完整原话继续；预算超限则停止。','原话与可信历史工具事实。','resolved_query、standard_query、order_id。','app/workflow/graph.py · resolve_node'),
+    n('classify',440,270,'识别八类意图','classify_intent','blue','八类是商品咨询、物流、订单、售后、退款退货、其他、投诉、闲聊。由代码映射到五个出口，不让模型随意选择图节点。','理解后的问题及历史。','意图与置信度、固定路线。','app/workflow/routing.py · _INTENT_ROUTES'),
+    n('decide',440,395,'先做一次工具决策','decide_tools','orange','如果申请工具或需要追问，先进入 Agent 子图；如果决定回答，再进入原来的分类路径。决策不是立刻生成最终正文。','当前可见工具定义、上下文与预算。','工具申请、追问、回答决定或停止。','app/workflow/graph.py · after_predecision'),
+    n('agent',820,395,'工具与回答子图','决策 ↔ 工具 → 正文','orange','工具结果回到决策器，可继续查其他工具。知识或订单政策还未完成时，子图回到根图补齐原路线；完成后才生成正文。','工具申请、结果、路线就绪状态。','继续决策、回根图或回答。','app/workflow/agent.py · build_agent_graph','actions'),
+    n('route',440,540,'按意图进入五个出口','fixed_route','slate','商品咨询走知识；退款退货 / 售后走订单政策；订单 / 物流 / 其他走业务；投诉与闲聊各走固定回复。','已保存的意图路线。','下面五条路径之一。','app/workflow/graph.py · fixed_route'),
+    n('retrieval',35,690,'① 商品咨询','retrieve_knowledge','teal','检索商品资料，然后检查知识证据。没有足够证据时走固定拒答，不靠模型记忆补答案。','可信检索问法。','检索结果和证据检查。','app/workflow/graph.py · retrieve_node','knowledge'),
+    n('order',305,690,'② 退款退货 / 售后','fetch_order → retrieve_policy','teal','核实本人订单；订单不明确就暂停等待选单，续跑时再次校验归属。用订单事实检索相关政策。','问题、本人订单候选。','订单事实及政策证据。','app/workflow/graph.py · fetch_order / retrieve_node','knowledge'),
+    n('business',575,690,'③ 订单 / 物流 / 其他','main_agent','orange','直接进入业务 Agent。模型按当前授权清单调用订单、物流、售后等工具，也可能申请知识查询。','动态清单与已验证上下文。','业务事实或追问。','app/workflow/agent.py · build_agent_graph'),
+    n('fixed',845,690,'④ 投诉 / ⑤ 闲聊','complaint_reply / chitchat_reply','rose','投诉提供固定安抚及后续建议；闲聊说明客服能力。转人工是本地话术，未连接真实坐席。','投诉或闲聊意图。','固定正文。','app/workflow/routing.py · fixed_reply'),
+    n('gate',170,840,'证据检查','confidence_check','teal','商品知识不足会拒答。订单政策不足时仍允许回答已经核实的订单 / 物流事实，政策部分明确无法确认。','检索快照及门闸结果。','可用证据或受限回答条件。','app/workflow/graph.py · confidence_node'),
+    n('generate',575,840,'Agent 生成最终正文','main_agent / answer_node','blue','普通业务正文可逐段发送；知识正文先完成结构、自评和引用校验，再发布。预算、重复调用或工具失败会停止后续调用。','业务事实、证据和处理限制。','正文及校验结果。','app/workflow/agent.py · answer_node'),
+    n('fallback',35,990,'固定拒答 / 降级出口','fallback_reply','rose','遇到模型失败、知识不足或输入 / 预算上限，保存真实停止原因。已经成功的工单等事实仍须保留。','失败原因与已核实回执。','明确说明限制的回答。','app/workflow/graph.py · fixed_node'),
+    n('log',575,990,'统一保存这一轮','log_turn → finish_turn','teal','保存最终回答、引用、检索快照、建议、知识缺口信号和业务元信息，然后回读增量历史对账。','正文及本轮所有完成信息。','MySQL 中的完成记录。','app/workflow/graph.py · log_node'),
+    n('done',575,1140,'核实保存后通知完成','answer_metadata → [DONE]','teal','最终检查点完成并验证后才发送完成信息；随后安排后台摘要。停止或断开时清理任务并标记未完成。','MySQL 完成结果与 SQLite 最终状态。','页面确认完成，释放会话锁。','app/services/chat.py · _run_graph / _cleanup_turn')
+  ],edges:[e('load','resolve'),e('resolve','classify'),e('classify','decide'),e('decide','agent','工具 / 追问',[],false,'right','left'),e('agent','route','需要补齐原路线',[[1090,439],[1090,520],[560,520]],true,'right'),e('decide','route','决定回答'),e('route','retrieval','商品',[[560,656],[155,656]]),e('route','order','订单政策',[[560,656],[425,656]]),e('route','business','业务',[[560,656],[695,656]]),e('route','fixed','固定',[[560,656],[965,656]]),e('retrieval','gate','',[[155,805],[290,805]]),e('order','gate','',[[425,805],[290,805]]),e('gate','generate','可回答',[],false,'right','left'),e('gate','fallback','知识不足',[[290,961],[155,961]]),e('business','generate'),e('generate','log'),e('fallback','log','',[],false,'right','left'),e('fixed','log','',[[965,1034]],false,'bottom','right'),e('agent','log','已产生回答',[[1104,439],[1104,1085],[695,1085]],true,'right','bottom'),e('log','done')]},
+  {id:'knowledge',name:'知识检索',title:'先找到资料，再判断能不能回答',subtitle:'知识检索也称 RAG：把可靠资料找出来，交给模型据此回答。',w:1030,h:1060,nodes:[
+    n('query',395,20,'确定知识问题','原话、可信问法、必要订单事实','blue','知识工具与根图复用核验逻辑。先保留金额、时间、地区、否定等关键条件；订单政策问题补充真实业务上下文。','用户问题和可信事实。','满足长度限制的检索输入。','app/tools/knowledge.py · retrieve_verified_knowledge'),
+    n('rewrite',395,145,'准备检索问法','普通知识 1 条；政策 3 角度','blue','沿用本轮理解结果，普通知识使用标准问，订单政策扩写为三个角度并限制政策来源。已准备的问法不再按标点拆句，保留金额、时间等完整条件。','完整问题、标准问及真实订单条件。','经过校验的检索问法。','app/knowledge/pipeline.py · app/knowledge/query_rewrite.py'),
+    n('dense',35,285,'语义召回','BGE-M3 → Dense','teal','用本地 BGE-M3 把问题转成向量，找含义相近的资料。它帮助识别相似表述，不能替代最终证据判断。','检索子句向量。','语义候选资料。','app/knowledge/embedding.py · app/knowledge/retrieval.py'),
+    n('bm25',395,285,'关键词召回','BM25','teal','根据关键词匹配资料，对商品型号、专有名词等精确表达有帮助。与语义召回共同提供候选。','同一组检索子句。','关键词候选资料。','app/knowledge/retrieval.py · app/knowledge/hybrid_index.py'),
+    n('source',755,285,'核对知识版本','MySQL 原文 ↔ Milvus 索引','teal','检索到的片段需要对应真实、当前可用的知识记录。来源、内容指纹和索引版本用于避免错配旧资料。','向量候选与知识记录。','可核对的完整证据块。','app/knowledge/retrieval.py · app/knowledge/store.py'),
+    n('rank',395,440,'合并候选，再重新排序','RRF 融合 → 本地重排','teal','融合不同召回方式，再用重排模型比较资料与问题的相关程度。保留完整证据块，并控制送入模型的长度。','语义及关键词候选。','排序后的有限证据集。','app/knowledge/retrieval.py · app/knowledge/rerank.py'),
+    n('gate',395,585,'检查证据是否足够','当前门槛 Top1 ≥ 0.924415…','slate','冻结策略记录最高分、分差和证据数；当前文件权重为 top1=1、count=0、gap=0，实际决策看候选非空且最高分达到门槛。它是相关度，不是答案正确概率。故障、超时和预算停止单独处理。','完整精排并集与预算内可用证据。','可用、证据不足或依赖失败。','app/knowledge/confidence.py · data/knowledge/evidence-policy.json','retrieval'),
+    n('answer',35,745,'用证据生成答案','只引用实际提供的资料','blue','把合法证据交给回答模型。保存可追溯引用；涉及知识的动态工具结果同样经过证据核验。','可用证据和已核实业务事实。','带合法引用的正文。','app/workflow/agent.py · answer_node'),
+    n('weak',395,745,'证据不足，限制回答','商品拒答；订单事实仍可答','rose','商品知识不足时固定拒答。订单政策不足时可继续核实并回答业务事实，但不能承诺未经核实的政策。','低置信度或成功空召回。','受限回答；符合条件的缺口信号。','app/workflow/graph.py · confidence_node / _pooled_low_confidence'),
+    n('fault',755,745,'依赖失败，明确中止','故障不进入低证据问题池','rose','知识依赖错误与预算停止保留失败原因，不伪造没有知识的结论。已核实订单或已提交工单结果不应丢失。','超时、服务不可用或预算耗尽。','失败记录及安全答复。','app/workflow/policy_context.py · app/workflow/resilience.py'),
+    n('citation',35,930,'保存引用与证据快照','完成后可打开引用原文','teal','回答关联本轮原始证据。后续资料变化时仍保留旧快照，并显示来源版本差异。','正文里的合法引用编号。','可追溯的引用与登记来源。','app/api/citations.py · app/repositories/chat.py'),
+    n('pool',395,930,'记录需要补充的知识','交给后台整理与人工审核','teal','仅按真实知识责任与检索 / 自评结果收集。可选探测没命中、故障和预算停止不直接当成低证据问题。','符合条件的知识缺口信号。','问题池记录。','app/workflow/graph.py · log_node','improve')
+  ],edges:[e('query','rewrite'),e('rewrite','dense','语义',[[515,253],[155,253]]),e('rewrite','bm25','关键词'),e('dense','rank','',[[155,408],[515,408]]),e('bm25','rank'),e('source','rank','版本校验',[[875,484]],true,'bottom','right'),e('rank','gate'),e('gate','answer','通过',[[515,713],[155,713]]),e('gate','weak','不足'),e('gate','fault','故障 / 超限',[[515,713],[875,713]]),e('answer','citation'),e('weak','pool','符合入池条件')]},
+  {id:'actions',name:'工具与确认',title:'能查询的直接查，会写入的先确认',subtitle:'暂停等待、恢复原轮与独立申请是三种不同的处理方式。',w:1100,h:1140,nodes:[
+    n('decision',35,30,'Agent 决策','当前授权工具清单','blue','工具清单随注册与本地权限更新。每次决策使用当前可见定义，受输入预算、调用次数与重复调用检查约束。','上下文和动态工具定义。','工具申请、追问或回答决定。','app/workflow/agent.py · build_agent_decision'),
+    n('executor',425,30,'统一执行器核验','参数 · 身份 · 权限 · 绑定','orange','执行前核对工具身份、参数和授权；拒绝非法或过期申请。查询结果回到决策器，失败和跳过同样留下轨迹。','工具名、参数、调用身份。','获准执行或明确拒绝。','app/tools/executor.py · ToolExecutor'),
+    n('read',815,180,'只读查询','订单 / 物流 / 知识 / 售后','orange','调用内置工具或已授权的 MCP 外部工具。物流可使用先前订单查询取得的物流单号继续执行。','合法参数与用户归属。','查询事实或工具错误。','app/tools/ · app/tools/mcp.py'),
+    n('preview',425,180,'写入前生成预览','create_ticket 等写操作','orange','服务端保留稳定动作身份与参数快照，暂停工作流，向页面展示待确认内容。此时还没有提交业务写入。','合法写工具申请与绑定。','待确认动作和保存的中断点。','app/workflow/agent.py · tools_node / app/tools/confirmation.py'),
+    n('confirm',425,335,'用户确认或取消','POST /api/chat/resume','orange','确认值回到原轮，并重新校验来源、参数、绑定和权限。取消就记录跳过；不会把页面传来的任意内容当成可信写入参数。','原动作标识及确认选择。','允许续跑，或取消该操作。','app/api/chat.py · resume_chat / app/services/chat.py'),
+    n('cancel',815,335,'取消本次写入','记录跳过，不创建工单','rose','用户取消后保留动作选择与跳过事实，回到原轮后续处理，不执行业务写入。','用户对原动作的取消决定。','未创建的明确结果。','app/workflow/agent.py · tools_node'),
+    n('write',425,490,'执行已确认的写操作','使用稳定操作身份','orange','执行确认过的工具调用并保存结果。重复确认、断线恢复和状态未知时，核对原操作，不换新身份重复提交。','经过再次核验的操作快照。','工单回执，或待核实 / 失败状态。','app/tools/executor.py · app/tools/confirmation.py'),
+    n('result',815,490,'工具结果回到决策','继续调用，或进入正文','blue','结果写入工具审计和上下文。还需知识或订单政策核验时回根图补齐；满足条件后生成最终回答。','成功、失败或跳过的工具结果。','下一步决定或最终正文。','app/workflow/agent.py · after_tools / after_decision'),
+    n('select',35,335,'订单不明确：等待选单','独立路径 · select_order','slate','退款退货或售后需要明确本人订单。页面选择订单后通过 /api/chat/resume 续跑原轮，并再次校验完整订单号和归属。','本人可选订单及原动作。','同一轮的订单事实。','app/workflow/graph.py · fetch_order / app/api/chat.py'),
+    n('policy',35,490,'回到订单政策路径','选单 → 查订单 → 查政策','teal','选单恢复后执行订单查询，再检索政策。这是只读处理，不等于确认创建工单，也不会自动提交退款。','用户选择的本人订单。','订单事实和后续政策证据。','app/workflow/graph.py · fetch_order / retrieve_node','chat'),
+    n('refund',35,710,'完成后：提交退款申请','POST /api/actions/refunds','orange','通过独立接口提交本地退款申请，核对保存的动作和退款原因。返回待处理回执，不代表付款系统已经退款。','保存的退款动作与用户填写信息。','本地退款申请及处理回执。','app/services/actions.py · RefundActionService'),
+    n('ticket',425,710,'完成后：确认建议工单','POST /api/actions/tickets','orange','对已经保存的工单建议做独立确认。服务端读取原问题与工单类型，重复确认复用原操作，不重跑聊天模型。','完成轮保存的建议及动作 ID。','工单回执或待核实状态。','app/services/actions.py · TicketActionService'),
+    n('current',815,710,'刷新后核对当前动作','GET /api/actions/current','teal','读取保存的等待或完成状态。遇到结果未知时沿用原动作核实，不能直接新建另一笔。','会话与用户身份。','待操作内容、回执或未知结果。','app/services/chat.py · get_current_actions'),
+    n('stop',35,955,'停止、断线与错误','取消任务，保留已经发生的事实','rose','中断网络流时停止上游并完成清理，将未完成轮标记为未完成；不能撤销已经提交的业务操作。','取消信号或异常。','释放会话锁，保留持久回执。','app/services/chat.py · _cleanup_turn'),
+    n('recover',425,955,'启动时恢复与对账','检查点与业务库共同核实','teal','启动阶段恢复旧运行状态，并核对等待动作。MySQL 是业务事实依据，SQLite 保存图进度，恢复必须检查两边是否一致。','数据库状态与保存的检查点。','可续跑的动作，或明确失败状态。','app/services/chat.py · reconcile_waiting_turns / app/main.py')
+  ],edges:[e('decision','executor','申请工具',[],false,'right','left'),e('executor','read','只读',[[545,147],[935,147]]),e('executor','preview','写入'),e('preview','confirm'),e('confirm','write','确认后'),e('confirm','cancel','取消',[],false,'right','left'),e('cancel','result'),e('write','result','回执',[],false,'right','left'),e('read','result','查询结果',[[1070,224],[1070,534]],false,'right','right'),e('result','decision','工具结果 → 再决策',[[1085,534],[1085,10],[155,10]],true,'right','top'),e('select','policy','选单后续跑'),e('result','current','完成后可查询',[],true),e('refund','recover','持久状态',[[155,908],[545,908]],true),e('ticket','recover','',[],true),e('current','recover','',[[935,908],[545,908]],true),e('stop','recover','保留结果',[],true,'right','left')]},
+  {id:'improve',name:'知识更新',title:'把答不好的问题，变成可审核的知识',subtitle:'机器整理问题，人核准答案；确认索引同步后才可供下次检索。',w:1100,h:1080,nodes:[
+    n('gap',425,25,'发现知识缺口','低证据 / 自评无用 / 用户点踩','rose','真实检索低置信度或回答自评无用可随完成事务入池。用户点踩也可经反馈接口入池，必须核对原轮已完成；点赞只保存在本浏览器。','检索结论、自评或有效的未解决反馈。','可追溯到原问题的记录。','app/workflow/graph.py · log_node / app/api/feedback.py'),
+    n('normalize',425,165,'标准化问题','去口语、保留条件、泛化隐私','blue','将原话整理成适合补知识的问题，保留金额、地区、时间、否定及所有诉求。模型建议答案只供参考，不能自动成为商家政策。','完整原问题。','标准问及有限参考建议。','app/knowledge/flywheel.py · FlywheelModel.normalize'),
+    n('dedup',425,305,'查重与合并频次','逐页比较真实候选','blue','只合并适用条件和诉求一致的知识缺口，校验模型返回的是本页真实 ID。相似主题但条件不同不能强行合并。','标准问与已有审核候选。','新增审核项或合并计数。','app/knowledge/flywheel.py · FlywheelModel.match'),
+    n('topics',815,165,'可选：按主题整理','CH10 · 独立批处理服务','slate','启用后在旁路批量给问题打主题标签。核对分类服务版本和标签定义；它不是实时意图识别，也不决定知识发布。','问题池文本及分类配置。','主题标签、未确定状态和报告。','app/services/topics.py · TopicBatchService'),
+    n('review',425,450,'人工审核并填写答案','通过或驳回','orange','审核者检查问题是否值得补充，并提交核实过的答案。人工答案校验后冻结；驳回项不会发布。','待审标准问、原问与参考建议。','人工核准答案或驳回决定。','app/api/flywheel.py · app/services/review_publish.py'),
+    n('reject',815,450,'驳回 / 暂不发布','保留审核记录','rose','不合适或缺少可靠答案的问题可以驳回。发布未完成时保留冻结状态，用同一条审核项重试。','人工决定或发布错误。','审核结果或待恢复的发布记录。','app/repositories/flywheel.py · app/services/review_publish.py'),
+    n('import',35,450,'另一入口：导入权威资料','文档 → 切分 → 知识记录','teal','受控导入登记来源，把文档切分成可追踪的知识块。已有库按迁移和同步流程更新，不重复初始化业务数据。','登记的权威资料。','带来源、内容指纹的知识块。','app/knowledge/cli.py · app/knowledge/jobs.py'),
+    n('publish',425,610,'写入知识并同步索引','MySQL → BGE-M3 → Milvus','teal','复用知识发布与同步机制，用稳定来源保存人工核准内容。编码及索引操作完成前，不把审核状态标成发布成功。','已核准答案或文档知识块。','已发布记录与同步中的索引。','app/services/review_publish.py · ReviewPublisher / app/knowledge/sync.py'),
+    n('verify',425,760,'核对当前版本可读','原文指纹、编码版本、索引回读','teal','回读数据库和索引，确认当前知识版本确实一致且可检索。只有确认后才完成发布；失败保留断点以便恢复。','数据库记录与索引指纹。','已确认可用的知识版本。','app/services/review_publish.py · _publish'),
+    n('next',425,930,'下一次提问可以使用','回到知识检索主线','teal','新知识进入正常检索。是否能答好仍需要检索、证据检查和真实评估，发布不等于所有相关问法都会答对。','新的用户问题与已更新知识。','通过检索得到的新证据。','app/knowledge/retrieval.py','knowledge'),
+    n('quality',35,760,'观测、评估与知识诊断','独立质量检查','slate','Langfuse 可记录请求与模型过程；独立评估保存真实结果和错误，知识浏览器可查看版本并诊断检索。检查结果用于人工定位问题。','调用记录、题集、知识快照。','追踪记录、质量报告或检索诊断。','app/observability/ · app/evaluation/ · app/api/kb.py'),
+    n('mining',35,165,'另一入口：离线问答挖掘','CH03 · mine-once / mine-schedule','teal','受控扫描已完成问答，经过抽取、证据校验、同义合并和冲突隔离。符合条件的结果可直接发布同步，这条路径不经过 CH09 人工审核队列。','指定范围内的已完成问答。','可发布的知识或被隔离的冲突。','app/knowledge/jobs.py · app/knowledge/lifecycle.py')
+  ],edges:[e('gap','normalize'),e('gap','topics','旁路分类',[[545,139],[935,139]],true),e('normalize','dedup'),e('dedup','review'),e('review','reject','驳回',[],false,'right','left'),e('review','publish','核准'),e('import','publish','资料导入',[[155,654]],false,'bottom','left'),e('mining','publish','校验后可自动发布',[[15,209],[15,700],[545,700]],true,'left','bottom'),e('publish','verify'),e('verify','next','确认可读'),e('quality','verify','诊断核对',[],true,'right','left')]} 
+];
+
+maps.push(
+  {id:'persistence',name:'状态与数据保存',title:'什么时候算完成？数据库和检查点都确认之后',subtitle:'MySQL 保存业务事实，SQLite 保存图进度；流式文字本身不代表保存成功。',w:1100,h:1120,nodes:[
+    n('request',35,25,'HTTP 请求校验','session / user / message','blue','校验请求结构与字段长度。user_id 在当前项目中是演示归属标识，不是完整的登录认证。普通消息与动作恢复走不同接口。','ChatRequest 或恢复动作。','合法请求或 422。','app/api/chat.py · app/schemas/chat.py'),
+    n('guard',425,25,'取得同会话互斥锁','ConversationGuard.hold','slate','同会话只处理一个请求，忙则立即拒绝。检查输入预算与未完成动作；不同会话可并发。','session_id 与持久动作状态。','独占处理权或忙碌错误。','app/services/chat.py · stream_turn'),
+    n('start',425,165,'事务保存用户消息','start_turn · running','teal','先记录原问题及稳定消息 ID，再运行模型。恢复原动作沿用原轮，不新建用户消息，也不重置原轮预算。','用户原话与可信轮次身份。','MySQL 用户消息和运行状态。','app/repositories/chat.py · start_turn'),
+    n('state',425,305,'核验并装配图状态','audit_cursor → 完整轮增量','teal','检查 SQLite 身份；不匹配或旧格式时从数据库重建。按游标回读完整受影响轮，再组装三层历史视图。','历史、checkpoint 与当前消息 ID。','独立新轮 State 或原轮 Command。','app/services/chat.py · _initial_state','context'),
+    n('run',425,445,'独立任务运行工作流','astream · durability="sync"','blue','独立 asyncio 任务拥有图流与取消责任，custom 事件通过队列送回 HTTP 层。同步持久化进度，避免先宣布成功再保存。','State / Command 与 thread_id。','过程事件、暂停或最终状态。','app/services/chat.py · _stream_workflow'),
+    n('events',35,445,'筛选并发送公开事件','delta / tool_status / workflow_stage','blue','只发送允许的字段。业务正文可逐段出现；知识正文验证后发布。ASGI 网络关闭会向上游传播取消。','图的 custom 事件。','SSE 过程流。','app/services/chat.py · _public_event / app/api/chat.py'),
+    n('mysql',425,595,'MySQL 完成事务','finish_turn → 增量回读对账','teal','原子保存客服正文、合法引用、动作建议、检索快照、流程元数据、问题池信号和完成状态。使用稳定消息 ID 防止重复追加答案。','本轮全部完成结果。','完成记录与最新 audit_cursor。','app/workflow/graph.py · log_node'),
+    n('sqlite',425,745,'SQLite 最终检查点确认','final.next 为空 + completed','teal','最终检查点完成后回读，检查没有待执行节点，并核对 completion_metadata 的轮次与状态。任何一项不明确就不能宣布完成。','根图结束状态。','持久完成，或 PersistenceUncertain。','app/services/chat.py · _run_graph'),
+    n('done',425,920,'发送完成信息','answer_metadata → [DONE]','teal','登记必要的后台摘要，再依次发送元信息和 DONE。完成后的引用与按钮来自已保存结果，随后关闭流并释放锁。','已确认完成的结果。','页面完成态及可执行建议。','app/services/chat.py · _run_graph','summary'),
+    n('pause',815,445,'图遇到 interrupt','选单 / 建单确认','orange','图先持久化中断点。读取官方待执行任务中的动作，不把任意 next 当成可以恢复的等待。','图中断和可信原轮。','持久化等待动作。','app/services/chat.py · _waiting_action'),
+    n('wait',815,595,'保存等待状态，释放锁','SQLite 暂停 → MySQL waiting','orange','先保存数据库等待信息，关闭图流并释放会话锁，才向浏览器发 select_order 或 confirm_ticket。暂停不发送正常 DONE。','已持久化中断点。','可供用户选择的动作。','app/services/chat.py · _run_graph / stream_turn'),
+    n('resume',815,920,'用户操作后续跑原轮','Command · 原动作与原预算','orange','先校验原动作身份，再用 Command 恢复原图。已接受或已完成的操作回查原结果，不能换新键重复执行。','原轮动作 ID 与用户选择。','同一轮继续处理。','app/services/chat.py · stream_resume','actions'),
+    n('error',35,745,'断线 / 错误 / 保存不明','error，不伪造完成帧','rose','取消模型和工具任务，并等待有界清理。失败或取消只标记仍在运行的轮；已暂停和已完成状态保留。','异常、断开或取消。','失败 / 取消状态与保存的回执。','app/services/chat.py · _cleanup_turn'),
+    n('recovery',35,920,'重启时核对遗留动作','reconcile_waiting_turns','slate','对照 MySQL 与 SQLite 恢复等待状态；已提交写入回查原结果。无法核实就报告未知，不能把请求重放当成新操作。','等待记录、旧运行状态和检查点。','可续跑动作或明确异常。','app/services/chat.py · reconcile_waiting_turns')
+  ],edges:[e('request','guard','',[],false,'right','left'),e('guard','start'),e('start','state'),e('state','run'),e('run','events','过程流',[],true,'left','right'),e('run','mysql','正常完成'),e('mysql','sqlite'),e('sqlite','done','核验通过'),e('run','pause','暂停',[],false,'right','left'),e('pause','wait'),e('wait','resume','等待用户'),e('sqlite','error','状态不明',[],false,'left','right'),e('error','recovery','下次启动核查',[],true),e('recovery','state','恢复可信状态',[[15,964],[15,349]],true,'left','left')]},
+  {id:'execution',name:'工具执行器',title:'模型提出调用，执行器逐项核验',subtitle:'调用结果优先回放；批内逐个执行；写操作不能靠重试重复提交。',w:1100,h:1220,nodes:[
+    n('calls',425,25,'先保存整批工具申请','assistant.tool_calls','orange','保存模型整批申请及冻结的来源绑定，随后逐个执行，每个申请都要有成功、失败或跳过的配对结果。','当前工具定义和申请列表。','可审计的完整调用批次。','app/workflow/agent.py · tools_node'),
+    n('identity',425,170,'核对调用身份与已有结果','session / turn / tool_call_id','slate','校验调用属于当前可信上下文。优先查找已经持久保存的结果，重复请求回放同一结果。','稳定调用身份。','原结果，或尚未执行的调用。','app/tools/executor.py · ToolExecutor'),
+    n('replay',815,170,'已有结果：直接回放','不重复调用业务服务','teal','已经提交的成功、失败或不确定状态按原操作核实，不另造新调用键。','持久工具结果。','原调用结果。','app/tools/executor.py'),
+    n('definition',425,315,'重新核对定义和来源','注册表 + MCP + 本地权限','slate','读取原工具来源的最新定义，检查冻结绑定与当前授权。工具同名但来源改变时不能偷偷替换执行。','工具绑定和最新注册表。','仍可信且可授权的定义。','app/tools/registry.py · app/tools/permissions.py · app/tools/mcp.py'),
+    n('validate',425,460,'校验参数与执行边界','参数类型、归属、次数与重复','orange','参数按工具定义验证，订单等业务对象另做归属检查。默认每轮最多 4 次工具调用，前项失败或预算耗尽会跳过后续项并保存配对结果。','工具参数与本轮计数。','允许执行或明确拒绝。','app/tools/validation.py · app/workflow/agent.py'),
+    n('read',35,625,'只读工具执行','默认 5s；故障最多重试 1 次','orange','读取型业务调用有有界超时与有限故障重试。知识工具使用独立的默认 60 秒超时。每次状态变化通过事件反馈给页面。','已验证只读调用。','查询结果或工具错误。','app/tools/executor.py'),
+    n('confirm',425,625,'写操作：请求原动作确认','interrupt → 用户确认 → 再核验','orange','确认必须绑定原会话、轮次、调用、参数快照和授权。当前外部 MCP 写工具不获准执行；内置建单才走确认流程。','合法写工具申请。','确认、取消或拒绝。','app/tools/confirmation.py','actions'),
+    n('write',815,625,'确认后提交一次','业务写入 + 成功结果同事务','orange','内置建单在同一 MySQL 事务保存工单与成功工具结果。写操作不自动重新执行；提交不明时只核查原键。','已确认参数及稳定操作身份。','工单回执或待核实结果。','app/repositories/support.py · create_ticket'),
+    n('persist',425,810,'可靠保存工具结果','原文不截断；模型视图有界','teal','持久化完整结果与状态。提供给模型的是受控副本，不能把裁剪后的模型视图替代审计原件。','成功 / 失败 / 跳过结果。','完整记录及可用业务事实。','app/tools/executor.py · app/core/context_layers.py'),
+    n('audit',425,965,'追加独立审计与状态事件','默认审计时限 1s','teal','记录来源、耗时与结果。独立审计失败不否定已经提交的业务事实；成功票号仍须保留。','持久工具结果与执行过程。','审计信息和最终 tool_status。','app/tools/executor.py'),
+    n('return',425,1110,'回到决策器','tools → decide_tools / answer','blue','将配对工具结果加入上下文。可继续调用下一个工具；路线准备未完成时回根图，不能绕过订单政策证据。','完整配对消息与可信业务事实。','下一步决定或最终回答。','app/workflow/agent.py · after_tools')
+  ],edges:[e('calls','identity'),e('identity','replay','已存在',[],false,'right','left'),e('identity','definition','首次调用'),e('definition','validate'),e('validate','read','只读',[[545,590],[155,590]]),e('validate','confirm','写入'),e('confirm','write','确认通过',[],false,'right','left'),e('read','persist','',[[155,780],[545,780]]),e('confirm','persist','取消 / 拒绝'),e('write','persist','',[[935,780],[545,780]]),e('persist','audit'),e('audit','return'),e('replay','return','原结果',[[1080,214],[1080,1154]],true,'right','right')]}
+);
+
+// 知识检索与质量旁路的数据片段；由最终页面提供 maps、n、e，不创建页面或运行资源。
+maps.push(
+  {
+    id: 'retrieval', name: '检索技术细节', title: '从完整问题，到可引用的知识答案',
+    subtitle: '按列从上往下阅读。数量为代码默认值；门槛取仓库冻结策略，运行配置仍须匹配其协议。',
+    w: 1100, h: 690,
+    nodes: [
+      n('r_prepare', 35, 25, '准备查询与证据策略', '普通 1 问 · 政策 3 问 · 60 秒', 'blue',
+        '核验冻结证据策略与查询、重排、预算协议；相同原轮、查询、过滤和策略版本可复用缓存。沿用本轮理解结果：普通检索用标准问，订单政策扩写成三个角度并限制来源。已准备问法整体检索，不再按标点拆散数字、型号、否定和时间条件。知识准备与检索外层默认共用 60 秒期限，故障不自动改走另一套检索。',
+        '原问、resolved_query、standard_query、可信订单条件、过滤条件、独占账本。',
+        '一条或三条完整查询、已校验过滤范围；准备失败保留故障类别。',
+        'app/tools/knowledge.py · retrieve_verified_knowledge；app/knowledge/pipeline.py · prepare'),
+      n('r_encode', 35, 195, '把查询编码为语义向量', '本地 BGE-M3 · 完整查询', 'teal',
+        '每条完整查询调用本地 BGE-M3 编码器，并核对返回向量数量、维度与数值。查询原文同时保留给关键词检索。存在过滤条件时，先分页读取 MySQL 当前有效知识，形成两路共用的主键白名单。模型文件缺失或编码失败属于依赖故障，不等于库里没有答案。',
+        '完整检索问法、可选权威主键白名单。',
+        '一条合法 Dense 向量，以及同一问题的原始文本。',
+        'app/knowledge/retrieval.py · _filter_scope / _retrieve_one_observed；app/knowledge/embedding.py'),
+      n('r_recall', 35, 365, '语义与关键词分别召回', 'Dense ≤50 · BM25 ≤50', 'teal',
+        'Dense 用语义向量和 COSINE 相似度检索；BM25 用原文匹配关键词、型号和专有名词。两路都应用同一过滤范围。每路默认最多 50 条，由 recall_top_k 控制。这些分数口径不同，不能当作回答正确概率，也不能直接用作最终证据门槛。',
+        '问题向量、问题文本、同一主键白名单。',
+        '两路各最多 50 条候选及其原始排序。',
+        'app/knowledge/hybrid_index.py · hybrid_search；app/config.py · recall_top_k'),
+      n('r_fuse', 35, 535, '按两路名次融合候选', 'RRF k=60 · 融合后 ≤50', 'teal',
+        'Milvus 使用 RRFRanker(60) 合并两路排名，默认只返回最多 50 条融合候选，并使用 Strong 一致性读取。不是把两路可能合计 100 条全部交给重排。融合回执包含知识主键、内容指纹和编码版本，供下一步核对。正式聊天使用 RRF，诊断页的加权实验不会改写这里的配置。',
+        'Dense 与 BM25 的候选名次。',
+        '融合后的有限候选、RRF 分数及同步指纹。',
+        'app/knowledge/hybrid_index.py · hybrid_search'),
+      n('r_verify', 425, 25, '回读 MySQL 核实原文', 'active + done + 内容／版本一致', 'teal',
+        '按候选 ID 回读 MySQL，核对记录有效、向量化完成、vector_id 与主键对应、内容指纹和编码版本一致。带过滤范围时还要核对完整权威快照，防止范围被忽略或中途变化。没有任何可核对原文时作为同步故障；真空库才允许成功零结果。',
+        'Milvus 候选、MySQL 权威记录、可选过滤快照。',
+        '可进入重排的完整原文块；错误候选不能充当证据。',
+        'app/knowledge/retrieval.py · _retrieve_one_observed'),
+      n('r_rerank', 425, 195, '对全部合法候选重排', '每问 ≤10 块 · pair ≤512 token', 'teal',
+        '本地 bge-reranker-large 对全部合法候选评分，再按分数降序、主键升序返回每问最多 10 个原块。查询最多 128 个模型 token；长块按完整连续窗口评分，窗口重叠 64，单块最多 32 窗；窗口最高分映回原块。分数经过 sigmoid，仍是相关度，不是正确概率。设备或内存故障不会静默换模型。',
+        '完整查询与核验后的原文块；推理批次默认 4。',
+        '每条查询的 Top-K 完整原块及 0–1 相关度分数。',
+        'app/knowledge/rerank.py · BgeReranker._rank_sync；app/knowledge/retrieval.py · _retrieve_one'),
+      n('r_merge', 425, 365, '跨查询合并并保留审计', '普通 ≤10 · 政策 ≤30', 'teal',
+        '同一知识块在不同查询中出现时取最高分，并按真实最高分合并排序。普通问最多 10 块；三个政策问每问最多 10 块，合并后最多 30 块。另保留跨查询最终裁剪前的业务精排并集供判闸和评估；它不是全部召回 50 条，也不是检索审计的 Top5 快照。身份或原文冲突直接报错。',
+        '各查询的真实精排结果及检索快照。',
+        '完整 ranked 并集、有限候选和可追溯原文快照。',
+        'app/knowledge/retrieval.py · merge_ranked_chunks / retrieve_policy；app/knowledge/pipeline.py · retrieve'),
+      n('r_select', 425, 535, '按预算选择完整证据块', 'min(8192, 窗口÷16) · 整块跳过', 'slate',
+        '按排序逐块加入，超过证据预算就跳过该整块，继续尝试后面的块；不截断条款。默认窗口 131072，所以证据上限为 8192 个估算 token。存在候选但一个完整块也放不下时是预算故障，不产生知识缺口。正式模型账本按窗口推导输入和总预留：单次输入为窗口减 5% 安全余量与输出预留；每次预留两倍输入加输出，真实用量另记。',
+        '完整候选块、稳定引用编号、模型窗口和估算器。',
+        '实际送入模型的 selected 完整证据集；不满足容量则停止。',
+        'app/workflow/context.py · select_evidence；app/core/model_budget.py · BudgetLedger.from_settings', 'budget'),
+      n('r_gate', 815, 25, '按冻结策略判定证据', '当前 Top1 ≥0.924415 · 非空', 'slate',
+        '提取 Top1、Top2、分差、完整精排候选数和预算内有效证据数。当前仓库策略权重为 Top1=1、数量=0、分差=0，阈值为 0.9244152307510376，所以现行决策实质只由 Top1 与候选非空决定。minimum_score=0.9996993541717529、count_cap=1 仍记录特征。旧 FAQ 0.3 和未接入的参考 0.26 都不是这里的门槛。策略缺失或不兼容属于故障。',
+        '全精排并集、实际 selected、冻结 evidence-v2 策略。',
+        'gate：通过或证据不足；不足时不向模型注入弱证据。',
+        'app/knowledge/confidence.py · assess_evidence；data/knowledge/evidence-policy.json'),
+      n('r_generate', 815, 195, '生成答案并提交自评', '输出 ≤4096 · useful true / false', 'blue',
+        '先证明生成阶段没有缩小已判闸的完整证据集，再组装可信历史、原问、完整证据和本轮业务事实，复核整个模型输入预算。模型必须提交 useful、reason、answer、citation_numbers。useful=false 时丢弃猜测正文，改用固定兜底并记录 self_check。不能在这个阶段再次申请或模拟业务写入。',
+        '门槛已通过的同一完整证据集、可信上下文和剩余账本。',
+        '结构化 KnowledgeAnswer，或自评不足的固定兜底。',
+        'app/knowledge/pipeline.py · generate；app/workflow/model.py · answer_knowledge'),
+      n('r_citations', 815, 365, '校验正文与引用编号', '回答最多 2 次 · 引用修复 ≤1', 'blue',
+        '可答结果必须有非空正文、本轮有效引用和可展示正文角标。正文编号须属于声明引用，声明引用须属于本轮证据且不能重复；Markdown 代码、链接、图片或 HTML 中的数字不算正文角标。引用校验失败只允许基于同一证据修复一次，修复说明和再生成也占预算；再次失败报故障，不假装知识不足。',
+        'useful=true 的回答、声明引用编号、完整本轮证据。',
+        '经校验答案及实际出现在正文里的引用子集。',
+        'app/knowledge/answering.py · decide_answer / published_citations；app/knowledge/pipeline.py · generate'),
+      n('r_return', 815, 535, '返回受核验的知识结果', '正文 / 引用 / 缺口信号 / 预算', 'teal',
+        '返回 answer、refused、citations、pool_signals、usage 和 gate，由聊天上层处理展示与持久化。门槛不足返回固定兜底及 retrieval_low_conf；自评不足返回固定兜底及 self_check；正常结果仅发布正文使用的引用。网络、同步、结构、引用和预算故障另行传播，不自动变成问题池记录；实际是否落池由根图核验本轮责任与完成事务。',
+        '通过校验的答案，或明确的证据不足／自评不足结果。',
+        '交给聊天层的结构化知识回执；本子流程不直接保存聊天或问题池。',
+        'app/knowledge/pipeline.py · generate；app/workflow/graph.py · _pooled_low_confidence / log_node')
+    ],
+    edges: [
+      e('r_prepare', 'r_encode'), e('r_encode', 'r_recall'), e('r_recall', 'r_fuse'),
+      e('r_fuse', 'r_verify', '权威核验', [[350, 579], [350, 69]], false, 'right', 'left'),
+      e('r_verify', 'r_rerank'), e('r_rerank', 'r_merge'), e('r_merge', 'r_select'),
+      e('r_select', 'r_gate', '判闸', [[725, 579], [725, 69]], false, 'right', 'left'),
+      e('r_gate', 'r_generate', '通过'), e('r_generate', 'r_citations', 'useful=true'),
+      e('r_gate', 'r_return', '证据不足', [[780, 69], [780, 579]], true, 'left', 'left'),
+      e('r_generate', 'r_return', '', [[1070, 239], [1070, 579]], true, 'right', 'right'),
+      e('r_citations', 'r_generate', '修复≤1次', [[1085, 409], [1085, 315], [935, 315]], true, 'right', 'bottom'),
+      e('r_citations', 'r_return', '引用有效')
+    ]
+  },
+  {
+    id: 'quality', name: '观测评估诊断', title: '三条独立旁路，各自回答不同问题',
+    subtitle: '左：实际发生了什么；中：固定题是否答好；右：当前知识为何没找到。三列不构成聊天必经链。',
+    w: 1100, h: 710,
+    nodes: [
+      n('q_trace', 35, 25, '观测：建立原轮追踪', '默认关闭 · 同原轮 Trace ID', 'slate',
+        '显式启用 OBSERVABILITY_ENABLED 后才建立本机 Langfuse 资源。由可信 session、user、turn 稳定派生 trace_id；恢复执行链接最初的根观测。聊天、摘要、飞轮和评估分别记录 task_kind，避免后台消耗被当成用户聊天。此处记录执行经过，不负责评价答案正确性。',
+        '原轮身份、执行类别、显式观测配置。',
+        '同一原轮可贯通的根观测与任务局部上下文。',
+        'app/observability/runtime.py · identity_for / execution'),
+      n('q_capture', 35, 200, '记录模型、工具与检索', '输入输出 / 耗时 / 实际 usage', 'slate',
+        '模型通过回调记录生成，非 Runnable 的检索、精排和工具通过显式观测边界记录。意图分类完成后更新仍存活的根及后续调用标签。只认可模型实际报告的 token；缺失用量保留未知，本地编码和重排不冒充付费大模型消耗。观测更新失败只影响健康状态，不覆盖业务事务。',
+        '实际模型请求、检索候选、工具执行、原始用量和错误。',
+        '带正确父子关系及原轮归属的过程记录。',
+        'app/observability/runtime.py · observe / _UsageCallbackHandler；app/knowledge/rerank.py · rank'),
+      n('q_export', 35, 375, '导出到本机 Langfuse', '仅回环地址 · 开启后全量采样', 'slate',
+        '通过 OTLP 导出到配置的本机 Langfuse，地址只允许 localhost、127.0.0.1 或 ::1，并禁用环境代理。默认关闭；启用时 sample_rate=1.0。导出失败和关闭超时显式记录健康状态，不把记录未上传解释成业务失败。点赞仅存浏览器；点踩进入问题池，没有把点击评分上传 Langfuse 的代码。',
+        '过程观测、仅本地保存的项目凭据。',
+        '本机可查看的追踪，或明确的导出健康问题。',
+        'app/observability/runtime.py · ObservabilityRuntime.__init__ / aclose；app/static/citations.mjs'),
+      n('q_usage', 35, 550, '按任务与意图汇总用量', '完整翻页 · 未知保留 · cost=null', 'slate',
+        '按带时区的左闭右开时间窗，持续读取 generation 的全部 cursor 页，再补读相关 trace 的 span 归属。按任务类别和聊天意图汇总已知 token、原轮数、模型调用数及覆盖率。读取不完整时返回 503 且不展示半张账单；缺失用量不填零。当前金额 cost=null，不能显示为可靠实际费用。',
+        'from/to 时间窗，默认最多 31 天；本机完整观测分页。',
+        '覆盖率、未知计量数、已知 token 分组；金额保持不可用。',
+        'app/observability/costs.py · get_intent_usage / summarize_intent_usage；app/api/observability.py'),
+      n('q_eval_start', 425, 25, '评估：锁定本次运行', '每日 03:00 / 手动 · 独立执行锁', 'blue',
+        '应用默认每天上海时间 03:00 安排下一次生产评估，也可从页面手动触发；错过或冲突不追补。共同 manager 启动独立子进程，子进程先取得数据库执行锁，再冻结题集、知识快照、证据策略与模型协议。请求被接受不代表已经取得跨进程执行权。',
+        '配置题集、冻结策略、触发来源、应用只读知识目标。',
+        '独占运行身份与冻结资源，或 busy／明确失败状态。',
+        'app/evaluation/scheduler.py · EvaluationScheduler；app/evaluation/jobs.py · start；app/evaluation/production.py · run_complete_production'),
+      n('q_eval_cases', 425, 200, '逐题执行并核对事实', '48 道 evaluation · 冻结策略', 'blue',
+        '逐题运行正式理解、分类、查询准备、检索、预算选择、证据门槛和知识生成。对非拒答结果再调用裁判，把答案拆成事实，逐项检查是否被实际 selected 证据支持。只覆盖知识子流程，不执行订单或工单，不重新校准、不初始化应用库，也不把评估问题写入聊天或问题池。',
+        '原 72 题中固定的 48 道 evaluation 题、冻结语料与策略。',
+        '逐题检索证据、答案、拒答、裁判事实和双方真实用量。',
+        'app/evaluation/production.py · ProductionEvaluationRuntime.execute / evaluate_production；app/evaluation/faithfulness.py'),
+      n('q_eval_verify', 425, 375, '保留原件并复核版本', '逐题落盘 · 失败仍保留原分母', 'teal',
+        '每题写入并刷新 results.jsonl，保留真实失败阶段、错误类别、检索快照和预算；不能删除出错题提高成绩。结束时再次核对语料、向量、配置、协议、策略、题集和执行锁。运行中任何关键版本变化都会标记 invalidated；未完成或失效原件不能发布成完成成绩。',
+        '逐题结果、开始时冻结的指纹和仍持有的执行锁。',
+        '通过末次复核的运行原件，或明确失效／中断记录。',
+        'app/evaluation/production.py · evaluate_production / run_complete_production'),
+      n('q_eval_store', 425, 550, '保存指标供历史比较', 'Recall@10 / MRR@10 / 忠实度', 'teal',
+        '计算召回、排名、忠实度、拒答和错误指标；完成文件联合核验后才写评估表。只有题集、模型、策略和指标口径一致的运行可比较，知识版本允许变化。单纯数据库保存失败可用 persist-run 补存已完成原件，不能用失效原件补存。新增等价知识的证据标签仍需人工复核，分数不代表整张客服图。',
+        '完成标记、summary、逐题原件及冻结资源。',
+        '可核对的生产评估历史、比较键、已知用量与缺失信息。',
+        'app/evaluation/runner.py · production_summary / validate_completed_artifact；app/repositories/evaluations.py'),
+      n('q_browse', 815, 25, '诊断：浏览当前双库', '/rag-eval · 5 秒刷新 · 每页 20', 'teal',
+        '质量评估页内的知识检查器读取集合概况、当前页和已选记录详情。每 5 秒刷新，可暂停；失败保留上次数据及成功读取时间。展示 Milvus 与 MySQL 的原始字段、向量和同步状态；翻页是实时读取，不是固定快照。接口复用在线检索资源，不能启动导入或后台挖掘。',
+        'GET /kb/collection、/kb/records、/kb/records/{id}。',
+        '实时集合结构、计数、原文、版本、向量和同步差异。',
+        'app/static/kb-inspector.mjs；app/api/kb.py · inspect_collection / inspect_records / inspect_record'),
+      n('q_debug_prepare', 815, 200, '提交原问与诊断参数', 'weighted 0.5/0.5 · RRF / 单路', 'blue',
+        'POST /kb/retrieval-debug 接收完整原问和当前实验参数；默认加权 0.5/0.5，也可选择 RRF、Dense 或 BM25。参数须是真实有限数字，召回和结果条数限制在 1–50。原问不做理解改写或政策扩写；BM25 单路不做 Dense 编码。已提交问题调参 600 毫秒后重跑，草稿仍需再次提交。',
+        '原问、策略、两路权重、召回量、融合量、重排开关和 Top-K。',
+        '只用于当次诊断的已校验参数；不改变聊天配置。',
+        'app/knowledge/inspection.py · RetrievalDebugRequest；app/static/kb-inspector.mjs'),
+      n('q_debug_recall', 815, 375, '展示各路原始召回', '两路 ≤50 · 融合 ≤50 · 双库核验', 'teal',
+        '复用共享编码器和 Milvus 索引，按所选方式读取 Dense、BM25 与融合结果，再回读双库记录核对原文与同步状态。加权为零的一路仍可作为对照展示，但融合列表仅列实际融合命中。各路分数口径不同，不直接比较数值。先通过 SSE 发出完整召回，再进入可选重排。',
+        '当次原问及已校验策略参数；共享在线模型与索引。',
+        'recall 事件：各路候选、实际分数、原文与核验警告。',
+        'app/knowledge/inspection.py · _recall / _recall_rows / debug'),
+      n('q_debug_rerank', 815, 550, '查看重排和阶段耗时', '默认 Top10 · SSE 分阶段结果', 'teal',
+        '可选使用共享重排器对全部合法候选评分，默认显示 Top10 原块及名次变化。连续发送 rerank 和 complete，包含实际参数与分阶段耗时；后续失败保留已发出的召回并发送安全 error。整次沿用同一知识超时期限。诊断不生成答案、不经过正式证据门槛、不写知识或问题池。',
+        '融合候选、经过权威核验的完整原文、重排参数。',
+        '重排名次、实际分数和耗时，或保留前阶段结果的错误。',
+        'app/knowledge/inspection.py · _rerank / debug；app/api/kb.py · retrieval_debug')
+    ],
+    edges: [
+      e('q_trace', 'q_capture'), e('q_capture', 'q_export'), e('q_export', 'q_usage', '按时间窗读取'),
+      e('q_eval_start', 'q_eval_cases'), e('q_eval_cases', 'q_eval_verify'), e('q_eval_verify', 'q_eval_store', '复核通过'),
+      e('q_browse', 'q_debug_prepare', '手动诊断', [], true), e('q_debug_prepare', 'q_debug_recall'), e('q_debug_recall', 'q_debug_rerank', '可关闭重排')
+    ]
+  }
+);
+
+// 上下文、窗口预算与后台摘要的独立数据片段；插入主页面 maps 定义之后。
+// 这里只描述当前代码路径，所有容量与时间数值均为源码默认值。
+maps.push(
+  {
+    id: 'context', name: '上下文管理', title: '完整历史留在库里，模型读取有界副本',
+    subtitle: '三层按消息主键分界；当前轮冻结一次历史，后续模型调用共用。',
+    w: 1100, h: 1180,
+    nodes: [
+      n('restore',425,25,'增量对账完整历史','audit_cursor · 稳定消息 ID','blue',
+        '先核对检查点的会话、用户和轮次身份。按 audit_cursor 找新增消息涉及的轮次，再回读这些轮的完整流水；旧的未完成轮也可刷新状态。身份不符或旧格式时从可信数据库重建。',
+        '新轮身份、SQLite 检查点、MySQL 消息。','按稳定 ID 合并的完整历史及新 audit_cursor。','app/services/chat.py · _initial_state / app/repositories/chat.py · load_history_delta'),
+      n('anchors',425,170,'读取历史边界与摘要','摘要上界 ≤ 原文层边界','teal',
+        '读取 summary_upto_msg_id、layer1_from_msg_id 和已提交摘要段。前者表示摘要实际覆盖到哪里；后者之后属于最近原文层。当前轮从历史分层中排除，稍后单独完整加入。',
+        '完整历史与会话保存的两个边界。','可核验的三层来源；不凭消息下标编造边界。','app/repositories/context.py · load_context / app/workflow/context.py · history_snapshot'),
+      n('capacity',35,170,'推导共享历史容量','窗口扣减 → 历史七三分配','slate',
+        '按理解、分类、决策、回答各阶段中最大的固定提示和工具定义开销计算共享容量，再预留证据、摘要、输出、安全余量以及当前轮工具峰值。历史容量分为最近层 70% 和半压层 30%。',
+        '模型窗口配置、实际工具定义和补救消息。','本轮固定的历史预算。','app/workflow/context.py · shared_budget','budget'),
+      n('blocks',425,315,'组成不可拆分历史块','真实主键 · 整轮 · 工具配对','slate',
+        '核验真实消息主键是否有序且不重复。延迟回执可能与后续轮次的主键区间相交，这些轮会合成一块；裁剪和摘要不能从中间切开。模型视图只使用唯一配对的工具申请与结果，原始审计仍完整保留。',
+        '全部历史轮与已保存边界。','按时间排列、可安全选择或降级的完整块。','app/core/context_layers.py · history_blocks / _block_view'),
+      n('layer1',425,460,'第 1 层：最近历史','从最新向前保留完整后缀','teal',
+        '按预算保留最近连续的完整块，旧块降入半压层。工具结果仍按本地字段规则生成有界副本，保留编号、状态、金额等核心事实。旧结果核心事实放不下时整块降级；未完成、未配对或回执待核实的块不能降级。',
+        '完整历史块、原文层预算、工具呈现规则。','最近历史副本与建议推进的原文层边界。','app/core/context_layers.py · build_context_snapshot / app/workflow/context.py · _layered_history'),
+      n('stop',815,460,'无法安全容纳就停止','不切开待处理轮或关键事实','rose',
+        '未完成轮阻止安全降级、当前原话过大、当前工具关键事实放不下，或完整模型输入超过窗口时，抛出上下文预算错误。工作流转到明确的预算停止答复，不悄悄改短当前问题或丢失已创建工单事实。',
+        '无法安全满足的容量约束。','budget_exceeded 安全出口。','app/core/context_budget.py · ContextBudgetExceeded / app/workflow/agent.py · stopped_state'),
+      n('layer2',425,605,'第 2 层：半压历史','原问保留 · 助手前 60 字','teal',
+        '半压区位于摘要上界之后、原文层边界及之前。用户原话不改；助手长正文保留前 60 字并标记截短。工具结果超过 256 估算单位时换成一行标识，保留成功或失败、对象编号和原始消息 ID。',
+        '原先半压的历史块及本轮新降级的旧块。','较短但仍保持调用配对的历史副本。','app/core/context_layers.py · _shorten / _tool_marker'),
+      n('layer3',35,605,'第 3 层：已提交摘要','最近完整摘要段 · 不改旧段','teal',
+        '只选择已提交且覆盖上界合法的摘要段，从最新段向前选取，不能截断一个段。空的无事实段仅记录覆盖范围，不向模型加入占位文字。摘要只作背景；理解编号时仍回查其覆盖的原始用户或成功工具记录。',
+        '已提交摘要段及摘要投影容量。','有界早期梗概、实际注入的段号与原文范围。','app/core/context_layers.py · project_summaries / app/workflow/context.py · assemble_context'),
+      n('fit2',425,750,'半压历史是否仍超量','比较完整半压用量与层 2 容量','slate',
+        '先统计全部待摘要半压块的用量，再决定实际发送哪些块。预算足够就全部保留；预算不足只保留最近连续完整后缀。触发依据是用量，不是对话达到固定轮数。',
+        '半压历史和该层预算。','实际发送的半压层，以及是否需要后台摘要。','app/core/context_layers.py · build_context_snapshot / _suffix'),
+      n('omit',815,750,'临时省略最旧半压块','记录范围 · 请求后台摘要','orange',
+        '记录 omitted_ranges 并设置 summary_required=true。这里只是本轮模型没有收到这些块；原文没有删除，也没有被假装成已完成摘要。summary_upto_msg_id 必须等摘要事务成功后才能推进。',
+        '超出半压容量的完整旧块。','临时省略范围与摘要待办标记。','app/core/context_layers.py · ContextSnapshot'),
+      n('freeze',425,895,'提交降级边界，冻结本轮','短事务核验 · 后续调用共用','teal',
+        '若原文层边界需前移，短事务锁住会话并比较读取时的摘要上界，再核对完整源区间后单调推进。摘要已被其他任务推进则不覆盖。三层模型视图保存到 history_context，本轮后续调用共用，不受后台摘要中途改写。',
+        '三层投影、已读摘要边界和建议原文边界。','本轮冻结的 history_context；数据库原文仍完整。','app/repositories/context.py · advance_layer1 / app/workflow/graph.py · resolve_node'),
+      n('assemble',425,1040,'组装每次模型输入','半压 → 原文 → 当前轮与资料','blue',
+        '实际顺序为 system、半压层、最近层、当前原话、一条上下文资料、本轮工具链。资料中放早期梗概、完整问题、已过闸证据和操作说明。用稳定 current_message_id 核对原话，再检查当前输入及完整请求预算；动态资料不写入原始 messages。',
+        '冻结历史、本轮原话、证据及最新工具结果。','独立 ModelContext；校验来源等内部元数据不上送。','app/workflow/context.py · assemble_context / app/workflow/state.py · current_messages'),
+      n('schedule',815,1040,'完成或等待后登记摘要','不等待后台模型 · 不占聊天锁','slate',
+        '本轮完成或暂停状态已经保存后，若冻结快照要求摘要，就立即登记后台任务。当前回答不等待摘要生成；下一轮重新读库，才会看到后来提交的新摘要。摘要失败只记录故障，不把已完成聊天改成失败。',
+        'summary_required 标记和已完成或已暂停的轮次。','独立后台摘要任务，供后续对话读取结果。','app/services/chat.py · _schedule_summary / _run_graph','summary')
+    ],
+    edges: [
+      e('restore','anchors'),
+      e('anchors','capacity','计算容量',[],false,'left','right'),
+      e('capacity','blocks','',[[155,290],[545,290]]),
+      e('anchors','layer3','已提交段',[[315,214],[315,649]],true,'left','right'),
+      e('blocks','layer1'),
+      e('layer1','stop','无法降级',[],false,'right','left'),
+      e('layer1','layer2'),
+      e('layer2','fit2'),
+      e('fit2','omit','超量',[],false,'right','left'),
+      e('fit2','freeze','预算内'),
+      e('omit','freeze','保留最近部分',[[935,868],[545,868]]),
+      e('layer3','freeze','摘要投影',[[155,939]],true,'bottom','left'),
+      e('freeze','assemble'),
+      e('assemble','stop','输入放不下',[[715,1084],[715,504]],false,'right','left'),
+      e('omit','schedule','需摘要标记',[],true),
+      e('assemble','schedule','完成 / 等待',[],true,'right','left')
+    ]
+  },
+  {
+    id: 'budget', name: '窗口与预算', title: '先预留当前问题，再计算历史能放多少',
+    subtitle: 'CH07 使用窗口推导预算；下列为源码默认值，估算单位不等于模型实际计费量。',
+    w: 1100, h: 1180,
+    nodes: [
+      n('window',425,25,'声明模型窗口 W','默认 131072 估算单位','slate',
+        '配置 model_context_window 声明应用采用的模型窗口，默认 131072。统一估算器按实际消息与 JSON 字段计量：ASCII 字符约四个算一单位，非 ASCII 字符默认每个算两单位，再向上取整。它是容量估算，不是上游真实分词或账单。',
+        '窗口配置及 context_non_ascii_tokens=2.0。','各阶段统一使用的窗口与计量口径。','app/core/context_budget.py · TokenEstimator / app/config.py'),
+      n('reserve',425,170,'预留输出与安全余量','完整输入上限：120422','slate',
+        '输出预留默认 4096；安全余量取 max(512, ceil(W/20))，默认 6554。完整模型输入上限 R = W - 输出 - 安全，因此默认 R=120422。系统消息、工具定义和全部输入消息都计入 R。',
+        '窗口 W=131072、输出预留 4096。','request_limit=120422。','app/core/context_budget.py · derive_history_budget / app/core/model_budget.py · from_settings'),
+      n('fixed',35,170,'实测固定前缀 F','取四类模型阶段的最大开销','blue',
+        '分别测量理解、分类、决策、回答的固定 system 提示及对应工具定义，取其中最大值，作为所有阶段共享的历史扣减项。决策使用真实注册表工具定义；不能把工具 schema 当作免费内容。',
+        '各阶段提示、理解与分类协议、实际业务工具定义。','固定前缀用量 F；随工具清单和提示变化。','app/workflow/context.py · shared_budget'),
+      n('evidence',815,170,'预留证据与摘要','默认 8192 + 4096','teal',
+        '证据容量 E=min(context_evidence_max_tokens, W/16)，默认 8192；摘要容量 S=min(context_summary_max_tokens, W/24)，默认 4096。选资料时保留完整证据块和原编号；摘要也只选完整段。',
+        '窗口 W 与证据、摘要最大容量配置。','证据预留 E 和摘要预留 S。','app/core/context_budget.py · context_budget / app/workflow/context.py · select_evidence'),
+      n('current',425,315,'预留当前轮峰值 C','默认 8336 + 补救消息 P','slate',
+        'C = 当前原话上限 + 每轮工具数 × (单结果上限 + 单调用预留) + 补救消息峰值 P。默认 C=2000+4×(1200+384)+P=8336+P。按整轮工具数估算，包含同批和跨决策累积，不只看一次决策。',
+        '原话 2000、工具数 4、结果 1200、调用 384、实际补救提示。','本轮原话和完整工具链的峰值预留。','app/core/context_budget.py · context_budget'),
+      n('toolview',35,315,'工具只裁剪模型副本','单结果 1200 · 单调用预留 384','orange',
+        '结果超过预算时，优先缩短长说明或非关键明细，并标记 truncated。编号、状态、金额等核心事实及其父路径不能丢失；核心事实本身放不下就报预算不足。完整工具回执始终保存在数据库。',
+        '真实工具结果与本地字段、枚举呈现规则。','保留关键事实的模型副本；调用协议继续配对。','app/tools/presentation.py · model_tool_result'),
+      n('history',425,460,'计算历史容量 H','min(32768, 99798 − F − P)','slate',
+        'H=min(目标轮数×稳态单轮用量, R-F-E-S-C)。目标默认 32×1024=32768；代入其他默认项后是 H=min(32768,99798-F-P)。32 是预算推导目标，不是固定保留轮数，也不是摘要触发轮数。',
+        'R、F、E、S、C 和历史目标配置。','扣除所有必要预留后的共享历史容量 H。','app/core/context_budget.py · derive_history_budget'),
+      n('split',425,605,'历史按 70% / 30% 分层','容量满额时：22937 / 9831','teal',
+        '最近历史层容量 L1=floor(H×0.7)，半压层 L2=H-L1，舍入余数归半压层。若 H 达到目标上限 32768，则 L1=22937、L2=9831。若最近层连一轮稳态用量 1024 都容不下，立即拒绝该预算配置。',
+        '最终历史容量 H。','两层独立容量；摘要投影有另外的预留。','app/core/context_budget.py · derive_history_budget','context'),
+      n('request',425,750,'检查每次真实模型输入','原话 ≤2000 · 请求 ≤120422','blue',
+        '共享预留之后，每次调用仍检查实际内容。当前原话含协议的估算量不得超过 2000；系统、历史、当前原话、资料、工具链和本次工具定义总量不得超过请求上限。2000 是估算单位，不是 2000 个汉字。',
+        '本次完整消息、真实工具 schema、冻结历史预算。','可以发送的完整 ModelContext 或明确超限。','app/workflow/context.py · assemble_context'),
+      n('denied',815,750,'超限则固定停止','不靠删当前事实强行发送','rose',
+        '当前原话、关键工具事实、完整请求、调用次数或累计占额无法满足限制时，返回明确的预算停止答复。已经提交的业务结果仍需保留；不会把预算错误当作没有查到信息。',
+        'ContextBudgetExceeded 或 WorkflowBudgetExceeded。','budget_exceeded 安全出口及保留的事实。','app/workflow/agent.py · stopped_state / app/workflow/graph.py'),
+      n('ledger',425,895,'模型请求前先占额','每次预留 2 × (输入 + 输出)','slate',
+        '每次逻辑模型请求发出前先占额，按 2×(输入估算+阶段输出上限) 预留一次 SDK 重试。生产在线账本默认最多 9 次模型调用、5 次决策；总占额由窗口推导为 2×9×131072=2359296，不直接使用旧的 240000 字段。成功后也不退回保守重试占额。',
+        '实际输入估算、阶段输出上限、已用调用次数。','已记录的本次预留与剩余次数；不足则停止。','app/core/model_budget.py · BudgetLedger.from_settings / reserve / ensure_capacity'),
+      n('send',425,1040,'执行本次模型请求','按阶段限制输出，保留重试边界','blue',
+        '在已占额后调用模型。默认理解、扩写、改写、决策、摘要输出上限为 2048；分类与回答为 4096，并受 max_output_tokens 的更小值约束。当前轮账本跨图节点传递，恢复暂停动作时沿用原账本。',
+        '已通过输入检查且已占额的请求。','模型输出、结束原因和可选实际用量。','app/workflow/model.py · WorkflowModelAdapter / app/core/model_budget.py · OUTPUT_LIMITS'),
+      n('usage',815,1040,'分开保存估算与实际用量','缺少上游用量就标为未知','teal',
+        'reserved_units 是容量保护的保守估算；actual_tokens 只在所有请求都有可靠的上游 total_tokens 时汇总，缺一项就为未知。后台摘要另建独立账本，默认最多两次逻辑调用，总占额 2×2×131072=524288，不占当前聊天轮账本。',
+        '请求预留记录、上游 usage 与 finish_reason。','可追查的估算记录及已知或未知的真实用量。','app/core/model_budget.py · record_usage / snapshot','summary')
+    ],
+    edges: [
+      e('window','reserve'),
+      e('window','fixed','阶段前缀',[[545,140],[155,140]],true),
+      e('window','evidence','窗口比例',[[545,140],[935,140]],true),
+      e('reserve','current'),
+      e('toolview','current','工具预留',[],true,'right','left'),
+      e('current','history'),
+      e('fixed','history','F',[[300,258],[300,504]],true,'bottom','left'),
+      e('evidence','history','E + S',[[740,258],[740,504]],true,'bottom','right'),
+      e('history','split'),
+      e('split','request'),
+      e('request','denied','输入超限',[],false,'right','left'),
+      e('request','ledger','输入通过'),
+      e('ledger','denied','次数或占额不足',[[715,939],[715,794]],false,'right','left'),
+      e('ledger','send','占额成功'),
+      e('send','usage','观测结果',[],false,'right','left')
+    ]
+  },
+  {
+    id: 'summary', name: '后台摘要', title: '只总结已降级的原文，分段追加后再推进边界',
+    subtitle: '用量触发、完整块装批、来源校验、短事务提交；失败不影响已完成的聊天。',
+    w: 1100, h: 1330,
+    nodes: [
+      n('trigger',425,25,'收到摘要待办','本轮结束 / 等待，或启动扫描','slate',
+        '聊天完成或暂停状态保存后，若本轮快照的半压用量超预算，就登记摘要。应用启动也扫描原文层边界大于摘要边界的会话，重建遗留待办。扫描发现积压不等于立即生成，后台仍会重新计量。',
+        'summary_required 标记，或数据库遗留半压区。','可信会话 ID 对应的独立后台任务。','app/services/chat.py · _schedule_summary / app/services/summaries.py · recover'),
+      n('pool',425,170,'登记有界后台任务','并发 2 · 最多 32 个会话任务','slate',
+        '同一会话最多一个摘要任务；重复触发只标记还有新积压，现任务结束后再尝试。默认并发两个，最多登记 32 个。任务使用独立上下文，不持聊天锁、请求 session 或图检查点引用。',
+        '会话 ID、任务池状态和退避期限。','立即接受的任务，或暂缓原因。','app/services/summaries.py · SummaryManager / maybe_schedule'),
+      n('skip',815,170,'暂缓或无须生成','在途、退避、满队列或未超量','slate',
+        '关闭中、已有同会话任务、退避期或队列已满时暂不新增任务；已有任务会标记积压。获得槽位后重新核算若半压历史已经在容量内，就直接结束，不额外调用摘要模型。',
+        '任务登记条件或重新核算的半压用量。','明确的跳过原因；不会虚假推进摘要边界。','app/services/summaries.py · maybe_schedule / _run'),
+      n('freeze',425,315,'重新读库，冻结原文区间','(summary_upto, layer1_from]','teal',
+        '拿到全局槽位后读取同一数据库快照，冻结摘要旧上界到原文层边界之间的区间。边界不能切开相交轮组。只处理已结束且工具配对的完整块；正在处理或回执待核实的轮不能进入摘要。',
+        '会话边界、已有摘要段、完整消息流水。','本次固定的待摘要块列表；新到消息留给以后。','app/services/summaries.py · _run / app/core/context_layers.py · history_blocks'),
+      n('measure',425,460,'重新确认是否真的超量','全部半压用量 > 层 2 容量？','slate',
+        '基于刚读取的原文重新生成半压视图并计量，防止请求触发后其他任务已处理积压。只有未省略前的半压总量仍超预算，才开始本次冻结区间的摘要。',
+        '冻结完整块及后台共享历史预算。','开始生成，或因用量已在预算内退出。','app/services/summaries.py · _run / app/core/context_layers.py · build_context_snapshot'),
+      n('batch',425,605,'按完整块装入一批','最早待处理块开始，不截原文','teal',
+        '从最早未摘要块向后装批，发送完整原始消息。每次都为结构或来源校验的一次补救留够输入空间。旧摘要只作为有界 background 背景，新段只能提炼本批 source，不能把旧摘要重新合并覆盖。',
+        '尚未处理的冻结块、已有摘要投影。','能完整容纳的本批原文和只读背景。','app/services/summaries.py · _run / app/workflow/summarization.py · fits / _input'),
+      n('oversized',815,605,'单块过大，保留原文','退出并退避 60 秒','rose',
+        '如果连最早一个完整块都装不下，不把轮次拆开，不截短原始 source，也不假装已经总结。任务退出并登记默认 60 秒退避；之后由后续调度或重启扫描再尝试。',
+        '无法完整容纳的相交轮组。','原边界和原始消息不变，记录 oversized_turn。','app/services/summaries.py · _run'),
+      n('generate',425,750,'生成本段摘要草稿','最多 200 字 · 单批 90 秒','blue',
+        '独立摘要账本调用模型，要求只提交 submit_summary：正文、支撑它的本批消息 ID、是否明确无事实。正文最多 200 字；默认单批处理超时 90 秒，SDK 请求超时 60 秒且最多一次网络重试。网络故障不进入语义补救。',
+        '完整 source、只读 background、固定事实规则。','SummaryDraft 草稿或模型故障。','app/workflow/summarization.py · SummaryGenerator.generate / app/services/summaries.py · _run'),
+      n('validate',425,895,'校验来源与完整编号','用户原话 / 成功工具 data','teal',
+        '来源 ID 必须唯一且属于本批有效用户或工具消息。数字、金额、编号必须在所引可信来源中出现；助手正文和旧摘要不提供本段业务事实。失败工具只证明失败。no_facts=true 时正文必须为空；这不等于对自由文本语义做了完整验证。',
+        '严格草稿、本批完整原文及可信来源提取结果。','可保存的本段事实摘要，或校验失败。','app/workflow/summarization.py · validate_summary / _trusted_text'),
+      n('repair',35,895,'最多补救一次','只给来源约束，不回灌坏草稿','orange',
+        '第一次结构或来源校验失败时，程序列出本批允许的消息 ID 与完整数字集合，让模型基于相同 source 重新提交。不会把不合法草稿作为历史补入。第二次仍失败就退出并退避。',
+        '第一次校验错误、相同原文和程序计算的约束。','第二次且最后一次摘要逻辑请求。','app/workflow/summarization.py · _repair / generate'),
+      n('commit',425,1040,'短事务追加摘要段','保存段 + 更新投影 + 推进上界','teal',
+        '模型完成后才开启短事务并锁会话行。先查相同冻结范围是否已有段，再比较 expected_summary_upto；核对连续完整源区间后追加新段，同时更新 conversations.summary 投影与 summary_upto_msg_id。旧段和原文均不覆盖，空的无事实段也保留覆盖记录。',
+        '通过校验的正文、旧边界、本批真实起止消息 ID。','原子提交的新摘要段及新的摘要覆盖上界。','app/repositories/context.py · append_summary / _range'),
+      n('failure',815,1040,'未确认提交就保留原边界','过期任务退出 · 故障退避','rose',
+        '旧边界已经变化时丢弃过期任务，不覆盖其他任务成果。数据库提交异常会新开会话回读同范围，找到已保存段才认成功；否则保留异常。网络、超时或校验失败记录后退避 60 秒，不影响已完成聊天。停机最多等 5 秒，然后取消并收回任务。',
+        '来源失败、依赖故障、过期范围或未确认提交。','已确认的历史段仍有效；没有确认的新段不推进边界。','app/repositories/context.py · append_summary / app/services/summaries.py · _run / close'),
+      n('continue',425,1185,'还有本次冻结批次？','有则继续；全部完成再退出','slate',
+        '成功后将本批末消息 ID 作为新的摘要上界，并继续处理本次冻结范围的下一批。全部处理完成后退出；期间新增积压若已标记，会尝试重新登记。下一轮聊天重新读库，使用新提交摘要，不修改正在运行的冻结上下文。',
+        '已提交段、更新后的边界与本次剩余完整块。','下一批，或已完成的后台任务与后续可读摘要。','app/services/summaries.py · _run / app/workflow/context.py · history_snapshot','context')
+    ],
+    edges: [
+      e('trigger','pool'),
+      e('pool','skip','暂不登记',[],false,'right','left'),
+      e('pool','freeze','取得槽位'),
+      e('freeze','measure'),
+      e('measure','skip','已在预算内',[[735,504],[735,214]],false,'right','left'),
+      e('measure','batch','确实超量'),
+      e('batch','oversized','单块放不下',[],false,'right','left'),
+      e('batch','generate','完整装批'),
+      e('generate','validate'),
+      e('generate','failure','超时 / 故障',[[705,794],[705,1084]],false,'right','left'),
+      e('validate','repair','首次不合格',[],false,'left','right'),
+      e('repair','generate','仅一次补救',[[155,714],[545,714]],true,'top','top'),
+      e('validate','failure','仍不合格',[[745,939],[745,1084]],false,'right','left'),
+      e('validate','commit','通过校验'),
+      e('commit','failure','过期 / 故障',[],false,'right','left'),
+      e('commit','continue','提交确认'),
+      e('continue','batch','还有下一批',[[315,1229],[315,649]],true,'left','left')
+    ]
+  }
+);
+
+// 复杂节点是子图入口；技术细节留在下一层，根图只保留系统主干。
+const childLinks={overview:{accept:'persistence',save:'persistence',observe:'quality'},chat:{log:'persistence',done:'persistence'},actions:{executor:'execution'},knowledge:{rank:'retrieval',answer:'retrieval'}};
+Object.entries(childLinks).forEach(([mapId,links])=>Object.entries(links).forEach(([nodeId,jump])=>{const node=maps.find(map=>map.id===mapId).nodes.find(item=>item.id===nodeId);node.jump=jump;}));
+const parents={chat:'overview',knowledge:'overview',actions:'overview',improve:'overview',persistence:'overview',quality:'overview',context:'chat',budget:'context',summary:'context',execution:'actions',retrieval:'knowledge'};
+const $=id=>document.getElementById(id);
+const state={map:maps[0],selected:null,scale:1,list:window.innerWidth<600,fit:true,trail:['overview']};
+const svgNS='http://www.w3.org/2000/svg';
+function element(tag,className,text){const el=document.createElement(tag);if(className)el.className=className;if(text!==undefined)el.textContent=text;return el;}
+function svgElement(tag,attributes){const el=document.createElementNS(svgNS,tag);Object.entries(attributes).forEach(([key,value])=>el.setAttribute(key,String(value)));return el;}
+function anchor(node,side){return side==='left'?[node.x,node.y+node.h/2]:side==='right'?[node.x+node.w,node.y+node.h/2]:side==='top'?[node.x+node.w/2,node.y]:[node.x+node.w/2,node.y+node.h];}
+function renderMap(map,target,interactive=true){
+  target.replaceChildren();target.style.width=map.w+'px';target.style.height=map.h+'px';
+  const svg=svgElement('svg',{width:map.w,height:map.h,class:'connections','aria-hidden':'true'});
+  const markerId=(interactive?'screen-':'print-')+map.id;
+  const defs=svgElement('defs',{});const marker=svgElement('marker',{id:markerId,viewBox:'0 0 10 10',refX:9,refY:5,markerWidth:6,markerHeight:6,orient:'auto-start-reverse'});marker.append(svgElement('path',{d:'M 0 0 L 10 5 L 0 10 z',fill:'#96a7b5'}));defs.append(marker);svg.append(defs);
+  map.edges.forEach((edge,index)=>{
+    const from=map.nodes.find(node=>node.id===edge.from),to=map.nodes.find(node=>node.id===edge.to);
+    if(!from||!to)throw new Error('流程连线缺少节点：'+edge.from+' → '+edge.to);
+    const points=[anchor(from,edge.side),...edge.via,anchor(to,edge.end)];
+    const path=svgElement('path',{d:points.map((p,i)=>(i?'L':'M')+p.join(' ')).join(' '),class:'edge'+(edge.dashed?' dashed':''),'marker-end':'url(#'+markerId+')','data-edge':index});svg.append(path);
+    if(edge.label){
+      // 选择最长线段放标签；标签描边保持背景干净，避免与连线混在一起。
+      let longest=0,segment=[points[0],points[1]];for(let i=1;i<points.length;i++){const length=Math.hypot(points[i][0]-points[i-1][0],points[i][1]-points[i-1][1]);if(length>longest){longest=length;segment=[points[i-1],points[i]];}}
+      const [a,b]=segment;const horizontal=Math.abs(a[1]-b[1])<Math.abs(a[0]-b[0]);
+      const text=svgElement('text',{x:horizontal?(a[0]+b[0])/2:a[0]+10,y:horizontal?a[1]-8:(a[1]+b[1])/2+4,'text-anchor':horizontal?'middle':'start',class:'edge-label','data-edge':index});text.textContent=edge.label;svg.append(text);
+    }
+  });target.append(svg);
+  map.nodes.forEach((node,index)=>{
+    const button=element(interactive?'button':'div','node '+node.tone);Object.assign(button.style,{left:node.x+'px',top:node.y+'px',width:node.w+'px',height:node.h+'px'});button.dataset.id=node.id;
+    if(node.jump)button.dataset.subflow=node.jump;
+    if(interactive){button.type='button';if(!node.jump)button.setAttribute('aria-pressed','false');button.setAttribute('aria-label',node.title+'：'+node.sub+(node.jump?'，进入子流程':''));button.addEventListener('click',()=>chooseNode(node.id));}
+    button.append(element('span','node-tag',String(index+1).padStart(2,'0')+' / '+categories[node.tone]),element('strong','',node.title),element('small','',node.sub),element('span','node-arrow',node.jump?'展开 ↗':'·'));target.append(button);
+  });
+}
+function detailSection(title,text,isSource=false){const section=element('div','detail-section');section.append(element('h3','',title),element(isSource?'code':'p',isSource?'source':'',text));return section;}
+function enterMap(id){const previous=state.trail.indexOf(id);switchMap(id,previous>=0?state.trail.slice(0,previous+1):[...state.trail,id]);$('map-title').focus({preventScroll:true});if(window.innerWidth<=900)$('tabs').scrollIntoView({block:'start',behavior:'instant'});}
+function chooseNode(id){const node=state.map.nodes.find(item=>item.id===id);if(node?.jump){enterMap(node.jump);return;}selectNode(id);if(window.innerWidth<=900)$('detail').scrollIntoView({block:'start',behavior:'instant'});}
+function selectNode(id){
+  const node=state.map.nodes.find(item=>item.id===id);if(!node)return;state.selected=id;
+  $('stage').querySelectorAll('.node:not([data-subflow])').forEach(button=>button.setAttribute('aria-pressed',String(button.dataset.id===id)));
+  $('stage').querySelectorAll('.edge').forEach(path=>{const edge=state.map.edges[Number(path.dataset.edge)];path.classList.toggle('active',edge.from===id||edge.to===id);});
+  const detail=$('detail');detail.className='detail '+node.tone;detail.replaceChildren();
+  const top=element('div','detail-top');top.append(element('div','detail-kicker','STEP '+String(state.map.nodes.indexOf(node)+1).padStart(2,'0')+' / '+categories[node.tone]),element('h2','',node.title),element('p','',node.body));
+  const body=element('div','detail-body');body.append(detailSection('拿到什么',node.input),detailSection('产出什么',node.output),detailSection('对应代码',node.source,true));
+  const outgoing=state.map.edges.filter(edge=>edge.from===id);if(outgoing.length){const section=element('div','detail-section');section.append(element('h3','','接下来 / 相关步骤'));const links=element('div','detail-related');outgoing.forEach(edge=>{const next=state.map.nodes.find(item=>item.id===edge.to);const button=element('button','',next.title);button.type='button';button.addEventListener('click',()=>{chooseNode(next.id);if(!next.jump&&window.innerWidth>900)focusNode(next.id);});links.append(button);});section.append(links);body.append(section);}
+  if(node.jump){const map=maps.find(item=>item.id===node.jump);const button=element('button','detail-jump','展开「'+map.name+'」 →');button.type='button';button.addEventListener('click',()=>enterMap(map.id));body.append(button);}
+  detail.append(top,body);
+}
+function focusNode(id){const button=[...$('stage').querySelectorAll('.node')].find(item=>item.dataset.id===id);if(button){button.scrollIntoView({block:'nearest',inline:'nearest',behavior:'instant'});button.focus({preventScroll:true});}}
+function applyScale(){
+  const scale=state.scale;$('stage').style.transform='scale('+scale+')';$('stage-size').style.width=state.map.w*scale+'px';$('stage-size').style.height=state.map.h*scale+'px';$('zoom-level').textContent=Math.round(scale*100)+'%';$('zoom-out').disabled=state.list||scale<=.45;$('zoom-in').disabled=state.list||scale>=1.6;$('fit').disabled=state.list;
+}
+function fitWidth(){state.fit=true;state.scale=Math.max(.45,Math.min(1.15,($('viewport').clientWidth-36)/state.map.w));applyScale();}
+function changeZoom(delta){state.fit=false;state.scale=Math.max(.45,Math.min(1.6,Math.round((state.scale+delta)*100)/100));applyScale();}
+function setView(list){state.list=list;$('viewport').classList.toggle('list-mode',list);$('list-view').setAttribute('aria-pressed',String(list));$('graph-view').setAttribute('aria-pressed',String(!list));$('map-hint').textContent='点击「展开 ↗」进入子流程，普通节点查看说明。';if(!list)fitWidth();else applyScale();}
+function searchNodes(){const query=$('search').value.trim().toLocaleLowerCase();let count=0;const ids=new Set();state.map.nodes.forEach(node=>{const match=!query||[node.title,node.sub,node.body,node.source,node.input,node.output].join(' ').toLocaleLowerCase().includes(query);if(match){count++;ids.add(node.id);}const button=[...$('stage').querySelectorAll('.node')].find(item=>item.dataset.id===node.id);button.classList.toggle('dim',!match);});$('stage').querySelectorAll('[data-edge]').forEach(path=>{const edge=state.map.edges[Number(path.dataset.edge)];path.classList.toggle('dim',Boolean(query)&&!(ids.has(edge.from)&&ids.has(edge.to)));});$('search-status').textContent=query?(count?'找到 '+count+' 个步骤':'没有匹配步骤，请换个词'):state.map.nodes.length+' 个步骤';}
+function defaultTrail(id){const trail=[id];let current=id;while(parents[current]){current=parents[current];trail.unshift(current);}return trail;}
+function renderBreadcrumbs(){const nav=$('tabs');nav.replaceChildren();if(state.trail.length>1){const back=element('button','tab','← 上一级');back.type='button';back.addEventListener('click',()=>switchMap(state.trail.at(-2),state.trail.slice(0,-1)));nav.append(back);}state.trail.forEach((id,index)=>{if(index)nav.append(element('span','crumb-separator','/'));const map=maps.find(item=>item.id===id);const button=element('button','tab',map.name);button.type='button';button.dataset.map=id;if(index===state.trail.length-1)button.setAttribute('aria-current','page');button.addEventListener('click',()=>switchMap(id,state.trail.slice(0,index+1)));nav.append(button);});}
+function switchMap(id,trail){const map=maps.find(item=>item.id===id)||maps[0];state.map=map;state.trail=trail||defaultTrail(map.id);renderBreadcrumbs();$('flow-select').value=map.id;$('map-title').textContent=map.title;$('map-subtitle').textContent=map.subtitle;$('search').value='';renderMap(map,$('stage'));selectNode(map.nodes[0].id);setView(state.list);searchNodes();$('viewport').scrollTo(0,0);if(location.hash!=='#'+map.id)history.replaceState(null,'','#'+map.id);requestAnimationFrame(()=>$('viewport').scrollTo(0,0));}
+function preparePrint(){const area=$('print-area');area.replaceChildren();const map=state.map;const sheet=element('section','print-sheet');sheet.append(element('h1','','MewHelp / '+map.name),element('p','',state.trail.map(id=>maps.find(item=>item.id===id).name).join(' → ')+'\n'+map.subtitle));const box=element('div');box.style.height=map.h*.85+'px';const stage=element('div','stage');renderMap(map,stage,false);box.append(stage);sheet.append(box,element('p','print-caption','2026-11-13 本地代码快照 · 配置为默认/文件值，非运行配置。 · 实线：处理顺序；虚线：旁路、数据依赖或返回。'));area.append(sheet);}
+maps.forEach(map=>{const option=element('option','',map.name);option.value=map.id;$('flow-select').append(option);});$('flow-select').addEventListener('change',event=>switchMap(event.target.value));
+$('graph-view').addEventListener('click',()=>setView(false));$('list-view').addEventListener('click',()=>setView(true));$('zoom-out').addEventListener('click',()=>changeZoom(-.1));$('zoom-in').addEventListener('click',()=>changeZoom(.1));$('fit').addEventListener('click',fitWidth);$('search').addEventListener('input',searchNodes);
+$('search').addEventListener('keydown',event=>{if(event.key==='Enter'){const first=$('stage').querySelector('.node:not(.dim)');if(first){chooseNode(first.dataset.id);if(!first.dataset.subflow&&window.innerWidth>900)focusNode(first.dataset.id);}}});
+$('print').addEventListener('click',()=>window.print());window.addEventListener('beforeprint',preparePrint);window.addEventListener('afterprint',()=>$('print-area').replaceChildren());
+new ResizeObserver(()=>{if(state.fit&&!state.list)fitWidth();}).observe($('viewport'));
+window.addEventListener('hashchange',()=>switchMap(location.hash.slice(1)));
+switchMap(location.hash.slice(1)||'overview');
+</script>
+</body>
+</html>

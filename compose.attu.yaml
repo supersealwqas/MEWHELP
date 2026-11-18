@@ -1,0 +1,30 @@
+# Attu 浏览器管理界面：连接现有 Milvus，不创建或重建知识库。
+# 启动：docker compose -f compose.attu.yaml up -d
+# 页面：http://127.0.0.1:8001
+name: mewhelp-attu
+
+services:
+  attu:
+    image: zilliz/attu:v3.0.1
+    container_name: mewhelp-attu
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8001:3000"
+    environment:
+      # Attu 与现有应用 Milvus 共用网络，使用其服务别名连接。
+      MILVUS_ADDRESS: milvus:19530
+      MILVUS_DATABASE: mewhelp_ch03
+      # 仅本机访问，免去额外创建 Attu 管理员的步骤。
+      ATTU_AUTH_MODE: none
+    volumes:
+      - attu_data:/data
+    networks:
+      - application_milvus
+
+volumes:
+  attu_data:
+
+networks:
+  application_milvus:
+    external: true
+    name: mewhelp-ch02_default

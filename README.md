@@ -2,6 +2,11 @@
 
 喵购商城客服演示项目，当前已实现到 CH10。模型从动态工具清单选择订单、知识及 MCP 物流/售后查询；完整建单申请先显示预览，用户确认后才写入。CH09 提供本机观测、人工审核与评估，CH10 提供可选主题分类。后端使用 FastAPI、SQLAlchemy、MySQL 和 LangGraph，SQLite 保存可恢复的工作流；知识沿用 BGE-M3、Milvus 混合检索和本地重排。运行与验收见 [CH08 运行手册](docs/ch08-runbook.md)、[CH09 操作手册](docs/ch09-operations.md)和 [CH10 操作手册](docs/ch10-operations.md)。
 
+## 看两段实现
+
+- **长对话压缩。** 按完整轮次压缩旧对话，将工具调用和返回结果配对处理。相关测试覆盖未返回结果的工具调用和超出长度预算的对话。[实现与测试](https://github.com/supersealwqas/MEWHELP/commit/8260eca0857b2e9703956427b53030dbd6f89bd5)
+- **工单确认。** 客服先给出建单预览，用户单独确认后执行。系统记录每次请求的处理结果，重复确认使用已有回执。[实现与测试](https://github.com/supersealwqas/MEWHELP/commit/90cc17aa349c1f07e216f6fe70b7831266f53489)
+
 ## 启动与演示
 
 在项目根目录用 Git Bash 执行。先把 `.env.example` 中的配置补到本地 `.env`，填写已有模型配置及两个本地 MySQL 密码；不要覆盖已有模型凭据。以下库名 `mewhelp` 必须与 `.env` 的目标应用库一致，自定义库名时同步替换。
@@ -165,12 +170,11 @@ uv run python tests/verify_ch03_live.py recovery --test --report dev-notes/ch03-
 - `app/core/`：模型工厂与适配、完整轮次历史裁剪、提示词。
 - `app/static/`：纯文本安全渲染与工具轨迹，无外部 CDN。
 - `tests/knowledge/`、`tests/knowledge_integration/`：离线知识规则测试与真实存储集成测试，共享替身集中在 `tests/knowledge/fakes.py`。
-- [CH02 开发记录](dev-notes/ch02.md)、[CH02 历史评估](dev-notes/ch02-evaluation.md)。
-- [CH03 开发记录](dev-notes/ch03.md)、[CH03 校准](dev-notes/ch03-calibration.md)、[CH03 验收](dev-notes/ch03-evaluation.md)、[CH03 运行手册](docs/ch03-runbook.md)。
-- [CH04 开发记录](dev-notes/ch04.md)、[CH04 运行手册](docs/ch04-runbook.md)、[CH04 题集](docs/ch04-evaluation-set.md)。
-- [CH05开发记录](dev-notes/ch05.md)、[CH05运行手册与真实验收](docs/ch05-runbook.md)。
-- [CH07开发记录](dev-notes/ch07.md)、[CH07上下文管理运行与验收](docs/ch07-runbook.md)：三层历史、后台追加摘要和多会话回载；已有应用库启用前需按手册增量迁移。
-- [CH08开发记录](dev-notes/ch08.md)、[CH08运行手册](docs/ch08-runbook.md)、[CH08页面验收](docs/ch08-browser-verification.md)：动态工具、热权限、独立审计与确认恢复。
+- [CH03 运行手册](docs/ch03-runbook.md)。
+- [CH04 运行手册](docs/ch04-runbook.md)、[CH04 题集](docs/ch04-evaluation-set.md)。
+- [CH05运行手册与真实验收](docs/ch05-runbook.md)。
+- [CH07上下文管理运行与验收](docs/ch07-runbook.md)：三层历史、后台追加摘要和多会话回载；已有应用库启用前需按手册增量迁移。
+- [CH08运行手册](docs/ch08-runbook.md)、[CH08页面验收](docs/ch08-browser-verification.md)：动态工具、热权限、独立审计与确认恢复。
 
 当前 embedding 使用本地 BGE-M3。`EMBED_BASE_URL`、`EMBED_MODEL`、`EMBED_API_KEY` 仍是预留配置，填写它们不会切换编码器；云端接入与配置切换后续单独实现。
 

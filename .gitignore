@@ -50,3 +50,19 @@ build/
 # 知识库运行时缓存；manifest 与校准策略仍需正常跟踪
 /data/knowledge/cache/
 /.pytest-tmp/
+
+# Secrets, private notes, browser traces and local reference material
+/.env.*
+!/.env.example
+!/.env.langfuse.example
+/.data/
+/.pi/
+/.superpowers/
+/.playwright-cli/
+/dev-notes/
+/docs/references/
+/docs/superpowers/
+/DEV_SPEC.md
+*.sqlite
+*.sqlite3
+*.har
